@@ -1,0 +1,30 @@
+# Local gstack analytics
+.gstack/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Environment
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Audio measurement files (large, device-specific)
+*.mdat
+*.cal
+
+# SQLite database
+*.db
+*.sqlite3
