@@ -12,13 +12,13 @@ Version: pytest 9.x, pytest-asyncio 1.x
 
 ```bash
 # All tests
-pytest tests/ -v
+uv run python -m pytest tests/ -v
 
 # With coverage
-pytest tests/ -v --cov=calibrate --cov-report=term-missing
+uv run python -m pytest tests/ -v --cov --cov-report=term-missing
 
 # Single file
-pytest tests/test_preflight.py -v
+uv run python -m pytest tests/test_preflight.py -v
 ```
 
 ## Test layers
@@ -38,8 +38,10 @@ Run against real hardware after `calibrate check` passes. Not automated — run 
 - **Class grouping:** Test methods grouped in classes by the function under test (e.g., `TestMicCheck`, `TestMinidspCheck`)
 - **Async tests:** All async test methods are automatically handled by `pytest-asyncio` (mode=auto in `pyproject.toml`)
 - **sounddevice mocking:** `sounddevice` is injected into `sys.modules` via a session-scoped fixture in `conftest.py` (avoids PortAudio dependency in CI)
+- **pytta mocking:** `pytta` is injected into `sys.modules` the same way — `fake_pytta_module` fixture; individual tests set return values and call `reset_mock()` to clear cross-test call history
 - **HTTP mocking:** Use `respx` for mocking httpx calls to minidspd
 - **Denon mocking:** Use `unittest.mock.patch("denonavr.DenonAVR", ...)` with `AsyncMock` for `async_setup`
+- **numpy:** Used directly (not mocked) — real FFT computation in `_compute_fr` tests; mock signals via `numpy.random`
 
 ## Adding tests
 

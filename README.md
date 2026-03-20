@@ -26,9 +26,13 @@ Tired of endless manual loops with REW, miniDSP, and OCA? This tool closes the l
 pip install avr-calibration
 
 # Configure
-calibrate check   # creates ~/.avr-calibration/config.yaml if missing
+calibrate check           # creates ~/.avr-calibration/config.yaml if missing
 # edit the config with your Denon IP, then:
-calibrate check   # verify all hardware is reachable
+calibrate check           # verify all hardware is reachable
+
+# Measure
+calibrate measure         # run a log-sweep and save to history
+calibrate measure --label "before EQ"
 ```
 
 ## Requirements
@@ -40,8 +44,11 @@ calibrate check   # verify all hardware is reachable
 
 ## Status
 
-Early development. Currently implemented: hardware pre-flight check (`calibrate check`).
+Early development. Currently implemented:
 
-Next: measurement spike (PyTTa integration), AI analysis module, full calibration loop.
+- `calibrate check` — hardware pre-flight verification (UMIK mic, miniDSP, Denon AVR)
+- `calibrate measure` — log-sweep frequency response measurement via PyTTa + SQLite session history
+
+Next: AI analysis module (Claude API, Harman target comparison), hardware adapters (miniDSP + Denon write), full calibration loop.
 
 See [TODOS.md](TODOS.md) for the roadmap.

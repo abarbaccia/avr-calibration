@@ -21,6 +21,20 @@ def fake_sounddevice_module():
     yield mock_sd
 
 
+@pytest.fixture(autouse=True, scope="session")
+def fake_pytta_module():
+    """
+    Inject a fake pytta module into sys.modules for the entire test session.
+
+    pytta requires PortAudio and hardware at import time. MeasurementEngine
+    imports it lazily, so we pre-populate sys.modules so that 'import pytta'
+    resolves to our mock. Individual tests configure return values as needed.
+    """
+    mock_pytta = MagicMock()
+    sys.modules.setdefault("pytta", mock_pytta)
+    yield mock_pytta
+
+
 @pytest.fixture
 def config() -> Config:
     return Config({

@@ -19,6 +19,7 @@
 **Cons:** Requires SQLite schema to be designed thoughtfully early — retrofitting queries later is painful.
 **Context:** Read-only queries against the same SQLite store the pipeline writes to. Output as a formatted table or JSON. No UI needed initially. Schema should include: session_id, timestamp, start_fr (JSON blob), end_fr (JSON blob), filters_applied (JSON array), feedback_entries (FK to feedback log).
 **Depends on:** SQLite storage schema (define this in the initial build, not as an afterthought).
+**Status (v0.1.1):** ✓ Schema defined and live in `SessionStore` — `sessions` and `feedback` tables match the spec. `calibrate history` command still to build.
 
 ---
 
@@ -29,3 +30,4 @@
 **Cons:** Adds logging friction; content-aware profiles require multiple optimization runs (one per content type).
 **Context:** Build the `content_tag` field into the feedback log schema from day one (nullable, optional). Even if unused initially, having it in the schema makes adding content-aware logic trivial later. miniDSP 2x4 HD has exactly 4 preset slots — this maps perfectly to 4 content profiles.
 **Depends on:** Feedback log schema, AI analysis prompt engineering.
+**Status (v0.1.1):** ✓ `content_tag` column is live in the `feedback` table; `add_feedback()` accepts and stores it. AI analysis grouping still to implement.
