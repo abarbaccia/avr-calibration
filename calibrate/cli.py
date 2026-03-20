@@ -121,6 +121,18 @@ def measure(config_path: Path | None, label: str | None) -> None:
 
 
 @cli.command()
+@click.option("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
+@click.option("--port", default=8000, help="Port to listen on (default: 8000)")
+def web(host: str, port: int) -> None:
+    """Start the web UI server."""
+    import uvicorn
+    click.echo(f"Starting web server at http://{host}:{port}")
+    click.echo("Access from any browser on your local network.")
+    click.echo("Press Ctrl+C to stop.")
+    uvicorn.run("calibrate.web:app", host=host, port=port, reload=False)
+
+
+@cli.command()
 def history() -> None:
     """List past measurement sessions."""
     from .storage import SessionStore, DB_PATH
