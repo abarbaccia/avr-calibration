@@ -78,8 +78,9 @@ echo "--- Installing Python dependencies ---"
 if [[ "$ARCH" == "armv6l" ]]; then
     echo "ARMv6 detected — pinning numpy to 1.24.x (compiling from source, ~20 min)"
     uv venv .venv
-    source .venv/bin/activate
-    pip install "numpy>=1.24.4,<1.25" --no-binary numpy
+    # Install numpy 1.24.x into the venv before uv sync so uv reuses it.
+    # Use the venv's pip directly to avoid PEP 668 externally-managed-environment.
+    .venv/bin/pip install "numpy>=1.24.4,<1.25" --no-binary numpy
     uv sync --extra dev --no-build-isolation
 else
     uv sync --extra dev
