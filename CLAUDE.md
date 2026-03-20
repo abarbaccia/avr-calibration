@@ -42,14 +42,15 @@ These are enforced in `SafetyValidator` before any write to miniDSP:
 ```bash
 # Set up environment
 uv venv .venv && source .venv/bin/activate
-uv pip install -e ".[dev]"
+uv sync --extra dev
 
 # Run tests
-pytest tests/ -v
+uv run python -m pytest tests/ -v
 
 # Run the CLI
 calibrate --help
 calibrate check
+calibrate measure [--label TEXT]
 ```
 
 ## Testing
