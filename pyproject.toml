@@ -1,13 +1,15 @@
 [project]
 name = "avr-calibration"
-version = "0.1.0"
+version = "0.1.1"
 description = "AI-first home theater calibration — closed-loop bass optimization"
 requires-python = ">=3.11"
 dependencies = [
     "click>=8.0",
     "denonavr>=0.12",
     "httpx>=0.27",
+    "numpy>=1.26",
     "pyyaml>=6.0",
+    "pytta>=0.1",
     "sounddevice>=0.4",
 ]
 

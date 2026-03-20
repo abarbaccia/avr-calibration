@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2026-03-20
+
+### Added
+- `calibrate measure` CLI command — runs a log-sweep measurement and saves to SQLite history
+- `MeasurementEngine` — PyTTa-based acoustic measurement with lazy import (no PortAudio required at import time)
+- `FrequencyResponse` dataclass — serializable result with `to_json`/`from_json`, `peak_spl`, `freq_at_peak`
+- Deconvolution via numpy FFT: `H(f) = FFT(recording) / FFT(sweep)`, zero-division guarded, trimmed to calibration band
+- `SessionStore` — SQLite session persistence (`~/.avr-calibration/history.db`) with schema designed for `calibrate history` (TODO-2) and content-tagged feedback (TODO-3)
+- `add_feedback()` / `get_feedback()` on `SessionStore` — optional `content_tag` field baked in from day one
+- `measurement` config section with defaults for freq range, sweep duration, sample rate, and channel routing
+- 40 new tests covering all new code paths, data flow branches, and CLI commands at 100% coverage
+- `fake_pytta_module` session fixture in conftest — same lazy-import mock pattern as sounddevice
+
 ## [0.1.0] - 2026-03-19
 
 ### Added
