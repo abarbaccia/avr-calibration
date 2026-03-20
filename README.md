@@ -41,12 +41,26 @@ calibrate show 1 --csv    # export frequency response as CSV
 calibrate show 1 --json   # export as JSON
 ```
 
+## Deployment
+
+Designed to run on a **Raspberry Pi Zero W** permanently installed in your rack.
+miniDSP is always connected via USB. Plug in the UMIK when calibrating, then access
+the web UI from any browser on your network — no software install on the client.
+
+```bash
+# On the Pi Zero W:
+bash <(curl -sL https://raw.githubusercontent.com/abarbaccia/avr-calibration/main/deploy/install.sh)
+calibrate web   # http://<pi-ip>:8000
+```
+
+See [docs/deployment/pi-zero-w.md](docs/deployment/pi-zero-w.md) for the full guide.
+
 ## Requirements
 
 - Python 3.11+
 - [minidsp-rs](https://github.com/mrene/minidsp-rs) daemon running (`minidspd`)
 - Denon AVR on your local network
-- UMIK-1/2 connected via USB
+- UMIK-1/2 connected via USB (to the measurement client, not the Pi)
 
 ## Status
 
@@ -56,7 +70,9 @@ Early development. Currently implemented:
 - `calibrate measure` — log-sweep frequency response measurement via PyTTa + SQLite session history
 - `calibrate history` — list past sessions with timestamp, label, peak SPL, and point count
 - `calibrate show <id>` — session detail with ASCII frequency response plot; `--csv` and `--json` export
+- `calibrate web` — start web server (Pi serves UI; browser captures UMIK audio)
+- `deploy/install.sh` — Pi Zero W bootstrap (numpy ARMv6 pin, minidsp-rs, systemd)
 
-Next: AI analysis module (Claude API, Harman target comparison), hardware adapters (miniDSP + Denon write), full calibration loop.
+Next: web UI with browser audio capture (Web Audio API), AI analysis, miniDSP write adapter, closed loop.
 
 See [TODOS.md](TODOS.md) for the roadmap.
