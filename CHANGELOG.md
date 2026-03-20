@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-03-20
+
+### Added
+- `calibrate history` CLI command — lists all past measurement sessions (id, timestamp, label, peak SPL, point count; checkmark for sessions with a final post-EQ measurement)
+- `calibrate show <id>` CLI command — human-readable session detail with ASCII frequency response plot, plus `--csv` and `--json` export modes
+- `_ascii_plot()` helper — 10-bar log-spaced ASCII bar chart of frequency response
+- `show` command displays feedback notes (text + optional `content_tag`) when present
+- `show` command shows final peak SPL and delta (Δ dB) when `end_fr` is recorded
+- 15 new tests covering all `history`, `show`, and `_ascii_plot` code paths at 100% coverage
+- `update_end_fr()` on `SessionStore` — records post-EQ measurement for a session
+
 ## [0.1.1] - 2026-03-20
 
 ### Added

@@ -33,6 +33,12 @@ calibrate check           # verify all hardware is reachable
 # Measure
 calibrate measure         # run a log-sweep and save to history
 calibrate measure --label "before EQ"
+
+# Inspect results
+calibrate history         # list all past sessions
+calibrate show 1          # detail view: ASCII plot, peak SPL, band
+calibrate show 1 --csv    # export frequency response as CSV
+calibrate show 1 --json   # export as JSON
 ```
 
 ## Requirements
@@ -48,6 +54,8 @@ Early development. Currently implemented:
 
 - `calibrate check` — hardware pre-flight verification (UMIK mic, miniDSP, Denon AVR)
 - `calibrate measure` — log-sweep frequency response measurement via PyTTa + SQLite session history
+- `calibrate history` — list past sessions with timestamp, label, peak SPL, and point count
+- `calibrate show <id>` — session detail with ASCII frequency response plot; `--csv` and `--json` export
 
 Next: AI analysis module (Claude API, Harman target comparison), hardware adapters (miniDSP + Denon write), full calibration loop.
 

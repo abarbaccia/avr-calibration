@@ -116,4 +116,140 @@ def measure(config_path: Path | None, label: str | None) -> None:
     click.echo(f"  Session #{session_id} saved{f'  ({label})' if label else ''}")
     click.echo(f"  Peak: {fr.peak_spl:.1f} dBFS at {fr.freq_at_peak:.0f} Hz")
     click.echo(f"  Frequency points: {len(fr.frequencies)}")
+    click.echo(f"  Run 'calibrate show {session_id}' to inspect or export the FR.")
     click.echo()
+
+
+@cli.command()
+def history() -> None:
+    """List past measurement sessions."""
+    from .storage import SessionStore, DB_PATH
+
+    store = SessionStore()
+    sessions = store.list_sessions()
+
+    if not sessions:
+        click.echo("No measurement sessions yet. Run 'calibrate measure' first.")
+        return
+
+    click.echo()
+    click.echo("AVR Calibration — Measurement History")
+    click.echo("─" * 65)
+    header = f"  {'#':<5}  {'Date (UTC)':<22}  {'Label':<18}  {'Peak SPL':<10}  Pts"
+    click.echo(header)
+    click.echo("  " + "─" * 63)
+
+    for s in sessions:
+        ts = s.timestamp[:19].replace("T", " ")  # "2026-03-20 12:34:56"
+        label = (s.label or "—")[:18]
+        peak = f"{s.start_fr.peak_spl:.1f} dBFS"
+        pts = len(s.start_fr.frequencies)
+        end_marker = click.style(" ✓", fg="green") if s.end_fr else ""
+        click.echo(f"  #{s.id:<4}  {ts:<22}  {label:<18}  {peak:<10}  {pts}{end_marker}")
+
+    click.echo()
+    click.echo(f"  {len(sessions)} session(s).  Run 'calibrate show <id>' to inspect.")
+    click.echo()
+
+
+@cli.command()
+@click.argument("session_id", type=int)
+@click.option("--csv", "as_csv", is_flag=True, default=False, help="Export FR as CSV to stdout")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Export FR as JSON to stdout")
+def show(session_id: int, as_csv: bool, as_json: bool) -> None:
+    """Inspect a measurement session. Use --csv or --json to export the FR data."""
+    import csv as csv_mod
+    import io
+    import json as json_mod
+    from .storage import SessionStore
+
+    store = SessionStore()
+    session = store.get_session(session_id)
+
+    if session is None:
+        click.echo(f"Session #{session_id} not found.", err=True)
+        sys.exit(1)
+
+    fr = session.start_fr
+
+    if as_csv:
+        buf = io.StringIO()
+        writer = csv_mod.writer(buf)
+        writer.writerow(["frequency_hz", "spl_dbfs"])
+        for f, s in zip(fr.frequencies, fr.spl):
+            writer.writerow([f"{f:.3f}", f"{s:.3f}"])
+        click.echo(buf.getvalue(), nl=False)
+        return
+
+    if as_json:
+        click.echo(json_mod.dumps({
+            "session_id": session.id,
+            "timestamp": session.timestamp,
+            "label": session.label,
+            "sample_rate": fr.sample_rate,
+            "sweep_duration": fr.sweep_duration,
+            "frequencies_hz": fr.frequencies,
+            "spl_dbfs": fr.spl,
+        }, indent=2))
+        return
+
+    # Human-readable summary
+    click.echo()
+    click.echo(f"AVR Calibration — Session #{session_id}")
+    click.echo("─" * 45)
+    ts = session.timestamp[:19].replace("T", " ")
+    click.echo(f"  Date:       {ts} UTC")
+    if session.label:
+        click.echo(f"  Label:      {session.label}")
+    click.echo(f"  Sample rate:{fr.sample_rate} Hz")
+    click.echo(f"  Sweep:      {fr.sweep_duration:.1f}s log sweep")
+    click.echo(f"  Band:       {fr.frequencies[0]:.0f}–{fr.frequencies[-1]:.0f} Hz  ({len(fr.frequencies)} pts)")
+    click.echo(f"  Peak:       {fr.peak_spl:.1f} dBFS at {fr.freq_at_peak:.0f} Hz")
+    if session.end_fr:
+        delta = session.end_fr.peak_spl - fr.peak_spl
+        click.echo(f"  Final peak: {session.end_fr.peak_spl:.1f} dBFS  (Δ{delta:+.1f} dB)")
+
+    # ASCII mini-plot: 40-char wide, normalized to peak
+    click.echo()
+    click.echo("  Frequency response (start measurement):")
+    _ascii_plot(fr.frequencies, fr.spl)
+
+    feedback = store.get_feedback(session_id)
+    if feedback:
+        click.echo()
+        click.echo(f"  Feedback ({len(feedback)} note(s)):")
+        for entry in feedback:
+            tag = f"[{entry['content_tag']}] " if entry["content_tag"] else ""
+            click.echo(f"    • {tag}{entry['text']}")
+
+    click.echo()
+    click.echo("  Export: calibrate show {id} --csv  |  calibrate show {id} --json")
+    click.echo()
+
+
+def _ascii_plot(frequencies: list[float], spl: list[float], width: int = 40) -> None:
+    """Print a simple ASCII bar chart of the frequency response."""
+    if not frequencies:
+        return
+
+    spl_min = min(spl)
+    spl_max = max(spl)
+    spl_range = spl_max - spl_min or 1.0
+
+    # Sample ~10 representative frequencies log-spaced
+    import math
+    f_min, f_max = frequencies[0], frequencies[-1]
+    n_bars = min(10, len(frequencies))
+    log_steps = [
+        f_min * (f_max / f_min) ** (i / max(n_bars - 1, 1))
+        for i in range(n_bars)
+    ]
+
+    for target_f in log_steps:
+        # Find closest frequency in data
+        idx = min(range(len(frequencies)), key=lambda i: abs(frequencies[i] - target_f))
+        f = frequencies[idx]
+        s = spl[idx]
+        bar_len = int((s - spl_min) / spl_range * width)
+        bar = "█" * bar_len
+        click.echo(f"  {f:>6.0f} Hz  {bar:<{width}}  {s:+.1f} dB")
