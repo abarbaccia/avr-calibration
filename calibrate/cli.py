@@ -121,18 +121,6 @@ def measure(config_path: Path | None, label: str | None) -> None:
 
 
 @cli.command()
-@click.option("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
-@click.option("--port", default=8000, help="Port to listen on (default: 8000)")
-def web(host: str, port: int) -> None:
-    """Start the web UI server."""
-    import uvicorn
-    click.echo(f"Starting web server at http://{host}:{port}")
-    click.echo("Access from any browser on your local network.")
-    click.echo("Press Ctrl+C to stop.")
-    uvicorn.run("calibrate.web:app", host=host, port=port, reload=False)
-
-
-@cli.command()
 def history() -> None:
     """List past measurement sessions."""
     from .storage import SessionStore, DB_PATH
@@ -237,6 +225,18 @@ def show(session_id: int, as_csv: bool, as_json: bool) -> None:
     click.echo()
     click.echo("  Export: calibrate show {id} --csv  |  calibrate show {id} --json")
     click.echo()
+
+
+@cli.command()
+@click.option("--host", default="0.0.0.0", show_default=True, help="Host to bind")
+@click.option("--port", default=8000, show_default=True, help="Port to listen on")
+def web(host: str, port: int) -> None:
+    """Start the web UI server for browser-based measurement."""
+    import uvicorn
+    click.echo(f"Starting web server at http://{host}:{port}")
+    click.echo("Open that URL from any browser on your local network.")
+    click.echo("Press Ctrl+C to stop.")
+    uvicorn.run("calibrate.web:app", host=host, port=port, reload=False)
 
 
 def _ascii_plot(frequencies: list[float], spl: list[float], width: int = 40) -> None:

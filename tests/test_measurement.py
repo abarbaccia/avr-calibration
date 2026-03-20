@@ -283,3 +283,142 @@ class TestMeasureCLI:
         result, _ = self._run([], cfg_path, engine_error=RuntimeError("pytta is required"))
         assert result.exit_code == 1
         assert "pytta is required" in result.output
+
+
+# ── MeasurementEngine.generate_sweep() ───────────────────────────────────────
+
+class TestGenerateSweep:
+    def _engine(self, **overrides) -> MeasurementEngine:
+        return MeasurementEngine(make_config(**overrides))
+
+    def test_returns_tuple_of_samples_sr_duration(self):
+        engine = self._engine()
+        mock_pytta = sys.modules["pytta"]
+        mock_pytta.reset_mock()
+        mock_signal = make_signal(48000 * 3)
+        mock_pytta.generate.sweep.return_value = mock_signal
+
+        samples, sr, dur = engine.generate_sweep()
+
+        assert isinstance(samples, list)
+        assert isinstance(sr, int)
+        assert isinstance(dur, float)
+
+    def test_uses_config_defaults(self):
+        engine = self._engine(freq_min=30, freq_max=150, sweep_duration=4.0, sample_rate=44100)
+        mock_pytta = sys.modules["pytta"]
+        mock_pytta.reset_mock()
+        mock_pytta.generate.sweep.return_value = make_signal(44100 * 4)
+
+        engine.generate_sweep()
+
+        mock_pytta.generate.sweep.assert_called_once_with(
+            freq_min=30,
+            freq_max=150,
+            duration=4.0,
+            Fs=44100,
+            method="log",
+        )
+
+    def test_explicit_params_override_config(self):
+        engine = self._engine()
+        mock_pytta = sys.modules["pytta"]
+        mock_pytta.reset_mock()
+        mock_pytta.generate.sweep.return_value = make_signal(48000 * 2)
+
+        engine.generate_sweep(freq_min=10, freq_max=500, duration=2.0, sample_rate=48000)
+
+        mock_pytta.generate.sweep.assert_called_once_with(
+            freq_min=10, freq_max=500, duration=2.0, Fs=48000, method="log"
+        )
+
+    def test_pytta_import_error_raises_runtime_error(self):
+        engine = self._engine()
+        with patch.dict(sys.modules, {"pytta": None}):
+            with pytest.raises(RuntimeError, match="pytta is required"):
+                engine.generate_sweep()
+
+    def test_numpy_import_error_raises_runtime_error(self):
+        engine = self._engine()
+        with patch.dict(sys.modules, {"numpy": None}):
+            with pytest.raises(RuntimeError, match="numpy is required"):
+                engine.generate_sweep()
+
+
+# ── MeasurementEngine.play_signal() ──────────────────────────────────────────
+
+class TestPlaySignal:
+    def _engine(self) -> MeasurementEngine:
+        return MeasurementEngine(make_config())
+
+    def test_calls_sounddevice_play_and_wait(self):
+        engine = self._engine()
+        mock_sd = sys.modules["sounddevice"]
+        mock_sd.reset_mock()
+        samples = [0.1, -0.1, 0.05] * 100
+
+        engine.play_signal(samples, 48000)
+
+        mock_sd.play.assert_called_once()
+        mock_sd.wait.assert_called_once()
+
+    def test_sounddevice_import_error_raises_runtime_error(self):
+        engine = self._engine()
+        with patch.dict(sys.modules, {"sounddevice": None}):
+            with pytest.raises(RuntimeError, match="sounddevice"):
+                engine.play_signal([0.0], 48000)
+
+
+# ── MeasurementEngine.compute_fr() (public) ───────────────────────────────────
+
+class TestPublicComputeFr:
+    def _engine(self, **overrides) -> MeasurementEngine:
+        return MeasurementEngine(make_config(**overrides))
+
+    def test_returns_frequency_response(self):
+        engine = self._engine()
+        n = 4800
+        sweep = np.sin(np.linspace(0, 2 * np.pi * 100, n)).tolist()
+        recording = (np.array(sweep) * 0.9).tolist()
+
+        fr = engine.compute_fr(sweep, recording, sample_rate=48000)
+
+        assert isinstance(fr, FrequencyResponse)
+        assert len(fr.frequencies) > 0
+        assert len(fr.spl) == len(fr.frequencies)
+        assert all(20 <= f <= 200 for f in fr.frequencies)
+
+    def test_explicit_freq_min_max(self):
+        engine = self._engine()
+        n = 4800
+        sweep = np.random.default_rng(0).standard_normal(n).tolist()
+        recording = np.random.default_rng(1).standard_normal(n).tolist()
+
+        fr = engine.compute_fr(sweep, recording, freq_min=40, freq_max=100, sample_rate=48000)
+
+        assert all(40 <= f <= 100 for f in fr.frequencies)
+
+    def test_mismatched_lengths_truncated(self):
+        """Sweep longer than recording — should not crash, just truncate."""
+        engine = self._engine()
+        sweep = [0.1] * 4800
+        recording = [0.05] * 2400  # shorter
+
+        fr = engine.compute_fr(sweep, recording, sample_rate=48000)
+        assert isinstance(fr, FrequencyResponse)
+
+    def test_numpy_import_error_raises_runtime_error(self):
+        engine = self._engine()
+        with patch.dict(sys.modules, {"numpy": None}):
+            with pytest.raises(RuntimeError, match="numpy is required"):
+                engine.compute_fr([0.0], [0.0])
+
+    def test_sweep_duration_derived_from_sample_count(self):
+        engine = self._engine()
+        n = 9600  # 0.2s at 48000 Hz
+        sweep = [0.1] * n
+        recording = [0.1] * n
+
+        fr = engine.compute_fr(sweep, recording, sample_rate=48000)
+
+        assert abs(fr.sweep_duration - (n / 48000)) < 0.001
