@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] - 2026-03-20
+
+### Added
+- `calibrate web` CLI command — starts a FastAPI web server (`--host`, `--port` options)
+- `calibrate/web.py` — FastAPI app with placeholder index page and `/health` endpoint; full web UI ships in next release
+- `deploy/install.sh` — Pi Zero W bootstrap script: system packages, uv, numpy ARMv6 pin, minidsp-rs ARM binary, udev rule, config template, systemd service
+- `deploy/avr-calibration.service` — systemd unit file for the web server (auto-start on boot)
+- `docs/deployment/pi-zero-w.md` — step-by-step Pi Zero W deployment guide
+- `fastapi>=0.110` and `uvicorn>=0.29` added as core dependencies
+- 7 new tests covering web app endpoints and CLI command at 100% coverage
+
 ## [0.1.2] - 2026-03-20
 
 ### Added
