@@ -77,7 +77,7 @@ echo "--- Installing Python dependencies ---"
 # Pi Zero W ships with Python 3.11 on Bookworm so this is safe.
 if [[ "$ARCH" == "armv6l" ]]; then
     echo "ARMv6 detected — pinning numpy to 1.24.x (compiling from source, ~20 min)"
-    uv venv .venv
+    uv venv .venv --clear
     # Install numpy 1.24.x into the venv before uv sync so uv reuses it.
     # Use the venv's pip directly to avoid PEP 668 externally-managed-environment.
     .venv/bin/pip install "numpy>=1.24.4,<1.25" --no-binary numpy
