@@ -49,9 +49,10 @@ echo ""
 echo "--- Installing uv ---"
 if ! command -v uv &>/dev/null; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.cargo/bin:$PATH"
-    echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$HOME/.bashrc"
 fi
+# uv installs to ~/.local/bin; make it available for the rest of this script
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+echo 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"' >> "$HOME/.bashrc"
 echo "uv: $(uv --version)"
 
 # ── 4. Clone / update repo ─────────────────────────────────────────────────
