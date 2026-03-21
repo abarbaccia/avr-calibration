@@ -2,7 +2,7 @@
 
 AI-first home theater calibration — closed-loop bass optimization.
 
-Tired of endless manual loops with REW, miniDSP, and OCA? This tool closes the loop: measure → AI analyzes (measurements + how it sounds) → apply changes → re-measure → repeat until converged on a target curve.
+Tired of endless manual loops with REW, miniDSP, UMIK-1, etc? This tool closes the loop: measure → AI analyzes (measurements + how it sounds) → apply changes → re-measure → repeat until converged on a target curve.
 
 ## What it does
 
