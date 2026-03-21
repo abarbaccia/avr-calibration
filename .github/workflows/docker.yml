@@ -53,6 +53,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          # Pi Zero 2 W (arm/v7): when ready, add linux/arm/v7 here — no Dockerfile
+          # changes needed, it falls through to the uv sync path automatically.
           platforms: linux/arm/v6,linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}

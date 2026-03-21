@@ -1,8 +1,18 @@
 # ── Stage 1: builder ─────────────────────────────────────────────────────────
-# Builds the venv with compiled C extensions.
-# On arm/v6 (Pi Zero W): numpy 1.24.x is compiled from source (no wheel for
-# 1.26+) and pytta is skipped (requires llvmlite/LLVM which is impractical).
-# On all other arches: full deps including pytta via normal uv sync.
+#
+# arm/v6  (Pi Zero W — current):
+#   • uv has no armv6 wheel; building from source needs cargo → fails under QEMU
+#   • pydantic-core (FastAPI dep) has no armv6 wheel; same cargo problem
+#   • numpy 1.26+ has no armv6 wheel → compile 1.24.x from source via pip
+#   • pytta → llvmlite → LLVM impractical on armv6 → skipped
+#   Fix: plain pip + venv, pin pydantic v1 + fastapi 0.99.x (pure Python, no Rust)
+#
+# arm/v7  (Pi Zero 2 W — TODO: uncomment platforms line in docker.yml):
+#   All Rust wheels available for armv7. Just falls through to the else branch.
+#   No Dockerfile changes needed; uv sync handles everything.
+#
+# amd64: full deps including pytta via uv sync.
+#
 FROM python:3.11-slim-bookworm AS builder
 
 ARG TARGETARCH
@@ -21,14 +31,13 @@ WORKDIR /build
 COPY pyproject.toml uv.lock ./
 COPY calibrate/ ./calibrate/
 
-# arm/v6: uv has no pre-built wheel for armv6 and building it from source
-# requires cargo/Rust (fails under QEMU). Use plain pip + venv instead.
-# Other arches: install uv and use uv sync for a locked, reproducible build.
 RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v6" ]; then \
-        echo "ARMv6: using pip (uv has no armv6 wheel); numpy from source, pytta skipped" && \
+        echo "ARMv6 (Pi Zero W): pip-only build, pydantic v1, numpy from source" && \
         python -m venv /opt/venv && \
         /opt/venv/bin/pip install --no-cache-dir "numpy>=1.24.4,<1.25" --no-binary numpy && \
-        /opt/venv/bin/pip install --no-cache-dir ".[dev]"; \
+        /opt/venv/bin/pip install --no-cache-dir ".[dev]" \
+            "pydantic>=1.10,<2" \
+            "fastapi>=0.99,<0.100"; \
     else \
         echo "Building full deps including pytta (measurement extra)" && \
         pip install --no-cache-dir uv && \
