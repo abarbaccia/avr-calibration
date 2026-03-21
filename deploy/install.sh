@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# avr-calibration Pi Zero W bootstrap
+# avr-calibration Pi Zero W bootstrap (Docker-based)
 # Run as the pi user (not root): bash install.sh
-# Tested on Raspberry Pi OS Bookworm Lite (32-bit, Python 3.11)
+# Tested on Raspberry Pi OS Bookworm Lite (32-bit)
 set -euo pipefail
 
-REPO_URL="https://github.com/abarbaccia/avr-calibration"
-INSTALL_DIR="$HOME/avr-calibration"
+IMAGE="ghcr.io/abarbaccia/avr-calibration:latest"
 SERVICE_NAME="avr-calibration"
+DATA_DIR="$HOME/.avr-calibration"
 MINIDSP_VERSION="0.1.5"
 MINIDSP_URL="https://github.com/mrene/minidsp-rs/releases/download/v${MINIDSP_VERSION}/minidspd-arm-unknown-linux-gnueabihf.tar.gz"
 
@@ -14,79 +14,34 @@ echo ""
 echo "=== avr-calibration Pi Zero W setup ==="
 echo ""
 
-# ── 1. System check ────────────────────────────────────────────────────────
-
-PYTHON=$(python3 --version 2>&1)
-echo "Python: $PYTHON"
-if ! python3 -c "import sys; assert sys.version_info >= (3,11)" 2>/dev/null; then
-    echo "ERROR: Python 3.11+ required. Run: sudo apt install python3.11"
-    exit 1
-fi
-
 ARCH=$(uname -m)
-echo "Arch:   $ARCH"
-if [[ "$ARCH" != "armv6l" && "$ARCH" != "armv7l" && "$ARCH" != "aarch64" ]]; then
-    echo "WARNING: unexpected architecture $ARCH — continuing anyway"
-fi
+echo "Arch: $ARCH"
 
-# ── 2. System packages ─────────────────────────────────────────────────────
+# ── 1. System packages ─────────────────────────────────────────────────────
 
 echo ""
 echo "--- Installing system packages ---"
 sudo apt-get update -qq
 sudo apt-get install -y -qq \
-    git \
-    portaudio19-dev \
-    libatlas-base-dev \
-    python3-dev \
-    python3-pip \
     curl \
-    udev
+    udev \
+    ca-certificates \
+    gnupg
 
-# ── 3. uv ──────────────────────────────────────────────────────────────────
-
-echo ""
-echo "--- Installing uv ---"
-if ! command -v uv &>/dev/null; then
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-fi
-# uv installs to ~/.local/bin; make it available for the rest of this script
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-echo 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"' >> "$HOME/.bashrc"
-echo "uv: $(uv --version)"
-
-# ── 4. Clone / update repo ─────────────────────────────────────────────────
+# ── 2. Docker ─────────────────────────────────────────────────────────────
 
 echo ""
-echo "--- Setting up avr-calibration ---"
-if [ -d "$INSTALL_DIR" ]; then
-    echo "Updating existing install..."
-    git -C "$INSTALL_DIR" pull --ff-only
+echo "--- Installing Docker ---"
+if ! command -v docker &>/dev/null; then
+    curl -fsSL https://get.docker.com | sh
+    sudo usermod -aG docker "$USER"
+    echo "Docker installed. NOTE: you may need to log out and back in for"
+    echo "docker group membership to take effect. The service will still start."
 else
-    git clone "$REPO_URL" "$INSTALL_DIR"
+    echo "Docker already installed: $(docker --version)"
 fi
 
-cd "$INSTALL_DIR"
-
-# ── 5. Python deps (ARMv6 numpy pin) ──────────────────────────────────────
-
-echo ""
-echo "--- Installing Python dependencies ---"
-# On ARMv6 (Pi Zero W), numpy 1.26+ has no wheel — pin to last ARMv6 release.
-# numpy 1.24.x requires distutils (available in Python 3.11, removed in 3.12).
-# Pi Zero W ships with Python 3.11 on Bookworm so this is safe.
-if [[ "$ARCH" == "armv6l" ]]; then
-    echo "ARMv6 detected — pinning numpy to 1.24.x (compiling from source, ~20 min)"
-    uv venv .venv --clear
-    # Install numpy 1.24.x into the venv before uv sync so uv reuses it.
-    # uv pip uses uv's own resolver — no system pip needed, no PEP 668 issue.
-    uv pip install "numpy>=1.24.4,<1.25" --no-binary numpy --python .venv/bin/python
-    uv sync --extra dev --no-build-isolation
-else
-    uv sync --extra dev
-fi
-
-# ── 6. minidsp-rs ─────────────────────────────────────────────────────────
+# ── 3. minidsp-rs ─────────────────────────────────────────────────────────
 
 echo ""
 echo "--- Installing minidsp-rs ---"
@@ -102,7 +57,7 @@ else
     echo "minidspd already installed: $(minidspd --version 2>/dev/null || echo 'version unknown')"
 fi
 
-# ── 7. udev rule for miniDSP USB ──────────────────────────────────────────
+# ── 4. udev rule for miniDSP USB ──────────────────────────────────────────
 
 echo ""
 echo "--- Setting up udev rule for miniDSP ---"
@@ -116,50 +71,109 @@ else
     echo "udev rule already exists"
 fi
 
-# ── 8. Config ─────────────────────────────────────────────────────────────
+# ── 5. Config ─────────────────────────────────────────────────────────────
 
 echo ""
 echo "--- Generating config ---"
-mkdir -p "$HOME/.avr-calibration"
-if [ ! -f "$HOME/.avr-calibration/config.yaml" ]; then
-    uv run calibrate check 2>/dev/null || true  # creates template
+mkdir -p "$DATA_DIR"
+if [ ! -f "$DATA_DIR/config.yaml" ]; then
+    cat > "$DATA_DIR/config.yaml" << 'EOF'
+# AVR Calibration Configuration
+# Run 'calibrate check' after editing to verify everything is reachable.
+
+denon:
+  host: "192.168.1.100"  # IP address of your Denon X3800H
+
+minidsp:
+  host: "localhost"
+  port: 5380             # default minidspd port (run: minidspd)
+
+mic:
+  name: "UMIK"           # substring matched against audio device names
+
+measurement:
+  freq_min: 20           # Hz — lower bound of calibration band
+  freq_max: 200          # Hz — upper bound (bass calibration only)
+  sweep_duration: 3.0    # seconds
+  sample_rate: 48000     # Hz
+  input_channel: 1       # audio device channel for microphone
+  output_channel: 1      # audio device channel for subwoofer output
+EOF
     echo ""
-    echo "IMPORTANT: Edit ~/.avr-calibration/config.yaml with your Denon IP:"
+    echo "IMPORTANT: Edit $DATA_DIR/config.yaml with your Denon IP:"
     echo "  denon:"
     echo "    host: \"192.168.x.x\""
 else
-    echo "Config already exists at ~/.avr-calibration/config.yaml"
+    echo "Config already exists at $DATA_DIR/config.yaml"
 fi
 
-# ── 9. systemd service ────────────────────────────────────────────────────
+# ── 6. Pull Docker image ───────────────────────────────────────────────────
+
+echo ""
+echo "--- Pulling Docker image ---"
+# Use sudo in case the pi user isn't yet in the docker group (first install)
+sudo docker pull "$IMAGE"
+echo "Image pulled: $IMAGE"
+
+# ── 7. systemd service ────────────────────────────────────────────────────
 
 echo ""
 echo "--- Installing systemd service ---"
-SERVICE_FILE="$INSTALL_DIR/deploy/avr-calibration.service"
 SYSTEMD_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
-# Substitute actual paths into service file
-sed "s|__INSTALL_DIR__|$INSTALL_DIR|g; s|__USER__|$USER|g" \
-    "$SERVICE_FILE" | sudo tee "$SYSTEMD_FILE" > /dev/null
+# Detect USB bus path for miniDSP (2752:0011) — passed as --device to container
+MINIDSP_DEV=""
+if DEVPATH=$(udevadm info --query=path --name=/dev/bus/usb/$(lsusb | awk '/2752:0011/{print $2"/"substr($4,1,3)}') 2>/dev/null); then
+    MINIDSP_DEV="--device=/dev/bus/usb"
+else
+    MINIDSP_DEV="--device=/dev/bus/usb"  # pass the whole USB bus; safe default
+fi
+
+sudo tee "$SYSTEMD_FILE" > /dev/null << EOF
+[Unit]
+Description=AVR Calibration — web server (Docker)
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=$USER
+ExecStartPre=-/usr/bin/docker rm -f ${SERVICE_NAME}
+ExecStart=/usr/bin/docker run --rm \\
+    --name ${SERVICE_NAME} \\
+    -p 8000:8000 \\
+    ${MINIDSP_DEV} \\
+    -v ${DATA_DIR}:/data/.avr-calibration \\
+    ${IMAGE}
+ExecStop=/usr/bin/docker stop ${SERVICE_NAME}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable "$SERVICE_NAME"
 sudo systemctl start "$SERVICE_NAME"
 echo "Service enabled and started"
 
-# ── 10. Done ──────────────────────────────────────────────────────────────
+# ── 8. Done ───────────────────────────────────────────────────────────────
 
 echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "Next steps:"
-echo "  1. Edit ~/.avr-calibration/config.yaml (set denon.host)"
+echo "  1. Edit $DATA_DIR/config.yaml (set denon.host)"
 echo "  2. Plug in miniDSP via USB"
-echo "  3. Run: uv run calibrate check"
+echo "  3. Run: docker exec ${SERVICE_NAME} calibrate check"
 echo "  4. Service URL: http://$(hostname -I | awk '{print $1}'):8000"
 echo ""
 echo "Service commands:"
 echo "  sudo systemctl status $SERVICE_NAME"
 echo "  sudo systemctl restart $SERVICE_NAME"
 echo "  sudo journalctl -u $SERVICE_NAME -f"
+echo ""
+echo "Upgrade to latest image:"
+echo "  sudo docker pull $IMAGE && sudo systemctl restart $SERVICE_NAME"
 echo ""

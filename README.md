@@ -19,20 +19,17 @@ Tired of endless manual loops with REW, miniDSP, UMIK-1, etc? This tool closes t
 - UMIK-1 or UMIK-2 measurement microphone
 - Subwoofer(s) — initially tuned for SVS PB12-NSD
 
-## Quick start
+## Quick start (local dev)
 
 ```bash
-# Install
-pip install avr-calibration
+# Set up environment
+uv venv .venv && source .venv/bin/activate
+uv sync --extra dev
 
 # Configure
 calibrate check           # creates ~/.avr-calibration/config.yaml if missing
 # edit the config with your Denon IP, then:
 calibrate check           # verify all hardware is reachable
-
-# Measure
-calibrate measure         # run a log-sweep and save to history
-calibrate measure --label "before EQ"
 
 # Inspect results
 calibrate history         # list all past sessions
@@ -43,14 +40,14 @@ calibrate show 1 --json   # export as JSON
 
 ## Deployment
 
-Designed to run on a **Raspberry Pi Zero W** permanently installed in your rack.
-miniDSP is always connected via USB. Plug in the UMIK when calibrating, then access
-the web UI from any browser on your network — no software install on the client.
+Designed to run on a **Raspberry Pi Zero W** permanently installed in your rack as a
+Docker container. The image is pre-built for `linux/arm/v6` and `linux/amd64` — no
+source compilation on the Pi.
 
 ```bash
-# On the Pi Zero W:
+# On the Pi Zero W — one command installs Docker, pulls image, and starts the service:
 bash <(curl -sL https://raw.githubusercontent.com/abarbaccia/avr-calibration/main/deploy/install.sh)
-calibrate web   # http://<pi-ip>:8000
+# Web UI: http://<pi-ip>:8000
 ```
 
 See [docs/deployment/pi-zero-w.md](docs/deployment/pi-zero-w.md) for the full guide.
@@ -71,8 +68,9 @@ Early development. Currently implemented:
 - `calibrate history` — list past sessions with timestamp, label, peak SPL, and point count
 - `calibrate show <id>` — session detail with ASCII frequency response plot; `--csv` and `--json` export
 - `calibrate web` — start web server (Pi serves UI; browser captures UMIK audio)
-- `deploy/install.sh` — Pi Zero W bootstrap (numpy ARMv6 pin, minidsp-rs, systemd)
+- `Dockerfile` + `.github/workflows/docker.yml` — multi-platform Docker image (arm/v6 + amd64), built and pushed to GHCR via GitHub Actions
+- `deploy/install.sh` — Pi Zero W bootstrap: installs Docker, pulls GHCR image, starts systemd service
 
-Next: web UI with browser audio capture (Web Audio API), AI analysis, miniDSP write adapter, closed loop.
+Next: AI analysis, miniDSP write adapter, closed loop.
 
 See [TODOS.md](TODOS.md) for the roadmap.

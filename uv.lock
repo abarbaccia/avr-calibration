@@ -62,7 +62,6 @@ dependencies = [
     { name = "httpx" },
     { name = "numpy" },
     { name = "python-multipart" },
-    { name = "pytta" },
     { name = "pyyaml" },
     { name = "sounddevice" },
     { name = "uvicorn" },
@@ -75,6 +74,9 @@ dev = [
     { name = "pytest-cov" },
     { name = "respx" },
 ]
+measurement = [
+    { name = "pytta" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -82,18 +84,18 @@ requires-dist = [
     { name = "denonavr", specifier = ">=0.12" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "numpy", specifier = ">=1.26" },
+    { name = "numpy", specifier = ">=1.24.4" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "python-multipart", specifier = ">=0.0.9" },
-    { name = "pytta", specifier = ">=0.1" },
+    { name = "pytta", marker = "extra == 'measurement'", specifier = ">=0.1" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "respx", marker = "extra == 'dev'", specifier = ">=0.21" },
     { name = "sounddevice", specifier = ">=0.4" },
     { name = "uvicorn", specifier = ">=0.29" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["measurement", "dev"]
 
 [[package]]
 name = "certifi"
