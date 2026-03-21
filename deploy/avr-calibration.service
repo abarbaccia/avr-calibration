@@ -1,15 +1,21 @@
 [Unit]
-Description=AVR Calibration — web server
-After=network.target
+Description=AVR Calibration — web server (Docker)
+After=network.target docker.service
+Requires=docker.service
 
 [Service]
 Type=simple
-User=__USER__
-WorkingDirectory=__INSTALL_DIR__
-ExecStart=__INSTALL_DIR__/.venv/bin/python -m uvicorn calibrate.web:app --host 0.0.0.0 --port 8000
+User=pi
+ExecStartPre=-/usr/bin/docker rm -f avr-calibration
+ExecStart=/usr/bin/docker run --rm \
+    --name avr-calibration \
+    -p 8000:8000 \
+    --device=/dev/bus/usb \
+    -v /home/pi/.avr-calibration:/data/.avr-calibration \
+    ghcr.io/abarbaccia/avr-calibration:latest
+ExecStop=/usr/bin/docker stop avr-calibration
 Restart=on-failure
 RestartSec=5
-Environment=PATH=__INSTALL_DIR__/.venv/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=multi-user.target
