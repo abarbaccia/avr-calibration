@@ -18,20 +18,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Install uv into the builder
-RUN pip install --no-cache-dir uv
-
 COPY pyproject.toml uv.lock ./
 COPY calibrate/ ./calibrate/
 
+# arm/v6: uv has no pre-built wheel for armv6 and building it from source
+# requires cargo/Rust (fails under QEMU). Use plain pip + venv instead.
+# Other arches: install uv and use uv sync for a locked, reproducible build.
 RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v6" ]; then \
-        echo "ARMv6: building numpy 1.24.x from source, skipping pytta" && \
-        uv venv /opt/venv && \
-        uv pip install "numpy>=1.24.4,<1.25" --no-binary numpy \
-            --python /opt/venv/bin/python && \
-        uv pip install ".[dev]" --python /opt/venv/bin/python; \
+        echo "ARMv6: using pip (uv has no armv6 wheel); numpy from source, pytta skipped" && \
+        python -m venv /opt/venv && \
+        /opt/venv/bin/pip install --no-cache-dir "numpy>=1.24.4,<1.25" --no-binary numpy && \
+        /opt/venv/bin/pip install --no-cache-dir ".[dev]"; \
     else \
         echo "Building full deps including pytta (measurement extra)" && \
+        pip install --no-cache-dir uv && \
         uv venv /opt/venv && \
         uv sync --extra dev --extra measurement --no-editable; \
     fi
