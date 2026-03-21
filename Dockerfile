@@ -29,7 +29,7 @@ RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v6" ]; then \
         uv venv /opt/venv && \
         uv pip install "numpy>=1.24.4,<1.25" --no-binary numpy \
             --python /opt/venv/bin/python && \
-        uv pip install -e ".[dev]" --python /opt/venv/bin/python; \
+        uv pip install ".[dev]" --python /opt/venv/bin/python; \
     else \
         echo "Building full deps including pytta (measurement extra)" && \
         uv venv /opt/venv && \
@@ -45,7 +45,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
-COPY calibrate/ /app/calibrate/
 
 WORKDIR /app
 ENV PATH="/opt/venv/bin:$PATH"
