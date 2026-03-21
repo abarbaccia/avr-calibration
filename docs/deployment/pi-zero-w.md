@@ -21,7 +21,7 @@ install on the laptop required.
 - Micro USB OTG hub (the Pi Zero W has one OTG USB port)
 - miniDSP 2x4 HD
 - UMIK-1 or UMIK-2 microphone (plugged into your **laptop**, not the Pi)
-- Raspberry Pi OS **Bookworm Lite** (32-bit) — Python 3.11 required
+- Raspberry Pi OS **Bookworm Lite** (32-bit)
 - microSD card (8GB minimum)
 
 ## OS Setup
@@ -42,16 +42,16 @@ SSH into the Pi, then:
 curl -sL https://raw.githubusercontent.com/abarbaccia/avr-calibration/main/deploy/install.sh | bash
 ```
 
-Or clone and run locally:
+The script:
+1. Installs Docker (if not already present)
+2. Installs `minidspd` (miniDSP USB daemon)
+3. Sets up the udev rule for the miniDSP USB device
+4. Creates `~/.avr-calibration/config.yaml` with defaults
+5. Pulls the pre-built Docker image from GHCR (`ghcr.io/abarbaccia/avr-calibration:latest`)
+6. Installs and starts the `avr-calibration` systemd service
 
-```bash
-git clone https://github.com/abarbaccia/avr-calibration
-bash avr-calibration/deploy/install.sh
-```
-
-> **Note on numpy:** The Pi Zero W is ARMv6. numpy 1.26+ has no ARMv6 wheel,
-> so the install script pins numpy to 1.24.x and compiles from source.
-> This takes ~20 minutes on first install. Subsequent installs are cached.
+> **Note:** The Docker image is pre-built for `linux/arm/v6` via GitHub Actions CI.
+> No source compilation happens on the Pi — the install takes only a few minutes.
 
 ## Configuration
 
@@ -72,7 +72,7 @@ network settings menu.
 ## Verify hardware
 
 ```bash
-uv run calibrate check
+docker exec avr-calibration calibrate check
 ```
 
 Expected output:
@@ -111,9 +111,7 @@ sudo systemctl stop avr-calibration
 ## Updates
 
 ```bash
-cd ~/avr-calibration
-git pull
-uv sync --extra dev
+sudo docker pull ghcr.io/abarbaccia/avr-calibration:latest
 sudo systemctl restart avr-calibration
 ```
 
@@ -136,7 +134,8 @@ sudo systemctl status avr-calibration
 sudo journalctl -u avr-calibration -n 50
 ```
 
-**numpy compile fails:** Ensure you're on Python 3.11 (not 3.12):
+**Pull fails / image not found:** Check that Docker is running and the Pi has internet access:
 ```bash
-python3 --version
+sudo systemctl status docker
+ping -c 1 ghcr.io
 ```
