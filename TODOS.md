@@ -123,10 +123,10 @@ measurement:
 ## Completed
 
 ### TODO-4: Sweep playback routing — miniDSP USB vs. Denon HDMI
-**Completed:** docker-pipeline PR (2026-03-22) — implemented `_play_via_usb()` + `_play_via_hdmi()` with `playback_route: usb | hdmi` config dispatch. Two-stage calibration model (Stage 1 USB for sub alignment, Stage 2 HDMI for full-chain integration). `calibrate check` reports playback route status.
+**Completed:** v0.1.6.0 (2026-03-22) — implemented `_play_via_usb()` + `_play_via_hdmi()` with `playback_route: usb | hdmi` config dispatch. Two-stage calibration model (Stage 1 USB for sub alignment, Stage 2 HDMI for full-chain integration). `calibrate check` reports playback route status.
 
 ### TODO-5: Measurement quality validation
-**Completed:** docker-pipeline PR (2026-03-22) — implemented `validate_recording()` with three checks (floor noise gate → warn, cross-correlation sweep capture → raise, SNR → raise). HTTP 422 response with structured `{error, check, detail, suggestion}` body. `FrequencyResponse.warnings` field for non-fatal warnings.
+**Completed:** v0.1.6.0 (2026-03-22) — implemented `validate_recording()` with three checks (floor noise gate → warn, cross-correlation sweep capture → raise, SNR → raise). HTTP 422 response with structured `{error, check, detail, suggestion}` body. `FrequencyResponse.warnings` field for non-fatal warnings.
 
 ### TODO-2: Measurement history browser
 **What:** `calibrate history` CLI command — shows past sessions with date, starting FR vs. final FR, filters applied, and subjective feedback logged during that session.
