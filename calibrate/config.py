@@ -10,7 +10,7 @@ DEFAULT_CONFIG: dict = {
         "host": None,
     },
     "minidsp": {
-        "host": "localhost",
+        "host": "172.17.0.1",
         "port": 5380,
     },
     "mic": {
@@ -43,8 +43,8 @@ denon:
   host: "192.168.1.100"  # IP address of your Denon X3800H
 
 minidsp:
-  host: "localhost"
-  port: 5380             # default minidspd port (run: minidspd)
+  host: "172.17.0.1"    # Docker bridge gateway — minidspd runs on Pi host, not in container
+  port: 5380             # default minidspd port
 
 mic:
   name: "UMIK"           # substring matched against audio device names

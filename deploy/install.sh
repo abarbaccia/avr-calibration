@@ -94,8 +94,8 @@ denon:
   host: "192.168.1.100"  # IP address of your Denon X3800H
 
 minidsp:
-  host: "localhost"
-  port: 5380             # default minidspd port (run: minidspd)
+  host: "172.17.0.1"    # Docker bridge gateway — minidspd runs on Pi host, not in container
+  port: 5380             # default minidspd port
 
 mic:
   name: "UMIK"           # substring matched against audio device names
@@ -133,25 +133,52 @@ echo "--- Pulling Docker image ---"
 sudo docker pull "$IMAGE"
 echo "Image pulled: $IMAGE"
 
-# ── 7. systemd service ────────────────────────────────────────────────────
+# ── 7. minidspd systemd service ───────────────────────────────────────────
+#
+# minidspd runs on the Pi HOST (not inside Docker) so it has exclusive,
+# stable access to the miniDSP USB HID interface. The Docker container
+# talks to it over HTTP via the Docker bridge gateway (172.17.0.1:5380).
+#
+# Passing --device=/dev/bus/usb to Docker steals the hidraw interface from
+# the host, breaking minidsp probe after any container restart. Keep Docker
+# off the USB bus entirely.
 
 echo ""
-echo "--- Installing systemd service ---"
-SYSTEMD_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+echo "--- Installing minidspd systemd service ---"
+MINIDSPD_FILE="/etc/systemd/system/minidspd.service"
 
-# Detect USB bus path for miniDSP (2752:0011) — passed as --device to container
-MINIDSP_DEV=""
-if DEVPATH=$(udevadm info --query=path --name=/dev/bus/usb/$(lsusb | awk '/2752:0011/{print $2"/"substr($4,1,3)}') 2>/dev/null); then
-    MINIDSP_DEV="--device=/dev/bus/usb"
-else
-    MINIDSP_DEV="--device=/dev/bus/usb"  # pass the whole USB bus; safe default
-fi
+sudo tee "$MINIDSPD_FILE" > /dev/null << 'EOF'
+[Unit]
+Description=miniDSP HTTP daemon
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/minidsp server 0.0.0.0:5380
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable minidspd
+sudo systemctl start minidspd
+echo "minidspd service enabled and started"
+
+# ── 8. avr-calibration Docker systemd service ─────────────────────────────
+
+echo ""
+echo "--- Installing avr-calibration systemd service ---"
+SYSTEMD_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 sudo tee "$SYSTEMD_FILE" > /dev/null << EOF
 [Unit]
 Description=AVR Calibration — web server (Docker)
-After=network.target docker.service
-Requires=docker.service
+After=network.target docker.service minidspd.service
+Requires=docker.service minidspd.service
 
 [Service]
 Type=simple
@@ -160,7 +187,6 @@ ExecStartPre=-/usr/bin/docker rm -f ${SERVICE_NAME}
 ExecStart=/usr/bin/docker run --rm \\
     --name ${SERVICE_NAME} \\
     -p 8000:8000 \\
-    ${MINIDSP_DEV} \\
     -v ${DATA_DIR}:/data/.avr-calibration \\
     ${IMAGE}
 ExecStop=/usr/bin/docker stop ${SERVICE_NAME}
