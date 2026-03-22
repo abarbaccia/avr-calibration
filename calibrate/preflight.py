@@ -36,13 +36,15 @@ class PreflightChecker:
 
     async def run_all(self) -> list[CheckResult]:
         """Run all hardware checks concurrently. Never raises — errors become failed results."""
-        raw = await asyncio.gather(
-            self.check_mic(),
-            self.check_minidsp(),
-            self.check_denon(),
-            return_exceptions=True,
-        )
-        names = ["Microphone", "miniDSP", "Denon AVR"]
+        checks = [
+            ("Microphone", self.check_mic()),
+            ("miniDSP", self.check_minidsp()),
+            ("Denon AVR", self.check_denon()),
+            ("Playback Route", self.check_playback_route()),
+        ]
+        names = [name for name, _ in checks]
+        coros = [coro for _, coro in checks]
+        raw = await asyncio.gather(*coros, return_exceptions=True)
         results = []
         for name, outcome in zip(names, raw):
             if isinstance(outcome, BaseException):
@@ -177,5 +179,70 @@ class PreflightChecker:
                 name="Denon AVR",
                 passed=False,
                 detail=f"Cannot connect to Denon AVR at {host}",
+                error=str(exc),
+            )
+
+    async def check_playback_route(self) -> CheckResult:
+        """Check that the configured playback route is ready.
+
+        USB route: verify the playback device (e.g. miniDSP) is visible as an audio output.
+        HDMI route: verify Denon AVR is reachable (reuses check_denon result for detail).
+        """
+        route = self.config.measurement.get("playback_route", "usb")
+
+        if route == "hdmi":
+            # HDMI route requires a reachable Denon AVR
+            host = self.config.denon.get("host")
+            if not host:
+                return CheckResult(
+                    name="Playback Route",
+                    passed=False,
+                    detail="HDMI route requires denon.host — edit ~/.avr-calibration/config.yaml",
+                    error="Set denon.host and measurement.playback_route",
+                )
+            try:
+                import denonavr
+                receiver = denonavr.DenonAVR(host)
+                await receiver.async_setup()
+                model = receiver.model_name or "Denon AVR"
+                return CheckResult(
+                    name="Playback Route",
+                    passed=True,
+                    detail=f"HDMI via {model} at {host}",
+                )
+            except Exception as exc:
+                return CheckResult(
+                    name="Playback Route",
+                    passed=False,
+                    detail=f"HDMI route: cannot connect to Denon AVR at {host}",
+                    error=str(exc),
+                )
+
+        # USB route: verify playback device is visible
+        try:
+            import sounddevice as sd  # lazy: only needs PortAudio at runtime
+            devices = sd.query_devices()
+            device_name = self.config.measurement.get("playback_device", "miniDSP")
+            for idx, dev in enumerate(devices):
+                if dev["max_output_channels"] > 0 and device_name.lower() in dev["name"].lower():
+                    return CheckResult(
+                        name="Playback Route",
+                        passed=True,
+                        detail=f'USB: {dev["name"]} (device {idx})',
+                    )
+            available_outputs = [d["name"] for d in devices if d["max_output_channels"] > 0]
+            shown = ", ".join(available_outputs[:3])
+            ellipsis = "…" if len(available_outputs) > 3 else ""
+            return CheckResult(
+                name="Playback Route",
+                passed=False,
+                detail=f'USB: no "{device_name}" found. Available outputs: {shown}{ellipsis}',
+                error=f"Connect {device_name} via USB or set measurement.playback_device",
+            )
+        except Exception as exc:
+            return CheckResult(
+                name="Playback Route",
+                passed=False,
+                detail="",
                 error=str(exc),
             )

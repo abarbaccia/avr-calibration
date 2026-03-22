@@ -10,9 +10,12 @@ install on the laptop required.
 [Pi Zero W — rack, permanent]
   └── USB OTG hub
        └── miniDSP 2x4 HD (always connected)
-       └── UMIK-1 (plug in when calibrating)
   └── WiFi → Denon AVR on local network
   └── WiFi → your laptop (just a browser)
+
+[Your laptop — when calibrating]
+  └── USB → UMIK-1 microphone
+  └── Browser → https://<pi-ip>:8000  (captures UMIK audio via Web Audio API)
 ```
 
 ## Requirements
@@ -77,20 +80,25 @@ docker exec avr-calibration calibrate check
 
 Expected output:
 ```
-  ✓  Microphone    UMIK-1 detected
   ✓  miniDSP       minidspd reachable at localhost:5380
   ✓  Denon AVR     Denon AVR-X3800H online at 192.168.x.x
 ```
+
+> **Note:** UMIK mic is not checked here — it's on your laptop, accessed by the browser via Web Audio API.
 
 ## Access the web UI
 
 From any device on your network:
 
 ```
-http://avr-cal.local:8000
+https://avr-cal.local:8000
 ```
 
-Or by IP: `http://<pi-ip>:8000`
+Or by IP: `https://<pi-ip>:8000`
+
+> **Note:** The server uses a self-signed TLS certificate (generated on first boot).
+> Your browser will show a security warning — click **Advanced → Proceed** to accept it.
+> This is required for microphone access (`getUserMedia` only works over HTTPS).
 
 ## Service management
 

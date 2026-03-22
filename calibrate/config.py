@@ -23,6 +23,13 @@ DEFAULT_CONFIG: dict = {
         "sample_rate": 48000,
         "input_channel": 1,
         "output_channel": 1,
+        "playback_route": "usb",
+        "denon_sweep_input": "AUX1",
+        "denon_sweep_volume": -25.0,
+        "denon_settle_ms": 800,
+        "sweep_channel": "lfe",
+        "playback_device": "miniDSP",
+        "hdmi_playback_device": None,
     },
 }
 
@@ -47,6 +54,13 @@ measurement:
   sample_rate: 48000     # Hz
   input_channel: 1       # audio device channel for microphone
   output_channel: 1      # audio device channel for subwoofer output
+  playback_route: "usb"  # "usb" = direct to miniDSP, "hdmi" = via Denon full chain
+  denon_sweep_input: "AUX1"    # Denon input to switch to during HDMI sweep
+  denon_sweep_volume: -25.0    # dB — MUST be ≤ -25.0 (safety limit)
+  denon_settle_ms: 800         # ms to wait after Denon input/volume change
+  sweep_channel: "lfe"         # "lfe" = LFE/subwoofer channel, "left"/"right" = main
+  playback_device: "miniDSP"   # substring matched against USB audio device names
+  hdmi_playback_device: null   # HDMI audio device name; null = system default
 """
 
 
