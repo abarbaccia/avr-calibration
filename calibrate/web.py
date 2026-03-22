@@ -443,8 +443,8 @@ async def measure_start(body: StartRequest) -> dict:
         time.sleep(COUNTDOWN_MS / 1000.0)
         try:
             engine.play_signal(samples, sample_rate)
-        except RuntimeError as exc:
-            logger.warning("play_signal failed: %s", exc)
+        except Exception as exc:
+            logger.warning("play_signal failed (%s): %s", type(exc).__name__, exc)
 
     threading.Thread(target=_play, daemon=True).start()
 

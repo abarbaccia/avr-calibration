@@ -220,6 +220,60 @@ def test_play_background_thread_logs_runtime_error(client, cfg_path):
     captured_target["fn"]()  # must not raise
 
 
+def test_play_background_thread_logs_value_error(client, cfg_path):
+    """_play() must also catch ValueError (e.g. denon_sweep_volume guard, missing input)."""
+    captured_target = {}
+
+    def capture_thread(target=None, daemon=False):
+        captured_target["fn"] = target
+        m = MagicMock()
+        m.start = MagicMock()
+        return m
+
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_path),
+        patch("calibrate.web.MeasurementEngine") as MockEngine,
+        patch("calibrate.web.threading.Thread", side_effect=capture_thread),
+        patch("calibrate.web.time.sleep"),
+    ):
+        engine = MockEngine.return_value
+        engine.generate_sweep.return_value = ([0.0] * 100, 48000, 3.0)
+        engine.play_signal.side_effect = ValueError("denon_sweep_volume must be ≤ -25.0 dB")
+        client.post("/api/measure/start", json={})
+
+    assert captured_target.get("fn") is not None
+    captured_target["fn"]()  # must not raise — was previously unhandled
+
+
+def test_play_background_thread_logs_avr_exception(client, cfg_path):
+    """_play() must catch non-RuntimeError AVR exceptions (AvrCommandError etc.)."""
+
+    class FakeAvrCommandError(Exception):
+        pass
+
+    captured_target = {}
+
+    def capture_thread(target=None, daemon=False):
+        captured_target["fn"] = target
+        m = MagicMock()
+        m.start = MagicMock()
+        return m
+
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_path),
+        patch("calibrate.web.MeasurementEngine") as MockEngine,
+        patch("calibrate.web.threading.Thread", side_effect=capture_thread),
+        patch("calibrate.web.time.sleep"),
+    ):
+        engine = MockEngine.return_value
+        engine.generate_sweep.return_value = ([0.0] * 100, 48000, 3.0)
+        engine.play_signal.side_effect = FakeAvrCommandError("No mapping for input source")
+        client.post("/api/measure/start", json={})
+
+    assert captured_target.get("fn") is not None
+    captured_target["fn"]()  # must not raise — was previously unhandled
+
+
 # ── POST /api/measure/record ───────────────────────────────────────────────────
 
 def _inject_pending(token: str, sweep_samples=None):
