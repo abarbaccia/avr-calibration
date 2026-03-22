@@ -20,6 +20,7 @@ Measurement flow
 
 from __future__ import annotations
 
+import logging
 import struct
 import threading
 import time
@@ -27,12 +28,14 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+logger = logging.getLogger(__name__)
+
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from .config import Config, CONFIG_PATH
-from .measurement import MeasurementEngine, FrequencyResponse
+from .measurement import MeasurementEngine, FrequencyResponse, MeasurementQualityError
 from .storage import SessionStore
 
 app = FastAPI(title="avr-calibration")
@@ -440,8 +443,8 @@ async def measure_start(body: StartRequest) -> dict:
         time.sleep(COUNTDOWN_MS / 1000.0)
         try:
             engine.play_signal(samples, sample_rate)
-        except RuntimeError:
-            pass  # non-critical — browser recording will just see silence
+        except RuntimeError as exc:
+            logger.warning("play_signal failed: %s", exc)
 
     threading.Thread(target=_play, daemon=True).start()
 
@@ -487,6 +490,16 @@ async def measure_record(
             freq_max=pending["freq_max"],
             sample_rate=sr,
         )
+    except MeasurementQualityError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "measurement_quality",
+                "check": exc.check,
+                "detail": exc.detail,
+                "suggestion": exc.suggestion,
+            },
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -499,6 +512,7 @@ async def measure_record(
         "spl_dbfs": fr.spl,
         "peak_spl": fr.peak_spl,
         "freq_at_peak": fr.freq_at_peak,
+        "warnings": fr.warnings,
     }
 
 

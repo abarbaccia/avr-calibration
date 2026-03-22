@@ -5,7 +5,12 @@ AI-first home theater calibration — closed-loop bass optimization for Denon X3
 ## Architecture
 
 ```
-[ PyTTa measurement ]  [ Subjective feedback log ]
+[ Browser (laptop) ]
+  UMIK-1 → Web Audio API → measurement upload
+         |
+         ▼
+[ Pi Zero W — web server (Docker) ]
+  [ PyTTa analysis ]  [ Subjective feedback log ]
          |                         |
          └──────── AI Analysis (Claude API) ──────
                           |

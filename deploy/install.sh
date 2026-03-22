@@ -7,8 +7,8 @@ set -euo pipefail
 IMAGE="ghcr.io/abarbaccia/avr-calibration:latest"
 SERVICE_NAME="avr-calibration"
 DATA_DIR="$HOME/.avr-calibration"
-MINIDSP_VERSION="0.1.5"
-MINIDSP_URL="https://github.com/mrene/minidsp-rs/releases/download/v${MINIDSP_VERSION}/minidspd-arm-unknown-linux-gnueabihf.tar.gz"
+MINIDSP_VERSION="0.1.12"
+MINIDSP_URL="https://github.com/mrene/minidsp-rs/releases/download/v${MINIDSP_VERSION}/minidsp.arm-linux-gnueabihf-rpi.tar.gz"
 
 echo ""
 echo "=== avr-calibration Pi Zero W setup ==="
@@ -44,17 +44,26 @@ fi
 # ── 3. minidsp-rs ─────────────────────────────────────────────────────────
 
 echo ""
-echo "--- Installing minidsp-rs ---"
-if ! command -v minidspd &>/dev/null; then
+echo "--- Installing minidsp ---"
+if ! command -v minidsp &>/dev/null; then
     TMP=$(mktemp -d)
-    echo "Downloading minidspd v${MINIDSP_VERSION} for ARM..."
-    curl -sL "$MINIDSP_URL" -o "$TMP/minidspd.tar.gz"
-    tar -xzf "$TMP/minidspd.tar.gz" -C "$TMP"
-    sudo install -m 755 "$TMP/minidspd" /usr/local/bin/minidspd
+    echo "Downloading minidsp v${MINIDSP_VERSION} for ARM..."
+    if ! curl -fsSL "$MINIDSP_URL" -o "$TMP/minidsp.tar.gz"; then
+        echo "ERROR: Failed to download minidsp from:"
+        echo "  $MINIDSP_URL"
+        echo "Check https://github.com/mrene/minidsp-rs/releases for available assets."
+        rm -rf "$TMP"
+        exit 1
+    fi
+    tar -xzf "$TMP/minidsp.tar.gz" -C "$TMP"
+    sudo install -m 755 "$TMP/minidsp" /usr/local/bin/minidsp
     rm -rf "$TMP"
-    echo "minidspd installed to /usr/local/bin/minidspd"
+    echo "minidsp installed to /usr/local/bin/minidsp"
+    # Note: the -rpi binary targets gnueabihf (ARMv7). On armv6l (Pi Zero W),
+    # run 'minidsp --version' to confirm it works; if you see "Illegal instruction",
+    # you'll need to cross-compile from source for ARMv6.
 else
-    echo "minidspd already installed: $(minidspd --version 2>/dev/null || echo 'version unknown')"
+    echo "minidsp already installed: $(minidsp --version 2>/dev/null || echo 'version unknown')"
 fi
 
 # ── 4. udev rule for miniDSP USB ──────────────────────────────────────────
@@ -92,12 +101,21 @@ mic:
   name: "UMIK"           # substring matched against audio device names
 
 measurement:
-  freq_min: 20           # Hz — lower bound of calibration band
-  freq_max: 200          # Hz — upper bound (bass calibration only)
-  sweep_duration: 3.0    # seconds
-  sample_rate: 48000     # Hz
-  input_channel: 1       # audio device channel for microphone
-  output_channel: 1      # audio device channel for subwoofer output
+  freq_min: 20               # Hz — lower bound of calibration band
+  freq_max: 200              # Hz — upper bound (bass calibration only)
+  sweep_duration: 3.0        # seconds
+  sample_rate: 48000         # Hz
+
+  # Sweep playback route: hdmi (recommended) or usb
+  # hdmi: Pi HDMI → Denon AUX1 → full signal chain (crossover, bass mgmt, miniDSP)
+  # usb:  Pi USB  → miniDSP direct (bypasses Denon — sub only, for testing)
+  playback_route: hdmi
+  denon_sweep_input: "AUX1"  # Denon input your Pi HDMI is connected to
+  denon_sweep_volume: -25.0  # dB master volume during sweep (restored after)
+  sweep_channel: lfe          # lfe | fl | fr | c | sl | sr
+
+  # USB route only (playback_route: usb)
+  playback_device: "miniDSP" # substring matched against ALSA device names
 EOF
     echo ""
     echo "IMPORTANT: Edit $DATA_DIR/config.yaml with your Denon IP:"
@@ -167,7 +185,8 @@ echo "Next steps:"
 echo "  1. Edit $DATA_DIR/config.yaml (set denon.host)"
 echo "  2. Plug in miniDSP via USB"
 echo "  3. Run: docker exec ${SERVICE_NAME} calibrate check"
-echo "  4. Service URL: http://$(hostname -I | awk '{print $1}'):8000"
+echo "  4. Service URL: https://$(hostname -I | awk '{print $1}'):8000"
+echo "     (self-signed cert — click Advanced → Proceed in your browser)"
 echo ""
 echo "Service commands:"
 echo "  sudo systemctl status $SERVICE_NAME"

@@ -52,6 +52,7 @@ FROM python:3.11-slim-bookworm AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libportaudio2 \
     libatlas3-base \
+    openssl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
@@ -64,7 +65,12 @@ ENV HOME=/data
 
 EXPOSE 8000
 
-# /data holds config.yaml and the SQLite measurement DB — mount as a volume
+# /data holds config.yaml, TLS cert, and the SQLite measurement DB — mount as a volume
 VOLUME ["/data"]
 
-CMD ["python", "-m", "uvicorn", "calibrate.web:app", "--host", "0.0.0.0", "--port", "8000"]
+COPY deploy/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Generates a self-signed TLS cert on first boot (stored in /data volume),
+# then starts uvicorn over HTTPS — required for browser getUserMedia access.
+CMD ["/entrypoint.sh"]

@@ -213,10 +213,11 @@ class TestRunAll:
             patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1")),
             patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", True, "2x4HD")),
             patch.object(checker, "check_denon", return_value=CheckResult("Denon AVR", True, "X3800H")),
+            patch.object(checker, "check_playback_route", return_value=CheckResult("Playback Route", True, "USB: miniDSP")),
         ):
             results = await checker.run_all()
         assert all(r.passed for r in results)
-        assert len(results) == 3
+        assert len(results) == 4
 
     async def test_unhandled_exception_becomes_failed_result(self, config):
         checker = PreflightChecker(config)
@@ -224,6 +225,7 @@ class TestRunAll:
             patch.object(checker, "check_mic", side_effect=RuntimeError("boom")),
             patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", True, "2x4HD")),
             patch.object(checker, "check_denon", return_value=CheckResult("Denon AVR", True, "X3800H")),
+            patch.object(checker, "check_playback_route", return_value=CheckResult("Playback Route", True, "USB")),
         ):
             results = await checker.run_all()
         mic = next(r for r in results if r.name == "Microphone")
@@ -236,9 +238,10 @@ class TestRunAll:
             patch.object(checker, "check_mic", side_effect=RuntimeError("err")),
             patch.object(checker, "check_minidsp", side_effect=RuntimeError("err")),
             patch.object(checker, "check_denon", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_playback_route", side_effect=RuntimeError("err")),
         ):
             results = await checker.run_all()
-        assert [r.name for r in results] == ["Microphone", "miniDSP", "Denon AVR"]
+        assert [r.name for r in results] == ["Microphone", "miniDSP", "Denon AVR", "Playback Route"]
 
     async def test_partial_failure(self, config):
         checker = PreflightChecker(config)
@@ -246,8 +249,72 @@ class TestRunAll:
             patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1")),
             patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", False, "", "start minidspd")),
             patch.object(checker, "check_denon", return_value=CheckResult("Denon AVR", True, "X3800H")),
+            patch.object(checker, "check_playback_route", return_value=CheckResult("Playback Route", True, "USB")),
         ):
             results = await checker.run_all()
         assert results[0].passed
         assert not results[1].passed
         assert results[2].passed
+        assert results[3].passed
+
+
+# ── Playback route checks ─────────────────────────────────────────────────────
+
+class TestPlaybackRouteCheck:
+    async def test_usb_device_found(self, config):
+        config._data.setdefault("measurement", {})["playback_route"] = "usb"
+        config._data["measurement"]["playback_device"] = "miniDSP"
+        from tests.conftest import make_output_device
+        sys.modules["sounddevice"].query_devices.return_value = [
+            make_output_device("miniDSP USB"),
+        ]
+        result = await PreflightChecker(config).check_playback_route()
+        assert result.passed
+        assert "USB" in result.detail
+
+    async def test_usb_device_not_found(self, config):
+        config._data.setdefault("measurement", {})["playback_route"] = "usb"
+        config._data["measurement"]["playback_device"] = "miniDSP"
+        from tests.conftest import make_input_device
+        sys.modules["sounddevice"].query_devices.return_value = [
+            make_input_device("Built-in Mic"),
+        ]
+        result = await PreflightChecker(config).check_playback_route()
+        assert not result.passed
+        assert "miniDSP" in result.detail
+
+    async def test_hdmi_route_denon_reachable(self, config):
+        config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
+        config._data["denon"]["host"] = "192.168.1.100"
+        mock_receiver = MagicMock()
+        mock_receiver.model_name = "Denon AVR-X3800H"
+        mock_receiver.async_setup = AsyncMock()
+        with patch("denonavr.DenonAVR", return_value=mock_receiver):
+            result = await PreflightChecker(config).check_playback_route()
+        assert result.passed
+        assert "HDMI" in result.detail
+        assert "192.168.1.100" in result.detail
+
+    async def test_hdmi_route_no_denon_host(self, config):
+        config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
+        config._data["denon"]["host"] = None
+        result = await PreflightChecker(config).check_playback_route()
+        assert not result.passed
+        assert "denon.host" in result.detail
+
+    async def test_hdmi_route_denon_unreachable(self, config):
+        config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
+        config._data["denon"]["host"] = "192.168.1.100"
+        mock_receiver = MagicMock()
+        mock_receiver.async_setup = AsyncMock(side_effect=ConnectionRefusedError("refused"))
+        with patch("denonavr.DenonAVR", return_value=mock_receiver):
+            result = await PreflightChecker(config).check_playback_route()
+        assert not result.passed
+
+    async def test_usb_sounddevice_raises_captured(self, config):
+        config._data.setdefault("measurement", {})["playback_route"] = "usb"
+        sys.modules["sounddevice"].query_devices.side_effect = RuntimeError("portaudio error")
+        result = await PreflightChecker(config).check_playback_route()
+        assert not result.passed
+        assert "portaudio error" in result.error
+        sys.modules["sounddevice"].query_devices.side_effect = None

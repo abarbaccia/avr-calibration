@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from calibrate.config import Config
-from calibrate.measurement import FrequencyResponse
+from calibrate.measurement import FrequencyResponse, MeasurementQualityError
 from calibrate.web import app, _pending_sweeps, _pending_lock, COUNTDOWN_MS
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -194,6 +194,32 @@ def test_measure_start_spawns_background_thread(client, cfg_path):
     assert kwargs.get("daemon") is True
 
 
+def test_play_background_thread_logs_runtime_error(client, cfg_path):
+    """The _play() closure logs RuntimeError from play_signal instead of crashing."""
+    captured_target = {}
+
+    def capture_thread(target=None, daemon=False):
+        captured_target["fn"] = target
+        m = MagicMock()
+        m.start = MagicMock()
+        return m
+
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_path),
+        patch("calibrate.web.MeasurementEngine") as MockEngine,
+        patch("calibrate.web.threading.Thread", side_effect=capture_thread),
+        patch("calibrate.web.time.sleep"),  # skip the countdown sleep
+    ):
+        engine = MockEngine.return_value
+        engine.generate_sweep.return_value = ([0.0] * 100, 48000, 3.0)
+        engine.play_signal.side_effect = RuntimeError("audio device unavailable")
+        client.post("/api/measure/start", json={})
+
+    # Call the actual _play() function synchronously — should log, not raise
+    assert captured_target.get("fn") is not None
+    captured_target["fn"]()  # must not raise
+
+
 # ── POST /api/measure/record ───────────────────────────────────────────────────
 
 def _inject_pending(token: str, sweep_samples=None):
@@ -309,6 +335,59 @@ def test_measure_record_compute_fr_error(client, cfg_path):
         )
 
     assert r.status_code == 500
+
+
+def test_measure_record_quality_error_returns_422(client, cfg_path):
+    """MeasurementQualityError → 422 with structured error body."""
+    token = str(uuid.uuid4())
+    _inject_pending(token)
+    body = _float32_bytes([0.01] * 100)
+
+    exc = MeasurementQualityError("sweep_capture", "no sweep found", "check amp")
+
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_path),
+        patch("calibrate.web.MeasurementEngine") as MockEngine,
+    ):
+        MockEngine.return_value.compute_fr.side_effect = exc
+        r = client.post(
+            "/api/measure/record",
+            content=body,
+            headers={"Content-Type": "application/octet-stream", "X-Token": token},
+        )
+
+    assert r.status_code == 422
+    data = r.json()
+    assert data["error"] == "measurement_quality"
+    assert data["check"] == "sweep_capture"
+    assert data["detail"] == "no sweep found"
+    assert data["suggestion"] == "check amp"
+
+
+def test_measure_record_response_includes_warnings(client, cfg_path):
+    """Successful record response includes warnings array from FrequencyResponse."""
+    token = str(uuid.uuid4())
+    _inject_pending(token)
+    body = _float32_bytes([0.05] * 100)
+
+    fr = _make_fr()
+    fr.warnings = [{"check": "floor_noise", "detail": "noisy room"}]
+
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_path),
+        patch("calibrate.web.MeasurementEngine") as MockEngine,
+        patch("calibrate.web.SessionStore") as MockStore,
+    ):
+        MockEngine.return_value.compute_fr.return_value = fr
+        MockStore.return_value.save_measurement.return_value = 1
+        r = client.post(
+            "/api/measure/record",
+            content=body,
+            headers={"Content-Type": "application/octet-stream", "X-Token": token},
+        )
+
+    assert r.status_code == 200
+    assert r.json()["warnings"] == [{"check": "floor_noise", "detail": "noisy room"}]
 
 
 def test_measure_record_uses_x_sample_rate_header(client, cfg_path):
