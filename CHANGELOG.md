@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.5.1] - 2026-03-22
+
+### Fixed
+- HTTPS (self-signed TLS) — `getUserMedia` requires a secure context; server now generates a self-signed cert on first boot (stored in the data volume) and runs uvicorn over HTTPS; browser shows a one-time "proceed anyway" warning
+- `deploy/entrypoint.sh` — new Docker entrypoint that generates the cert and starts uvicorn with `--ssl-keyfile` / `--ssl-certfile`
+- `Dockerfile` — added `openssl` to runtime stage; CMD now runs entrypoint.sh
+- `deploy/install.sh` + docs — URLs updated from `http://` to `https://`
+
 ## [0.1.5.0] - 2026-03-22
 
 ### Fixed

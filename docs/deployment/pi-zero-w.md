@@ -15,7 +15,7 @@ install on the laptop required.
 
 [Your laptop — when calibrating]
   └── USB → UMIK-1 microphone
-  └── Browser → http://<pi-ip>:8000  (captures UMIK audio via Web Audio API)
+  └── Browser → https://<pi-ip>:8000  (captures UMIK audio via Web Audio API)
 ```
 
 ## Requirements
@@ -91,10 +91,14 @@ Expected output:
 From any device on your network:
 
 ```
-http://avr-cal.local:8000
+https://avr-cal.local:8000
 ```
 
-Or by IP: `http://<pi-ip>:8000`
+Or by IP: `https://<pi-ip>:8000`
+
+> **Note:** The server uses a self-signed TLS certificate (generated on first boot).
+> Your browser will show a security warning — click **Advanced → Proceed** to accept it.
+> This is required for microphone access (`getUserMedia` only works over HTTPS).
 
 ## Service management
 
