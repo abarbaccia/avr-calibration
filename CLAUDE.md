@@ -72,6 +72,27 @@ When adding error handling, write a test that triggers the error.
 When adding a conditional, write tests for BOTH branches.
 Never commit code that makes existing tests fail.
 
+## Deployment
+
+- Docker image built by GitHub Actions on every push to any branch (not just main)
+- Branch push → image tagged `ghcr.io/abarbaccia/avr-calibration:<branch-name>`
+- Main push → also tagged `:latest`
+- Pi pulls from GHCR; no source compilation on the Pi (arm/v6 cross-compiled in CI)
+- Full guide: `docs/deployment/pi-zero-w.md`
+
+**To validate a branch on the Pi:**
+```bash
+sudo docker pull ghcr.io/abarbaccia/avr-calibration:<branch-name>
+sudo systemctl restart avr-calibration
+sudo journalctl -u avr-calibration -f
+```
+
+**SSH hotfix (no rebuild, ephemeral):**
+```bash
+ssh pi@avr-cal.local "docker cp - avr-calibration:/app/calibrate/web.py" < calibrate/web.py
+ssh pi@avr-cal.local "sudo systemctl restart avr-calibration"
+```
+
 ## Key design decisions
 
 - **PyTTa** replaces REW as the measurement engine (REW Pro API costs $100; PyTTa is free and sufficient for bass calibration)
