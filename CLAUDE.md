@@ -74,23 +74,30 @@ Never commit code that makes existing tests fail.
 
 ## Deployment
 
-- Docker image built by GitHub Actions on every push to any branch (not just main)
-- Branch push → image tagged `ghcr.io/abarbaccia/avr-calibration:<branch-name>`
+- Docker image built by GitHub Actions on every branch push
+- Branch push → `ghcr.io/abarbaccia/avr-calibration:<branch-name>`
 - Main push → also tagged `:latest`
-- Pi pulls from GHCR; no source compilation on the Pi (arm/v6 cross-compiled in CI)
+- arm/v6 cross-compiled in CI (~30-60 min); no compilation on the Pi
+- Source installed at `/opt/venv/lib/python3.11/site-packages/calibrate/` inside container
 - Full guide: `docs/deployment/pi-zero-w.md`
 
-**To validate a branch on the Pi:**
-```bash
-sudo docker pull ghcr.io/abarbaccia/avr-calibration:<branch-name>
-sudo systemctl restart avr-calibration
-sudo journalctl -u avr-calibration -f
+**Primary workflow:** hotfix first, pipeline second.
+
+```
+SSH hotfix → validate → git push → CI build → pull branch image → validate → merge
 ```
 
-**SSH hotfix (no rebuild, ephemeral):**
+**SSH hotfix (seconds, no rebuild):**
 ```bash
-ssh pi@avr-cal.local "docker cp - avr-calibration:/app/calibrate/web.py" < calibrate/web.py
-ssh pi@avr-cal.local "sudo systemctl restart avr-calibration"
+./deploy/hotfix.sh                    # auto-detects modified calibrate/ files
+./deploy/hotfix.sh calibrate/web.py   # specific file
+PI_HOST=192.168.1.50 ./deploy/hotfix.sh
+```
+
+**Pull branch image after CI:**
+```bash
+sudo docker pull ghcr.io/abarbaccia/avr-calibration:<branch>
+sudo systemctl restart avr-calibration
 ```
 
 ## Key design decisions
