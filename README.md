@@ -47,7 +47,7 @@ source compilation on the Pi.
 ```bash
 # On the Pi Zero W — one command installs Docker, pulls image, and starts the service:
 bash <(curl -sL https://raw.githubusercontent.com/abarbaccia/avr-calibration/main/deploy/install.sh)
-# Web UI: http://<pi-ip>:8000
+# Web UI: https://<pi-ip>:8000  (self-signed cert — click Advanced → Proceed)
 ```
 
 See [docs/deployment/pi-zero-w.md](docs/deployment/pi-zero-w.md) for the full guide.
