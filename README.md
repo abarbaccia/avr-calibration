@@ -6,7 +6,8 @@ Tired of endless manual loops with REW, miniDSP, UMIK-1, etc? This tool closes t
 
 ## What it does
 
-- **Automated measurement** via PyTTa (log sweep + UMIK mic calibration)
+- **Automated measurement** via log sweep + numpy deconvolution (UMIK-1/2 captures via browser Web Audio API)
+- **Multi-sub alignment** — MSO-inspired IR phase alignment: travel-time delays, polarity correction, level matching
 - **AI analysis** with Claude — reads both frequency response graphs and subjective feedback ("the Fury Road chase scene sounded muddy")
 - **Hardware control** via miniDSP 2x4 HD (through minidsp-rs) and Denon X3800H (through denonavr)
 - **Safety rails** — hard limits on boost depth and frequency floor protect your drivers
@@ -68,9 +69,10 @@ Early development. Currently implemented:
 - `calibrate history` — list past sessions with timestamp, label, peak SPL, and point count
 - `calibrate show <id>` — session detail with ASCII frequency response plot; `--csv` and `--json` export
 - `calibrate web` — start web server (Pi serves UI; browser captures UMIK audio)
+- **Sub-alignment:** `POST /api/align-subs/start|record|cancel` — sweep each sub independently, extract IR, apply delays + polarity + level matching via miniDSP
 - `Dockerfile` + `.github/workflows/docker.yml` — multi-platform Docker image (arm/v6 + amd64), built and pushed to GHCR via GitHub Actions
 - `deploy/install.sh` — Pi Zero W bootstrap: installs Docker, pulls GHCR image, starts systemd service
 
-Next: AI analysis, miniDSP write adapter, closed loop.
+Next: AI analysis, closed-loop EQ optimization.
 
 See [TODOS.md](TODOS.md) for the roadmap.
