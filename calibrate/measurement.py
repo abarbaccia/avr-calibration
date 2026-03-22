@@ -458,7 +458,8 @@ class MeasurementEngine:
             await receiver.async_set_volume(sweep_vol)
             await asyncio.sleep(settle_ms / 1000.0)
 
-            arr = np.array(samples, dtype=np.float32).reshape(-1, 1)
+            # vc4-hdmi (Pi HDMI) only supports integer formats — convert float32 → int16
+            arr = (np.clip(np.array(samples, dtype=np.float32), -1.0, 1.0) * 32767).astype(np.int16).reshape(-1, 1)
             sd.play(arr, samplerate=sample_rate, device=hdmi_device)
             sd.wait()
 
