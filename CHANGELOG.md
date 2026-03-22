@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.7.0] - 2026-03-22
+
+### Added
+- **Sub-alignment algorithm (TODO-6, Phases 1-4):** MSO-inspired IR phase alignment for multiple subs — independent per-sub sweep+record, FFT deconvolution to extract impulse responses, travel-time delay offsets (Phase 2), polarity detection and correction (Phase 3), level matching (Phase 4)
+- **`calibrate/adapters/minidsp.py`:** Async HTTP client (`MinidspClient`) wrapping the minidspd REST API — `set_output_gain()`, `set_output_delay()`, `set_output_polarity()`, `set_output_peq()`, `restore_all_gains()`; `MinidspApiError` on 4xx; `ValueError` guards for delay > 30 ms and reserved APF PEQ slots
+- **`calibrate/alignment.py`:** Core signal-processing module — `extract_ir()` (FFT deconvolution, adaptive peak detection in configurable search window), `compute_delay_offsets()`, `measure_sub_ir()`, `detect_and_correct_polarity()`, `level_match_subs()`, `apply_delays()`, `run_alignment_phases()`; `SubIRResult` and `AlignmentSummary` dataclasses
+- **Web API:** Three new endpoints — `POST /api/align-subs/start` (mute others, schedule sweep, return token), `POST /api/align-subs/record` (extract IR per step, run phases 2-4 on final step, restore gains), `POST /api/align-subs/cancel` (abort + restore gains)
+- **TTL cleanup:** Background daemon thread evicts stale alignment sessions (>10 min) and restores sub gains automatically
+- New config keys: `measurement.sub_outputs` (list of miniDSP output indices) and `measurement.ir_search_window_ms` (default 50 ms = 17.5 m max travel time)
+
+### Fixed
+- `_restore_sub_gains()` — moved `asyncio.new_event_loop()` before `try` block to prevent `NameError` in `finally` if loop creation fails
+
 ## [0.1.6.1] - 2026-03-22
 
 ### Fixed
