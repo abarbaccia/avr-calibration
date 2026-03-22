@@ -30,6 +30,8 @@ DEFAULT_CONFIG: dict = {
         "sweep_channel": "lfe",
         "playback_device": "miniDSP",
         "hdmi_playback_device": None,
+        "sub_outputs": [0, 1],
+        "ir_search_window_ms": 50.0,
     },
 }
 
@@ -62,6 +64,8 @@ measurement:
   sweep_channel: "lfe"         # "lfe" = LFE/subwoofer channel, "left"/"right" = main
   playback_device: "miniDSP"   # substring matched against USB audio device names
   hdmi_playback_device: null   # HDMI audio device name; null = system default
+  sub_outputs: [0, 1]          # miniDSP output indices for each sub (0-indexed)
+  ir_search_window_ms: 50.0    # IR peak search window; 50 ms = 17 m at 343 m/s
 """
 
 
