@@ -101,12 +101,21 @@ mic:
   name: "UMIK"           # substring matched against audio device names
 
 measurement:
-  freq_min: 20           # Hz — lower bound of calibration band
-  freq_max: 200          # Hz — upper bound (bass calibration only)
-  sweep_duration: 3.0    # seconds
-  sample_rate: 48000     # Hz
-  input_channel: 1       # audio device channel for microphone
-  output_channel: 1      # audio device channel for subwoofer output
+  freq_min: 20               # Hz — lower bound of calibration band
+  freq_max: 200              # Hz — upper bound (bass calibration only)
+  sweep_duration: 3.0        # seconds
+  sample_rate: 48000         # Hz
+
+  # Sweep playback route: hdmi (recommended) or usb
+  # hdmi: Pi HDMI → Denon AUX1 → full signal chain (crossover, bass mgmt, miniDSP)
+  # usb:  Pi USB  → miniDSP direct (bypasses Denon — sub only, for testing)
+  playback_route: hdmi
+  denon_sweep_input: "AUX1"  # Denon input your Pi HDMI is connected to
+  denon_sweep_volume: -25.0  # dB master volume during sweep (restored after)
+  sweep_channel: lfe          # lfe | fl | fr | c | sl | sr
+
+  # USB route only (playback_route: usb)
+  playback_device: "miniDSP" # substring matched against ALSA device names
 EOF
     echo ""
     echo "IMPORTANT: Edit $DATA_DIR/config.yaml with your Denon IP:"

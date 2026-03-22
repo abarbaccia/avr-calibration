@@ -3,7 +3,9 @@
 # origin as secure — required for getUserMedia (microphone access).
 # Stored in the mounted data volume so it persists across container restarts.
 
-CERT_DIR="${HOME}/.avr-calibration"
+# Hard-coded to match the Docker volume mount (-v host_data:/data/.avr-calibration)
+# and ENV HOME=/data in the Dockerfile. Do not rely on $HOME to avoid silent breakage.
+CERT_DIR=/data/.avr-calibration
 CERT="${CERT_DIR}/cert.pem"
 KEY="${CERT_DIR}/key.pem"
 
@@ -21,7 +23,7 @@ if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
         -days 3650 -nodes \
         -subj '/CN=avr-calibration' \
         -addext "subjectAltName=${SAN}" \
-        2>/dev/null
+        2>&1 || { echo "ERROR: TLS cert generation failed — check openssl output above" >&2; exit 1; }
     echo "Certificate generated at ${CERT}"
 fi
 
