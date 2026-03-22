@@ -1,4 +1,4 @@
-"""Tests for the PyTTa measurement engine and the `calibrate measure` CLI command.
+"""Tests for the measurement engine and the `calibrate measure` CLI command.
 
 Coverage diagram:
   FrequencyResponse
@@ -292,51 +292,34 @@ class TestGenerateSweep:
         return MeasurementEngine(make_config(**overrides))
 
     def test_returns_tuple_of_samples_sr_duration(self):
-        engine = self._engine()
-        mock_pytta = sys.modules["pytta"]
-        mock_pytta.reset_mock()
-        mock_signal = make_signal(48000 * 3)
-        mock_pytta.generate.sweep.return_value = mock_signal
-
-        samples, sr, dur = engine.generate_sweep()
-
+        samples, sr, dur = self._engine().generate_sweep()
         assert isinstance(samples, list)
         assert isinstance(sr, int)
         assert isinstance(dur, float)
 
+    def test_sample_count_matches_sr_times_duration(self):
+        samples, sr, dur = self._engine(sweep_duration=2.0, sample_rate=44100).generate_sweep()
+        assert len(samples) == 44100 * 2
+
     def test_uses_config_defaults(self):
-        engine = self._engine(freq_min=30, freq_max=150, sweep_duration=4.0, sample_rate=44100)
-        mock_pytta = sys.modules["pytta"]
-        mock_pytta.reset_mock()
-        mock_pytta.generate.sweep.return_value = make_signal(44100 * 4)
-
-        engine.generate_sweep()
-
-        mock_pytta.generate.sweep.assert_called_once_with(
-            freq_min=30,
-            freq_max=150,
-            duration=4.0,
-            Fs=44100,
-            method="log",
-        )
+        samples, sr, dur = self._engine(
+            freq_min=30, freq_max=150, sweep_duration=4.0, sample_rate=44100
+        ).generate_sweep()
+        assert sr == 44100
+        assert dur == 4.0
+        assert len(samples) == 44100 * 4
 
     def test_explicit_params_override_config(self):
-        engine = self._engine()
-        mock_pytta = sys.modules["pytta"]
-        mock_pytta.reset_mock()
-        mock_pytta.generate.sweep.return_value = make_signal(48000 * 2)
-
-        engine.generate_sweep(freq_min=10, freq_max=500, duration=2.0, sample_rate=48000)
-
-        mock_pytta.generate.sweep.assert_called_once_with(
-            freq_min=10, freq_max=500, duration=2.0, Fs=48000, method="log"
+        samples, sr, dur = self._engine().generate_sweep(
+            freq_min=10, freq_max=500, duration=2.0, sample_rate=48000
         )
+        assert sr == 48000
+        assert dur == 2.0
+        assert len(samples) == 48000 * 2
 
-    def test_pytta_import_error_raises_runtime_error(self):
-        engine = self._engine()
-        with patch.dict(sys.modules, {"pytta": None}):
-            with pytest.raises(RuntimeError, match="pytta is required"):
-                engine.generate_sweep()
+    def test_samples_are_float32_in_range(self):
+        samples, _, _ = self._engine().generate_sweep()
+        assert all(-1.0 <= s <= 1.0 for s in samples[:100])
 
     def test_numpy_import_error_raises_runtime_error(self):
         engine = self._engine()

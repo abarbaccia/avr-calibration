@@ -79,17 +79,13 @@ class MeasurementEngine:
         sample_rate: int | None = None,
     ) -> tuple[list[float], int, float]:
         """
-        Generate a log-sweep signal.
+        Generate a log-sweep signal using numpy (no pytta dependency).
 
         Returns (samples, sample_rate, duration) where samples is a flat list
         of float32 values suitable for playback or JSON serialisation.
 
-        Raises RuntimeError if pytta or numpy are unavailable.
+        Raises RuntimeError if numpy is unavailable.
         """
-        try:
-            import pytta
-        except ImportError as exc:
-            raise RuntimeError("pytta is required — pip install pytta") from exc
         try:
             import numpy as np
         except ImportError as exc:
@@ -101,14 +97,13 @@ class MeasurementEngine:
         dur = duration if duration is not None else cfg.get("sweep_duration", 3.0)
         sr = sample_rate if sample_rate is not None else cfg.get("sample_rate", 48000)
 
-        sweep = pytta.generate.sweep(
-            freq_min=f_min,
-            freq_max=f_max,
-            duration=dur,
-            Fs=sr,
-            method="log",
-        )
-        samples: list[float] = sweep.timeSignal[:, 0].tolist()
+        # Logarithmic (exponential) sine sweep: y(t) = sin(2π·f_min·k·(e^(t/k) - 1))
+        # where k = dur / ln(f_max / f_min)
+        n = int(sr * dur)
+        t = np.linspace(0.0, dur, n, endpoint=False)
+        k = dur / np.log(f_max / f_min)
+        phase = 2.0 * np.pi * f_min * k * (np.exp(t / k) - 1.0)
+        samples: list[float] = np.sin(phase).astype(np.float32).tolist()
         return samples, sr, dur
 
     def play_signal(
