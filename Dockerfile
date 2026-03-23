@@ -64,14 +64,7 @@ RUN set -e; \
     else \
         URL="https://github.com/mrene/minidsp-rs/releases/download/v${MINIDSP_VERSION}/minidsp.arm-linux-gnueabihf-rpi.tar.gz"; \
     fi; \
-    URL_EXPORT="$URL" python3 -c "\
-import urllib.request, tarfile, os, stat; \
-url = os.environ['URL_EXPORT']; \
-urllib.request.urlretrieve(url, '/tmp/minidsp.tar.gz'); \
-with tarfile.open('/tmp/minidsp.tar.gz') as tf: tf.extract('minidsp', '/tmp/'); \
-os.rename('/tmp/minidsp', '/usr/local/bin/minidsp'); \
-os.chmod('/usr/local/bin/minidsp', 0o755); \
-"
+    URL_EXPORT="$URL" python3 -c "import urllib.request, tarfile, os; url = os.environ['URL_EXPORT']; urllib.request.urlretrieve(url, '/tmp/minidsp.tar.gz'); tf = tarfile.open('/tmp/minidsp.tar.gz'); tf.extract('minidsp', '/tmp/'); tf.close(); os.rename('/tmp/minidsp', '/usr/local/bin/minidsp'); os.chmod('/usr/local/bin/minidsp', 0o755)"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libportaudio2 \
