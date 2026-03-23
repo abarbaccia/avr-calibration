@@ -55,6 +55,7 @@ ARG TARGETVARIANT
 # minidsp-rs: talks HID to the miniDSP 2x4HD — serves HTTP on localhost:5380
 # Runs inside the container (container gets --device=/dev/hidraw0 from Docker run).
 # All three variants use the same ARMv7-hf RPi binary; x86_64 uses the Linux x86_64 build.
+# Use Python urllib to avoid apt-get curl/tar (causes held-package resolver failures under QEMU).
 ARG MINIDSP_VERSION=0.1.12
 RUN set -e; \
     ARCH="${TARGETARCH}${TARGETVARIANT}"; \
@@ -63,14 +64,14 @@ RUN set -e; \
     else \
         URL="https://github.com/mrene/minidsp-rs/releases/download/v${MINIDSP_VERSION}/minidsp.arm-linux-gnueabihf-rpi.tar.gz"; \
     fi; \
-    apt-get update && apt-get install -y --no-install-recommends curl tar && \
-    TMP=$(mktemp -d) && \
-    curl -fsSL "$URL" -o "$TMP/minidsp.tar.gz" && \
-    tar -xzf "$TMP/minidsp.tar.gz" -C "$TMP" && \
-    install -m 755 "$TMP/minidsp" /usr/local/bin/minidsp && \
-    rm -rf "$TMP" && \
-    apt-get purge -y --auto-remove curl tar && \
-    rm -rf /var/lib/apt/lists/*
+    URL_EXPORT="$URL" python3 -c " \
+import urllib.request, tarfile, os, stat; \
+url = os.environ['URL_EXPORT']; \
+urllib.request.urlretrieve(url, '/tmp/minidsp.tar.gz'); \
+with tarfile.open('/tmp/minidsp.tar.gz') as tf: tf.extract('minidsp', '/tmp/'); \
+os.rename('/tmp/minidsp', '/usr/local/bin/minidsp'); \
+os.chmod('/usr/local/bin/minidsp', 0o755); \
+"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libportaudio2 \
