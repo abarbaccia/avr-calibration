@@ -27,6 +27,28 @@ if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
     echo "Certificate generated at ${CERT}"
 fi
 
+# ── minidspd ──────────────────────────────────────────────────────────────────
+# Start the minidsp HTTP daemon in the background so the web server can reach
+# the miniDSP 2x4HD via localhost:5380.
+# Requires --device=/dev/hidraw0 (or equivalent) on `docker run`.
+# If the device is absent (first boot without DSP, or Pi Zero W HID issue),
+# minidsp exits immediately and measurements will fail gracefully via HTTP error.
+if [ -e /dev/hidraw0 ]; then
+    echo "Starting minidspd on localhost:5380..."
+    minidsp server 0.0.0.0:5380 >/tmp/minidspd.log 2>&1 &
+    MINIDSPD_PID=$!
+    # Give it a moment to bind the port
+    sleep 2
+    if kill -0 "$MINIDSPD_PID" 2>/dev/null; then
+        echo "minidspd started (pid $MINIDSPD_PID)"
+    else
+        echo "WARNING: minidspd exited — DSP control unavailable. Check /tmp/minidspd.log"
+    fi
+else
+    echo "WARNING: /dev/hidraw0 not found — DSP control unavailable."
+    echo "  Add --device=/dev/hidraw0 to docker run and ensure usbhid is bound."
+fi
+
 exec python -m uvicorn calibrate.web:app \
     --host 0.0.0.0 --port 8000 \
     --ssl-keyfile "$KEY" \
