@@ -64,7 +64,7 @@ RUN set -e; \
     else \
         URL="https://github.com/mrene/minidsp-rs/releases/download/v${MINIDSP_VERSION}/minidsp.arm-linux-gnueabihf-rpi.tar.gz"; \
     fi; \
-    URL_EXPORT="$URL" python3 -c " \
+    URL_EXPORT="$URL" python3 -c "\
 import urllib.request, tarfile, os, stat; \
 url = os.environ['URL_EXPORT']; \
 urllib.request.urlretrieve(url, '/tmp/minidsp.tar.gz'); \
