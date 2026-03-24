@@ -1,0 +1,15 @@
+# miniDSP 2x4HD — bind usbhid to HID interface on hotplug so hidraw is created
+ACTION=="add", SUBSYSTEM=="usb_interface", \
+    ATTRS{idVendor}=="2752", ATTRS{idProduct}=="0011", \
+    ATTR{bInterfaceClass}=="03", \
+    RUN+="/bin/sh -c 'echo -n %k > /sys/bus/usb/drivers/usbhid/bind'"
+
+# Grant container-accessible permissions to the hidraw device
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2752", ATTRS{idProduct}=="0011", \
+    MODE="0666", GROUP="plugdev"
+
+# Restart the avr-calibration service when miniDSP hidraw reappears
+# (handles device resets — container needs to be restarted to pick up new /dev/hidraw0)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2752", ATTRS{idProduct}=="0011", \
+    ACTION=="add", \
+    RUN+="/bin/systemctl restart avr-calibration"

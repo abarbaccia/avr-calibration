@@ -63,11 +63,34 @@ ACTION=="add", SUBSYSTEM=="usb_interface", \
 # Grant container-accessible permissions to the hidraw device
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2752", ATTRS{idProduct}=="0011", \
     MODE="0666", GROUP="plugdev"
+
+# Restart the avr-calibration service when miniDSP hidraw reappears
+# (handles device resets — container needs to be restarted to pick up new /dev/hidraw0)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2752", ATTRS{idProduct}=="0011", \
+    ACTION=="add", \
+    RUN+="/bin/systemctl restart avr-calibration"
 EOF
 sudo udevadm control --reload-rules
 echo "udev rules installed — replug miniDSP USB if already connected"
 
-# ── 4. Config ─────────────────────────────────────────────────────────────
+# ── 4. USB power boost ─────────────────────────────────────────────────────
+#
+# miniDSP 2x4HD draws ~500mA. The Pi Zero W USB OTG port is current-limited
+# by default. max_usb_current=1 enables a GPIO switch that raises the USB
+# current limit to 1.2A, preventing device resets under sustained load.
+
+echo ""
+echo "--- Enabling USB current boost (max_usb_current=1) ---"
+CONFIG_FILE="/boot/firmware/config.txt"
+[ -f "$CONFIG_FILE" ] || CONFIG_FILE="/boot/config.txt"
+if ! grep -q "max_usb_current" "$CONFIG_FILE"; then
+    sudo sed -i '/^\[all\]/a max_usb_current=1' "$CONFIG_FILE"
+    echo "Added max_usb_current=1 to $CONFIG_FILE (takes effect after reboot)"
+else
+    echo "max_usb_current already set in $CONFIG_FILE"
+fi
+
+# ── 5. Config ─────────────────────────────────────────────────────────────
 
 echo ""
 echo "--- Generating config ---"
@@ -112,7 +135,7 @@ else
     echo "Config already exists at $DATA_DIR/config.yaml"
 fi
 
-# ── 5. Pull Docker image ───────────────────────────────────────────────────
+# ── 6. Pull Docker image ───────────────────────────────────────────────────
 
 echo ""
 echo "--- Pulling Docker image ---"
@@ -120,7 +143,7 @@ echo "--- Pulling Docker image ---"
 sudo docker pull "$IMAGE"
 echo "Image pulled: $IMAGE"
 
-# ── 6. avr-calibration Docker systemd service ─────────────────────────────
+# ── 7. avr-calibration Docker systemd service ─────────────────────────────
 #
 # minidspd now runs INSIDE the container (not on the Pi host).
 # We pass --device=/dev/hidraw0 so the container can reach the miniDSP HID
@@ -145,12 +168,12 @@ Requires=docker.service
 [Service]
 Type=simple
 User=$USER
+ExecStartPre=/bin/sh -c 'for i in \$(seq 30); do [ -e /dev/hidraw0 ] && exit 0; sleep 1; done; echo "WARNING: /dev/hidraw0 not found after 30s, starting without miniDSP"; exit 0'
 ExecStartPre=-/usr/bin/docker rm -f ${SERVICE_NAME}
 ExecStart=/usr/bin/docker run --rm \\
     --name ${SERVICE_NAME} \\
     -p 8000:8000 \\
     --device=/dev/hidraw0 \\
-    --device=/dev/snd \\
     -v ${DATA_DIR}:/data/.avr-calibration \\
     ${IMAGE}
 ExecStop=/usr/bin/docker stop ${SERVICE_NAME}
@@ -166,7 +189,7 @@ sudo systemctl enable "$SERVICE_NAME"
 sudo systemctl start "$SERVICE_NAME"
 echo "Service enabled and started"
 
-# ── 7. Done ───────────────────────────────────────────────────────────────
+# ── 8. Done ───────────────────────────────────────────────────────────────
 
 echo ""
 echo "=== Setup complete ==="
