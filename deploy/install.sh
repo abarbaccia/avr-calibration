@@ -60,6 +60,16 @@ ACTION=="add", SUBSYSTEM=="usb_interface", \
     ATTR{bInterfaceClass}=="03", \
     RUN+="/bin/sh -c 'echo -n %k > /sys/bus/usb/drivers/usbhid/bind'"
 
+# Immediately unbind snd-usb-audio from miniDSP audio interfaces.
+# We don't use the USB audio output (playback is via HDMI). The audio driver's
+# repeated failed probes generate -71 errors that stress the DWC2 controller
+# and accelerate device resets on Pi Zero W.
+ACTION=="bind", SUBSYSTEM=="usb_interface", \
+    ATTRS{idVendor}=="2752", ATTRS{idProduct}=="0011", \
+    ATTR{bInterfaceClass}=="01", \
+    ENV{DRIVER}=="snd-usb-audio", \
+    RUN+="/bin/sh -c 'echo -n %k > /sys/bus/usb/drivers/snd-usb-audio/unbind 2>/dev/null || true'"
+
 # Grant container-accessible permissions to the hidraw device
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2752", ATTRS{idProduct}=="0011", \
     MODE="0666", GROUP="plugdev"
