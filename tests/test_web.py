@@ -13,7 +13,16 @@ from fastapi.testclient import TestClient
 
 from calibrate.config import Config
 from calibrate.measurement import FrequencyResponse, MeasurementQualityError
-from calibrate.web import app, _pending_sweeps, _pending_lock, COUNTDOWN_MS
+from calibrate.web import (
+    app,
+    _pending_sweeps,
+    _pending_lock,
+    _pending_alignments,
+    _align_lock,
+    _AlignmentSession,
+    _restore_sub_gains,
+    COUNTDOWN_MS,
+)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -218,6 +227,60 @@ def test_play_background_thread_logs_runtime_error(client, cfg_path):
     # Call the actual _play() function synchronously — should log, not raise
     assert captured_target.get("fn") is not None
     captured_target["fn"]()  # must not raise
+
+
+def test_play_background_thread_logs_value_error(client, cfg_path):
+    """_play() must also catch ValueError (e.g. denon_sweep_volume guard, missing input)."""
+    captured_target = {}
+
+    def capture_thread(target=None, daemon=False):
+        captured_target["fn"] = target
+        m = MagicMock()
+        m.start = MagicMock()
+        return m
+
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_path),
+        patch("calibrate.web.MeasurementEngine") as MockEngine,
+        patch("calibrate.web.threading.Thread", side_effect=capture_thread),
+        patch("calibrate.web.time.sleep"),
+    ):
+        engine = MockEngine.return_value
+        engine.generate_sweep.return_value = ([0.0] * 100, 48000, 3.0)
+        engine.play_signal.side_effect = ValueError("denon_sweep_volume must be ≤ -25.0 dB")
+        client.post("/api/measure/start", json={})
+
+    assert captured_target.get("fn") is not None
+    captured_target["fn"]()  # must not raise — was previously unhandled
+
+
+def test_play_background_thread_logs_avr_exception(client, cfg_path):
+    """_play() must catch non-RuntimeError AVR exceptions (AvrCommandError etc.)."""
+
+    class FakeAvrCommandError(Exception):
+        pass
+
+    captured_target = {}
+
+    def capture_thread(target=None, daemon=False):
+        captured_target["fn"] = target
+        m = MagicMock()
+        m.start = MagicMock()
+        return m
+
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_path),
+        patch("calibrate.web.MeasurementEngine") as MockEngine,
+        patch("calibrate.web.threading.Thread", side_effect=capture_thread),
+        patch("calibrate.web.time.sleep"),
+    ):
+        engine = MockEngine.return_value
+        engine.generate_sweep.return_value = ([0.0] * 100, 48000, 3.0)
+        engine.play_signal.side_effect = FakeAvrCommandError("No mapping for input source")
+        client.post("/api/measure/start", json={})
+
+    assert captured_target.get("fn") is not None
+    captured_target["fn"]()  # must not raise — was previously unhandled
 
 
 # ── POST /api/measure/record ───────────────────────────────────────────────────
@@ -515,3 +578,315 @@ def test_web_command_custom_host_port():
     mock_run.assert_called_once_with(
         "calibrate.web:app", host="127.0.0.1", port=9000, reload=False
     )
+
+
+# ── TestAlignmentEndpoints ─────────────────────────────────────────────────────
+
+def _make_align_config(sub_outputs=None) -> Config:
+    """Config with sub_outputs for alignment tests."""
+    return Config({
+        "denon": {"host": "192.168.1.100"},
+        "minidsp": {"host": "localhost", "port": 5380},
+        "mic": {"name": "UMIK"},
+        "measurement": {
+            "freq_min": 20,
+            "freq_max": 200,
+            "sweep_duration": 0.5,
+            "sample_rate": 48000,
+            "sub_outputs": sub_outputs if sub_outputs is not None else [0, 1],
+            "ir_search_window_ms": 50.0,
+            "playback_route": "usb",
+            "playback_device": "miniDSP",
+        },
+    })
+
+
+def _make_recording_bytes(n: int = 2400) -> bytes:
+    """Float32LE zeros — a valid (if silent) recording body."""
+    return struct.pack(f"<{n}f", *([0.001] * n))
+
+
+def _make_ir_result(sub_index: int = 0):
+    from calibrate.alignment import SubIRResult
+    return SubIRResult(
+        sub_index=sub_index,
+        peak_time_s=0.010 + sub_index * 0.002,
+        peak_sign=1,
+        polarity_inverted=False,
+        spl_db=-20.0,
+    )
+
+
+@pytest.fixture(autouse=True)
+def clean_align():
+    """Ensure _pending_alignments is empty before and after each test."""
+    with _align_lock:
+        _pending_alignments.clear()
+    yield
+    with _align_lock:
+        _pending_alignments.clear()
+
+
+class TestAlignmentEndpoints:
+
+    def test_align_subs_start_happy_path(self, client, tmp_path):
+        """POST /api/align-subs/start → 200 with token, step=0, n_steps=2."""
+        from unittest.mock import AsyncMock
+
+        with (
+            patch("calibrate.web._load_config", return_value=_make_align_config()),
+            patch("calibrate.web.MeasurementEngine") as mock_engine_cls,
+            patch("calibrate.adapters.minidsp.MinidspClient") as mock_client_cls,
+        ):
+            mock_engine = mock_engine_cls.return_value
+            mock_engine.generate_sweep.return_value = ([0.0] * 100, 48000, 0.5)
+            mock_engine.play_signal.return_value = None
+
+            mock_client = AsyncMock()
+            mock_client_cls.return_value = mock_client
+
+            r = client.post("/api/align-subs/start")
+
+        assert r.status_code == 200
+        data = r.json()
+        assert "token" in data
+        assert data["step"] == 0
+        assert data["n_steps"] == 2
+        assert data["sample_rate"] == 48000
+
+    def test_align_subs_start_no_sub_outputs_config(self, client):
+        """sub_outputs not configured → 422 with informative message."""
+        cfg = _make_align_config(sub_outputs=[])
+        with patch("calibrate.web._load_config", return_value=cfg):
+            r = client.post("/api/align-subs/start")
+
+        assert r.status_code == 422
+        assert "sub_outputs" in r.json()["detail"]
+
+    def test_align_subs_start_minidsp_unreachable(self, client):
+        """MinidspClient.set_output_gain raises ConnectError → 503."""
+        import httpx as _httpx
+        from unittest.mock import AsyncMock
+
+        with (
+            patch("calibrate.web._load_config", return_value=_make_align_config()),
+            patch("calibrate.web.MeasurementEngine") as mock_engine_cls,
+            patch("calibrate.adapters.minidsp.MinidspClient") as mock_client_cls,
+        ):
+            mock_engine = mock_engine_cls.return_value
+            mock_engine.generate_sweep.return_value = ([0.0] * 100, 48000, 0.5)
+
+            mock_client = AsyncMock()
+            mock_client.set_output_gain.side_effect = _httpx.ConnectError("refused")
+            mock_client_cls.return_value = mock_client
+
+            r = client.post("/api/align-subs/start")
+
+        assert r.status_code == 503
+
+    def test_align_subs_step_record_mid_sequence(self, client):
+        """Step 0 of 2 → extracts IR, advances state, returns next_step=1."""
+        from unittest.mock import AsyncMock
+        import numpy as np
+
+        # Pre-insert a session with step=0
+        token = str(uuid.uuid4())
+        sweep = [0.001] * 2400
+        session = _AlignmentSession(
+            token=token,
+            created_at=__import__("time").time(),
+            sub_outputs=[0, 1],
+            sweep_samples=sweep,
+            sample_rate=48000,
+            sweep_duration=0.05,
+            step=0,
+        )
+        with _align_lock:
+            _pending_alignments[token] = session
+
+        with (
+            patch("calibrate.web._load_config", return_value=_make_align_config()),
+            patch("calibrate.web.MeasurementEngine") as mock_engine_cls,
+            patch("calibrate.alignment.measure_sub_ir") as mock_measure,
+            patch("calibrate.adapters.minidsp.MinidspClient") as mock_client_cls,
+        ):
+            mock_engine = mock_engine_cls.return_value
+            mock_engine.play_signal.return_value = None
+
+            # measure_sub_ir is async — set return_value directly
+            mock_measure.return_value = _make_ir_result(0)
+
+            mock_client = AsyncMock()
+            mock_client_cls.return_value = mock_client
+
+            r = client.post(
+                "/api/align-subs/record",
+                content=_make_recording_bytes(),
+                headers={"X-Token": token, "X-Step": "0"},
+            )
+
+        assert r.status_code == 200
+        data = r.json()
+        assert data["next_step"] == 1
+        assert data["n_steps"] == 2
+
+    def test_align_subs_step_record_final(self, client):
+        """Final step (step=1 of 2) → runs phases 2-4, returns alignment_summary."""
+        from unittest.mock import AsyncMock
+        from calibrate.alignment import AlignmentSummary
+
+        token = str(uuid.uuid4())
+        sweep = [0.001] * 2400
+        session = _AlignmentSession(
+            token=token,
+            created_at=__import__("time").time(),
+            sub_outputs=[0, 1],
+            sweep_samples=sweep,
+            sample_rate=48000,
+            sweep_duration=0.05,
+            step=1,
+            ir_results=[_make_ir_result(0)],
+        )
+        with _align_lock:
+            _pending_alignments[token] = session
+
+        summary = AlignmentSummary(
+            sub_results=[_make_ir_result(0), _make_ir_result(1)],
+            delay_offsets_ms=[2.0, 0.0],
+            gain_trims_db=[0.0, 0.0],
+        )
+
+        with (
+            patch("calibrate.web._load_config", return_value=_make_align_config()),
+            patch("calibrate.web.MeasurementEngine") as mock_engine_cls,
+            patch("calibrate.alignment.measure_sub_ir") as mock_measure,
+            patch("calibrate.alignment.run_alignment_phases") as mock_phases,
+            patch("calibrate.adapters.minidsp.MinidspClient") as mock_client_cls,
+        ):
+            mock_engine_cls.return_value.play_signal.return_value = None
+            mock_measure.return_value = _make_ir_result(1)
+            mock_phases.return_value = summary
+
+            mock_client = AsyncMock()
+            mock_client_cls.return_value = mock_client
+
+            r = client.post(
+                "/api/align-subs/record",
+                content=_make_recording_bytes(),
+                headers={"X-Token": token, "X-Step": "1"},
+            )
+
+        assert r.status_code == 200
+        data = r.json()
+        assert "alignment_summary" in data
+        assert len(data["alignment_summary"]["delay_offsets_ms"]) == 2
+        # Session should be evicted
+        with _align_lock:
+            assert token not in _pending_alignments
+
+    def test_align_subs_step_unknown_token(self, client):
+        """Unknown X-Token → 404."""
+        r = client.post(
+            "/api/align-subs/record",
+            content=_make_recording_bytes(),
+            headers={"X-Token": "deadbeef-0000-0000-0000-000000000000", "X-Step": "0"},
+        )
+        assert r.status_code == 404
+
+    def test_align_subs_step_measurement_quality_error(self, client):
+        """MeasurementQualityError in IR extraction → 422 with structured body."""
+        from unittest.mock import AsyncMock
+
+        token = str(uuid.uuid4())
+        session = _AlignmentSession(
+            token=token,
+            created_at=__import__("time").time(),
+            sub_outputs=[0, 1],
+            sweep_samples=[0.001] * 2400,
+            sample_rate=48000,
+            sweep_duration=0.05,
+            step=0,
+        )
+        with _align_lock:
+            _pending_alignments[token] = session
+
+        with (
+            patch("calibrate.web._load_config", return_value=_make_align_config()),
+            patch("calibrate.web.MeasurementEngine"),
+            patch("calibrate.alignment.measure_sub_ir") as mock_measure,
+            patch("calibrate.adapters.minidsp.MinidspClient"),
+        ):
+            mock_measure.side_effect = MeasurementQualityError(
+                check="sweep_capture",
+                detail="Sweep not captured",
+                suggestion="Turn on your amp",
+            )
+            r = client.post(
+                "/api/align-subs/record",
+                content=_make_recording_bytes(),
+                headers={"X-Token": token, "X-Step": "0"},
+            )
+
+        assert r.status_code == 422
+        body = r.json()
+        assert body["check"] == "sweep_capture"
+
+    def test_align_subs_cancel_restores_gains(self, client):
+        """POST /api/align-subs/cancel → gains restored, session evicted."""
+        from unittest.mock import AsyncMock
+
+        token = str(uuid.uuid4())
+        session = _AlignmentSession(
+            token=token,
+            created_at=__import__("time").time(),
+            sub_outputs=[0, 1],
+            sweep_samples=[0.001] * 100,
+            sample_rate=48000,
+            sweep_duration=0.05,
+            step=0,
+        )
+        with _align_lock:
+            _pending_alignments[token] = session
+
+        with patch("calibrate.adapters.minidsp.MinidspClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client_cls.return_value = mock_client
+
+            r = client.post("/api/align-subs/cancel", headers={"X-Token": token})
+
+        assert r.status_code == 200
+        assert r.json()["status"] == "cancelled"
+        # Session must be evicted
+        with _align_lock:
+            assert token not in _pending_alignments
+        # Gains must be restored
+        mock_client.restore_all_gains.assert_called_once_with([0, 1])
+
+    def test_align_subs_cancel_unknown_token(self, client):
+        """Cancel with unknown token → 404."""
+        r = client.post(
+            "/api/align-subs/cancel",
+            headers={"X-Token": "deadbeef-0000-0000-0000-000000000000"},
+        )
+        assert r.status_code == 404
+
+    def test_align_subs_ttl_cleanup_restores_gains(self):
+        """Expired session: _restore_sub_gains calls client.restore_all_gains."""
+        from unittest.mock import AsyncMock, patch
+
+        session = _AlignmentSession(
+            token="expired-token",
+            created_at=0.0,  # epoch — always expired
+            sub_outputs=[0, 1],
+            sweep_samples=[],
+            sample_rate=48000,
+            sweep_duration=0.05,
+            step=1,
+        )
+
+        with patch("calibrate.adapters.minidsp.MinidspClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client_cls.return_value = mock_client
+            _restore_sub_gains(session)
+
+        mock_client.restore_all_gains.assert_called_once_with([0, 1])

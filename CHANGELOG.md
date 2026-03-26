@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.7.1] - 2026-03-23
+
+### Changed
+- **minidsp runs inside the Docker container** (not on the Pi host): `entrypoint.sh` now starts `minidsp server` in the background when `/dev/hidraw0` is present; container launched with `--device=/dev/hidraw0` instead of the full USB bus
+- `minidsp.host` default changed from `172.17.0.1` (Docker bridge gateway) to `localhost`; config template updated to match
+- `install.sh`: removed separate `minidspd.service` on the Pi host; replaced with udev rules that auto-bind `usbhid` to the HID interface on hotplug, so `/dev/hidraw0` is created automatically on every miniDSP replug
+- `Dockerfile`: minidsp binary now bundled in the runtime image (`MINIDSP_VERSION=0.1.12`; ARM and x86_64 variants resolved via `TARGETARCH`/`TARGETVARIANT`)
+
+### Fixed
+- `install.sh` udev rule now also sets `MODE="0666"` on `/dev/hidraw*` (not just the raw USB device) so Docker can access the HID interface without running as root
+
+## [0.1.7.0] - 2026-03-22
+
+### Added
+- **Sub-alignment algorithm (TODO-6, Phases 1-4):** MSO-inspired IR phase alignment for multiple subs — independent per-sub sweep+record, FFT deconvolution to extract impulse responses, travel-time delay offsets (Phase 2), polarity detection and correction (Phase 3), level matching (Phase 4)
+- **`calibrate/adapters/minidsp.py`:** Async HTTP client (`MinidspClient`) wrapping the minidspd REST API — `set_output_gain()`, `set_output_delay()`, `set_output_polarity()`, `set_output_peq()`, `restore_all_gains()`; `MinidspApiError` on 4xx; `ValueError` guards for delay > 30 ms and reserved APF PEQ slots
+- **`calibrate/alignment.py`:** Core signal-processing module — `extract_ir()` (FFT deconvolution, adaptive peak detection in configurable search window), `compute_delay_offsets()`, `measure_sub_ir()`, `detect_and_correct_polarity()`, `level_match_subs()`, `apply_delays()`, `run_alignment_phases()`; `SubIRResult` and `AlignmentSummary` dataclasses
+- **Web API:** Three new endpoints — `POST /api/align-subs/start` (mute others, schedule sweep, return token), `POST /api/align-subs/record` (extract IR per step, run phases 2-4 on final step, restore gains), `POST /api/align-subs/cancel` (abort + restore gains)
+- **TTL cleanup:** Background daemon thread evicts stale alignment sessions (>10 min) and restores sub gains automatically
+- New config keys: `measurement.sub_outputs` (list of miniDSP output indices) and `measurement.ir_search_window_ms` (default 50 ms = 17.5 m max travel time)
+
+### Fixed
+- `_restore_sub_gains()` — moved `asyncio.new_event_loop()` before `try` block to prevent `NameError` in `finally` if loop creation fails
+
+## [0.1.6.1] - 2026-03-22
+
+### Fixed
+- `_play_via_hdmi()` now calls `await receiver.async_update()` after `async_setup()` — without this, `_input_func_map` is empty and `async_set_input_func()` raises `AvrCommandError: No mapping for input source` even when the input name is correct
+- `DEFAULT_CONFIG` `denon_sweep_input` changed from `"AUX1"` to `None` — AUX1 is not a valid input on all Denon models; `None` forces explicit configuration with a clear error message and discovery command if unset
+- `_play_via_hdmi()` raises `ValueError` with actionable message when `denon_sweep_input` is not configured, rather than silently failing or raising a cryptic `KeyError`
+
 ## [0.1.6.0] - 2026-03-22
 
 ### Added

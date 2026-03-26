@@ -120,6 +120,30 @@ measurement:
 
 ---
 
+## Multi-Sub Calibration
+
+### TODO-9: OCA + Audyssey integration guide
+**What:** Document the 3-step calibration sequence: (1) `avr-calibration align-subs` first to align miniDSP sub outputs relative to each other, (2) Run Audyssey MultEQ XT32 on the Denon AVR (which now sees a phase-coherent dual-sub source), (3) optional OCA A1 EVO AcoustiX post-processing (Windows + Audyssey MultEQ Editor required) to further optimize Audyssey's result.
+**Why:** avr-calibration and Audyssey are not mutually exclusive — they operate on different layers of the signal chain. Without this guide, users run Audyssey before aligning subs (wrong order), causing Audyssey to try to calibrate two out-of-phase subs and produce a confused calibration. avr-calibration is the prerequisite for accurate Audyssey/OCA results.
+**Pros:** Zero implementation cost — this is documentation only. Captures the system architecture before the insight is lost.
+**Cons:** OCA step requires Windows machine + Audyssey MultEQ Editor license — not automated by avr-calibration.
+**Context:** OCA's *software* (Audyssey One, A1 EVO AcoustiX) is Audyssey-locked and Windows-only. OCA's *methodology* (phase convergence via IR analysis) is what `align-subs` implements natively. The full calibration stack is: avr-calibration miniDSP alignment → Audyssey full-system calibration → OCA post-processing of Audyssey result. Add a `docs/calibration-workflow.md` that explains this layering with ASCII signal-chain diagram.
+**Depends on:** align-subs Phase 1-4 (shipped v0.1.7.0) — dependency now met; APF (TODO-10) extends the guide further when implemented.
+**Priority:** P3 — useful guide, not blocking anything.
+
+---
+
+### TODO-10: APF all-pass filter phase correction (Phase 3.5)
+**What:** After the Phase 1-5 alignment algorithm runs, detect whether a persistent notch remains in 60-120 Hz that PEQ amplitude correction couldn't fix. If yes, implement Phase 3.5: design 1-2 all-pass filters (APFs) per sub to correct frequency-dependent phase differences. APF biquad coefficients written to miniDSP PEQ slots 1-2 (reserved; slots 3-10 are used for amplitude EQ).
+**Why:** A single delay corrects travel-time differences (physical distance between subs, ~90% of typical 2-sub setups). APFs correct frequency-dependent phase differences caused by each sub's proximity to different room boundaries, port resonances, and room modes — these can't be fixed by a single delay. MSO solves this; we should too for challenging sub placements.
+**Pros:** Closes the gap between our Approach B and full MSO for rooms where subs are placed in acoustically different positions (front vs. side wall, corner vs. free-standing).
+**Cons:** Minimum-phase extraction is mathematically involved; APF design requires scipy signal processing. Must respect the 2-APF-per-sub limit (more causes excessive group delay). Only needed when the standard Phase 1-5 produces a persistent notch — most 2-sub setups won't need it.
+**Context:** Trigger condition: after Phase 5 combined EQ pass, if the residual FR shows a notch deeper than -6dB in 60-120Hz that persisted after EQ (i.e., PEQ couldn't fill it without >+6dB boost), the system prompts: "Run `calibrate align-subs --apf` for all-pass filter correction." Detection function: `detect_apf_needed(combined_fr, pEQ_applied) -> bool`. PEQ slot budget: slots 1-2 (0-indexed) reserved for APFs; Phase 5 EQ implementation must only use slots 2-9 (=slots 3-10 in 1-indexed miniDSP UI). Source: MSO methodology, Harman research on multi-sub room interaction.
+**Depends on:** TODO-10 alias for Phase 1-5 (align-subs v1) working and validated on real hardware.
+**Priority:** P2 — most 2-sub setups won't need it; implement after validating v1 and observing whether the notch pattern appears in practice.
+
+---
+
 ## Completed
 
 ### TODO-4: Sweep playback routing — miniDSP USB vs. Denon HDMI

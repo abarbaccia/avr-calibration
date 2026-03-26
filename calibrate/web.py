@@ -16,20 +16,36 @@ Measurement flow
   6. Browser  →  POST /api/measure/record  (binary Float32LE body, X-Token header)
   7. Pi           deconvolves sweep + recording → FrequencyResponse
   8. Browser  ←  {session_id, frequencies_hz, spl_dbfs, peak_spl, freq_at_peak}
+
+Sub-alignment flow
+──────────────────
+  1. Browser  →  POST /api/align-subs/start
+  2. Pi       ←  {token, sample_rate, sweep_duration, countdown_ms, step: 0, n_steps: N}
+                  Pi: mutes all subs except first, schedules sweep
+  3. Browser  →  POST /api/align-subs/record  (X-Token, X-Step=0, Float32LE body)
+  4. Pi       ←  {next_step: 1, ...}  (Pi: mutes sub 0, unmutes sub 1, schedules sweep)
+                  ... repeat until step = N-1 ...
+  5. Browser  →  POST /api/align-subs/record  (X-Step=N-1, final)
+  6. Pi           runs Phase 2-4 (delays, polarity, level), restores gains
+  7. Browser  ←  {alignment_summary: {...}}
+  8. Browser  →  POST /api/align-subs/cancel  (optional early abort, restores gains)
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import struct
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+import httpx
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -44,7 +60,69 @@ app = FastAPI(title="avr-calibration")
 _pending_sweeps: dict[str, dict] = {}
 _pending_lock = threading.Lock()
 
+# token → AlignmentSession
+_pending_alignments: dict[str, "_AlignmentSession"] = {}
+_align_lock = threading.Lock()
+
 COUNTDOWN_MS = 1500   # time browser has to set up recording before sweep plays
+ALIGNMENT_SESSION_TTL_S = 600   # evict stale alignment sessions after 10 min
+ALIGNMENT_CLEANUP_INTERVAL_S = 60  # how often the cleanup thread wakes up
+
+
+# ── Alignment session state ────────────────────────────────────────────────────
+
+@dataclass
+class _AlignmentSession:
+    token: str
+    created_at: float
+    sub_outputs: list[int]
+    sweep_samples: list[float]
+    sample_rate: int
+    sweep_duration: float
+    step: int
+    ir_results: list = field(default_factory=list)
+    minidsp_host: str = "localhost"
+    minidsp_port: int = 5380
+    ir_search_window_ms: float = 50.0
+    complete: bool = False
+
+
+# ── Background TTL cleanup ─────────────────────────────────────────────────────
+
+def _alignment_cleanup_loop() -> None:
+    """Daemon thread — evict expired alignment sessions and restore sub gains."""
+    while True:
+        time.sleep(ALIGNMENT_CLEANUP_INTERVAL_S)
+        now = time.time()
+        expired: list[_AlignmentSession] = []
+        with _align_lock:
+            for token, session in list(_pending_alignments.items()):
+                if now - session.created_at > ALIGNMENT_SESSION_TTL_S:
+                    expired.append(session)
+                    del _pending_alignments[token]
+        for session in expired:
+            logger.warning(
+                "Alignment session %s expired — restoring sub gains", session.token[:8]
+            )
+            _restore_sub_gains(session)
+
+
+def _restore_sub_gains(session: _AlignmentSession) -> None:
+    """Restore all sub outputs to 0 dB (sync wrapper for async client)."""
+    from .adapters.minidsp import MinidspClient
+
+    client = MinidspClient(session.minidsp_host, session.minidsp_port)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(client.restore_all_gains(session.sub_outputs))
+    except Exception as exc:
+        logger.error("restore_sub_gains failed: %s", exc)
+    finally:
+        loop.close()
+
+
+# Start cleanup thread at module load
+threading.Thread(target=_alignment_cleanup_loop, daemon=True).start()
 
 
 # ── HTML page ─────────────────────────────────────────────────────────────────
@@ -398,6 +476,10 @@ class FeedbackRequest(BaseModel):
     content_tag: Optional[str] = None
 
 
+class AlignSubsStartRequest(BaseModel):
+    pass  # no body fields for now; config drives sub_outputs
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
@@ -443,8 +525,8 @@ async def measure_start(body: StartRequest) -> dict:
         time.sleep(COUNTDOWN_MS / 1000.0)
         try:
             engine.play_signal(samples, sample_rate)
-        except RuntimeError as exc:
-            logger.warning("play_signal failed: %s", exc)
+        except Exception as exc:
+            logger.warning("play_signal failed (%s): %s", type(exc).__name__, exc)
 
     threading.Thread(target=_play, daemon=True).start()
 
@@ -547,6 +629,234 @@ async def add_feedback(session_id: int, body: FeedbackRequest) -> dict:
         content_tag=body.content_tag,
     )
     return {"feedback_id": fid}
+
+
+# ── Sub-alignment endpoints ───────────────────────────────────────────────────
+
+@app.post("/api/align-subs/start")
+async def align_subs_start() -> dict:
+    """Start a multi-sub alignment session.
+
+    1. Reads sub_outputs from config (list of miniDSP output indices).
+    2. Generates a log sweep.
+    3. Mutes all sub outputs except the first.
+    4. Schedules sweep playback after COUNTDOWN_MS.
+    5. Returns token + session metadata for the browser to begin recording.
+    """
+    from .adapters.minidsp import MinidspClient, MinidspApiError
+
+    cfg = _load_config()
+    sub_outputs: list[int] = cfg.measurement.get("sub_outputs", [])
+    if not sub_outputs:
+        raise HTTPException(
+            status_code=422,
+            detail="measurement.sub_outputs not configured — add sub output indices to config.yaml",
+        )
+
+    engine = MeasurementEngine(cfg)
+    try:
+        samples, sample_rate, sweep_duration = engine.generate_sweep()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    minidsp_host = cfg.minidsp.get("host", "localhost")
+    minidsp_port = cfg.minidsp.get("port", 5380)
+    ir_search_window_ms = cfg.measurement.get("ir_search_window_ms", 50.0)
+
+    # Mute all sub outputs except the first before scheduling the sweep
+    client = MinidspClient(minidsp_host, minidsp_port)
+    from .alignment import MUTE_GAIN_DB
+
+    async def _mute_others() -> None:
+        for output_idx in sub_outputs[1:]:
+            await client.set_output_gain(output_idx, MUTE_GAIN_DB)
+
+    try:
+        await _mute_others()
+    except httpx.ConnectError as exc:
+        raise HTTPException(status_code=503, detail=f"Cannot reach minidspd: {exc}")
+    except MinidspApiError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    token = str(uuid.uuid4())
+    session = _AlignmentSession(
+        token=token,
+        created_at=time.time(),
+        sub_outputs=sub_outputs,
+        sweep_samples=samples,
+        sample_rate=sample_rate,
+        sweep_duration=sweep_duration,
+        step=0,
+        minidsp_host=minidsp_host,
+        minidsp_port=minidsp_port,
+        ir_search_window_ms=ir_search_window_ms,
+    )
+    with _align_lock:
+        _pending_alignments[token] = session
+
+    def _play():
+        time.sleep(COUNTDOWN_MS / 1000.0)
+        try:
+            engine.play_signal(samples, sample_rate)
+        except Exception as exc:
+            logger.warning("align-subs play_signal failed: %s", exc)
+
+    threading.Thread(target=_play, daemon=True).start()
+
+    return {
+        "token": token,
+        "sample_rate": sample_rate,
+        "sweep_duration": sweep_duration,
+        "countdown_ms": COUNTDOWN_MS,
+        "step": 0,
+        "n_steps": len(sub_outputs),
+    }
+
+
+@app.post("/api/align-subs/record")
+async def align_subs_record(
+    request: Request,
+    x_token: str = Header(...),
+    x_step: int = Header(...),
+    x_sample_rate: Optional[int] = Header(default=None),
+) -> JSONResponse:
+    """Receive a recording for the current sub step.
+
+    For steps 0..N-2: extract the IR, advance to the next sub (mute current,
+    unmute next, schedule sweep), and return next_step metadata.
+
+    For step N-1 (final): extract IR, run Phases 2-4, restore gains, and
+    return the alignment summary.
+    """
+    import httpx as _httpx
+    from .adapters.minidsp import MinidspClient, MinidspApiError
+    from .alignment import measure_sub_ir, run_alignment_phases, MUTE_GAIN_DB
+
+    with _align_lock:
+        session = _pending_alignments.get(x_token)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Unknown alignment token or expired")
+
+    body = await request.body()
+    if len(body) < 4:
+        raise HTTPException(status_code=400, detail="Recording too short")
+
+    n_samples = len(body) // 4
+    recording_samples = list(struct.unpack(f"<{n_samples}f", body[:n_samples * 4]))
+
+    cfg = _load_config()
+    engine = MeasurementEngine(cfg)
+    sr = x_sample_rate or session.sample_rate
+    sub_index = x_step  # step N corresponds to sub_outputs[N]
+
+    # Extract IR for this sub
+    try:
+        ir_result = await measure_sub_ir(
+            engine=engine,
+            recording_samples=recording_samples,
+            sweep_samples=session.sweep_samples,
+            sample_rate=sr,
+            sub_index=sub_index,
+            ir_search_window_ms=session.ir_search_window_ms,
+        )
+    except MeasurementQualityError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "measurement_quality",
+                "check": exc.check,
+                "detail": exc.detail,
+                "suggestion": exc.suggestion,
+            },
+        )
+
+    with _align_lock:
+        session.ir_results.append(ir_result)
+        session.step = x_step + 1
+
+    n_steps = len(session.sub_outputs)
+    is_final = (x_step + 1 >= n_steps)
+
+    client = MinidspClient(session.minidsp_host, session.minidsp_port)
+
+    if not is_final:
+        # Advance to next sub: mute current, restore next, schedule sweep
+        current_output = session.sub_outputs[x_step]
+        next_output = session.sub_outputs[x_step + 1]
+
+        async def _advance_subs() -> None:
+            await client.set_output_gain(current_output, MUTE_GAIN_DB)
+            await client.set_output_gain(next_output, 0.0)
+
+        try:
+            await _advance_subs()
+        except Exception as exc:
+            logger.warning("align-subs advance_subs failed: %s", exc)
+
+        def _play_next() -> None:
+            time.sleep(COUNTDOWN_MS / 1000.0)
+            try:
+                engine.play_signal(session.sweep_samples, session.sample_rate)
+            except Exception as exc:
+                logger.warning("align-subs play_signal (next) failed: %s", exc)
+
+        threading.Thread(target=_play_next, daemon=True).start()
+
+        return JSONResponse(content={
+            "token": session.token,
+            "next_step": x_step + 1,
+            "n_steps": n_steps,
+            "sample_rate": session.sample_rate,
+            "sweep_duration": session.sweep_duration,
+            "countdown_ms": COUNTDOWN_MS,
+        })
+
+    # ── Final step: run Phases 2-4 and restore gains ─────────────────────────
+    try:
+        summary = await run_alignment_phases(
+            ir_results=session.ir_results,
+            sub_outputs=session.sub_outputs,
+            client=client,
+        )
+    finally:
+        # Always restore gains — even if phases partially fail
+        await client.restore_all_gains(session.sub_outputs)
+        with _align_lock:
+            session.complete = True
+            _pending_alignments.pop(session.token, None)
+
+    return JSONResponse(content={
+        "alignment_summary": {
+            "sub_results": [
+                {
+                    "sub_index": r.sub_index,
+                    "peak_time_s": r.peak_time_s,
+                    "peak_sign": r.peak_sign,
+                    "polarity_inverted": r.polarity_inverted,
+                    "spl_db": r.spl_db,
+                }
+                for r in summary.sub_results
+            ],
+            "delay_offsets_ms": summary.delay_offsets_ms,
+            "gain_trims_db": summary.gain_trims_db,
+        }
+    })
+
+
+@app.post("/api/align-subs/cancel")
+async def align_subs_cancel(x_token: str = Header(...)) -> dict:
+    """Cancel an in-progress alignment session and restore all sub gains."""
+    from .adapters.minidsp import MinidspClient
+
+    with _align_lock:
+        session = _pending_alignments.pop(x_token, None)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Unknown alignment token or expired")
+
+    client = MinidspClient(session.minidsp_host, session.minidsp_port)
+    await client.restore_all_gains(session.sub_outputs)
+
+    return {"status": "cancelled"}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

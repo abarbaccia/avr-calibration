@@ -7,8 +7,6 @@ set -euo pipefail
 IMAGE="ghcr.io/abarbaccia/avr-calibration:latest"
 SERVICE_NAME="avr-calibration"
 DATA_DIR="$HOME/.avr-calibration"
-MINIDSP_VERSION="0.1.12"
-MINIDSP_URL="https://github.com/mrene/minidsp-rs/releases/download/v${MINIDSP_VERSION}/minidsp.arm-linux-gnueabihf-rpi.tar.gz"
 
 echo ""
 echo "=== avr-calibration Pi Zero W setup ==="
@@ -41,43 +39,65 @@ else
     echo "Docker already installed: $(docker --version)"
 fi
 
-# ── 3. minidsp-rs ─────────────────────────────────────────────────────────
+# ── 3. udev rules for miniDSP HID ─────────────────────────────────────────
+#
+# Two rules are needed:
+#   a) Bind usbhid to the HID interface (interface 4, class 0x03) on hotplug.
+#      Without this the hidraw device is not created after a replug.
+#   b) Grant group-readable permissions to /dev/hidraw* for the miniDSP.
+#
+# The Docker container gets access via --device=/dev/hidraw0.
+# We do NOT pass --device=/dev/bus/usb — that steals exclusive USB HID access
+# from the kernel and breaks hidraw for everyone else.
 
 echo ""
-echo "--- Installing minidsp ---"
-if ! command -v minidsp &>/dev/null; then
-    TMP=$(mktemp -d)
-    echo "Downloading minidsp v${MINIDSP_VERSION} for ARM..."
-    if ! curl -fsSL "$MINIDSP_URL" -o "$TMP/minidsp.tar.gz"; then
-        echo "ERROR: Failed to download minidsp from:"
-        echo "  $MINIDSP_URL"
-        echo "Check https://github.com/mrene/minidsp-rs/releases for available assets."
-        rm -rf "$TMP"
-        exit 1
-    fi
-    tar -xzf "$TMP/minidsp.tar.gz" -C "$TMP"
-    sudo install -m 755 "$TMP/minidsp" /usr/local/bin/minidsp
-    rm -rf "$TMP"
-    echo "minidsp installed to /usr/local/bin/minidsp"
-    # Note: the -rpi binary targets gnueabihf (ARMv7). On armv6l (Pi Zero W),
-    # run 'minidsp --version' to confirm it works; if you see "Illegal instruction",
-    # you'll need to cross-compile from source for ARMv6.
-else
-    echo "minidsp already installed: $(minidsp --version 2>/dev/null || echo 'version unknown')"
-fi
-
-# ── 4. udev rule for miniDSP USB ──────────────────────────────────────────
-
-echo ""
-echo "--- Setting up udev rule for miniDSP ---"
-UDEV_RULE='SUBSYSTEM=="usb", ATTR{idVendor}=="2752", ATTR{idProduct}=="0011", MODE="0666", GROUP="plugdev"'
+echo "--- Setting up udev rules for miniDSP HID ---"
 UDEV_FILE="/etc/udev/rules.d/99-minidsp.rules"
-if [ ! -f "$UDEV_FILE" ]; then
-    echo "$UDEV_RULE" | sudo tee "$UDEV_FILE" > /dev/null
-    sudo udevadm control --reload-rules
-    echo "udev rule installed"
+sudo tee "$UDEV_FILE" > /dev/null << 'EOF'
+# miniDSP 2x4HD — bind usbhid to HID interface on hotplug so hidraw is created
+ACTION=="add", SUBSYSTEM=="usb_interface", \
+    ATTRS{idVendor}=="2752", ATTRS{idProduct}=="0011", \
+    ATTR{bInterfaceClass}=="03", \
+    RUN+="/bin/sh -c 'echo -n %k > /sys/bus/usb/drivers/usbhid/bind'"
+
+# Immediately unbind snd-usb-audio from miniDSP audio interfaces.
+# We don't use the USB audio output (playback is via HDMI). The audio driver's
+# repeated failed probes generate -71 errors that stress the DWC2 controller
+# and accelerate device resets on Pi Zero W.
+ACTION=="bind", SUBSYSTEM=="usb_interface", \
+    ATTRS{idVendor}=="2752", ATTRS{idProduct}=="0011", \
+    ATTR{bInterfaceClass}=="01", \
+    ENV{DRIVER}=="snd-usb-audio", \
+    RUN+="/bin/sh -c 'echo -n %k > /sys/bus/usb/drivers/snd-usb-audio/unbind 2>/dev/null || true'"
+
+# Grant container-accessible permissions to the hidraw device
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2752", ATTRS{idProduct}=="0011", \
+    MODE="0666", GROUP="plugdev"
+
+# Restart the avr-calibration service when miniDSP hidraw reappears
+# (handles device resets — container needs to be restarted to pick up new /dev/hidraw0)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2752", ATTRS{idProduct}=="0011", \
+    ACTION=="add", \
+    RUN+="/bin/systemctl restart avr-calibration"
+EOF
+sudo udevadm control --reload-rules
+echo "udev rules installed — replug miniDSP USB if already connected"
+
+# ── 4. USB power boost ─────────────────────────────────────────────────────
+#
+# miniDSP 2x4HD draws ~500mA. The Pi Zero W USB OTG port is current-limited
+# by default. max_usb_current=1 enables a GPIO switch that raises the USB
+# current limit to 1.2A, preventing device resets under sustained load.
+
+echo ""
+echo "--- Enabling USB current boost (max_usb_current=1) ---"
+CONFIG_FILE="/boot/firmware/config.txt"
+[ -f "$CONFIG_FILE" ] || CONFIG_FILE="/boot/config.txt"
+if ! grep -q "max_usb_current" "$CONFIG_FILE"; then
+    sudo sed -i '/^\[all\]/a max_usb_current=1' "$CONFIG_FILE"
+    echo "Added max_usb_current=1 to $CONFIG_FILE (takes effect after reboot)"
 else
-    echo "udev rule already exists"
+    echo "max_usb_current already set in $CONFIG_FILE"
 fi
 
 # ── 5. Config ─────────────────────────────────────────────────────────────
@@ -94,8 +114,8 @@ denon:
   host: "192.168.1.100"  # IP address of your Denon X3800H
 
 minidsp:
-  host: "localhost"
-  port: 5380             # default minidspd port (run: minidspd)
+  host: "localhost"       # minidspd runs inside the Docker container
+  port: 5380              # default minidspd port
 
 mic:
   name: "UMIK"           # substring matched against audio device names
@@ -133,19 +153,21 @@ echo "--- Pulling Docker image ---"
 sudo docker pull "$IMAGE"
 echo "Image pulled: $IMAGE"
 
-# ── 7. systemd service ────────────────────────────────────────────────────
+# ── 7. avr-calibration Docker systemd service ─────────────────────────────
+#
+# minidspd now runs INSIDE the container (not on the Pi host).
+# We pass --device=/dev/hidraw0 so the container can reach the miniDSP HID
+# interface. This is less destructive than --device=/dev/bus/usb which would
+# steal exclusive USB access from the kernel and break hidraw for the host.
+#
+# The udev rule above ensures /dev/hidraw0 is created and group-accessible
+# whenever the miniDSP is plugged in.
+#
+# Power note: miniDSP 2x4HD requires 12V 1A minimum. 0.8A causes a boot loop.
 
 echo ""
-echo "--- Installing systemd service ---"
+echo "--- Installing avr-calibration systemd service ---"
 SYSTEMD_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-
-# Detect USB bus path for miniDSP (2752:0011) — passed as --device to container
-MINIDSP_DEV=""
-if DEVPATH=$(udevadm info --query=path --name=/dev/bus/usb/$(lsusb | awk '/2752:0011/{print $2"/"substr($4,1,3)}') 2>/dev/null); then
-    MINIDSP_DEV="--device=/dev/bus/usb"
-else
-    MINIDSP_DEV="--device=/dev/bus/usb"  # pass the whole USB bus; safe default
-fi
 
 sudo tee "$SYSTEMD_FILE" > /dev/null << EOF
 [Unit]
@@ -156,11 +178,12 @@ Requires=docker.service
 [Service]
 Type=simple
 User=$USER
+ExecStartPre=/bin/sh -c 'for i in \$(seq 30); do [ -e /dev/hidraw0 ] && exit 0; sleep 1; done; echo "WARNING: /dev/hidraw0 not found after 30s, starting without miniDSP"; exit 0'
 ExecStartPre=-/usr/bin/docker rm -f ${SERVICE_NAME}
 ExecStart=/usr/bin/docker run --rm \\
     --name ${SERVICE_NAME} \\
     -p 8000:8000 \\
-    ${MINIDSP_DEV} \\
+    --device=/dev/hidraw0 \\
     -v ${DATA_DIR}:/data/.avr-calibration \\
     ${IMAGE}
 ExecStop=/usr/bin/docker stop ${SERVICE_NAME}
@@ -183,7 +206,7 @@ echo "=== Setup complete ==="
 echo ""
 echo "Next steps:"
 echo "  1. Edit $DATA_DIR/config.yaml (set denon.host)"
-echo "  2. Plug in miniDSP via USB"
+echo "  2. Plug in miniDSP via USB — hidraw0 will be created automatically"
 echo "  3. Run: docker exec ${SERVICE_NAME} calibrate check"
 echo "  4. Service URL: https://$(hostname -I | awk '{print $1}'):8000"
 echo "     (self-signed cert — click Advanced → Proceed in your browser)"

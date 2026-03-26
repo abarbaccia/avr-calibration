@@ -432,7 +432,14 @@ class MeasurementEngine:
                 f"got {sweep_vol}"
             )
 
-        sweep_input = cfg.get("denon_sweep_input", "AUX1")
+        sweep_input = cfg.get("denon_sweep_input") or None
+        if not sweep_input:
+            raise ValueError(
+                "denon_sweep_input is not set in config. "
+                "Find your input name: python -c \"import asyncio, denonavr; "
+                "r=denonavr.DenonAVR('YOUR_IP'); asyncio.run(r.async_setup()); "
+                "asyncio.run(r.async_update()); print(r.input_func_list)\""
+            )
         settle_ms = cfg.get("denon_settle_ms", 800)
         hdmi_device = cfg.get("hdmi_playback_device", None)
 
@@ -441,6 +448,7 @@ class MeasurementEngine:
 
         receiver = denonavr.DenonAVR(host)
         await receiver.async_setup()
+        await receiver.async_update()
 
         try:
             saved_input = receiver.input_func
@@ -450,7 +458,8 @@ class MeasurementEngine:
             await receiver.async_set_volume(sweep_vol)
             await asyncio.sleep(settle_ms / 1000.0)
 
-            arr = np.array(samples, dtype=np.float32).reshape(-1, 1)
+            # vc4-hdmi (Pi HDMI) only supports integer formats — convert float32 → int16
+            arr = (np.clip(np.array(samples, dtype=np.float32), -1.0, 1.0) * 32767).astype(np.int16).reshape(-1, 1)
             sd.play(arr, samplerate=sample_rate, device=hdmi_device)
             sd.wait()
 

@@ -50,6 +50,7 @@ def make_config(**measurement_overrides) -> Config:
         "sample_rate": 48000,
         "input_channel": 1,
         "output_channel": 1,
+        "denon_sweep_input": "TV",  # test default; real value must be set in config.yaml
     }
     defaults.update(measurement_overrides)
     return Config({
@@ -646,6 +647,17 @@ class TestPlaySignalRouting:
         with pytest.raises(ValueError, match="-25.0 dB"):
             asyncio.get_event_loop().run_until_complete(run())
 
+    def test_hdmi_no_sweep_input_raises_value_error(self):
+        """_play_via_hdmi raises ValueError if denon_sweep_input is None."""
+        engine = self._engine(route="hdmi", denon_sweep_input=None)
+        import asyncio
+
+        async def run():
+            await engine._play_via_hdmi([0.1] * 100, 48000)
+
+        with pytest.raises(ValueError, match="denon_sweep_input is not set"):
+            asyncio.get_event_loop().run_until_complete(run())
+
     def test_hdmi_denonavr_import_error_raises_runtime_error(self):
         """If denonavr is not installed, _play_via_hdmi raises RuntimeError."""
         engine = self._engine(route="hdmi")
@@ -681,6 +693,7 @@ class TestPlaySignalRouting:
 
         mock_receiver = MagicMock()
         mock_receiver.async_setup = AsyncMock()
+        mock_receiver.async_update = AsyncMock()
         mock_receiver.input_func = "TV"
         mock_receiver.volume = -35.0
         mock_receiver.async_set_input_func = AsyncMock()
@@ -709,6 +722,7 @@ class TestPlaySignalRouting:
 
         mock_receiver = MagicMock()
         mock_receiver.async_setup = AsyncMock()
+        mock_receiver.async_update = AsyncMock()
         mock_receiver.input_func = "TV"
         mock_receiver.volume = -35.0
         mock_receiver.async_set_input_func = AsyncMock()

@@ -116,7 +116,68 @@ sudo systemctl restart avr-calibration
 sudo systemctl stop avr-calibration
 ```
 
-## Updates
+## Deployment workflow
+
+The recommended workflow for any code change:
+
+```
+1. SSH hotfix  →  validate on Pi (seconds, no rebuild)
+2. git push    →  CI builds branch image (~30-60 min, arm/v6 QEMU)
+3. Pi pulls branch image  →  re-validate the built container
+4. PR merged to main  →  :latest image published
+5. Pi pulls :latest  →  done
+```
+
+### Step 1 — SSH hotfix (immediate validation)
+
+From your dev machine, run the hotfix script. It SCPs changed files to the Pi
+and starts the container with those files bind-mounted over the installed
+package — no Docker rebuild required.
+
+```bash
+# Auto-detects git-modified calibrate/ files:
+./deploy/hotfix.sh
+
+# Or target specific files:
+./deploy/hotfix.sh calibrate/web.py
+
+# Override Pi address:
+PI_HOST=192.168.1.50 ./deploy/hotfix.sh
+```
+
+The script:
+1. SCPs changed files to the Pi
+2. Stops the systemd service
+3. Starts the container with the hotfix files bind-mounted
+4. Follows the logs live
+5. On Ctrl+C, offers to restore the stable image
+
+> **Note:** The hotfix is ephemeral — bind mounts override the installed package
+> in the running container only. The underlying image is unchanged.
+
+### Step 2 — CI build (confirm the real image works)
+
+GitHub Actions builds and pushes an image for every branch push, tagged with
+the branch name:
+
+```bash
+# After git push origin <branch>:
+sudo docker pull ghcr.io/abarbaccia/avr-calibration:<branch-name>
+sudo docker stop avr-calibration && sudo docker rm avr-calibration
+sudo systemctl start avr-calibration  # starts with :latest — swap image first if needed
+```
+
+To test a specific branch image via systemd, temporarily edit the service:
+
+```bash
+sudo sed -i 's|:latest|:<branch-name>|' /etc/systemd/system/avr-calibration.service
+sudo systemctl daemon-reload && sudo systemctl restart avr-calibration
+# After validation, restore:
+sudo sed -i 's|:<branch-name>|:latest|' /etc/systemd/system/avr-calibration.service
+sudo systemctl daemon-reload
+```
+
+### Step 3 — Update to stable (after PR merged)
 
 ```bash
 sudo docker pull ghcr.io/abarbaccia/avr-calibration:latest

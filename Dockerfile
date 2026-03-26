@@ -7,11 +7,12 @@
 #   • pytta → llvmlite → LLVM impractical on armv6 → skipped
 #   Fix: plain pip + venv, pin pydantic v1 + fastapi 0.99.x (pure Python, no Rust)
 #
-# arm/v7  (Pi Zero 2 W — TODO: uncomment platforms line in docker.yml):
-#   All Rust wheels available for armv7. Just falls through to the else branch.
-#   No Dockerfile changes needed; uv sync handles everything.
+# arm/v7  (Pi Zero 2 W):
+#   Rust wheels available; uv works. But pytta → sounddevice C extension uses
+#   old distutils spawn(dry_run=) API removed in setuptools 60+ → build fails.
+#   Fix: uv sync without --extra measurement (pytta not needed; web UI uses browser audio).
 #
-# amd64: full deps including pytta via uv sync.
+# amd64: full deps including pytta via uv sync (dev use; CLI measure command).
 #
 FROM python:3.11-slim-bookworm AS builder
 
@@ -39,8 +40,13 @@ RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v6" ]; then \
         /opt/venv/bin/pip install --no-cache-dir ".[dev]" \
             "pydantic>=1.10,<2" \
             "fastapi>=0.99,<0.100"; \
+    elif [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \
+        echo "ARMv7 (Pi Zero 2 W): uv build, skip measurement extra (pytta build fails on arm/v7)" && \
+        pip install --no-cache-dir uv && \
+        uv venv /opt/venv && \
+        uv sync --extra dev --no-editable; \
     else \
-        echo "Building full deps including pytta (measurement extra)" && \
+        echo "amd64: full deps including pytta (measurement extra)" && \
         pip install --no-cache-dir uv && \
         uv venv /opt/venv && \
         uv sync --extra dev --extra measurement --no-editable; \
@@ -48,6 +54,23 @@ RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v6" ]; then \
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM python:3.11-slim-bookworm AS runtime
+
+ARG TARGETARCH
+ARG TARGETVARIANT
+
+# minidsp-rs: talks HID to the miniDSP 2x4HD — serves HTTP on localhost:5380
+# Runs inside the container (container gets --device=/dev/hidraw0 from Docker run).
+# All three variants use the same ARMv7-hf RPi binary; x86_64 uses the Linux x86_64 build.
+# Use Python urllib to avoid apt-get curl/tar (causes held-package resolver failures under QEMU).
+ARG MINIDSP_VERSION=0.1.12
+RUN set -e; \
+    ARCH="${TARGETARCH}${TARGETVARIANT}"; \
+    if [ "$ARCH" = "amd64" ]; then \
+        URL="https://github.com/mrene/minidsp-rs/releases/download/v${MINIDSP_VERSION}/minidsp.x86_64-unknown-linux-gnu.tar.gz"; \
+    else \
+        URL="https://github.com/mrene/minidsp-rs/releases/download/v${MINIDSP_VERSION}/minidsp.arm-linux-gnueabihf-rpi.tar.gz"; \
+    fi; \
+    URL_EXPORT="$URL" python3 -c "import urllib.request, tarfile, os; url = os.environ['URL_EXPORT']; urllib.request.urlretrieve(url, '/tmp/minidsp.tar.gz'); tf = tarfile.open('/tmp/minidsp.tar.gz'); tf.extract('minidsp', '/tmp/'); tf.close(); os.rename('/tmp/minidsp', '/usr/local/bin/minidsp'); os.chmod('/usr/local/bin/minidsp', 0o755)"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libportaudio2 \
