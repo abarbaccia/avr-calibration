@@ -1,12 +1,5 @@
 # ── Stage 1: builder ─────────────────────────────────────────────────────────
 #
-# arm/v6  (Pi Zero W — current):
-#   • uv has no armv6 wheel; building from source needs cargo → fails under QEMU
-#   • pydantic-core (FastAPI dep) has no armv6 wheel; same cargo problem
-#   • numpy 1.26+ has no armv6 wheel → compile 1.24.x from source via pip
-#   • pytta → llvmlite → LLVM impractical on armv6 → skipped
-#   Fix: plain pip + venv, pin pydantic v1 + fastapi 0.99.x (pure Python, no Rust)
-#
 # arm/v7  (Pi Zero 2 W):
 #   Rust wheels available; uv works. But pytta → sounddevice C extension uses
 #   old distutils spawn(dry_run=) API removed in setuptools 60+ → build fails.
@@ -33,14 +26,7 @@ WORKDIR /build
 COPY pyproject.toml uv.lock ./
 COPY calibrate/ ./calibrate/
 
-RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v6" ]; then \
-        echo "ARMv6 (Pi Zero W): pip-only build, pydantic v1, numpy from source" && \
-        python -m venv /opt/venv && \
-        /opt/venv/bin/pip install --no-cache-dir "numpy>=1.24.4,<1.25" --no-binary numpy && \
-        /opt/venv/bin/pip install --no-cache-dir ".[dev]" \
-            "pydantic>=1.10,<2" \
-            "fastapi>=0.99,<0.100"; \
-    elif [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \
+RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \
         echo "ARMv7 (Pi Zero 2 W): uv build, skip measurement extra (pytta build fails on arm/v7)" && \
         pip install --no-cache-dir uv && \
         uv venv /opt/venv && \
@@ -60,7 +46,7 @@ ARG TARGETVARIANT
 
 # minidsp-rs: talks HID to the miniDSP 2x4HD — serves HTTP on localhost:5380
 # Runs inside the container (container gets --device=/dev/hidraw0 from Docker run).
-# All three variants use the same ARMv7-hf RPi binary; x86_64 uses the Linux x86_64 build.
+# arm/v7 uses the ARMv7-hf RPi binary; amd64 uses the Linux x86_64 build.
 # Use Python urllib to avoid apt-get curl/tar (causes held-package resolver failures under QEMU).
 ARG MINIDSP_VERSION=0.1.12
 RUN set -e; \
