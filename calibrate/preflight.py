@@ -1,12 +1,16 @@
 """Hardware pre-flight checks — verify mic, miniDSP, and Denon AVR are reachable."""
 
 import asyncio
+import os
 from dataclasses import dataclass
 from typing import Optional
 
 import httpx
 
 from .config import Config
+
+HIDRAW_DEVICE: str = "/dev/hidraw0"
+"""Expected HID device node for the miniDSP 2x4 HD."""
 
 
 @dataclass
@@ -38,6 +42,7 @@ class PreflightChecker:
         """Run all hardware checks concurrently. Never raises — errors become failed results."""
         checks = [
             ("Microphone", self.check_mic()),
+            ("miniDSP USB", self.check_hidraw()),
             ("miniDSP", self.check_minidsp()),
             ("Denon AVR", self.check_denon()),
             ("Playback Route", self.check_playback_route()),
@@ -57,6 +62,33 @@ class PreflightChecker:
             else:
                 results.append(outcome)
         return results
+
+    async def check_hidraw(self) -> CheckResult:
+        """Check that the miniDSP HID device node exists at HIDRAW_DEVICE.
+
+        Absence means the Pi's USB host controller hasn't enumerated the device.
+        Most common cause on Pi Zero 2 W: using a plain USB-A → micro-USB cable
+        instead of a micro-USB OTG adapter (the OTG adapter flips the ID pin that
+        switches the port from device mode to host mode).
+        """
+        if os.path.exists(HIDRAW_DEVICE):
+            return CheckResult(
+                name="miniDSP USB",
+                passed=True,
+                detail=f"{HIDRAW_DEVICE} present",
+            )
+        return CheckResult(
+            name="miniDSP USB",
+            passed=False,
+            detail=f"{HIDRAW_DEVICE} not found",
+            error=(
+                "miniDSP not detected on USB. "
+                "Pi Zero 2 W requires a micro-USB OTG adapter — "
+                "a plain USB-A to micro-USB cable will not work. "
+                "Connect a micro-USB OTG adapter to the Pi's USB port, "
+                "then plug the miniDSP into the adapter."
+            ),
+        )
 
     async def check_mic(self) -> CheckResult:
         """Check that the UMIK (or configured mic) is visible as an audio input device."""

@@ -2,6 +2,9 @@
 
 Coverage diagram:
   PreflightChecker
+  ├── check_hidraw()
+  │   ├── [TESTED] /dev/hidraw0 exists → passes with path in detail
+  │   └── [TESTED] /dev/hidraw0 missing → fails with OTG adapter hint
   ├── check_mic()
   │   ├── [TESTED] UMIK found by name match → passes with device detail
   │   ├── [TESTED] Name match is case-insensitive
@@ -24,7 +27,7 @@ Coverage diagram:
   │   ├── [TESTED] Connection fails → fails with host in detail
   │   └── [TESTED] Timeout → fails
   └── run_all()
-      ├── [TESTED] All pass → 3 passed results
+      ├── [TESTED] All pass → 5 passed results
       ├── [TESTED] Unhandled exception → captured as failed result
       ├── [TESTED] Results named correctly even when exceptions occur
       └── [TESTED] Partial failure (2 pass, 1 fail)
@@ -36,8 +39,27 @@ import httpx
 import respx
 from unittest.mock import patch, MagicMock, AsyncMock
 
-from calibrate.preflight import PreflightChecker, CheckResult
+from calibrate.preflight import PreflightChecker, CheckResult, HIDRAW_DEVICE
 from tests.conftest import make_input_device, make_output_device
+
+
+# ── HID device node checks ───────────────────────────────────────────────────
+
+class TestHidrawCheck:
+    async def test_hidraw_present(self, config):
+        with patch("os.path.exists", return_value=True):
+            result = await PreflightChecker(config).check_hidraw()
+        assert result.passed
+        assert HIDRAW_DEVICE in result.detail
+        assert result.error is None
+
+    async def test_hidraw_missing_gives_otg_hint(self, config):
+        with patch("os.path.exists", return_value=False):
+            result = await PreflightChecker(config).check_hidraw()
+        assert not result.passed
+        assert HIDRAW_DEVICE in result.detail
+        assert "OTG" in result.error
+        assert "micro-USB" in result.error
 
 
 # ── Microphone checks ────────────────────────────────────────────────────────
@@ -210,6 +232,7 @@ class TestRunAll:
     async def test_all_pass(self, config):
         checker = PreflightChecker(config)
         with (
+            patch.object(checker, "check_hidraw", return_value=CheckResult("miniDSP USB", True, "/dev/hidraw0 present")),
             patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1")),
             patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", True, "2x4HD")),
             patch.object(checker, "check_denon", return_value=CheckResult("Denon AVR", True, "X3800H")),
@@ -217,11 +240,12 @@ class TestRunAll:
         ):
             results = await checker.run_all()
         assert all(r.passed for r in results)
-        assert len(results) == 4
+        assert len(results) == 5
 
     async def test_unhandled_exception_becomes_failed_result(self, config):
         checker = PreflightChecker(config)
         with (
+            patch.object(checker, "check_hidraw", return_value=CheckResult("miniDSP USB", True, "/dev/hidraw0 present")),
             patch.object(checker, "check_mic", side_effect=RuntimeError("boom")),
             patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", True, "2x4HD")),
             patch.object(checker, "check_denon", return_value=CheckResult("Denon AVR", True, "X3800H")),
@@ -235,27 +259,30 @@ class TestRunAll:
     async def test_result_names_match_expected(self, config):
         checker = PreflightChecker(config)
         with (
+            patch.object(checker, "check_hidraw", side_effect=RuntimeError("err")),
             patch.object(checker, "check_mic", side_effect=RuntimeError("err")),
             patch.object(checker, "check_minidsp", side_effect=RuntimeError("err")),
             patch.object(checker, "check_denon", side_effect=RuntimeError("err")),
             patch.object(checker, "check_playback_route", side_effect=RuntimeError("err")),
         ):
             results = await checker.run_all()
-        assert [r.name for r in results] == ["Microphone", "miniDSP", "Denon AVR", "Playback Route"]
+        assert [r.name for r in results] == ["Microphone", "miniDSP USB", "miniDSP", "Denon AVR", "Playback Route"]
 
     async def test_partial_failure(self, config):
         checker = PreflightChecker(config)
         with (
+            patch.object(checker, "check_hidraw", return_value=CheckResult("miniDSP USB", True, "/dev/hidraw0 present")),
             patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1")),
             patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", False, "", "start minidspd")),
             patch.object(checker, "check_denon", return_value=CheckResult("Denon AVR", True, "X3800H")),
             patch.object(checker, "check_playback_route", return_value=CheckResult("Playback Route", True, "USB")),
         ):
             results = await checker.run_all()
-        assert results[0].passed
-        assert not results[1].passed
-        assert results[2].passed
-        assert results[3].passed
+        assert results[0].passed  # Microphone
+        assert results[1].passed  # miniDSP USB
+        assert not results[2].passed  # miniDSP
+        assert results[3].passed  # Denon AVR
+        assert results[4].passed  # Playback Route
 
 
 # ── Playback route checks ─────────────────────────────────────────────────────
