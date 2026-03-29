@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.8.1] - 2026-03-29
+
+### Fixed
+- **arm/v7 Docker image missing packages:** `uv sync` was installing into `/build/.venv` instead of `/opt/venv` because the venv path wasn't explicitly passed. Added `UV_PROJECT_ENVIRONMENT=/opt/venv` so packages land in the venv that the runtime stage copies. Fixes `No module named uvicorn` crash on Pi Zero 2 W.
+
 ## [0.1.8.0] - 2026-03-29
 
 ### Added
