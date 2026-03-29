@@ -30,12 +30,12 @@ RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \
         echo "ARMv7 (Pi Zero 2 W): uv build, skip measurement extra (pytta build fails on arm/v7)" && \
         pip install --no-cache-dir uv && \
         uv venv /opt/venv && \
-        uv sync --extra dev --no-editable; \
+        UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --extra dev --no-editable; \
     else \
         echo "amd64: full deps including pytta (measurement extra)" && \
         pip install --no-cache-dir uv && \
         uv venv /opt/venv && \
-        uv sync --extra dev --extra measurement --no-editable; \
+        UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --extra dev --extra measurement --no-editable; \
     fi
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
