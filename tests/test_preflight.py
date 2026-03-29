@@ -47,14 +47,14 @@ from tests.conftest import make_input_device, make_output_device
 
 class TestHidrawCheck:
     async def test_hidraw_present(self, config):
-        with patch("os.path.exists", return_value=True):
+        with patch("calibrate.preflight.os.path.exists", return_value=True):
             result = await PreflightChecker(config).check_hidraw()
         assert result.passed
         assert HIDRAW_DEVICE in result.detail
         assert result.error is None
 
     async def test_hidraw_missing_gives_otg_hint(self, config):
-        with patch("os.path.exists", return_value=False):
+        with patch("calibrate.preflight.os.path.exists", return_value=False):
             result = await PreflightChecker(config).check_hidraw()
         assert not result.passed
         assert HIDRAW_DEVICE in result.detail

@@ -71,7 +71,7 @@ class PreflightChecker:
         instead of a micro-USB OTG adapter (the OTG adapter flips the ID pin that
         switches the port from device mode to host mode).
         """
-        if os.path.exists(HIDRAW_DEVICE):
+        if await asyncio.to_thread(os.path.exists, HIDRAW_DEVICE):
             return CheckResult(
                 name="miniDSP USB",
                 passed=True,
