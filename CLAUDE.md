@@ -9,7 +9,7 @@ AI-first home theater calibration — closed-loop bass optimization for Denon X3
   UMIK-1 → Web Audio API → measurement upload
          |
          ▼
-[ Pi Zero W — web server (Docker) ]
+[ Pi Zero 2 W — web server (Docker) ]
   [ PyTTa analysis ]  [ Subjective feedback log ]
          |                         |
          └──────── AI Analysis (Claude API) ──────
@@ -77,7 +77,7 @@ Never commit code that makes existing tests fail.
 - Docker image built by GitHub Actions on every branch push
 - Branch push → `ghcr.io/abarbaccia/avr-calibration:<branch-name>`
 - Main push → also tagged `:latest`
-- arm/v6 cross-compiled in CI (~30-60 min); no compilation on the Pi
+- arm/v7 cross-compiled in CI (~30-60 min); no compilation on the Pi
 - Source installed at `/opt/venv/lib/python3.11/site-packages/calibrate/` inside container
 - Full guide: `docs/deployment/pi-zero-w.md`
 

@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.8.0] - 2026-03-29
+
+### Added
+- **miniDSP USB preflight check:** `calibrate check` now verifies `/dev/hidraw0` exists before attempting to contact minidspd. Missing device shows a targeted OTG adapter hint — Pi Zero 2 W requires a micro-USB OTG adapter, not a plain USB-A cable. Uses `asyncio.to_thread` to avoid blocking the event loop during the filesystem stat.
+
+### Changed
+- **Drop arm/v6 build target:** Docker image CI now builds only `linux/arm/v7,linux/amd64`. Pi Zero W (arm/v6) is no longer supported; Pi Zero 2 W (arm/v7) is the target platform.
+- **QEMU setup scoped to arm:** CI QEMU step explicitly sets `platforms: arm` to avoid installing all emulators on every build (+30-60s CI waste removed).
+- Updated deployment docs to reflect Pi Zero 2 W, arm/v7, and the OTG adapter requirement.
+
 ## [0.1.7.1] - 2026-03-23
 
 ### Changed

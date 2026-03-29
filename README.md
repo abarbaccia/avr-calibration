@@ -41,12 +41,12 @@ calibrate show 1 --json   # export as JSON
 
 ## Deployment
 
-Designed to run on a **Raspberry Pi Zero W** permanently installed in your rack as a
-Docker container. The image is pre-built for `linux/arm/v6` and `linux/amd64` — no
+Designed to run on a **Raspberry Pi Zero 2 W** permanently installed in your rack as a
+Docker container. The image is pre-built for `linux/arm/v7` and `linux/amd64` — no
 source compilation on the Pi.
 
 ```bash
-# On the Pi Zero W — one command installs Docker, pulls image, and starts the service:
+# On the Pi Zero 2 W — one command installs Docker, pulls image, and starts the service:
 bash <(curl -sL https://raw.githubusercontent.com/abarbaccia/avr-calibration/main/deploy/install.sh)
 # Web UI: https://<pi-ip>:8000  (self-signed cert — click Advanced → Proceed)
 ```
@@ -70,8 +70,8 @@ Early development. Currently implemented:
 - `calibrate show <id>` — session detail with ASCII frequency response plot; `--csv` and `--json` export
 - `calibrate web` — start web server (Pi serves UI; browser captures UMIK audio)
 - **Sub-alignment:** `POST /api/align-subs/start|record|cancel` — sweep each sub independently, extract IR, apply delays + polarity + level matching via miniDSP
-- `Dockerfile` + `.github/workflows/docker.yml` — multi-platform Docker image (arm/v6 + amd64), built and pushed to GHCR via GitHub Actions
-- `deploy/install.sh` — Pi Zero W bootstrap: installs Docker, pulls GHCR image, starts systemd service
+- `Dockerfile` + `.github/workflows/docker.yml` — multi-platform Docker image (arm/v7 + amd64), built and pushed to GHCR via GitHub Actions
+- `deploy/install.sh` — Pi Zero 2 W bootstrap: installs Docker, pulls GHCR image, starts systemd service
 
 Next: AI analysis, closed-loop EQ optimization.
 

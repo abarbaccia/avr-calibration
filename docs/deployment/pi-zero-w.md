@@ -20,9 +20,11 @@ install on the laptop required.
 
 ## Requirements
 
-- Raspberry Pi Zero W
-- Micro USB OTG hub (the Pi Zero W has one OTG USB port)
-- miniDSP 2x4 HD
+- Raspberry Pi Zero 2 W
+- **Micro-USB OTG adapter** (micro-USB male → USB-A female) — required to connect USB peripherals
+  - ⚠️ A plain USB-A to micro-USB cable will **not** work. The Pi Zero's USB port is OTG;
+    it needs the OTG adapter's ID pin to switch into host mode.
+- miniDSP 2x4 HD (connected via the OTG adapter)
 - UMIK-1 or UMIK-2 microphone (plugged into your **laptop**, not the Pi)
 - Raspberry Pi OS **Bookworm Lite** (32-bit)
 - microSD card (8GB minimum)
@@ -53,7 +55,7 @@ The script:
 5. Pulls the pre-built Docker image from GHCR (`ghcr.io/abarbaccia/avr-calibration:latest`)
 6. Installs and starts the `avr-calibration` systemd service
 
-> **Note:** The Docker image is pre-built for `linux/arm/v6` via GitHub Actions CI.
+> **Note:** The Docker image is pre-built for `linux/arm/v7` via GitHub Actions CI.
 > No source compilation happens on the Pi — the install takes only a few minutes.
 
 ## Configuration
@@ -122,7 +124,7 @@ The recommended workflow for any code change:
 
 ```
 1. SSH hotfix  →  validate on Pi (seconds, no rebuild)
-2. git push    →  CI builds branch image (~30-60 min, arm/v6 QEMU)
+2. git push    →  CI builds branch image (~30-60 min, arm/v7 QEMU)
 3. Pi pulls branch image  →  re-validate the built container
 4. PR merged to main  →  :latest image published
 5. Pi pulls :latest  →  done
@@ -186,7 +188,16 @@ sudo systemctl restart avr-calibration
 
 ## Troubleshooting
 
-**miniDSP not detected:** Check USB connection and udev rule:
+**miniDSP not detected / `calibrate check` shows "miniDSP USB … not found":**
+
+The most common cause on Pi Zero 2 W is using the wrong cable. You **must** use a
+micro-USB OTG adapter (not a plain USB-A → micro-USB cable):
+
+```
+miniDSP  →  [USB-A cable]  →  [micro-USB OTG adapter]  →  Pi Zero 2 W USB port
+```
+
+Then check USB enumeration and udev rule:
 ```bash
 lsusb | grep -i minidsp
 cat /etc/udev/rules.d/99-minidsp.rules
