@@ -367,6 +367,39 @@ _HTML = """<!DOCTYPE html>
     <div id="cardioidDetail"></div>
   </div>
 
+  <div class="card" id="signalPathCard">
+    <h2>Signal Path</h2>
+    <div style="display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1rem">
+      <div style="flex:1;min-width:140px">
+        <label for="spSource">Input Source</label>
+        <select id="spSource">
+          <option value="Analog">Analog</option>
+          <option value="Toslink">Toslink</option>
+          <option value="USB">USB</option>
+        </select>
+      </div>
+      <div style="flex:1;min-width:120px">
+        <label for="spPreset">Preset Slot</label>
+        <select id="spPreset">
+          <option value="0">Preset 0</option>
+          <option value="1">Preset 1</option>
+          <option value="2">Preset 2</option>
+          <option value="3">Preset 3</option>
+        </select>
+      </div>
+    </div>
+    <div style="margin-bottom:1rem">
+      <label>Routing Matrix (input → outputs)</label>
+      <div id="spRoutingMatrix" style="font-size:.82rem;color:#94a3b8"></div>
+    </div>
+    <div style="display:flex;gap:.75rem;align-items:center;flex-wrap:wrap">
+      <button id="spApplyBtn" onclick="applySignalPath()" style="background:#2dd4bf;color:#0d0f14;font-weight:600">Apply to Device</button>
+      <button id="spReadBtn" onclick="readDeviceState()" style="background:#334155;color:#cbd5e1">Read Device State</button>
+    </div>
+    <div id="spStatus" style="margin-top:.75rem;font-size:.85rem;color:#94a3b8"></div>
+    <div id="spDeviceState" style="margin-top:.75rem;font-size:.82rem;color:#64748b"></div>
+  </div>
+
   <script>
   let currentSessionId = null;
   let selectedSessionId = null;
@@ -990,7 +1023,90 @@ _HTML = """<!DOCTYPE html>
     el.className = cls;
   }
 
+  // ── Signal Path ────────────────────────────────────────────────────────
+  async function loadSignalPathConfig() {
+    try {
+      const r = await fetch('/api/signal-path');
+      if (!r.ok) return;
+      const d = await r.json();
+      if (d.source) document.getElementById('spSource').value = d.source;
+      if (d.preset !== undefined && d.preset !== null) document.getElementById('spPreset').value = String(d.preset);
+      renderRoutingMatrix(d.routing || []);
+    } catch (e) { /* ignore — config may not define signal_path */ }
+  }
+
+  function renderRoutingMatrix(routing) {
+    const el = document.getElementById('spRoutingMatrix');
+    if (!routing.length) {
+      el.textContent = 'No routing configured. Add signal_path.routing to config.yaml.';
+      return;
+    }
+    el.innerHTML = routing.map(r =>
+      `<div style="margin:.2rem 0">Input ${r.input} → Outputs [${(r.outputs || []).join(', ')}]</div>`
+    ).join('');
+  }
+
+  async function applySignalPath() {
+    const btn = document.getElementById('spApplyBtn');
+    const status = document.getElementById('spStatus');
+    btn.disabled = true;
+    status.textContent = 'Applying…';
+    status.style.color = '#94a3b8';
+    try {
+      const body = {
+        source: document.getElementById('spSource').value,
+        preset: parseInt(document.getElementById('spPreset').value, 10),
+      };
+      const r = await fetch('/api/signal-path/apply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (!r.ok) {
+        status.textContent = 'Error: ' + (d.detail || r.statusText);
+        status.style.color = '#f87171';
+      } else {
+        status.textContent = `Applied — source: ${d.source}, preset: ${d.preset}${d.routing_applied ? ', routing matrix set' : ''}.`;
+        status.style.color = '#4ade80';
+      }
+    } catch (e) {
+      status.textContent = 'Error: ' + e.message;
+      status.style.color = '#f87171';
+    }
+    btn.disabled = false;
+  }
+
+  async function readDeviceState() {
+    const btn = document.getElementById('spReadBtn');
+    const status = document.getElementById('spStatus');
+    const devState = document.getElementById('spDeviceState');
+    btn.disabled = true;
+    status.textContent = 'Reading device state…';
+    status.style.color = '#94a3b8';
+    try {
+      const r = await fetch('/api/signal-path/device-state');
+      const d = await r.json();
+      if (!r.ok) {
+        status.textContent = 'Error: ' + (d.detail || r.statusText);
+        status.style.color = '#f87171';
+        devState.textContent = '';
+      } else {
+        status.textContent = '';
+        const m = d.master || {};
+        devState.innerHTML = `<strong>Device state:</strong> Source: <strong>${m.source || '?'}</strong>, Preset: <strong>${m.preset ?? '?'}</strong>, Volume: ${m.volume ?? '?'} dB${m.mute ? ', MUTED' : ''}`;
+        if (m.source) document.getElementById('spSource').value = m.source;
+        if (m.preset !== undefined && m.preset !== null) document.getElementById('spPreset').value = String(m.preset);
+      }
+    } catch (e) {
+      status.textContent = 'Error: ' + e.message;
+      status.style.color = '#f87171';
+    }
+    btn.disabled = false;
+  }
+
   loadMics();
+  loadSignalPathConfig();
   loadHistory().then(() => {
     const urlParams = new URLSearchParams(window.location.search);
     const urlSession = urlParams.get('session');
@@ -1369,7 +1485,7 @@ async def cardioid_mode(body: CardioidRequest) -> dict:
     from .adapters.minidsp import MinidspClient, MinidspApiError
 
     cfg = _load_config()
-    sub_outputs = cfg.minidsp.get("signal_path", {}).get("sub_outputs", []) if cfg.minidsp else []
+    sub_outputs = (cfg.minidsp.get("signal_path") or {}).get("sub_outputs", []) if cfg.minidsp else []
     if len(sub_outputs) < 2:
         raise HTTPException(
             status_code=422,
@@ -1689,6 +1805,105 @@ async def align_subs_cancel(x_token: str = Header(...)) -> dict:
     await client.restore_all_gains(session.sub_outputs)
 
     return {"status": "cancelled"}
+
+
+# ── Signal Path endpoints ─────────────────────────────────────────────────────
+
+class SignalPathApplyRequest(BaseModel):
+    source: Optional[str] = None   # Analog | Toslink | USB
+    preset: Optional[int] = None   # 0-3
+
+
+@app.get("/api/signal-path")
+async def get_signal_path_config() -> dict:
+    """Return the signal_path section from config.yaml.
+
+    Returns source, preset, and routing list from config. If signal_path is not
+    configured, returns empty defaults so the UI can still render.
+    """
+    cfg = _load_config()
+    sp = cfg.minidsp.get("signal_path") or {}
+    routing = sp.get("routing") or []
+    return {
+        "source": sp.get("source"),
+        "preset": sp.get("preset"),
+        "routing": routing,
+    }
+
+
+@app.post("/api/signal-path/apply")
+async def apply_signal_path(body: SignalPathApplyRequest) -> dict:
+    """Apply source and preset (and routing from config) to the miniDSP device.
+
+    Only the fields in the request body are applied. Routing is always applied
+    from config if present.
+    """
+    from .adapters.minidsp import MinidspClient, MinidspApiError, VALID_SOURCES, MAX_PRESET_INDEX
+
+    cfg = _load_config()
+    host = cfg.minidsp.get("host", "localhost")
+    port = cfg.minidsp.get("port", 5380)
+    client = MinidspClient(host=host, port=port)
+
+    if body.source is not None and body.source not in VALID_SOURCES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"source must be one of {sorted(VALID_SOURCES)}",
+        )
+    if body.preset is not None and not (0 <= body.preset <= MAX_PRESET_INDEX):
+        raise HTTPException(
+            status_code=422,
+            detail=f"preset must be 0-{MAX_PRESET_INDEX}",
+        )
+
+    try:
+        if body.preset is not None:
+            await client.switch_preset(body.preset)
+        if body.source is not None:
+            await client.switch_source(body.source)
+
+        routing_applied = False
+        sp = cfg.minidsp.get("signal_path") or {}
+        routing = sp.get("routing") or []
+        for entry in routing:
+            input_idx = entry.get("input", 0)
+            enabled_outputs = set(entry.get("outputs", []))
+            output_enabled = {i: (i in enabled_outputs) for i in range(4)}
+            await client.set_input_routing(input_idx, output_enabled)
+            routing_applied = True
+
+    except MinidspApiError as exc:
+        raise HTTPException(status_code=502, detail=f"miniDSP error: {exc}")
+
+    return {
+        "status": "ok",
+        "source": body.source,
+        "preset": body.preset,
+        "routing_applied": routing_applied,
+    }
+
+
+@app.get("/api/signal-path/device-state")
+async def get_device_state() -> dict:
+    """Read the current master status from the miniDSP device.
+
+    Returns preset, source, volume, and mute state as reported by minidspd.
+    """
+    from .adapters.minidsp import MinidspClient, MinidspApiError
+
+    cfg = _load_config()
+    host = cfg.minidsp.get("host", "localhost")
+    port = cfg.minidsp.get("port", 5380)
+    client = MinidspClient(host=host, port=port)
+
+    try:
+        status = await client.get_device_status()
+    except MinidspApiError as exc:
+        raise HTTPException(status_code=502, detail=f"miniDSP error: {exc}")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Cannot reach miniDSP: {exc}")
+
+    return status
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

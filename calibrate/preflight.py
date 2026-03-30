@@ -46,6 +46,7 @@ class PreflightChecker:
             ("miniDSP", self.check_minidsp()),
             ("Denon AVR", self.check_denon()),
             ("Playback Route", self.check_playback_route()),
+            ("Signal Path", self.check_signal_path_sync()),
         ]
         names = [name for name, _ in checks]
         coros = [coro for _, coro in checks]
@@ -278,3 +279,78 @@ class PreflightChecker:
                 detail="",
                 error=str(exc),
             )
+
+    async def check_signal_path_sync(self) -> CheckResult:
+        """Compare the configured signal path against the live device state.
+
+        Skipped (passes) if signal_path is not configured in config.yaml.
+        Warns if the live device source or preset differs from config.
+        """
+        from .adapters.minidsp import MinidspClient, MinidspApiError
+
+        sp = self.config.minidsp.get("signal_path")
+        if not sp:
+            return CheckResult(
+                name="Signal Path",
+                passed=True,
+                detail="not configured (skipped)",
+            )
+
+        cfg_source = sp.get("source")
+        cfg_preset = sp.get("preset")
+        if cfg_source is None and cfg_preset is None:
+            return CheckResult(
+                name="Signal Path",
+                passed=True,
+                detail="no source/preset defined (skipped)",
+            )
+
+        host = self.config.minidsp.get("host", "localhost")
+        port = self.config.minidsp.get("port", 5380)
+        client = MinidspClient(host, port)
+
+        try:
+            status = await client.get_device_status()
+        except MinidspApiError as exc:
+            return CheckResult(
+                name="Signal Path",
+                passed=False,
+                detail="",
+                error=f"Cannot read device state: {exc}",
+            )
+        except Exception as exc:
+            return CheckResult(
+                name="Signal Path",
+                passed=False,
+                detail="",
+                error=f"Cannot reach miniDSP daemon: {exc}",
+            )
+
+        master = status.get("master", {})
+        live_source = master.get("source")
+        live_preset = master.get("preset")
+
+        mismatches = []
+        if cfg_source is not None and live_source != cfg_source:
+            mismatches.append(f"source: device={live_source} config={cfg_source}")
+        if cfg_preset is not None and live_preset != cfg_preset:
+            mismatches.append(f"preset: device={live_preset} config={cfg_preset}")
+
+        if mismatches:
+            return CheckResult(
+                name="Signal Path",
+                passed=False,
+                detail=f"mismatch — {', '.join(mismatches)}",
+                error="Run 'calibrate signal-path apply' to sync device to config",
+            )
+
+        parts = []
+        if cfg_source is not None:
+            parts.append(f"source={live_source}")
+        if cfg_preset is not None:
+            parts.append(f"preset={live_preset}")
+        return CheckResult(
+            name="Signal Path",
+            passed=True,
+            detail=", ".join(parts) + " matches config",
+        )

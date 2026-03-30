@@ -12,6 +12,7 @@ DEFAULT_CONFIG: dict = {
     "minidsp": {
         "host": "localhost",
         "port": 5380,
+        "signal_path": None,
     },
     "mic": {
         "name": "UMIK",
@@ -45,6 +46,14 @@ denon:
 minidsp:
   host: "localhost"      # minidspd runs inside the container (--device=/dev/hidraw0)
   port: 5380             # default minidspd port
+  signal_path:           # optional: declare your signal path to apply it on startup
+    source: "Analog"     # Analog | Toslink | USB
+    preset: 0            # preset slot 0-3
+    routing:             # input → output mapping
+      - input: 0
+        outputs: [0, 1, 2, 3]   # output indices this input routes to (unmuted)
+      - input: 1
+        outputs: [0, 1, 2, 3]
 
 mic:
   name: "UMIK"           # substring matched against audio device names

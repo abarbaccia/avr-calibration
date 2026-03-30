@@ -239,6 +239,144 @@ def web(host: str, port: int) -> None:
     uvicorn.run("calibrate.web:app", host=host, port=port, reload=False)
 
 
+@cli.group()
+def signal_path() -> None:
+    """Inspect and configure the miniDSP signal path (source, preset, routing)."""
+
+
+@signal_path.command("show")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help=f"Config file path (default: {CONFIG_PATH})",
+)
+def signal_path_show(config_path: Path | None) -> None:
+    """Show the current device state and configured signal path."""
+    from .adapters.minidsp import MinidspClient, MinidspApiError
+
+    path = config_path or CONFIG_PATH
+    if not path.exists():
+        click.echo(f"No config found at {path}. Run 'calibrate check' first.", err=True)
+        sys.exit(1)
+
+    cfg = Config.load(path)
+    host = cfg.minidsp.get("host", "localhost")
+    port = cfg.minidsp.get("port", 5380)
+    sp = cfg.minidsp.get("signal_path") or {}
+
+    click.echo()
+    click.echo("AVR Calibration — Signal Path")
+    click.echo("─" * 40)
+
+    click.echo("  Configured in config.yaml:")
+    click.echo(f"    Source:  {sp.get('source', '— not set —')}")
+    click.echo(f"    Preset:  {sp.get('preset', '— not set —')}")
+    routing_cfg = sp.get("routing") or []
+    if routing_cfg:
+        for entry in routing_cfg:
+            click.echo(f"    Routing: Input {entry.get('input', '?')} → Outputs {entry.get('outputs', [])}")
+    else:
+        click.echo("    Routing: — not configured —")
+
+    click.echo()
+    click.echo("  Live device state:")
+    client = MinidspClient(host, port)
+    try:
+        status = asyncio.run(client.get_device_status())
+        master = status.get("master", {})
+        click.echo(f"    Source:  {master.get('source', '?')}")
+        click.echo(f"    Preset:  {master.get('preset', '?')}")
+        vol = master.get("volume", "?")
+        mute = "  (MUTED)" if master.get("mute") else ""
+        click.echo(f"    Volume:  {vol} dB{mute}")
+    except MinidspApiError as exc:
+        click.echo(click.style(f"    Cannot read device state: {exc}", fg="yellow"))
+    except Exception as exc:
+        click.echo(click.style(f"    Cannot reach miniDSP daemon: {exc}", fg="yellow"))
+
+    click.echo()
+
+
+@signal_path.command("apply")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help=f"Config file path (default: {CONFIG_PATH})",
+)
+@click.option("--source", default=None, help="Input source: Analog, Toslink, or USB")
+@click.option("--preset", default=None, type=int, help="Preset slot 0-3")
+def signal_path_apply(config_path: Path | None, source: str | None, preset: int | None) -> None:
+    """Apply signal path config to the miniDSP (source, preset, routing matrix).
+
+    Reads source/preset from config.yaml unless overridden by --source/--preset.
+    Always applies the routing matrix from config if defined.
+    """
+    from .adapters.minidsp import MinidspClient, MinidspApiError, VALID_SOURCES, MAX_PRESET_INDEX
+
+    path = config_path or CONFIG_PATH
+    if not path.exists():
+        click.echo(f"No config found at {path}. Run 'calibrate check' first.", err=True)
+        sys.exit(1)
+
+    cfg = Config.load(path)
+    sp = cfg.minidsp.get("signal_path") or {}
+
+    effective_source = source or sp.get("source")
+    effective_preset = preset if preset is not None else sp.get("preset")
+
+    if effective_source is not None and effective_source not in VALID_SOURCES:
+        click.echo(click.style(f"Error: source must be one of {sorted(VALID_SOURCES)}", fg="red"), err=True)
+        sys.exit(1)
+    if effective_preset is not None and not (0 <= effective_preset <= MAX_PRESET_INDEX):
+        click.echo(click.style(f"Error: preset must be 0-{MAX_PRESET_INDEX}", fg="red"), err=True)
+        sys.exit(1)
+
+    host = cfg.minidsp.get("host", "localhost")
+    port = cfg.minidsp.get("port", 5380)
+    client = MinidspClient(host, port)
+
+    async def _apply() -> None:
+        if effective_preset is not None:
+            click.echo(f"  Switching to preset {effective_preset}…")
+            await client.switch_preset(effective_preset)
+        if effective_source is not None:
+            click.echo(f"  Switching source to {effective_source}…")
+            await client.switch_source(effective_source)
+
+        routing = sp.get("routing") or []
+        for entry in routing:
+            input_idx = entry.get("input", 0)
+            enabled_outputs = set(entry.get("outputs", []))
+            output_enabled = {i: (i in enabled_outputs) for i in range(4)}
+            click.echo(f"  Setting routing: Input {input_idx} → Outputs {sorted(enabled_outputs)}…")
+            await client.set_input_routing(input_idx, output_enabled)
+
+    click.echo()
+    click.echo("AVR Calibration — Apply Signal Path")
+    click.echo("─" * 40)
+
+    if effective_source is None and effective_preset is None and not (sp.get("routing") or []):
+        click.echo("  Nothing to apply. Add signal_path to config.yaml or use --source/--preset flags.")
+        click.echo()
+        sys.exit(0)
+
+    try:
+        asyncio.run(_apply())
+    except MinidspApiError as exc:
+        click.echo(click.style(f"\n  miniDSP error: {exc}", fg="red"), err=True)
+        sys.exit(1)
+    except Exception as exc:
+        click.echo(click.style(f"\n  Error: {exc}", fg="red"), err=True)
+        sys.exit(1)
+
+    click.echo(click.style("  Done.", fg="green"))
+    click.echo()
+
+
 def _ascii_plot(frequencies: list[float], spl: list[float], width: int = 40) -> None:
     """Print a simple ASCII bar chart of the frequency response."""
     if not frequencies:
