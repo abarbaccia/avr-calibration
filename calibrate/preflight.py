@@ -47,6 +47,7 @@ class PreflightChecker:
             ("Denon AVR", self.check_denon()),
             ("Playback Route", self.check_playback_route()),
             ("Signal Path", self.check_signal_path_sync()),
+            ("Config", self.check_config()),
         ]
         names = [name for name, _ in checks]
         coros = [coro for _, coro in checks]
@@ -224,32 +225,15 @@ class PreflightChecker:
         route = self.config.measurement.get("playback_route", "usb")
 
         if route == "hdmi":
-            # HDMI route requires a reachable Denon AVR
-            host = self.config.denon.get("host")
-            if not host:
-                return CheckResult(
-                    name="Playback Route",
-                    passed=False,
-                    detail="HDMI route requires denon.host — edit ~/.avr-calibration/config.yaml",
-                    error="Set denon.host and measurement.playback_route",
-                )
-            try:
-                import denonavr
-                receiver = denonavr.DenonAVR(host)
-                await receiver.async_setup()
-                model = receiver.model_name or "Denon AVR"
-                return CheckResult(
-                    name="Playback Route",
-                    passed=True,
-                    detail=f"HDMI via {model} at {host}",
-                )
-            except Exception as exc:
-                return CheckResult(
-                    name="Playback Route",
-                    passed=False,
-                    detail=f"HDMI route: cannot connect to Denon AVR at {host}",
-                    error=str(exc),
-                )
+            # Delegate to check_denon() to avoid creating a second DenonAVR connection
+            # when run_all() fires both check_denon and check_playback_route in parallel.
+            denon_result = await self.check_denon()
+            return CheckResult(
+                name="Playback Route",
+                passed=denon_result.passed,
+                detail=f"HDMI via {denon_result.detail}" if denon_result.passed else denon_result.detail,
+                error=denon_result.error,
+            )
 
         # USB route: verify playback device is visible
         try:
@@ -354,3 +338,16 @@ class PreflightChecker:
             passed=True,
             detail=", ".join(parts) + " matches config",
         )
+
+    async def check_config(self) -> CheckResult:
+        """Check that all required config fields are present."""
+        required = [("denon.host", self.config.denon.get("host"))]
+        missing = [name for name, val in required if val is None]
+        if missing:
+            return CheckResult(
+                name="Config",
+                passed=False,
+                detail=f"{len(missing)} required field(s) missing",
+                error=f"Missing required fields: {', '.join(missing)}",
+            )
+        return CheckResult(name="Config", passed=True, detail="Required fields present")

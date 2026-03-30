@@ -34,6 +34,7 @@ Sub-alignment flow
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import math
 import statistics
@@ -54,6 +55,7 @@ from pydantic import BaseModel, Field
 
 from .config import Config, CONFIG_PATH
 from .measurement import MeasurementEngine, FrequencyResponse, MeasurementQualityError
+from .preflight import PreflightChecker
 from .storage import SessionStore
 
 app = FastAPI(title="avr-calibration")
@@ -246,10 +248,106 @@ _HTML = """<!DOCTYPE html>
     input[type=checkbox].toggle:checked::after { left: 1.3rem; }
     #cardioidDetail { font-size: .82rem; color: #94a3b8; }
     #cardioidDetail .warn-note { color: #fbbf24; margin-top: .4rem; }
+    /* Workflow nav */
+    .workflow-nav { display: flex; width: 100%; max-width: 760px; margin-bottom: 2rem; }
+    .workflow-nav .step { flex: 1; padding: .6rem .5rem; text-align: center; font-size: .72rem;
+      font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: #64748b;
+      border-bottom: 2px solid #2d3748; cursor: pointer; transition: color .15s, border-color .15s; }
+    .workflow-nav .step.active { color: #3b82f6; border-color: #3b82f6; }
+    .workflow-nav .step.done { color: #4ade80; border-color: #4ade80; }
+    .workflow-nav .step.locked { opacity: .35; cursor: not-allowed; pointer-events: none; }
+    /* Hardware check rows */
+    .check-row { display: flex; align-items: flex-start; gap: .75rem; padding: .65rem 0;
+      border-bottom: 1px solid #1a2030; }
+    .check-row:last-child { border-bottom: none; }
+    .check-badge { min-width: 3.5rem; padding: .2rem .4rem; border-radius: 4px; font-size: .72rem;
+      font-weight: 700; text-align: center; flex-shrink: 0; }
+    .check-badge.pass { background: rgba(34,197,94,.15); color: #4ade80; border: 1px solid #22c55e; }
+    .check-badge.fail { background: rgba(239,68,68,.15); color: #f87171; border: 1px solid #ef4444; }
+    .check-badge.pending { background: rgba(100,116,139,.15); color: #64748b; border: 1px solid #374151; }
+    .check-badge.running { background: rgba(59,130,246,.15); color: #93c5fd; border: 1px solid #3b82f6; }
+    .check-name { font-size: .875rem; font-weight: 500; color: #cbd5e1; }
+    .check-detail { font-size: .78rem; color: #94a3b8; margin-top: .1rem; }
+    .check-error { font-size: .75rem; color: #f87171; margin-top: .15rem; }
+    /* Phase content */
+    .phase-header { font-size: .95rem; font-weight: 600; color: #e2e8f0; margin-bottom: .25rem; }
+    .phase-desc { font-size: .82rem; color: #64748b; margin-bottom: 1.25rem; line-height: 1.5; }
+    /* Test tone */
+    #testToneBtn { background: #334155; color: #cbd5e1; font-size: .85rem; margin-right: .5rem; }
+    #testToneBtn.playing { background: #7c3aed; color: #fff; }
+    #testToneBtn:not(:disabled):hover { background: #475569; }
+    #confirmToneBtn { background: #22c55e; color: #0d0f14; font-weight: 600; font-size: .85rem; display: none; }
+    #confirmToneBtn:not(:disabled):hover { opacity: .85; }
   </style>
 </head>
 <body>
   <h1>AVR Calibration</h1>
+
+  <!-- Workflow Navigator -->
+  <div class="workflow-nav">
+    <div class="step active" id="navStep1" onclick="showPhase(1)">1 Room Setup</div>
+    <div class="step" id="navStep2" onclick="showPhase(2)">2 Equipment</div>
+    <div class="step locked" id="navStep3">3 Baseline</div>
+    <div class="step locked" id="navStep4">4 Calibrate</div>
+    <div class="step locked" id="navStep5">5 Feedback</div>
+  </div>
+
+  <!-- Phase 1: Room Setup -->
+  <div id="phase1Content" class="card">
+    <div class="phase-header">Room Setup</div>
+    <div class="phase-desc">Describe your room and equipment. The AI will structure this into your digital twin.</div>
+    <label>What speakers, subwoofer(s), and AVR do you have?</label>
+    <input type="text" id="roomEquipment" placeholder="e.g. Denon X3800H, SVS PB12-NSD, Klipsch RP-8000F fronts&hellip;" />
+    <label>Where is your subwoofer positioned?</label>
+    <input type="text" id="subPosition" placeholder="e.g. front-left corner, 2ft from wall, 8ft from main seat&hellip;" />
+    <label>Describe your listening position and room layout</label>
+    <input type="text" id="roomLayout" placeholder="e.g. 12x16ft rectangular living room, couch 10ft back, side walls open&hellip;" />
+    <label>Signal path (how is audio routed?)</label>
+    <input type="text" id="signalPathDesc" placeholder="e.g. TV HDMI-ARC &rarr; Denon X3800H &rarr; miniDSP 2x4 HD &rarr; SVS PB12-NSD&hellip;" />
+    <button onclick="completeRoomSetup()" style="background:#3b82f6;color:#fff;width:100%;padding:.75rem;margin-top:.5rem">
+      Save Room Setup &amp; Continue &rarr;
+    </button>
+  </div>
+
+  <!-- Phase 2: Equipment Verification -->
+  <div id="phase2Content" class="card" style="display:none">
+    <div class="phase-header">Equipment Verification</div>
+    <div class="phase-desc">Confirm every part of the signal chain is reachable before calibration.</div>
+
+    <!-- Test Tone -->
+    <div style="margin-bottom:1.25rem;padding-bottom:1rem;border-bottom:1px solid #2d3748">
+      <div style="font-size:.82rem;color:#94a3b8;margin-bottom:.6rem">
+        Play a test tone to confirm your browser and audio path are working.
+      </div>
+      <button id="testToneBtn" onclick="toggleTestTone()">&#9654; Play Test Tone (80 Hz)</button>
+      <button id="confirmToneBtn" onclick="confirmTestTone()">&#10003; I Can Hear It</button>
+      <div id="testToneStatus" style="font-size:.78rem;color:#64748b;margin-top:.4rem"></div>
+    </div>
+
+    <!-- Hardware Checks -->
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:.75rem">
+      <div style="font-size:.85rem;font-weight:600;color:#cbd5e1">Hardware Checks</div>
+      <button id="runChecksBtn" onclick="runAllChecks()" style="background:#334155;color:#cbd5e1;font-size:.78rem;padding:.3rem .75rem">Run All</button>
+    </div>
+    <div id="checkRows">
+      <div class="check-row" id="check-row-config"><span class="check-badge pending" id="badge-config">&mdash;</span><div><div class="check-name">Config</div><div class="check-detail" id="detail-config">Not run yet</div></div></div>
+      <div class="check-row" id="check-row-mic"><span class="check-badge pending" id="badge-mic">&mdash;</span><div><div class="check-name">Microphone</div><div class="check-detail" id="detail-mic">Not run yet</div></div></div>
+      <div class="check-row" id="check-row-hidraw"><span class="check-badge pending" id="badge-hidraw">&mdash;</span><div><div class="check-name">miniDSP USB</div><div class="check-detail" id="detail-hidraw">Not run yet</div></div></div>
+      <div class="check-row" id="check-row-minidsp"><span class="check-badge pending" id="badge-minidsp">&mdash;</span><div><div class="check-name">miniDSP</div><div class="check-detail" id="detail-minidsp">Not run yet</div></div></div>
+      <div class="check-row" id="check-row-denon"><span class="check-badge pending" id="badge-denon">&mdash;</span><div><div class="check-name">Denon AVR</div><div class="check-detail" id="detail-denon">Not run yet</div></div></div>
+      <div class="check-row" id="check-row-playback"><span class="check-badge pending" id="badge-playback">&mdash;</span><div><div class="check-name">Playback Route</div><div class="check-detail" id="detail-playback">Not run yet</div></div></div>
+      <div class="check-row" id="check-row-signal-path"><span class="check-badge pending" id="badge-signal-path">&mdash;</span><div><div class="check-name">Signal Path</div><div class="check-detail" id="detail-signal-path">Not run yet</div></div></div>
+    </div>
+    <div style="display:flex;gap:.75rem;margin-top:1.25rem">
+      <button onclick="showPhase(1)" style="background:#334155;color:#cbd5e1;flex:0 0 auto">&larr; Back</button>
+      <button id="continueToBaselineBtn" onclick="showPhase(3)" style="background:#3b82f6;color:#fff;flex:1;opacity:.4" disabled>
+        Continue to Baseline &rarr;
+      </button>
+    </div>
+  </div>
+
+  <!-- Phase 3: Baseline + Calibration (existing cards) -->
+  <div id="phase3Content" style="display:none">
 
   <div class="card" id="dynEqCard">
     <h2>⚠ Disable Dynamic EQ</h2>
@@ -398,6 +496,24 @@ _HTML = """<!DOCTYPE html>
     </div>
     <div id="spStatus" style="margin-top:.75rem;font-size:.85rem;color:#94a3b8"></div>
     <div id="spDeviceState" style="margin-top:.75rem;font-size:.82rem;color:#64748b"></div>
+  </div>
+
+  </div><!-- /phase3Content -->
+
+  <!-- Phase 4: locked placeholder -->
+  <div id="phase4Content" style="display:none" class="card">
+    <div style="text-align:center;padding:2rem;color:#475569">
+      <div style="font-size:2rem;margin-bottom:.5rem">&#128274;</div>
+      <div style="font-size:.85rem">Complete equipment verification to unlock Calibration.</div>
+    </div>
+  </div>
+
+  <!-- Phase 5: locked placeholder -->
+  <div id="phase5Content" style="display:none" class="card">
+    <div style="text-align:center;padding:2rem;color:#475569">
+      <div style="font-size:2rem;margin-bottom:.5rem">&#128274;</div>
+      <div style="font-size:.85rem">Complete calibration to unlock Feedback.</div>
+    </div>
   </div>
 
   <script>
@@ -1104,6 +1220,144 @@ _HTML = """<!DOCTYPE html>
     }
     btn.disabled = false;
   }
+
+  // ── Workflow navigation ──────────────────────────────────────────────────
+  let _currentPhase = parseInt(localStorage.getItem('wf_phase') || '1');
+  let _testOscillator = null;
+  let _testAudioCtx = null;
+
+  function showPhase(n) {
+    _currentPhase = n;
+    localStorage.setItem('wf_phase', n);
+    [1, 2, 3, 4, 5].forEach(i => {
+      const c = document.getElementById('phase' + i + 'Content');
+      if (c) c.style.display = (i === n) ? 'block' : 'none';
+      const s = document.getElementById('navStep' + i);
+      if (!s) return;
+      s.classList.remove('active', 'done', 'locked');
+      if (i < n) s.classList.add('done');
+      else if (i === n) s.classList.add('active');
+      else s.classList.add('locked');
+    });
+  }
+
+  function completeRoomSetup() {
+    const data = {
+      equipment: document.getElementById('roomEquipment').value,
+      sub_position: document.getElementById('subPosition').value,
+      room_layout: document.getElementById('roomLayout').value,
+      signal_path: document.getElementById('signalPathDesc').value,
+    };
+    localStorage.setItem('wf_room_setup', JSON.stringify(data));
+    showPhase(2);
+  }
+
+  function _updateCheckRow(checkId, result) {
+    const badge = document.getElementById('badge-' + checkId);
+    const detail = document.getElementById('detail-' + checkId);
+    const row = document.getElementById('check-row-' + checkId);
+    if (!badge || !detail || !row) return;
+    badge.className = 'check-badge ' + (result.passed ? 'pass' : 'fail');
+    badge.textContent = result.passed ? 'PASS' : 'FAIL';
+    detail.textContent = result.detail || '';
+    let errorEl = row.querySelector('.check-error');
+    if (result.error) {
+      if (!errorEl) {
+        errorEl = document.createElement('div');
+        errorEl.className = 'check-error';
+        row.querySelector('div').appendChild(errorEl);
+      }
+      errorEl.textContent = result.error;
+    } else if (errorEl) {
+      errorEl.textContent = '';
+    }
+  }
+
+  async function runAllChecks() {
+    const btn = document.getElementById('runChecksBtn');
+    btn.disabled = true;
+    btn.textContent = 'Running\u2026';
+    const checkIds = ['config', 'mic', 'hidraw', 'minidsp', 'denon', 'playback', 'signal-path'];
+    checkIds.forEach(id => {
+      const badge = document.getElementById('badge-' + id);
+      const detail = document.getElementById('detail-' + id);
+      if (badge) { badge.className = 'check-badge running'; badge.textContent = '\u2026'; }
+      if (detail) detail.textContent = 'Checking\u2026';
+    });
+    try {
+      const resp = await fetch('/api/preflight');
+      if (!resp.ok) throw new Error(await resp.text());
+      const results = await resp.json();
+      const nameToId = {
+        'Config': 'config', 'Microphone': 'mic', 'miniDSP USB': 'hidraw',
+        'miniDSP': 'minidsp', 'Denon AVR': 'denon',
+        'Playback Route': 'playback', 'Signal Path': 'signal-path',
+      };
+      for (const r of results) {
+        const id = nameToId[r.name];
+        if (id) _updateCheckRow(id, r);
+      }
+      const allPass = results.length > 0 && results.every(r => r.passed);
+      const continueBtn = document.getElementById('continueToBaselineBtn');
+      if (continueBtn) {
+        continueBtn.disabled = !allPass;
+        continueBtn.style.opacity = allPass ? '1' : '.4';
+      }
+    } catch (e) {
+      checkIds.forEach(id => {
+        const badge = document.getElementById('badge-' + id);
+        const detail = document.getElementById('detail-' + id);
+        if (badge && badge.classList.contains('running')) {
+          badge.className = 'check-badge fail';
+          badge.textContent = 'ERR';
+          if (detail) detail.textContent = e.message;
+        }
+      });
+    }
+    btn.disabled = false;
+    btn.textContent = 'Run All';
+  }
+
+  function toggleTestTone() {
+    const btn = document.getElementById('testToneBtn');
+    const statusEl = document.getElementById('testToneStatus');
+    if (_testOscillator) {
+      _testOscillator.stop();
+      _testOscillator = null;
+      btn.textContent = '\u25b6 Play Test Tone (80 Hz)';
+      btn.classList.remove('playing');
+      statusEl.textContent = '';
+    } else {
+      if (!_testAudioCtx) _testAudioCtx = new AudioContext();
+      _testAudioCtx.resume().then(() => {
+        const osc = _testAudioCtx.createOscillator();
+        const gain = _testAudioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(80, _testAudioCtx.currentTime);
+        gain.gain.setValueAtTime(0.3, _testAudioCtx.currentTime);
+        osc.connect(gain);
+        gain.connect(_testAudioCtx.destination);
+        osc.start();
+        _testOscillator = osc;
+        btn.textContent = '\u25a0 Stop Tone';
+        btn.classList.add('playing');
+        statusEl.textContent = 'Playing 80 Hz tone\u2026';
+        document.getElementById('confirmToneBtn').style.display = 'inline-block';
+      });
+    }
+  }
+
+  function confirmTestTone() {
+    if (_testOscillator) { _testOscillator.stop(); _testOscillator = null; }
+    const btn = document.getElementById('testToneBtn');
+    btn.textContent = '\u25b6 Play Test Tone (80 Hz)';
+    btn.classList.remove('playing');
+    document.getElementById('confirmToneBtn').style.display = 'none';
+    document.getElementById('testToneStatus').textContent = '\u2713 Test tone confirmed';
+  }
+
+  // Restore phase from localStorage on load
+  showPhase(_currentPhase);
 
   loadMics();
   loadSignalPathConfig();
@@ -1904,6 +2158,38 @@ async def get_device_state() -> dict:
         raise HTTPException(status_code=502, detail=f"Cannot reach miniDSP: {exc}")
 
     return status
+
+
+# ── Preflight routes ─────────────────────────────────────────────────────────
+
+_PREFLIGHT_CHECK_MAP: dict[str, str] = {
+    "hidraw": "check_hidraw",
+    "mic": "check_mic",
+    "minidsp": "check_minidsp",
+    "denon": "check_denon",
+    "playback": "check_playback_route",
+    "signal-path": "check_signal_path_sync",
+    "config": "check_config",
+}
+
+
+@app.get("/api/preflight")
+async def preflight_all() -> list[dict]:
+    cfg = _load_config()
+    checker = PreflightChecker(cfg)
+    results = await checker.run_all()
+    return [dataclasses.asdict(r) for r in results]
+
+
+@app.get("/api/preflight/{check_name}")
+async def preflight_check(check_name: str) -> dict:
+    if check_name not in _PREFLIGHT_CHECK_MAP:
+        raise HTTPException(status_code=404, detail=f"Unknown check: {check_name}")
+    cfg = _load_config()
+    checker = PreflightChecker(cfg)
+    method = getattr(checker, _PREFLIGHT_CHECK_MAP[check_name])
+    result = await method()
+    return dataclasses.asdict(result)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
