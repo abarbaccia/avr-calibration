@@ -1726,14 +1726,17 @@ class TestGetDeviceState:
 
 from unittest.mock import AsyncMock, patch
 from calibrate.web import _version_cache
+import calibrate.web as _web_mod
 
 
 @pytest.fixture(autouse=False)
 def clear_version_cache():
     """Reset module-level version cache between tests."""
     _version_cache.clear()
+    _orig_semver = _web_mod._SEMANTIC_VERSION
     yield
     _version_cache.clear()
+    _web_mod._SEMANTIC_VERSION = _orig_semver
 
 
 class TestApiVersion:
@@ -1817,6 +1820,23 @@ class TestApiVersion:
             r = client.get("/api/version")
         assert r.status_code == 200
         assert r.json()["latest_sha"] is None
+
+    def test_version_includes_semantic_version(self, client, monkeypatch, clear_version_cache):
+        """semantic_version field is present and reads from the VERSION file."""
+        monkeypatch.delenv("BUILD_SHA", raising=False)
+        with patch("calibrate.web._fetch_latest_sha", new=AsyncMock(return_value=None)):
+            r = client.get("/api/version")
+        data = r.json()
+        assert "semantic_version" in data
+        assert data["semantic_version"] != ""
+
+    def test_version_semantic_version_fallback_on_missing_file(self, client, monkeypatch, clear_version_cache):
+        """_read_semantic_version returns 'unknown' when VERSION file is missing."""
+        monkeypatch.delenv("BUILD_SHA", raising=False)
+        with patch("calibrate.web._read_semantic_version", return_value="unknown"):
+            with patch("calibrate.web._fetch_latest_sha", new=AsyncMock(return_value=None)):
+                r = client.get("/api/version")
+        assert r.json()["semantic_version"] == "unknown"
 
 
 class TestApiUpgrade:

@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1.2] - 2026-03-30
+
+### Added
+- **Version chip (top-right corner):** Every page now shows a small pill badge in the top-right corner with the running semantic version (`v0.3.1.2`). The chip is green when up-to-date, amber with a ▲ indicator when an update is available, and grey when the version check cannot reach GHCR. Hovering shows the full version + git SHA.
+- **`semantic_version` in `/api/version`:** The version endpoint now returns the semantic version string from the `VERSION` file, in addition to the existing git SHA fields. Version is read once at startup and cached for the process lifetime — no per-request SD card I/O.
+- **Docker: `VERSION` copied into image:** `Dockerfile` now includes `COPY VERSION /app/VERSION` so the semantic version is available inside the container at the expected path.
+
+### Fixed
+- Version chip JS uses `classList.add/remove` instead of `className=` assignment, preserving any other classes applied to the chip element.
+- Version chip null-guarded so it silently no-ops when the element is absent from the DOM rather than throwing a TypeError.
+- Version chip `else` branch (GHCR unreachable) now clears stale CSS classes from a previous `loadVersion()` call.
+- `_read_semantic_version()` now tries `/app/VERSION` (Docker WORKDIR) before the repo-root path, fixing silent `"unknown"` fallback in production containers where the file was not previously present.
+
+## [0.3.1.1] - 2026-03-30
+
+### Changed
+- **Auto-update polls every minute** instead of once daily. The update timer fires 2 minutes after boot and every minute thereafter. No-op if the GHCR SHA hasn't changed — the update service exits immediately after the manifest check.
+
 ## [0.3.1.0] - 2026-03-30
 
 ### Changed

@@ -260,6 +260,16 @@ _HTML = """<!DOCTYPE html>
     input[type=checkbox].toggle:checked::after { left: 1.3rem; }
     #cardioidDetail { font-size: .82rem; color: #94a3b8; }
     #cardioidDetail .warn-note { color: #fbbf24; margin-top: .4rem; }
+    /* Version chip — top-right corner */
+    #versionChip {
+      position: fixed; top: .75rem; right: 1rem; z-index: 9999;
+      font-size: .72rem; font-weight: 600; letter-spacing: .03em;
+      background: #1a1f2e; border: 1px solid #2d3748; border-radius: 999px;
+      padding: .25rem .7rem; color: #94a3b8; cursor: default;
+      white-space: nowrap;
+    }
+    #versionChip.up-to-date { color: #4ade80; border-color: #4ade80; }
+    #versionChip.update-available { color: #fbbf24; border-color: #fbbf24; }
     /* Version footer */
     #versionFooter {
       width: 100%; max-width: 760px; margin-top: 1rem; padding: .5rem 1.5rem;
@@ -310,6 +320,7 @@ _HTML = """<!DOCTYPE html>
   </style>
 </head>
 <body>
+  <div id="versionChip" title="Running version">&#8230;</div>
   <h1>AVR Calibration</h1>
 
   <!-- Workflow Navigator -->
@@ -1404,7 +1415,16 @@ _HTML = """<!DOCTYPE html>
   const versionStatus = document.getElementById('versionStatus');
   const upgradeBtn = document.getElementById('upgradeBtn');
   const upgradeConfirm = document.getElementById('upgradeConfirm');
+  const versionChip = document.getElementById('versionChip');
   let _upgradePolling = false;
+
+  function _setChip(text, cls, title) {
+    if (!versionChip) return;
+    versionChip.textContent = text;
+    versionChip.classList.remove('up-to-date', 'update-available');
+    if (cls) versionChip.classList.add(cls);
+    versionChip.title = title;
+  }
 
   async function loadVersion() {
     try {
@@ -1412,22 +1432,30 @@ _HTML = """<!DOCTYPE html>
       if (!r.ok) throw new Error(r.statusText);
       const d = await r.json();
       const sha7 = d.current_sha !== 'unknown' ? d.current_sha.slice(0,7) : 'unknown';
+      const semver = (d.semantic_version && d.semantic_version !== 'unknown') ? d.semantic_version : sha7;
+      if (!d.semantic_version || d.semantic_version === 'unknown') {
+        console.warn('avr-calibration: semantic_version missing from /api/version response');
+      }
       if (d.up_to_date) {
-        versionBadge.innerHTML = '<span class="badge badge-optimal">v' + sha7 + ' — Up to date</span>';
+        versionBadge.innerHTML = '<span class="badge badge-optimal">v' + sha7 + ' \u2014 Up to date</span>';
         upgradeBtn.style.display = 'none';
         upgradeConfirm.style.display = 'none';
+        _setChip('v' + semver, 'up-to-date', 'v' + semver + ' (' + sha7 + ') \u2014 Up to date');
       } else if (d.latest_sha) {
-        versionBadge.innerHTML = '<span class="badge badge-warn">v' + sha7 + ' — Update available</span>';
+        versionBadge.innerHTML = '<span class="badge badge-warn">v' + sha7 + ' \u2014 Update available</span>';
         upgradeBtn.style.display = '';
         upgradeConfirm.style.display = 'none';
+        _setChip('v' + semver + ' \u25b2', 'update-available', 'v' + semver + ' (' + sha7 + ') \u2014 Update available');
       } else {
-        versionBadge.innerHTML = '<span class="badge badge-empty">v' + sha7 + ' — Version check unavailable</span>';
+        versionBadge.innerHTML = '<span class="badge badge-empty">v' + sha7 + ' \u2014 Version check unavailable</span>';
         upgradeBtn.style.display = 'none';
         upgradeConfirm.style.display = 'none';
+        _setChip('v' + semver, null, 'v' + semver + ' (' + sha7 + ')');
       }
     } catch (e) {
       versionBadge.innerHTML = '<span class="badge badge-empty">Version unavailable</span>';
       upgradeBtn.style.display = 'none';
+      _setChip('\u2014', null, 'Version unavailable');
     }
   }
 
@@ -1614,9 +1642,37 @@ async def _fetch_latest_sha() -> Optional[str]:
 
 # ── Version / upgrade routes ──────────────────────────────────────────────────
 
+_SEMANTIC_VERSION: str | None = None
+
+
+def _read_semantic_version() -> str:
+    """Return the semantic version, cached for the process lifetime.
+
+    Resolution order:
+    1. APP_VERSION env var (set by Dockerfile at build time)
+    2. /app/VERSION (Docker runtime — WORKDIR, copied by Dockerfile)
+    3. Repo root VERSION file (local dev — two levels up from calibrate/web.py)
+    """
+    global _SEMANTIC_VERSION
+    if _SEMANTIC_VERSION is not None:
+        return _SEMANTIC_VERSION
+    env_ver = os.environ.get("APP_VERSION")
+    if env_ver:
+        _SEMANTIC_VERSION = env_ver
+        return _SEMANTIC_VERSION
+    for candidate in (Path("/app/VERSION"), Path(__file__).parent.parent / "VERSION"):
+        try:
+            _SEMANTIC_VERSION = candidate.read_text().strip()
+            return _SEMANTIC_VERSION
+        except FileNotFoundError:
+            continue
+    _SEMANTIC_VERSION = "unknown"
+    return _SEMANTIC_VERSION
+
+
 @app.get("/api/version")
 async def api_version() -> dict:
-    """Return current and latest git SHAs. Cached for 1 hour."""
+    """Return current and latest git SHAs plus the semantic version. Cached for 1 hour."""
     current_sha = os.environ.get("BUILD_SHA", "unknown")
 
     cached = _version_cache.get("result")
@@ -1643,6 +1699,7 @@ async def api_version() -> dict:
         "latest_sha": latest_sha,
         "up_to_date": up_to_date,
         "latest_checked_at": checked_at,
+        "semantic_version": _read_semantic_version(),
     }
 
 

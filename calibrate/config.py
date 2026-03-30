@@ -41,7 +41,9 @@ CONFIG_TEMPLATE = """\
 # Run 'calibrate check' after editing to verify everything is reachable.
 
 denon:
-  host: "192.168.1.100"  # IP address of your Denon X3800H
+  # host: "192.168.1.100"  # Optional: set a fixed IP to skip SSDP auto-discovery.
+  #                         # Leave commented out — the equipment check will find
+  #                         # your Denon automatically via SSDP (recommended).
 
 minidsp:
   host: "localhost"      # minidspd runs inside the container (--device=/dev/hidraw0)
