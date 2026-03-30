@@ -208,10 +208,56 @@ _HTML = """<!DOCTYPE html>
     #blendStatus { font-size: .8rem; color: #94a3b8; margin-top: .75rem; min-height: 1.2em; }
     #blendBtn { background: #334155; color: #cbd5e1; font-size: .85rem; margin-top: .75rem; }
     #blendBtn:not(:disabled):hover { background: #475569; }
+    /* Advisory badges */
+    .badge { display: inline-block; padding: .25rem .7rem; border-radius: 4px; font-size: .8rem;
+             font-weight: 600; margin-bottom: .5rem; }
+    .badge-optimal { background: rgba(34,197,94,.15); color: #4ade80; border: 1px solid #22c55e; }
+    .badge-warn    { background: rgba(245,158,11,.15); color: #fbbf24; border: 1px solid #f59e0b; }
+    .badge-danger  { background: rgba(239,68,68,.15);  color: #f87171; border: 1px solid #ef4444; }
+    .badge-low     { background: rgba(59,130,246,.15); color: #93c5fd; border: 1px solid #3b82f6; }
+    .badge-empty   { background: rgba(100,116,139,.15);color: #94a3b8; border: 1px solid #475569; }
+    /* Dynamic EQ dismissable callout */
+    #dynEqCard { border-left: 4px solid #f59e0b; }
+    #dynEqCard p { font-size: .85rem; color: #94a3b8; line-height: 1.5; margin-bottom: .75rem; }
+    #dynEqDismissBtn { background: #334155; color: #cbd5e1; font-size: .8rem; padding: .35rem .8rem; }
+    #dynEqDismissBtn:hover { background: #475569; }
+    /* Sub Trim Advisor */
+    #trimInput { width: 8rem; margin-bottom: .5rem; }
+    #trimGuidance { font-size: .8rem; color: #94a3b8; margin-top: .25rem; }
+    /* Phase check card */
+    .phase-row { display: flex; gap: .75rem; align-items: flex-end; margin-bottom: .75rem; }
+    .phase-row > div { flex: 1; }
+    .phase-row label { font-size: .8rem; }
+    .phase-row select { margin-bottom: 0; }
+    #phaseRunBtn { background: #334155; color: #cbd5e1; font-size: .85rem; white-space: nowrap; }
+    #phaseRunBtn:not(:disabled):hover { background: #475569; }
+    #phaseResult { margin-top: .75rem; font-size: .85rem; color: #94a3b8; }
+    /* Variance band */
+    .variance-note { font-size: .75rem; color: #64748b; margin-top: .25rem; text-align: center; }
+    /* Cardioid toggle */
+    .toggle-row { display: flex; align-items: center; gap: 1rem; margin-bottom: .75rem; }
+    .toggle-row label { margin: 0; cursor: pointer; }
+    input[type=checkbox].toggle { width: 2.5rem; height: 1.4rem; appearance: none;
+      background: #334155; border-radius: 1rem; cursor: pointer; position: relative;
+      transition: background .2s; }
+    input[type=checkbox].toggle:checked { background: #2dd4bf; }
+    input[type=checkbox].toggle::after { content: ''; position: absolute; top: .2rem; left: .2rem;
+      width: 1rem; height: 1rem; background: #fff; border-radius: 50%; transition: left .2s; }
+    input[type=checkbox].toggle:checked::after { left: 1.3rem; }
+    #cardioidDetail { font-size: .82rem; color: #94a3b8; }
+    #cardioidDetail .warn-note { color: #fbbf24; margin-top: .4rem; }
   </style>
 </head>
 <body>
   <h1>AVR Calibration</h1>
+
+  <div class="card" id="dynEqCard">
+    <h2>⚠ Disable Dynamic EQ</h2>
+    <p>Audyssey Dynamic EQ re-applies a loudness curve at every volume level. This fights your
+    calibration by adding bass boost that conflicts with the Harman target you just measured.
+    Disable it in AVR Settings → Audyssey → Dynamic EQ, or set Reference Level Offset to −15 dB.</p>
+    <button id="dynEqDismissBtn" onclick="dismissDynEq()">Got it — I've disabled it</button>
+  </div>
 
   <div class="card">
     <h2>Measure</h2>
@@ -238,6 +284,8 @@ _HTML = """<!DOCTYPE html>
       <label for="curveSelect">Target curve:</label>
       <select id="curveSelect" onchange="onCurveChange()">
         <option value="harman">Harman (+3 dB/oct below 80 Hz)</option>
+        <option value="ht">HT-Aggressive (+4 dB/oct below 100 Hz)</option>
+        <option value="music">Musicality (Gaussian peak at 30 Hz)</option>
         <option value="flat">Flat</option>
       </select>
     </div>
@@ -270,6 +318,33 @@ _HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="card" id="subTrimCard">
+    <h2>Sub Trim Advisor</h2>
+    <label for="trimInput">Audyssey Sub Trim Level (dB)</label>
+    <input type="number" id="trimInput" step="0.5" placeholder="-10" oninput="onTrimInput(this.value)">
+    <div id="trimBadge"></div>
+    <div id="trimGuidance">Enter your Audyssey sub trim reading above.</div>
+  </div>
+
+  <div class="card" id="phaseCard">
+    <h2>Phase Check</h2>
+    <p style="font-size:.8rem;color:#64748b;margin-bottom:.75rem">
+      Select a sub-only measurement and a mains-only measurement. Analyzes time offset at the crossover.
+    </p>
+    <div class="phase-row">
+      <div>
+        <label for="phaseSubSel">Sub session</label>
+        <select id="phaseSubSel"><option value="">— select session —</option></select>
+      </div>
+      <div>
+        <label for="phaseMainsSel">Mains session</label>
+        <select id="phaseMainsSel"><option value="">— select session —</option></select>
+      </div>
+      <button id="phaseRunBtn" onclick="runPhaseCheck()">Analyze Alignment</button>
+    </div>
+    <div id="phaseResult"></div>
+  </div>
+
   <div class="card">
     <div class="hist-header">
       <h2>History</h2>
@@ -281,6 +356,15 @@ _HTML = """<!DOCTYPE html>
       </thead>
       <tbody id="histBody"></tbody>
     </table>
+  </div>
+
+  <div class="card" id="cardioidCard" style="display:none">
+    <h2>Sub Array Mode</h2>
+    <div class="toggle-row">
+      <input type="checkbox" class="toggle" id="cardioidToggle" onchange="onCardioidToggle(this.checked)">
+      <label for="cardioidToggle" id="cardioidLabel">Normal — standard sub output</label>
+    </div>
+    <div id="cardioidDetail"></div>
   </div>
 
   <script>
@@ -448,8 +532,121 @@ _HTML = """<!DOCTYPE html>
     const sorted = [...spl].sort((a, b) => a - b);
     const refSpl = sorted[Math.floor(sorted.length / 2)];
     if (targetCurveType === 'flat') return freqs.map(() => refSpl);
+    if (targetCurveType === 'ht')
+      return freqs.map(f => f >= 100 ? refSpl : refSpl + 4 * Math.log2(100 / f));
+    if (targetCurveType === 'music') return freqs.map(f => {
+      const oct = Math.log2(f / 30);
+      return refSpl + 4 * Math.exp(-(oct * oct) / (2 * 0.7 * 0.7));
+    });
     // Harman: flat above 80 Hz, +3 dB/octave below 80 Hz
     return freqs.map(f => f >= 80 ? refSpl : refSpl + 3 * Math.log2(80 / f));
+  }
+
+  // ── Dynamic EQ dismiss ─────────────────────────────────────────────────
+  function dismissDynEq() {
+    localStorage.setItem('dynEqDismissed', '1');
+    const card = document.getElementById('dynEqCard');
+    if (card) card.style.display = 'none';
+  }
+  if (localStorage.getItem('dynEqDismissed') === '1') {
+    const card = document.getElementById('dynEqCard');
+    if (card) card.style.display = 'none';
+  }
+
+  // ── Sub Trim Advisor ────────────────────────────────────────────────────
+  const TRIM_RULES = [
+    { max: -12,  cls: 'badge-low',     badge: 'Too low',    msg: 'Too low — increase physical gain knob or sub output level.' },
+    { max: -10,  cls: 'badge-optimal', badge: 'Optimal',    msg: 'Optimal — physical gain knob is correctly calibrated.' },
+    { max:  -5,  cls: 'badge-warn',    badge: 'Acceptable', msg: 'Slightly hot — consider lowering physical gain 2–3 dB.' },
+    { max: Infinity, cls: 'badge-danger', badge: 'Too hot', msg: 'Too hot — lower physical gain knob and re-run Audyssey.' },
+  ];
+  function onTrimInput(val) {
+    const badge = document.getElementById('trimBadge');
+    const guide = document.getElementById('trimGuidance');
+    if (val === '' || isNaN(parseFloat(val))) {
+      badge.innerHTML = '';
+      guide.textContent = 'Enter your Audyssey sub trim reading above.';
+      return;
+    }
+    const v = parseFloat(val);
+    const rule = TRIM_RULES.find(r => v <= r.max);
+    badge.innerHTML = `<span class="badge ${rule.cls}">${rule.badge} (${v} dB)</span>`;
+    guide.textContent = rule.msg;
+  }
+
+  // ── Phase Check ────────────────────────────────────────────────────────
+  async function runPhaseCheck() {
+    const subId = parseInt(document.getElementById('phaseSubSel').value);
+    const mainsId = parseInt(document.getElementById('phaseMainsSel').value);
+    const resultEl = document.getElementById('phaseResult');
+    const btn = document.getElementById('phaseRunBtn');
+    if (!subId || !mainsId) {
+      resultEl.textContent = 'Select both a sub session and a mains session.';
+      return;
+    }
+    btn.disabled = true;
+    resultEl.textContent = 'Computing cross-correlation…';
+    try {
+      const r = await fetch('/api/sessions/time-align', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sub_session_id: subId, mains_session_id: mainsId }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({ detail: r.statusText }));
+        const msg = err.message || err.detail || 'Analysis failed';
+        resultEl.innerHTML = `<span style="color:#f87171">⚠ ${msg}</span>`;
+      } else {
+        const d = await r.json();
+        const sign = d.sub_leads ? 'Sub leads mains' : 'Sub lags mains';
+        const absBadgeCls = Math.abs(d.offset_ms) < 1 ? 'badge-optimal' :
+                            Math.abs(d.offset_ms) < 5 ? 'badge-warn' : 'badge-danger';
+        resultEl.innerHTML =
+          `<span class="badge ${absBadgeCls}">${sign} by ${Math.abs(d.offset_ms).toFixed(1)} ms</span>` +
+          `<p style="font-size:.82rem;color:#94a3b8;margin-top:.5rem">${d.recommendation}</p>`;
+      }
+    } catch (e) {
+      resultEl.innerHTML = `<span style="color:#f87171">Error: ${e.message}</span>`;
+    }
+    btn.disabled = false;
+  }
+
+  // ── Cardioid toggle ────────────────────────────────────────────────────
+  async function onCardioidToggle(enabled) {
+    const toggle = document.getElementById('cardioidToggle');
+    const detail = document.getElementById('cardioidDetail');
+    const label = document.getElementById('cardioidLabel');
+    toggle.disabled = true;
+    label.textContent = 'Applying…';
+    try {
+      const r = await fetch('/api/signal-path/cardioid', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+      if (!r.ok) {
+        detail.innerHTML = `<span style="color:#f87171">Failed to apply — check miniDSP connection.</span>`;
+        toggle.checked = !enabled; // revert
+      } else {
+        const d = await r.json();
+        if (d.status === 'advisory_only') {
+          label.textContent = 'Cardioid (manual configuration required)';
+          detail.innerHTML = `<p>${d.message}</p>
+            <p class="warn-note">Set Output 2: polarity inverted, delay ${d.delay_ms ? d.delay_ms.toFixed(1) : '?'} ms in miniDSP app.</p>`;
+        } else if (enabled) {
+          label.textContent = 'Cardioid — rear rejection active';
+          detail.innerHTML = `<p>Output 2: inverted polarity, ${d.delay_ms.toFixed(1)} ms delay applied.</p>
+            <p class="warn-note">Effective above ~170 Hz at 1m separation. Verify with measurement.</p>`;
+        } else {
+          label.textContent = 'Normal — standard sub output';
+          detail.innerHTML = '';
+        }
+      }
+    } catch (e) {
+      detail.innerHTML = `<span style="color:#f87171">Error: ${e.message}</span>`;
+      toggle.checked = !enabled;
+    }
+    toggle.disabled = false;
   }
 
   // ── Convergence delta table ────────────────────────────────────────────
@@ -505,7 +702,9 @@ _HTML = """<!DOCTYPE html>
         fill: !endFreqs,
       },
       {
-        label: targetCurveType === 'harman' ? 'Harman Target' : 'Flat Target',
+        label: targetCurveType === 'harman' ? 'Harman Target' :
+               targetCurveType === 'ht' ? 'HT-Aggressive Target' :
+               targetCurveType === 'music' ? 'Musicality Target' : 'Flat Target',
         data: targetLine,
         borderColor: '#94a3b8',
         borderDash: [5, 5],
@@ -631,14 +830,25 @@ _HTML = """<!DOCTYPE html>
       const label = s.label || '—';
       const peak = s.peak_spl.toFixed(1) + ' dBFS';
       const sel = s.id === selectedSessionId ? ' selected' : '';
+      const irNote = s.has_ir ? '' : ' ⚠';
       return `<tr class="${sel}" data-session-id="${s.id}" onclick="loadSession(${s.id})">
         <td class="cb-col" onclick="event.stopPropagation()">
           <input type="checkbox" data-id="${s.id}" onchange="updateAvgButton()">
         </td>
-        <td>${s.id}</td><td>${ts}</td><td>${label}</td>
+        <td>${s.id}</td><td>${ts}</td><td>${label}${irNote}</td>
         <td class="peak">${peak}</td><td>${s.n_freqs}</td>
       </tr>`;
     }).join('');
+    // Populate phase check selects
+    const phaseOpts = sessions.map(s => {
+      const lbl = (s.label || `Session #${s.id}`) + (s.has_ir ? '' : ' ⚠ no IR');
+      return `<option value="${s.id}">${s.id}: ${lbl}</option>`;
+    }).join('');
+    const emptyOpt = '<option value="">— select session —</option>';
+    const subSel = document.getElementById('phaseSubSel');
+    const mainsSel = document.getElementById('phaseMainsSel');
+    if (subSel) subSel.innerHTML = emptyOpt + phaseOpts;
+    if (mainsSel) mainsSel.innerHTML = emptyOpt + phaseOpts;
   }
 
   function updateAvgButton() {
@@ -664,6 +874,27 @@ _HTML = """<!DOCTYPE html>
       const result = await r.json();
       setStatus(`Averaged ${result.n_positions} positions`, 'ok');
       renderFR(result.frequencies_hz, result.spl_dbfs, null, null, `Average of ${result.n_positions} positions`);
+      if (result.spl_variance && frChart) {
+        const upper = result.spl_dbfs.map((v, i) => v + result.spl_variance[i]);
+        const lower = result.spl_dbfs.map((v, i) => v - result.spl_variance[i]);
+        frChart.data.datasets.push({
+          label: '±1σ variance band (upper)',
+          data: upper,
+          borderColor: 'transparent',
+          backgroundColor: 'rgba(45,212,191,0.12)',
+          pointRadius: 0,
+          fill: '+1',
+        });
+        frChart.data.datasets.push({
+          label: '±1σ variance band (lower)',
+          data: lower,
+          borderColor: 'transparent',
+          backgroundColor: 'rgba(45,212,191,0.12)',
+          pointRadius: 0,
+          fill: false,
+        });
+        frChart.update();
+      }
     } catch (e) {
       setStatus('Average error: ' + e.message, 'error');
     }
@@ -1014,15 +1245,164 @@ async def average_sessions(body: AverageRequest) -> dict:
 
     n = len(ref_freqs)
     averaged_spl = []
+    spl_variance = []
     for i in range(n):
-        linear_sum = sum(10 ** (fr.spl[i] / 20.0) for fr in frs)
-        result = linear_sum / len(frs)
-        averaged_spl.append(20 * math.log10(result) if result > 0 else -120.0)
+        linear_vals = [10 ** (fr.spl[i] / 20.0) for fr in frs]
+        avg_linear = sum(linear_vals) / len(linear_vals)
+        averaged_spl.append(20 * math.log10(avg_linear) if avg_linear > 0 else -120.0)
+        # Per-bin standard deviation in dB domain
+        db_vals = [fr.spl[i] for fr in frs]
+        spl_variance.append(statistics.stdev(db_vals) if len(db_vals) > 1 else 0.0)
 
     return {
         "frequencies_hz": ref_freqs,
         "spl_dbfs": averaged_spl,
+        "spl_variance": spl_variance,
         "n_positions": len(frs),
+    }
+
+
+class TimeAlignRequest(BaseModel):
+    sub_session_id: int
+    mains_session_id: int
+
+
+def _bandpass_fft(ir: list[float], f_lo: float, f_hi: float, sample_rate: int) -> list[float]:
+    """FFT-domain soft bandpass filter. Pure numpy — no scipy dependency."""
+    import numpy as np
+    arr = np.array(ir, dtype=np.float64)
+    N = len(arr)
+    freqs = np.fft.rfftfreq(N, 1.0 / sample_rate)
+    H = np.fft.rfft(arr)
+    mask = ((freqs >= f_lo) & (freqs <= f_hi)).astype(np.float64)
+    return np.fft.irfft(H * mask, n=N).tolist()
+
+
+def compute_time_offset_ms(
+    ir1: list[float],
+    ir2: list[float],
+    f_lo: float = 60.0,
+    f_hi: float = 100.0,
+    sample_rate: int = 48000,
+) -> float:
+    """Compute time offset between two IRs via bandpass cross-correlation.
+
+    Returns lag in milliseconds (positive = ir1 leads ir2).
+    """
+    import numpy as np
+    bp1 = np.array(_bandpass_fft(ir1, f_lo, f_hi, sample_rate))
+    bp2 = np.array(_bandpass_fft(ir2, f_lo, f_hi, sample_rate))
+    corr = np.correlate(bp1, bp2, mode="full")
+    lag_samples = int(np.argmax(np.abs(corr))) - (len(bp2) - 1)
+    return lag_samples / sample_rate * 1000.0
+
+
+@app.post("/api/sessions/time-align")
+async def time_align(body: TimeAlignRequest) -> dict:
+    """Estimate time offset between sub and mains via bandpass cross-correlation.
+
+    Both sessions must have an impulse response stored (re-measure if missing).
+    """
+    store = SessionStore()
+    sub_session = store.get_session(body.sub_session_id)
+    if sub_session is None:
+        raise HTTPException(status_code=404, detail=f"Session #{body.sub_session_id} not found")
+    mains_session = store.get_session(body.mains_session_id)
+    if mains_session is None:
+        raise HTTPException(status_code=404, detail=f"Session #{body.mains_session_id} not found")
+
+    if sub_session.impulse_response is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "IR_NOT_AVAILABLE",
+                "message": f"Session #{body.sub_session_id} has no IR — re-measure to enable phase check.",
+            },
+        )
+    if mains_session.impulse_response is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "IR_NOT_AVAILABLE",
+                "message": f"Session #{body.mains_session_id} has no IR — re-measure to enable phase check.",
+            },
+        )
+
+    offset_ms = compute_time_offset_ms(
+        sub_session.impulse_response,
+        mains_session.impulse_response,
+    )
+    offset_feet = abs(offset_ms) * 1.13
+    sub_leads = offset_ms > 0
+
+    if sub_leads:
+        rec = (
+            f"Sub leads mains by {abs(offset_ms):.1f} ms ({offset_feet:.1f} ft). "
+            f"Increase AVR sub distance by {offset_feet:.1f} feet."
+        )
+    else:
+        rec = (
+            f"Sub lags mains by {abs(offset_ms):.1f} ms ({offset_feet:.1f} ft). "
+            f"Decrease AVR sub distance by {offset_feet:.1f} feet."
+        )
+
+    return {
+        "offset_ms": round(offset_ms, 2),
+        "offset_feet": round(offset_feet, 2),
+        "sub_leads": sub_leads,
+        "recommendation": rec,
+    }
+
+
+class CardioidRequest(BaseModel):
+    enabled: bool
+    delay_ms: Optional[float] = None
+
+
+@app.post("/api/signal-path/cardioid")
+async def cardioid_mode(body: CardioidRequest) -> dict:
+    """Enable or disable cardioid sub array mode on output index 1.
+
+    Cardioid: output 1 gets inverted polarity + computed delay.
+    Requires 2+ sub_outputs in config. Delay defaults to sub_separation_m / 343 * 1000 ms.
+    """
+    from .adapters.minidsp import MinidspClient, MinidspApiError
+
+    cfg = _load_config()
+    sub_outputs = cfg.minidsp.get("signal_path", {}).get("sub_outputs", []) if cfg.minidsp else []
+    if len(sub_outputs) < 2:
+        raise HTTPException(
+            status_code=422,
+            detail="cardioid mode requires 2+ sub outputs configured in config.yaml",
+        )
+
+    sep_m: float = cfg.minidsp.get("sub_separation_m", 1.0) if cfg.minidsp else 1.0
+    delay_ms = body.delay_ms if body.delay_ms is not None else round(sep_m / 343.0 * 1000.0, 2)
+
+    host = cfg.minidsp.get("host", "localhost") if cfg.minidsp else "localhost"
+    port = cfg.minidsp.get("port", 5380) if cfg.minidsp else 5380
+    client = MinidspClient(host=host, port=port)
+
+    try:
+        if body.enabled:
+            await client.set_output_polarity(1, inverted=True)
+            await client.set_output_delay(1, delay_ms)
+        else:
+            await client.set_output_polarity(1, inverted=False)
+            await client.set_output_delay(1, 0.0)
+    except MinidspApiError as exc:
+        if exc.status_code == 404:
+            return {
+                "status": "advisory_only",
+                "message": "Polarity inversion not supported by this hardware. Set manually in miniDSP app.",
+                "delay_ms": delay_ms,
+            }
+        raise HTTPException(status_code=502, detail=f"miniDSP error: {exc}")
+
+    return {
+        "status": "ok",
+        "enabled": body.enabled,
+        "delay_ms": delay_ms if body.enabled else 0.0,
     }
 
 
@@ -1040,6 +1420,7 @@ async def list_sessions() -> list[dict]:
             "freq_at_peak": s.start_fr.freq_at_peak,
             "n_freqs": len(s.start_fr.frequencies),
             "has_end_fr": s.end_fr is not None,
+            "has_ir": s.impulse_response is not None,
         }
         for s in sessions
     ]

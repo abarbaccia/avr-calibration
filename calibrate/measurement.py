@@ -21,6 +21,7 @@ import json
 import logging
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from typing import Optional
 
 from .config import Config
 
@@ -53,6 +54,7 @@ class FrequencyResponse:
     sweep_duration: float     # seconds
     timestamp: str            # ISO-8601 UTC
     warnings: list[dict] = field(default_factory=list)  # non-fatal quality warnings
+    impulse_response: Optional[list[float]] = None  # time-domain IR, first 24 000 samples
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
@@ -60,7 +62,8 @@ class FrequencyResponse:
     @classmethod
     def from_json(cls, s: str) -> "FrequencyResponse":
         data = json.loads(s)
-        data.setdefault("warnings", [])  # backward compat — old sessions have no warnings field
+        data.setdefault("warnings", [])     # backward compat
+        data.setdefault("impulse_response", None)  # backward compat
         return cls(**data)
 
     @property
@@ -207,7 +210,7 @@ class MeasurementEngine:
 
         warnings = self.validate_recording(np, sweep_array, rec_array, sample_rate)
 
-        frequencies, spl = self._compute_fr_arrays(
+        frequencies, spl, ir_samples = self._compute_fr_arrays(
             np,
             sweep_array,
             rec_array,
@@ -222,6 +225,7 @@ class MeasurementEngine:
             sweep_duration=dur,
             timestamp=datetime.now(timezone.utc).isoformat(),
             warnings=warnings,
+            impulse_response=ir_samples,
         )
 
     def validate_recording(
@@ -348,7 +352,7 @@ class MeasurementEngine:
         )
         recording = meas.run()
 
-        frequencies, spl = self._compute_fr(
+        frequencies, spl, ir_samples = self._compute_fr(
             np, sweep, recording, freq_min, freq_max, sample_rate
         )
 
@@ -358,6 +362,7 @@ class MeasurementEngine:
             sample_rate=sample_rate,
             sweep_duration=duration,
             timestamp=datetime.now(timezone.utc).isoformat(),
+            impulse_response=ir_samples,
         )
 
     # ── Playback routes ────────────────────────────────────────────────────
@@ -497,11 +502,15 @@ class MeasurementEngine:
         with np.errstate(divide="ignore", invalid="ignore"):
             H = np.where(np.abs(X) > 1e-10, Y / X, 0.0 + 0.0j)
 
+        # Time-domain IR (first 24 000 samples, ~500 ms window at 48 kHz)
+        ir_full = np.fft.irfft(H, n=n)
+        ir_samples = ir_full[:24000].tolist()
+
         freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
         mag_db = 20.0 * np.log10(np.abs(H) + 1e-12)
 
         mask = (freqs >= freq_min) & (freqs <= freq_max)
-        return freqs[mask].tolist(), mag_db[mask].tolist()
+        return freqs[mask].tolist(), mag_db[mask].tolist(), ir_samples
 
     def _compute_fr(
         self,
@@ -511,7 +520,7 @@ class MeasurementEngine:
         freq_min: int,
         freq_max: int,
         sample_rate: int,
-    ) -> tuple[list[float], list[float]]:
+    ) -> tuple[list[float], list[float], list[float]]:
         """Wrapper that extracts numpy arrays from PyTTa SignalObj inputs."""
         x = sweep.timeSignal[:, 0]
         y = recording.timeSignal[:, 0]

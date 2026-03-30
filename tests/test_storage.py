@@ -239,3 +239,62 @@ class TestDefensiveDeserialization:
         )
         assert fr.peak_spl == 0.0
         assert fr.freq_at_peak == 0.0
+
+
+# ── Impulse response storage — F4 ────────────────────────────────────────────
+
+class TestImpulseResponseStorage:
+    def test_store_ir_with_session(self, store):
+        """Saving a measurement with an IR stores it and round-trips correctly."""
+        ir = [0.1 * i for i in range(100)]
+        fr = FrequencyResponse(
+            frequencies=[20.0, 40.0], spl=[-10.0, -8.0],
+            sample_rate=48000, sweep_duration=3.0,
+            timestamp="2026-03-20T00:00:00+00:00",
+            impulse_response=ir,
+        )
+        sid = store.save_measurement(fr)
+        session = store.get_session(sid)
+        assert session.impulse_response is not None
+        assert len(session.impulse_response) == 100
+        # float32 round-trip — allow small precision loss
+        assert abs(session.impulse_response[50] - ir[50]) < 1e-4
+
+    def test_store_without_ir_stores_null(self, store):
+        """Saving a measurement without an IR stores NULL — impulse_response is None."""
+        fr = make_fr()
+        sid = store.save_measurement(fr)
+        session = store.get_session(sid)
+        assert session.impulse_response is None
+
+    def test_ir_migration_nullable(self, tmp_path):
+        """A DB row inserted before the impulse_response column migration returns None."""
+        import sqlite3
+        db_path = tmp_path / "legacy.db"
+
+        # Simulate pre-migration DB: create the table without impulse_response column
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE sessions ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  timestamp TEXT NOT NULL,"
+            "  label TEXT,"
+            "  start_fr TEXT NOT NULL,"
+            "  end_fr TEXT,"
+            "  filters_applied TEXT,"
+            "  notes TEXT"
+            ")"
+        )
+        fr = make_fr()
+        conn.execute(
+            "INSERT INTO sessions (timestamp, label, start_fr) VALUES (?, ?, ?)",
+            (fr.timestamp, None, fr.to_json()),
+        )
+        conn.commit()
+        conn.close()
+
+        # Opening SessionStore against this DB runs migration — must not crash
+        store = SessionStore(db_path=db_path)
+        session = store.get_session(1)
+        assert session is not None
+        assert session.impulse_response is None
