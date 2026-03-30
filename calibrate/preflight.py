@@ -156,8 +156,8 @@ class PreflightChecker:
                 )
 
             device = devices[0]
-            product = device.get("product_name", "Unknown")
-            serial = device.get("version", {}).get("serial", "")
+            product = device.get("product_name") or "Unknown"
+            serial = (device.get("version") or {}).get("serial", "")
             serial_str = f" (serial {serial})" if serial else ""
 
             return CheckResult(
@@ -382,45 +382,42 @@ class PreflightChecker:
         )
 
     async def check_minidsp_combined(self) -> CheckResult:
-        """Combined check: verifies both the miniDSP USB device node AND the minidspd daemon.
+        """Combined check: minidspd HTTP daemon is the authoritative test.
 
-        Runs both checks concurrently. Returns a single CheckResult — pass only if both pass.
+        minidspd claims the miniDSP device via libusb/usbfs, which intentionally
+        detaches hid-generic, so /dev/hidraw0 does NOT exist while the daemon is
+        healthy. The hidraw check is only used as a diagnostic when the daemon is
+        unreachable — it distinguishes "miniDSP not plugged in at all" from
+        "miniDSP connected but daemon is not running".
         """
-        hidraw_result, daemon_result = await asyncio.gather(
-            self.check_hidraw(),
-            self.check_minidsp(),
-        )
+        daemon_result = await self.check_minidsp()
 
-        if hidraw_result.passed and daemon_result.passed:
+        if daemon_result.passed:
             return CheckResult(
                 name="miniDSP",
                 passed=True,
-                detail=f"{daemon_result.detail}; {hidraw_result.detail}",
+                detail=daemon_result.detail,
             )
 
-        if not hidraw_result.passed and not daemon_result.passed:
-            # USB issue is more fundamental — show it first, include daemon status for context.
-            daemon_note = f"; also: {daemon_result.error}" if daemon_result.error else ""
+        # Daemon failed — run hidraw check to give a better error message.
+        hidraw_result = await self.check_hidraw()
+
+        if hidraw_result.passed:
+            # Device is physically present but daemon is not running.
             return CheckResult(
                 name="miniDSP",
                 passed=False,
-                detail=f"USB: {hidraw_result.detail or 'not found'}; daemon: {daemon_result.detail or 'not reachable'}",
-                error=f"{hidraw_result.error}{daemon_note}",
+                detail=f"USB device found ({hidraw_result.detail}) but daemon unreachable: {daemon_result.detail}",
+                error=daemon_result.error,
             )
 
-        if not hidraw_result.passed:
-            return CheckResult(
-                name="miniDSP",
-                passed=False,
-                detail=hidraw_result.detail,
-                error=hidraw_result.error,
-            )
-
+        # Both failed — USB device not detected at all.
+        daemon_note = f"; also: {daemon_result.error}" if daemon_result.error else ""
         return CheckResult(
             name="miniDSP",
             passed=False,
-            detail=daemon_result.detail or hidraw_result.detail,
-            error=daemon_result.error,
+            detail=f"USB: {hidraw_result.detail or 'not found'}; daemon: {daemon_result.detail or 'not reachable'}",
+            error=f"{hidraw_result.error}{daemon_note}",
         )
 
     async def check_denon_and_playback(self) -> CheckResult:

@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1.3] - 2026-03-30
+
+### Fixed
+- **miniDSP preflight passes with minidspd running:** `check_minidsp_combined()` now treats the minidspd HTTP daemon as the authoritative check. Previously it required `/dev/hidraw0` to exist, but minidspd claims the device via libusb/usbfs which intentionally detaches `hid-generic` — so `hidraw0` is absent while the daemon is healthy. The hidraw check is now only used as a diagnostic fallback when the daemon itself fails, to distinguish "device not plugged in" from "daemon not running".
+- **miniDSP version field null crash:** `device.get("version", {})` returned `None` when minidspd reports `"version": null` (key present but null). Fixed with `(device.get("version") or {})` so the default applies regardless.
+
 ## [0.3.1.2] - 2026-03-30
 
 ### Added
