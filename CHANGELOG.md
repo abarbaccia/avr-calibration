@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 ## [0.3.0.0] - 2026-03-30
 
 ### Added
+- **Auto-update (F7):** New host-side `avr-calibration-update.service` (oneshot) + `avr-calibration-update.timer` (daily 3am, 30min jitter). The update service watches `~/.avr-calibration/upgrade-trigger` via `inotifywait -m`, pulls the latest GHCR image, restarts the container, polls `/health` for 30s, and rolls back to the previous digest on failure. Trigger file written by `POST /api/upgrade` inside the container — no Docker socket needed.
+- **Version badge + upgrade button (F8):** Fixed footer shows current git SHA and update status (up-to-date / update-available / upgrading / unknown). "Upgrade Now" button writes the trigger file, then polls `/health` every 3s with a 180s timeout until the new container is healthy. GHCR latest SHA is fetched from the OCI manifest index annotation (2 API calls: anon bearer token + manifest), cached 1hr in-process.
+- **`GET /api/version`:** Returns `current_sha`, `latest_sha`, `up_to_date`, `latest_checked_at`. Cached 1hr, reset on upgrade trigger.
+- **`POST /api/upgrade`:** Writes the upgrade trigger file. Returns 202 on success, 409 if upgrade already in progress, 503 if the data directory is not writable.
+- **Update audit log:** All upgrade events (auto or manual) are recorded in a new `update_events` SQLite table via `SessionStore.log_update_event()`. `GET /api/update-history` returns recent events.
+- **`inotify-tools` system dependency** added to `install.sh` and `avr-calibration-update.service` pre-check.
 - **Equipment Verification Workflow:** The flat single-page UI is replaced by a 5-step guided workflow navigator. Users start at Room Setup (Phase 1, placeholder form), move to Equipment Verification (Phase 2), then into the existing calibration tools (Phase 3). Phases 4-5 are visible but locked.
 - **Test tone:** Phase 2 includes an 80 Hz Web Audio API test tone with a "I Can Hear It" confirmation button. Handles tab-focus `AudioContext` suspension via `resume()` before playback.
 - **Hardware check rows:** Phase 2 shows pass/fail badges for all 7 checks: Config, Microphone, miniDSP USB, miniDSP, Denon AVR, Playback Route, Signal Path. "Run All" button fires all checks concurrently via `/api/preflight`.
@@ -12,6 +18,9 @@ All notable changes to this project will be documented in this file.
 - **`PreflightChecker.check_config()`:** New check that validates required config fields are present (`denon.host`). Included in `run_all()` as a 7th check.
 
 ### Changed
+- `avr-calibration.service` restart policy changed from `on-failure` to `always` (survives clean exits from container restarts during upgrade).
+- `Dockerfile`: `ARG BUILD_SHA` + `ENV BUILD_SHA=${BUILD_SHA:-unknown}` in runtime stage.
+- `.github/workflows/docker.yml`: passes `BUILD_SHA=${{ github.sha }}` as build-arg and writes `index:org.opencontainers.image.revision` OCI annotation.
 - **`check_playback_route(hdmi)` deduplication:** HDMI route now delegates to `self.check_denon()` instead of creating its own `DenonAVR` instance, preventing a double-connection when `run_all()` fires both checks in parallel.
 
 ## [0.2.0.0] - 2026-03-30

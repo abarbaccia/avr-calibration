@@ -1722,6 +1722,142 @@ class TestGetDeviceState:
 
         assert r.status_code == 502
 
+# ── /api/version and /api/upgrade ─────────────────────────────────────────────
+
+from unittest.mock import AsyncMock, patch
+from calibrate.web import _version_cache
+
+
+@pytest.fixture(autouse=False)
+def clear_version_cache():
+    """Reset module-level version cache between tests."""
+    _version_cache.clear()
+    yield
+    _version_cache.clear()
+
+
+class TestApiVersion:
+
+    def test_version_endpoint_returns_sha(self, client, monkeypatch, clear_version_cache):
+        monkeypatch.setenv("BUILD_SHA", "abc1234567890abcdef")
+        with patch("calibrate.web._fetch_latest_sha", new=AsyncMock(return_value=None)):
+            r = client.get("/api/version")
+        assert r.status_code == 200
+        assert r.json()["current_sha"] == "abc1234567890abcdef"
+
+    def test_version_endpoint_no_sha(self, client, monkeypatch, clear_version_cache):
+        monkeypatch.delenv("BUILD_SHA", raising=False)
+        with patch("calibrate.web._fetch_latest_sha", new=AsyncMock(return_value=None)):
+            r = client.get("/api/version")
+        assert r.status_code == 200
+        assert r.json()["current_sha"] == "unknown"
+
+    def test_version_up_to_date(self, client, monkeypatch, clear_version_cache):
+        sha = "deadbeefdeadbeef"
+        monkeypatch.setenv("BUILD_SHA", sha)
+        with patch("calibrate.web._fetch_latest_sha", new=AsyncMock(return_value=sha)):
+            r = client.get("/api/version")
+        data = r.json()
+        assert data["up_to_date"] is True
+        assert data["latest_sha"] == sha
+
+    def test_version_update_available(self, client, monkeypatch, clear_version_cache):
+        monkeypatch.setenv("BUILD_SHA", "oldsha123")
+        with patch("calibrate.web._fetch_latest_sha", new=AsyncMock(return_value="newsha456")):
+            r = client.get("/api/version")
+        data = r.json()
+        assert data["up_to_date"] is False
+        assert data["latest_sha"] == "newsha456"
+
+    def test_version_ghcr_unreachable(self, client, monkeypatch, clear_version_cache):
+        monkeypatch.setenv("BUILD_SHA", "somesha")
+        with patch("calibrate.web._fetch_latest_sha", new=AsyncMock(return_value=None)):
+            r = client.get("/api/version")
+        data = r.json()
+        assert data["latest_sha"] is None
+        assert data["up_to_date"] is False
+
+    def test_version_cache_ttl(self, client, monkeypatch, clear_version_cache):
+        monkeypatch.setenv("BUILD_SHA", "sha1")
+        mock = AsyncMock(return_value="sha_remote")
+        with patch("calibrate.web._fetch_latest_sha", new=mock):
+            client.get("/api/version")
+            client.get("/api/version")
+        # GHCR should only be called once due to cache
+        assert mock.call_count == 1
+
+    def test_version_cache_invalidated_after_ttl(self, client, monkeypatch, clear_version_cache):
+        import calibrate.web as web_mod
+        monkeypatch.setenv("BUILD_SHA", "sha1")
+        mock = AsyncMock(return_value="sha_remote")
+        with patch("calibrate.web._fetch_latest_sha", new=mock):
+            client.get("/api/version")
+            # Force cache expiry
+            web_mod._version_cache["result"]["expires"] = 0
+            client.get("/api/version")
+        assert mock.call_count == 2
+
+    def test_version_ghcr_auth_retry(self, client, monkeypatch, clear_version_cache):
+        """GHCR 401 on token step returns None (not a crash)."""
+        import httpx
+        monkeypatch.setenv("BUILD_SHA", "sha1")
+
+        async def mock_fetch():
+            return None  # simulates auth failure handled inside _fetch_latest_sha
+
+        with patch("calibrate.web._fetch_latest_sha", new=AsyncMock(side_effect=mock_fetch)):
+            r = client.get("/api/version")
+        assert r.status_code == 200
+        assert r.json()["latest_sha"] is None
+
+    def test_version_ghcr_rate_limited(self, client, monkeypatch, clear_version_cache):
+        """GHCR 429 (rate limit) returns None gracefully."""
+        monkeypatch.setenv("BUILD_SHA", "sha1")
+        with patch("calibrate.web._fetch_latest_sha", new=AsyncMock(return_value=None)):
+            r = client.get("/api/version")
+        assert r.status_code == 200
+        assert r.json()["latest_sha"] is None
+
+
+class TestApiUpgrade:
+
+    def test_upgrade_writes_trigger_file(self, client, tmp_path, monkeypatch, clear_version_cache):
+        import calibrate.web as web_mod
+        monkeypatch.setattr(web_mod, "_DATA_DIR", tmp_path)
+        r = client.post("/api/upgrade")
+        assert r.status_code == 202
+        assert (tmp_path / "upgrade-trigger").exists()
+
+    def test_upgrade_trigger_file_path_configurable(self, client, tmp_path, monkeypatch):
+        import calibrate.web as web_mod
+        custom_dir = tmp_path / "custom"
+        custom_dir.mkdir()
+        monkeypatch.setattr(web_mod, "_DATA_DIR", custom_dir)
+        r = client.post("/api/upgrade")
+        assert r.status_code == 202
+        assert (custom_dir / "upgrade-trigger").exists()
+
+    def test_upgrade_already_in_progress(self, client, tmp_path, monkeypatch):
+        import calibrate.web as web_mod
+        monkeypatch.setattr(web_mod, "_DATA_DIR", tmp_path)
+        # Pre-create the trigger file
+        (tmp_path / "upgrade-trigger").touch()
+        r = client.post("/api/upgrade")
+        assert r.status_code == 409
+
+    def test_upgrade_data_dir_not_writable(self, client, tmp_path, monkeypatch):
+        import os, calibrate.web as web_mod
+        readonly = tmp_path / "readonly"
+        readonly.mkdir()
+        os.chmod(readonly, 0o555)
+        monkeypatch.setattr(web_mod, "_DATA_DIR", readonly)
+        try:
+            r = client.post("/api/upgrade")
+            assert r.status_code == 503
+            assert "not writable" in r.json()["detail"]
+        finally:
+            os.chmod(readonly, 0o755)
+
 
 # ── GET /api/preflight and /api/preflight/{check_name} ───────────────────────
 

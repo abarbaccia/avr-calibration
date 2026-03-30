@@ -24,7 +24,8 @@ sudo apt-get install -y -qq \
     curl \
     udev \
     ca-certificates \
-    gnupg
+    gnupg \
+    inotify-tools
 
 # ── 2. Docker ─────────────────────────────────────────────────────────────
 
@@ -200,7 +201,44 @@ sudo systemctl enable "$SERVICE_NAME"
 sudo systemctl start "$SERVICE_NAME"
 echo "Service enabled and started"
 
-# ── 8. Done ───────────────────────────────────────────────────────────────
+# ── 8. Auto-update timer ──────────────────────────────────────────────────
+#
+# Registers avr-calibration-update.service (one-shot updater) and
+# avr-calibration-update.timer (fires daily at 3am) on the host.
+# The update service also watches for a trigger file written by the
+# in-container POST /api/upgrade endpoint.
+
+echo ""
+echo "--- Installing auto-update service and timer ---"
+
+UPDATE_SERVICE="/etc/systemd/system/avr-calibration-update.service"
+UPDATE_TIMER="/etc/systemd/system/avr-calibration-update.timer"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ -f "$SCRIPT_DIR/avr-calibration-update.service" ]; then
+    sudo cp "$SCRIPT_DIR/avr-calibration-update.service" "$UPDATE_SERVICE"
+    echo "Installed: $UPDATE_SERVICE"
+else
+    echo "WARNING: avr-calibration-update.service not found in $SCRIPT_DIR — skipping"
+fi
+
+if [ -f "$SCRIPT_DIR/avr-calibration-update.timer" ]; then
+    sudo cp "$SCRIPT_DIR/avr-calibration-update.timer" "$UPDATE_TIMER"
+    echo "Installed: $UPDATE_TIMER"
+else
+    echo "WARNING: avr-calibration-update.timer not found in $SCRIPT_DIR — skipping"
+fi
+
+sudo systemctl daemon-reload
+if [ -f "$UPDATE_TIMER" ]; then
+    sudo systemctl enable avr-calibration-update.timer
+    sudo systemctl start avr-calibration-update.timer
+    echo "Auto-update timer enabled and started"
+    echo "  Next run: $(systemctl show avr-calibration-update.timer --property=NextElapseUSecRealtime --value 2>/dev/null || echo 'unknown')"
+fi
+
+# ── 9. Done ───────────────────────────────────────────────────────────────
 
 echo ""
 echo "=== Setup complete ==="

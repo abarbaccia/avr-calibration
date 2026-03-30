@@ -37,6 +37,7 @@ import asyncio
 import dataclasses
 import logging
 import math
+import os
 import statistics
 import struct
 import threading
@@ -71,6 +72,17 @@ _align_lock = threading.Lock()
 COUNTDOWN_MS = 1500   # time browser has to set up recording before sweep plays
 ALIGNMENT_SESSION_TTL_S = 600   # evict stale alignment sessions after 10 min
 ALIGNMENT_CLEANUP_INTERVAL_S = 60  # how often the cleanup thread wakes up
+
+# ── Version / upgrade state ───────────────────────────────────────────────────
+
+_GHCR_IMAGE = "abarbaccia/avr-calibration"
+_GHCR_REGISTRY = "ghcr.io"
+_VERSION_CACHE_TTL = 3600  # seconds
+
+# {"latest_sha": str|None, "expires": float, "checked_at": float}
+_version_cache: dict = {}
+
+_DATA_DIR = Path.home() / ".avr-calibration"
 
 
 # ── Alignment session state ────────────────────────────────────────────────────
@@ -248,6 +260,23 @@ _HTML = """<!DOCTYPE html>
     input[type=checkbox].toggle:checked::after { left: 1.3rem; }
     #cardioidDetail { font-size: .82rem; color: #94a3b8; }
     #cardioidDetail .warn-note { color: #fbbf24; margin-top: .4rem; }
+    /* Version footer */
+    #versionFooter {
+      width: 100%; max-width: 760px; margin-top: 1rem; padding: .5rem 1.5rem;
+      background: #1a1f2e; border-top: 1px solid #2d3748; border-radius: 6px;
+      display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+      flex-wrap: wrap;
+    }
+    #versionBadge { font-size: .78rem; }
+    #upgradeBtn {
+      background: #2dd4bf; color: #0d0f14; font-size: .82rem; padding: .35rem .9rem;
+      border-radius: 5px;
+    }
+    #upgradeBtn:focus-visible { outline: 2px solid #2dd4bf; outline-offset: 2px; }
+    #upgradeBtn:not(:disabled):hover { opacity: .85; }
+    @keyframes versionPulse { 0%,100% { opacity:1; } 50% { opacity:.5; } }
+    .badge-upgrading { animation: versionPulse 1.2s ease-in-out infinite;
+      background: rgba(45,212,191,.15); color: #2dd4bf; border: 1px solid #2dd4bf; }
     /* Workflow nav */
     .workflow-nav { display: flex; width: 100%; max-width: 760px; margin-bottom: 2rem; }
     .workflow-nav .step { flex: 1; padding: .6rem .5rem; text-align: center; font-size: .72rem;
@@ -1371,7 +1400,138 @@ _HTML = """<!DOCTYPE html>
     const id = e.state && e.state.session;
     if (id) loadSession(id);
   });
+
+  // ── Version footer ────────────────────────────────────────────────────────
+
+  const versionFooter = document.getElementById('versionFooter');
+  const versionBadge = document.getElementById('versionBadge');
+  const versionStatus = document.getElementById('versionStatus');
+  const upgradeBtn = document.getElementById('upgradeBtn');
+  const upgradeConfirm = document.getElementById('upgradeConfirm');
+  let _upgradePolling = false;
+
+  async function loadVersion() {
+    try {
+      const r = await fetch('/api/version');
+      if (!r.ok) throw new Error(r.statusText);
+      const d = await r.json();
+      const sha7 = d.current_sha !== 'unknown' ? d.current_sha.slice(0,7) : 'unknown';
+      if (d.up_to_date) {
+        versionBadge.innerHTML = '<span class="badge badge-optimal">v' + sha7 + ' — Up to date</span>';
+        upgradeBtn.style.display = 'none';
+        upgradeConfirm.style.display = 'none';
+      } else if (d.latest_sha) {
+        versionBadge.innerHTML = '<span class="badge badge-warn">v' + sha7 + ' — Update available</span>';
+        upgradeBtn.style.display = '';
+        upgradeConfirm.style.display = 'none';
+      } else {
+        versionBadge.innerHTML = '<span class="badge badge-empty">v' + sha7 + ' — Version check unavailable</span>';
+        upgradeBtn.style.display = 'none';
+        upgradeConfirm.style.display = 'none';
+      }
+    } catch (e) {
+      versionBadge.innerHTML = '<span class="badge badge-empty">Version unavailable</span>';
+      upgradeBtn.style.display = 'none';
+    }
+  }
+
+  function showUpgradeConfirm() {
+    upgradeBtn.style.display = 'none';
+    upgradeConfirm.style.display = '';
+  }
+
+  function cancelUpgrade() {
+    upgradeConfirm.style.display = 'none';
+    upgradeBtn.style.display = '';
+  }
+
+  async function confirmUpgrade() {
+    upgradeConfirm.style.display = 'none';
+    versionBadge.innerHTML = '<span class="badge badge-upgrading">Upgrading...</span>';
+    versionStatus.textContent = 'Upgrading \u2014 checking every 3s (0s elapsed)';
+    versionStatus.style.display = '';
+    versionStatus.focus();
+    _upgradePolling = true;
+
+    try {
+      const r = await fetch('/api/upgrade', {method: 'POST'});
+      if (r.status === 409) {
+        versionStatus.textContent = 'Upgrade already in progress. Please wait.';
+        return;
+      }
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({detail: r.statusText}));
+        versionStatus.textContent = 'Upgrade failed: ' + (err.detail || r.statusText);
+        _upgradePolling = false;
+        await loadVersion();
+        return;
+      }
+    } catch (e) {
+      versionStatus.textContent = 'Upgrade request failed: ' + e.message;
+      _upgradePolling = false;
+      await loadVersion();
+      return;
+    }
+
+    // Poll /health until the new container is up
+    const startTime = Date.now();
+    const maxWait = 180000;
+    const pollInterval = 3000;
+
+    async function poll() {
+      if (!_upgradePolling) return;
+      const elapsed = Math.round((Date.now() - startTime) / 1000);
+      versionStatus.textContent = 'Upgrading \u2014 checking every 3s (' + elapsed + 's elapsed)';
+
+      if (elapsed * 1000 >= maxWait) {
+        versionStatus.textContent = 'Upgrade is taking longer than expected. Check the Pi\u2019s network connection.';
+        _upgradePolling = false;
+        await loadVersion();
+        return;
+      }
+
+      try {
+        const h = await fetch('/health', {cache: 'no-store'});
+        if (h.ok) {
+          const data = await h.json().catch(() => ({}));
+          // Make sure this isn't the old container by checking after restart gap
+          if (elapsed >= 5) {
+            versionStatus.textContent = 'Updated successfully \u2014 reloading\u2026';
+            setTimeout(() => window.location.reload(), 2000);
+            return;
+          }
+        }
+      } catch (_) { /* container restarting — expected */ }
+
+      setTimeout(poll, pollInterval);
+    }
+
+    // Brief pause so the old container has time to receive the trigger and restart
+    setTimeout(poll, 5000);
+  }
+
+  loadVersion();
   </script>
+
+  <div id="versionFooter">
+    <div id="versionBadge"><span class="badge badge-empty">Checking version\u2026</span></div>
+    <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;">
+      <span id="versionStatus" role="status" aria-live="polite" tabindex="-1"
+            style="font-size:.78rem;color:#94a3b8;display:none;"></span>
+      <div id="upgradeConfirm" style="display:none;font-size:.82rem;color:#94a3b8;">
+        Restart the appliance to install the update? Any active measurement will be interrupted.
+        &nbsp;<button type="button" onclick="confirmUpgrade()"
+          style="background:#2dd4bf;color:#0d0f14;font-size:.8rem;padding:.3rem .75rem;border-radius:4px;">
+          Confirm</button>
+        &nbsp;<button type="button" onclick="cancelUpgrade()"
+          style="background:#334155;color:#cbd5e1;font-size:.8rem;padding:.3rem .75rem;border-radius:4px;">
+          Cancel</button>
+      </div>
+      <button type="button" id="upgradeBtn" style="display:none;" onclick="showUpgradeConfirm()">
+        Upgrade
+      </button>
+    </div>
+  </div>
 </body>
 </html>
 """
@@ -1407,6 +1567,116 @@ async def index() -> str:
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+# ── Version / upgrade helpers ─────────────────────────────────────────────────
+
+async def _fetch_latest_sha() -> Optional[str]:
+    """Fetch the latest git SHA from GHCR manifest index annotations.
+
+    Two-step: anonymous token → manifest index. Returns None on any failure.
+    The SHA is stored as an OCI annotation on the manifest index by CI.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Step 1: anonymous bearer token (required even for public repos)
+            token_resp = await client.get(
+                f"https://{_GHCR_REGISTRY}/token",
+                params={
+                    "service": _GHCR_REGISTRY,
+                    "scope": f"repository:{_GHCR_IMAGE}:pull",
+                },
+            )
+            if token_resp.status_code == 401:
+                # Retry once with fresh request (shouldn't happen for anon token)
+                logger.warning("GHCR token: unexpected 401")
+                return None
+            token_resp.raise_for_status()
+            token = token_resp.json()["token"]
+
+            # Step 2: OCI image index for :latest — annotations include revision SHA
+            manifest_resp = await client.get(
+                f"https://{_GHCR_REGISTRY}/v2/{_GHCR_IMAGE}/manifests/latest",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.oci.image.index.v1+json",
+                },
+            )
+            if manifest_resp.status_code == 429:
+                logger.warning("GHCR manifest: rate limited (429)")
+                return None
+            manifest_resp.raise_for_status()
+            annotations = manifest_resp.json().get("annotations") or {}
+            return annotations.get("org.opencontainers.image.revision")
+    except httpx.TimeoutException:
+        logger.warning("GHCR version check timed out")
+        return None
+    except Exception as exc:
+        logger.warning("GHCR version check failed: %s", exc)
+        return None
+
+
+# ── Version / upgrade routes ──────────────────────────────────────────────────
+
+@app.get("/api/version")
+async def api_version() -> dict:
+    """Return current and latest git SHAs. Cached for 1 hour."""
+    current_sha = os.environ.get("BUILD_SHA", "unknown")
+
+    cached = _version_cache.get("result")
+    if cached and cached.get("expires", 0) > time.time():
+        latest_sha = cached.get("latest_sha")
+        checked_at = cached.get("checked_at")
+    else:
+        latest_sha = await _fetch_latest_sha()
+        checked_at = time.time()
+        _version_cache["result"] = {
+            "latest_sha": latest_sha,
+            "expires": checked_at + _VERSION_CACHE_TTL,
+            "checked_at": checked_at,
+        }
+
+    up_to_date = (
+        current_sha != "unknown"
+        and latest_sha is not None
+        and current_sha == latest_sha
+    )
+
+    return {
+        "current_sha": current_sha,
+        "latest_sha": latest_sha,
+        "up_to_date": up_to_date,
+        "latest_checked_at": checked_at,
+    }
+
+
+@app.post("/api/upgrade", status_code=202)
+async def api_upgrade() -> dict:
+    """Trigger a host-side upgrade by writing a trigger file to the data volume.
+
+    The host avr-calibration-update.service watches for this file via inotifywait
+    and performs docker pull + health-check gated restart.
+    Returns 202 immediately. Returns 409 if an upgrade is already in progress.
+    """
+    trigger = _DATA_DIR / "upgrade-trigger"
+
+    if trigger.exists():
+        raise HTTPException(status_code=409, detail="Upgrade already in progress")
+
+    try:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        trigger.touch()
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Upgrade unavailable: data volume not writable ({exc})",
+        )
+    except OSError as exc:
+        if exc.errno == 28:  # ENOSPC
+            raise HTTPException(status_code=503, detail="Upgrade unavailable: disk full")
+        raise HTTPException(status_code=503, detail=f"Upgrade unavailable: {exc}")
+
+    return {"status": "upgrade_triggered"}
 
 
 @app.post("/api/measure/start")

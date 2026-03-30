@@ -73,6 +73,10 @@ ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 # Set HOME to /data so config.py finds ~/.avr-calibration at /data/.avr-calibration
 ENV HOME=/data
+# Git SHA baked at build time by CI — used by /api/version to report current version.
+# Local builds without --build-arg BUILD_SHA=... will show "unknown".
+ARG BUILD_SHA
+ENV BUILD_SHA=${BUILD_SHA:-unknown}
 
 EXPOSE 8000
 
