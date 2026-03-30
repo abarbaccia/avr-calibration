@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.9.0] - 2026-03-30
+
+### Added
+- **Measurement curve viewer:** Click any row in the History table to load and display its frequency response curve. The chart shows the before-EQ FR alongside the Harman subwoofer target curve (dashed reference line: flat above 80 Hz, +3 dB/octave below).
+- **Before/after EQ overlay:** When a session has both `start_fr` and `end_fr`, the chart renders both as labeled datasets ("Before EQ" and "After EQ") for direct comparison.
+- **PNG export:** Export button on the FR chart card. Downloads `fr-session-{id}.png` via canvas.toDataURL.
+- **URL deep linking:** Selecting a session pushes `?session={id}` to the URL. Reloading the page restores the selected session. Browser back/forward navigates between sessions.
+- **`GET /api/sessions/{session_id}` endpoint:** Returns full frequency response data (`frequencies`, `spl`) for a single session. Returns `null` for `start_fr`/`end_fr` when data is absent or corrupt.
+
+### Fixed
+- **Crash on corrupt session data:** `_row_to_session()` now defensively handles malformed JSON in `start_fr`, `end_fr`, and `filters_applied` columns. Returns a sentinel FrequencyResponse with empty arrays instead of crashing, so `list_sessions()` and `get_session()` remain functional even if old or aborted measurements have corrupt data.
+- **Empty spl crash:** `FrequencyResponse.peak_spl` and `freq_at_peak` guard against empty `spl` lists, returning `0.0` instead of raising `ValueError`.
+
 ## [0.1.8.1] - 2026-03-29
 
 ### Fixed

@@ -1,5 +1,57 @@
 # TODOS
 
+## Deferred from /autoplan (2026-03-30) — Full-Room Measurement
+
+### TODO-R1: Resolve sweep delivery for multi-channel measurement
+**Status:** GATE 1 FAILED (2026-03-30). Pi Zero 2 W vc4-hdmi only exposes `IEC958_SUBFRAME_LE`
+(S/PDIF stereo container). 8-channel PCM is not available via this driver.
+**What:** Pick one of three fallback paths and implement:
+- **Path A — Denon test tone API:** trigger per-channel pink noise via denonavr/telnet,
+  record from UMIK, FFT for RTA-based FR. Check `plughw:vc4hdmi` first:
+  `aplay -D plughw:vc4hdmi --dump-hw-params /dev/null` and
+  `python3 -c "import denonavr; print([m for m in dir(denonavr.DenonAVR) if 'tone' in m.lower() or 'speaker' in m.lower()])"`
+- **Path B — Pi 5:** HDMI audio driver supports multi-channel PCM. Swap hardware, original
+  plan works as designed. Also solves FIR convolution headroom.
+- **Path C — Mono sweep + Denon channel routing:** play mono sweep via existing HDMI path
+  (already works), use denonavr to route each speaker in sequence. One sweep per channel,
+  same UMIK capture. Uses current hardware only.
+**Why:** Blocked the entire full-room measurement feature.
+**Priority:** P1 — unblocks feature. Pick a path before writing any measurement code.
+
+### TODO-R2: Satellite channel correction path
+**What:** When correction path for satellite speakers exists (CamillaDSP full-chain or
+future Denon feature), connect the room measurement dashboard data to drive EQ recommendations.
+**Why:** Currently visibility only — no correction path for non-sub channels.
+**Priority:** P3 — depends on hardware decisions.
+
+### TODO-R3: Waterfall / decay plots
+**What:** Add time-domain waterfall (spectrogram) to `/room` dashboard.
+**Why:** Room mode decay (ringing) is as important as steady-state frequency response.
+Deferred from this PR — adds significant rendering complexity.
+**Priority:** P2 — natural follow-on once FR measurement is working.
+
+### TODO-R4: Room health monitor (recurring automated measurement)
+**What:** Schedule `calibrate measure-room` on a cron/interval, store time-series,
+alert when room response shifts significantly (furniture moved, season change, etc.).
+**Why:** This is the genuinely novel value vs. REW — automation, not just visualization.
+**Priority:** P2 — after dashboard is working.
+
+## Deferred from /autoplan (2026-03-30) — Measurement Curve Viewer
+
+### TODO-CV1: Harman target overlay on FR chart
+**What:** Add the Harman target curve as a reference line on the frequency response chart.
+**Completed:** v0.1.9.0 (2026-03-30) — implemented as dashed `#94a3b8` dataset using median SPL as reference. Flat above 80 Hz, +3 dB/octave below.
+
+### TODO-CV2: Delta-from-Harman column in history table
+**What:** Add a computed column to the history table showing the RMS deviation from the Harman target curve for each session. A single number that answers "how close am I to target?"
+**Why:** Without this, 10 sessions of data still can't answer "is my calibration improving?" The column makes the history table a progress dashboard.
+**Effort:** M — requires computing the Harman error metric against stored FR data. Needs the Harman target data from TODO-CV1 first.
+**Priority:** P2 — depends on TODO-CV1.
+
+### TODO-CV3: URL deep linking for sessions
+**What:** `?session=3` query param on page load restores the selected session. `history.pushState()` when a session is loaded.
+**Completed:** v0.1.9.0 (2026-03-30) — `?session={id}` on load, `history.pushState` on select, `popstate` handler for back/forward.
+
 ## Deferred from /plan-eng-review (2026-03-19)
 
 ### TODO-1: Dry-run mode
