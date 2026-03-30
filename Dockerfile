@@ -27,10 +27,14 @@ COPY pyproject.toml uv.lock ./
 COPY calibrate/ ./calibrate/
 
 RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \
-        echo "ARMv7 (Pi Zero 2 W): uv build, skip measurement extra (pytta build fails on arm/v7)" && \
+        echo "ARMv7 (Pi Zero 2 W): pre-install numpy from piwheels, then uv sync for everything else" && \
         pip install --no-cache-dir uv && \
         uv venv /opt/venv && \
-        UV_PROJECT_ENVIRONMENT=/opt/venv UV_EXTRA_INDEX_URL=https://www.piwheels.org/simple uv sync --extra dev --no-editable; \
+        NUMPY_VER=$(grep -A1 '^name = "numpy"$' uv.lock | grep version | grep -o '[0-9][0-9.]*') && \
+        /opt/venv/bin/pip install --no-cache-dir \
+            --extra-index-url https://www.piwheels.org/simple \
+            "numpy==${NUMPY_VER}" && \
+        UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --extra dev --no-editable; \
     else \
         echo "amd64: full deps including pytta (measurement extra)" && \
         pip install --no-cache-dir uv && \
