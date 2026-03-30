@@ -73,6 +73,12 @@ Early development. Currently implemented:
   - **URL deep linking:** `?session={id}` restores the selected session on load; browser back/forward navigates history.
   - **PNG export:** export the active FR chart as a PNG.
 - **Sub-alignment:** `POST /api/align-subs/start|record|cancel` — sweep each sub independently, extract IR, apply delays + polarity + level matching via miniDSP
+- **Extended target curves:** HT-Aggressive (+4 dB/octave below 100 Hz for movies) and Musicality (Gaussian peak at 30 Hz) join Harman and Flat in the curve selector
+- **Sub Trim Advisor:** enter your Audyssey sub trim reading and get a color-coded badge (green/amber/red/blue) with actionable guidance
+- **Seat-to-seat variance:** average multiple measurement sessions and see a ±1σ variance band on the chart
+- **Phase/Time Alignment:** IR-based cross-correlation estimates sub/mains time offset in milliseconds and feet with a plain-language delay recommendation
+- **Dynamic EQ Advisor:** dismissable reminder card to disable Audyssey Dynamic EQ before calibrating
+- **Cardioid sub helper:** `POST /api/signal-path/cardioid` — inverts polarity and applies computed delay to miniDSP output 1 for cardioid array mode
 - `Dockerfile` + `.github/workflows/docker.yml` — multi-platform Docker image (arm/v7 + amd64), built and pushed to GHCR via GitHub Actions
 - `deploy/install.sh` — Pi Zero 2 W bootstrap: installs Docker, pulls GHCR image, starts systemd service
 

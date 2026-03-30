@@ -6,10 +6,16 @@ sessions  — one row per calibration run; holds start/end frequency responses
             and any filters applied during the session.
 feedback  — zero or more subjective feedback entries per session, with an
             optional content_tag for TODO-3 content-aware EQ profiles.
+
+Migration
+---------
+_migrate_schema() is called after _init_schema() on every startup. It uses
+PRAGMA table_info to detect missing columns and adds them with ALTER TABLE.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import sqlite3
@@ -45,6 +51,25 @@ CREATE TABLE IF NOT EXISTS feedback (
 """
 
 
+_IR_DTYPE = "float32"
+_IR_BYTES = 4  # bytes per float32
+
+
+def _encode_ir(ir: list[float]) -> str:
+    """Encode an IR sample list as a base64 float32 blob (TEXT column)."""
+    import struct
+    packed = struct.pack(f"<{len(ir)}f", *ir)
+    return base64.b64encode(packed).decode("ascii")
+
+
+def _decode_ir(blob: str) -> list[float]:
+    """Decode a base64 float32 blob back to a list of floats."""
+    import struct
+    raw = base64.b64decode(blob)
+    n = len(raw) // _IR_BYTES
+    return list(struct.unpack(f"<{n}f", raw[:n * _IR_BYTES]))
+
+
 @dataclass
 class Session:
     id: int
@@ -54,6 +79,7 @@ class Session:
     end_fr: Optional[FrequencyResponse]
     filters_applied: Optional[list[dict]]
     notes: Optional[str]
+    impulse_response: Optional[list[float]] = None  # time-domain IR (first 24 000 samples)
 
 
 class SessionStore:
@@ -72,6 +98,7 @@ class SessionStore:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+        self._migrate_schema()
 
     # ── Schema ───────────────────────────────────────────────────────────────
 
@@ -84,6 +111,18 @@ class SessionStore:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
 
+    def _migrate_schema(self) -> None:
+        """Add columns to existing tables that were introduced after initial schema.
+
+        Uses PRAGMA table_info to detect missing columns — idempotent on repeat runs.
+        """
+        with self._connect() as conn:
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+            if "impulse_response" not in existing:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN impulse_response TEXT DEFAULT NULL"
+                )
+
     # ── Sessions ─────────────────────────────────────────────────────────────
 
     def save_measurement(
@@ -92,10 +131,12 @@ class SessionStore:
         label: Optional[str] = None,
     ) -> int:
         """Persist a measurement as a new session. Returns the new session id."""
+        ir_blob = _encode_ir(fr.impulse_response) if fr.impulse_response else None
         with self._connect() as conn:
             cur = conn.execute(
-                "INSERT INTO sessions (timestamp, label, start_fr) VALUES (?, ?, ?)",
-                (fr.timestamp, label, fr.to_json()),
+                "INSERT INTO sessions (timestamp, label, start_fr, impulse_response)"
+                " VALUES (?, ?, ?, ?)",
+                (fr.timestamp, label, fr.to_json(), ir_blob),
             )
             return cur.lastrowid
 
@@ -180,6 +221,14 @@ class SessionStore:
             logger.warning("session %d has corrupt filters_applied; ignoring", row["id"])
             filters_applied = None
 
+        ir = None
+        try:
+            raw_ir = row["impulse_response"] if "impulse_response" in row.keys() else None
+            if raw_ir:
+                ir = _decode_ir(raw_ir)
+        except Exception:
+            logger.warning("session %d has corrupt impulse_response; ignoring", row["id"])
+
         return Session(
             id=row["id"],
             timestamp=row["timestamp"],
@@ -188,4 +237,5 @@ class SessionStore:
             end_fr=end_fr,
             filters_applied=filters_applied,
             notes=row["notes"],
+            impulse_response=ir,
         )

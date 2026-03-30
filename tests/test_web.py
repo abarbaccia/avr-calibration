@@ -1248,3 +1248,318 @@ def test_measure_start_position_label_optional(client, cfg_path):
     token = r.json()["token"]
     with _pending_lock:
         assert _pending_sweeps[token]["label"] == "after EQ"
+
+
+# ── POST /api/sessions/average — F3 variance ──────────────────────────────────
+
+def test_average_sessions_returns_variance(client):
+    """Response includes spl_variance array of same length as spl_dbfs."""
+    freqs = [20.0, 40.0, 80.0]
+    s1 = _make_session_with_fr(1, freqs, [0.0, 0.0, 0.0])
+    s2 = _make_session_with_fr(2, freqs, [6.0, 6.0, 6.0])
+
+    sessions = {1: s1, 2: s2}
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.side_effect = lambda sid: sessions.get(sid)
+        r = client.post("/api/sessions/average", json={"session_ids": [1, 2]})
+
+    assert r.status_code == 200
+    data = r.json()
+    assert "spl_variance" in data
+    assert len(data["spl_variance"]) == len(data["spl_dbfs"])
+
+
+def test_average_sessions_variance_zero_for_identical(client):
+    """Two identical sessions → spl_variance is all zeros."""
+    freqs = [20.0, 40.0, 80.0]
+    s1 = _make_session_with_fr(1, freqs, [3.0, 3.0, 3.0])
+    s2 = _make_session_with_fr(2, freqs, [3.0, 3.0, 3.0])
+
+    sessions = {1: s1, 2: s2}
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.side_effect = lambda sid: sessions.get(sid)
+        r = client.post("/api/sessions/average", json={"session_ids": [1, 2]})
+
+    assert r.status_code == 200
+    assert all(v == 0.0 for v in r.json()["spl_variance"])
+
+
+def test_average_sessions_variance_known_values(client):
+    """Sessions at +6 and -6 dB → σ = stdev(6, -6) = 6*sqrt(2) ≈ 8.485 dB."""
+    import math
+    freqs = [20.0]
+    s1 = _make_session_with_fr(1, freqs, [6.0])
+    s2 = _make_session_with_fr(2, freqs, [-6.0])
+
+    sessions = {1: s1, 2: s2}
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.side_effect = lambda sid: sessions.get(sid)
+        r = client.post("/api/sessions/average", json={"session_ids": [1, 2]})
+
+    assert r.status_code == 200
+    sigma = r.json()["spl_variance"][0]
+    assert abs(sigma - math.sqrt(72)) < 0.01  # stdev([6, -6]) = sqrt(72)
+
+
+# ── POST /api/sessions/time-align — F4 phase check ────────────────────────────
+
+from calibrate.web import compute_time_offset_ms
+
+
+def _make_session_with_ir(session_id: int, ir: list[float]):
+    """Build a minimal Session with an impulse response."""
+    from calibrate.storage import Session
+    freqs = [20.0, 40.0, 80.0]
+    fr = FrequencyResponse(
+        frequencies=freqs, spl=[0.0, 0.0, 0.0], sample_rate=48000,
+        sweep_duration=3.0, timestamp="2026-03-20T12:00:00+00:00",
+    )
+    return Session(id=session_id, timestamp="2026-03-20T12:00:00+00:00",
+                   label=None, start_fr=fr, end_fr=None,
+                   filters_applied=None, notes=None, impulse_response=ir)
+
+
+def test_compute_time_offset_ms_unit():
+    """IR impulse with known 10ms lag → offset within 1ms.
+
+    Uses a broadband impulse (n=24000) so the 60-100 Hz bandpass has enough
+    frequency bins (~20 bins at 2 Hz resolution) to localise the delay cleanly.
+    A pure sine would be ambiguous because the period (~12.5 ms) is close to
+    the shift (10 ms).
+    """
+    sr = 48000
+    shift = int(0.010 * sr)  # 480 samples = 10 ms
+    n = 24000                 # 2 Hz freq resolution → ~20 bins in 60-100 Hz band
+    base = [0.0] * n
+    base[1000] = 1.0          # impulse at sample 1000
+    delayed = [0.0] * n
+    delayed[1000 + shift] = 1.0  # same impulse, delayed by 480 samples
+    offset = compute_time_offset_ms(base, delayed, sample_rate=sr)
+    assert abs(abs(offset) - 10.0) < 1.0
+
+
+def test_time_align_happy_path(client):
+    """Two sessions with IR → returns offset_ms, offset_feet, sub_leads, recommendation."""
+    ir = [0.0] * 4096
+    ir[100] = 1.0  # impulse at sample 100
+    s1 = _make_session_with_ir(1, ir)
+    s2 = _make_session_with_ir(2, ir)
+
+    sessions = {1: s1, 2: s2}
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.side_effect = lambda sid: sessions.get(sid)
+        r = client.post("/api/sessions/time-align",
+                        json={"sub_session_id": 1, "mains_session_id": 2})
+
+    assert r.status_code == 200
+    data = r.json()
+    assert "offset_ms" in data
+    assert "offset_feet" in data
+    assert "sub_leads" in data
+    assert "recommendation" in data
+
+
+def test_time_align_session_not_found(client):
+    """Unknown session ID → 404."""
+    ir = [0.0] * 100
+    s1 = _make_session_with_ir(1, ir)
+
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.side_effect = lambda sid: s1 if sid == 1 else None
+        r = client.post("/api/sessions/time-align",
+                        json={"sub_session_id": 1, "mains_session_id": 99})
+
+    assert r.status_code == 404
+
+
+def test_time_align_no_ir_sub(client):
+    """Sub session has no IR → 422 with IR_NOT_AVAILABLE."""
+    from calibrate.storage import Session
+    freqs = [20.0, 40.0]
+    fr = FrequencyResponse(frequencies=freqs, spl=[0.0, 0.0], sample_rate=48000,
+                           sweep_duration=3.0, timestamp="2026-03-20T12:00:00+00:00")
+    no_ir = Session(id=1, timestamp="2026-03-20T12:00:00+00:00", label=None,
+                    start_fr=fr, end_fr=None, filters_applied=None, notes=None,
+                    impulse_response=None)
+    has_ir = _make_session_with_ir(2, [0.0] * 100)
+
+    sessions = {1: no_ir, 2: has_ir}
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.side_effect = lambda sid: sessions.get(sid)
+        r = client.post("/api/sessions/time-align",
+                        json={"sub_session_id": 1, "mains_session_id": 2})
+
+    assert r.status_code == 422
+    assert r.json()["detail"]["error"] == "IR_NOT_AVAILABLE"
+
+
+def test_time_align_no_ir_mains(client):
+    """Mains session has no IR → 422 with IR_NOT_AVAILABLE."""
+    from calibrate.storage import Session
+    freqs = [20.0, 40.0]
+    fr = FrequencyResponse(frequencies=freqs, spl=[0.0, 0.0], sample_rate=48000,
+                           sweep_duration=3.0, timestamp="2026-03-20T12:00:00+00:00")
+    has_ir = _make_session_with_ir(1, [0.0] * 100)
+    no_ir = Session(id=2, timestamp="2026-03-20T12:00:00+00:00", label=None,
+                    start_fr=fr, end_fr=None, filters_applied=None, notes=None,
+                    impulse_response=None)
+
+    sessions = {1: has_ir, 2: no_ir}
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.side_effect = lambda sid: sessions.get(sid)
+        r = client.post("/api/sessions/time-align",
+                        json={"sub_session_id": 1, "mains_session_id": 2})
+
+    assert r.status_code == 422
+    assert r.json()["detail"]["error"] == "IR_NOT_AVAILABLE"
+
+
+def test_time_align_crosscorr_known_offset(client):
+    """IR impulse with injected 10ms shift → endpoint returns offset within 1ms."""
+    sr = 48000
+    shift = int(0.010 * sr)  # 480 samples
+    n = 24000
+    base = [0.0] * n
+    base[1000] = 1.0
+    delayed = [0.0] * n
+    delayed[1000 + shift] = 1.0
+
+    s_sub = _make_session_with_ir(1, base)
+    s_mains = _make_session_with_ir(2, delayed)
+
+    sessions = {1: s_sub, 2: s_mains}
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.side_effect = lambda sid: sessions.get(sid)
+        r = client.post("/api/sessions/time-align",
+                        json={"sub_session_id": 1, "mains_session_id": 2})
+
+    assert r.status_code == 200
+    assert abs(abs(r.json()["offset_ms"]) - 10.0) < 1.0
+
+
+# ── GET /api/sessions — has_ir field ─────────────────────────────────────────
+
+def test_list_sessions_has_ir_field(client):
+    """GET /api/sessions includes has_ir: true when impulse_response is stored."""
+    from calibrate.storage import Session
+    ir = [0.0] * 100
+    fr = FrequencyResponse(frequencies=[20.0], spl=[0.0], sample_rate=48000,
+                           sweep_duration=3.0, timestamp="2026-03-20T12:00:00+00:00")
+    s_with_ir = Session(id=1, timestamp="2026-03-20T12:00:00+00:00", label=None,
+                        start_fr=fr, end_fr=None, filters_applied=None, notes=None,
+                        impulse_response=ir)
+    s_no_ir = Session(id=2, timestamp="2026-03-20T12:00:00+00:00", label=None,
+                      start_fr=fr, end_fr=None, filters_applied=None, notes=None,
+                      impulse_response=None)
+
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [s_with_ir, s_no_ir]
+        r = client.get("/api/sessions")
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data[0]["has_ir"] is True
+    assert data[1]["has_ir"] is False
+
+
+# ── POST /api/signal-path/cardioid — F6 ───────────────────────────────────────
+
+def _make_cardioid_config(tmp_path, sub_outputs=(0, 1), sep_m=1.0):
+    """Write a config.yaml with minidsp.signal_path.sub_outputs set."""
+    import yaml
+    p = tmp_path / "config.yaml"
+    cfg = {
+        "denon": {"host": "192.168.1.100"},
+        "minidsp": {
+            "host": "localhost",
+            "port": 5380,
+            "sub_separation_m": sep_m,
+            "signal_path": {"sub_outputs": list(sub_outputs)},
+        },
+        "mic": {"name": "UMIK"},
+    }
+    p.write_text(yaml.dump(cfg))
+    return p
+
+
+def test_cardioid_happy_path(client, tmp_path):
+    """Cardioid enabled → polarity inverted, delay set on output 1."""
+    from unittest.mock import AsyncMock
+    cfg_p = _make_cardioid_config(tmp_path)
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_p),
+        patch("calibrate.adapters.minidsp.MinidspClient") as MockClient,
+    ):
+        mc = MagicMock()
+        mc.set_output_polarity = AsyncMock(return_value=None)
+        mc.set_output_delay = AsyncMock(return_value=None)
+        MockClient.return_value = mc
+
+        r = client.post("/api/signal-path/cardioid",
+                        json={"enabled": True, "delay_ms": 2.9})
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "ok"
+    assert data["enabled"] is True
+    assert abs(data["delay_ms"] - 2.9) < 0.01
+
+
+def test_cardioid_disabled(client, tmp_path):
+    """Cardioid disabled → polarity normal, delay 0."""
+    from unittest.mock import AsyncMock
+    cfg_p = _make_cardioid_config(tmp_path)
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_p),
+        patch("calibrate.adapters.minidsp.MinidspClient") as MockClient,
+    ):
+        mc = MagicMock()
+        mc.set_output_polarity = AsyncMock(return_value=None)
+        mc.set_output_delay = AsyncMock(return_value=None)
+        MockClient.return_value = mc
+
+        r = client.post("/api/signal-path/cardioid",
+                        json={"enabled": False})
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "ok"
+    assert data["enabled"] is False
+    assert data["delay_ms"] == 0.0
+
+
+def test_cardioid_no_sub_outputs(client, tmp_path):
+    """Config without 2+ sub_outputs → 422."""
+    import yaml
+    cfg_p = tmp_path / "config.yaml"
+    cfg_p.write_text(yaml.dump({
+        "denon": {"host": "192.168.1.100"},
+        "minidsp": {"host": "localhost", "port": 5380},
+        "mic": {"name": "UMIK"},
+    }))
+    with patch("calibrate.web.CONFIG_PATH", cfg_p):
+        r = client.post("/api/signal-path/cardioid", json={"enabled": True})
+    assert r.status_code == 422
+
+
+def test_cardioid_polarity_404_fallback(client, tmp_path):
+    """MinidspApiError 404 on polarity → advisory_only response, not 500."""
+    from unittest.mock import AsyncMock
+    from calibrate.adapters.minidsp import MinidspApiError
+    cfg_p = _make_cardioid_config(tmp_path)
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_p),
+        patch("calibrate.adapters.minidsp.MinidspClient") as MockClient,
+    ):
+        mc = MagicMock()
+        mc.set_output_polarity = AsyncMock(
+            side_effect=MinidspApiError(404, "/output/1/polarity")
+        )
+        MockClient.return_value = mc
+
+        r = client.post("/api/signal-path/cardioid",
+                        json={"enabled": True})
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "advisory_only"
