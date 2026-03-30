@@ -1563,3 +1563,158 @@ def test_cardioid_polarity_404_fallback(client, tmp_path):
     assert r.status_code == 200
     data = r.json()
     assert data["status"] == "advisory_only"
+
+
+# ── Signal Path endpoints ─────────────────────────────────────────────────────
+
+class TestGetSignalPathConfig:
+    def test_returns_empty_when_not_configured(self, client, tmp_path, monkeypatch):
+        import yaml
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({
+            "minidsp": {"host": "localhost", "port": 5380},
+        }))
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_file)
+        r = client.get("/api/signal-path")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["source"] is None
+        assert data["preset"] is None
+        assert data["routing"] == []
+
+    def test_returns_configured_values(self, client, tmp_path, monkeypatch):
+        import yaml
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({
+            "minidsp": {
+                "host": "localhost", "port": 5380,
+                "signal_path": {
+                    "source": "Toslink",
+                    "preset": 1,
+                    "routing": [{"input": 0, "outputs": [0, 1]}],
+                },
+            },
+        }))
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_file)
+        r = client.get("/api/signal-path")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["source"] == "Toslink"
+        assert data["preset"] == 1
+        assert data["routing"] == [{"input": 0, "outputs": [0, 1]}]
+
+
+class TestApplySignalPath:
+    def test_invalid_source_returns_422(self, client, tmp_path, monkeypatch):
+        import yaml
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({"minidsp": {"host": "localhost", "port": 5380}}))
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_file)
+        r = client.post("/api/signal-path/apply", json={"source": "HDMI", "preset": 0})
+        assert r.status_code == 422
+
+    def test_invalid_preset_returns_422(self, client, tmp_path, monkeypatch):
+        import yaml
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({"minidsp": {"host": "localhost", "port": 5380}}))
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_file)
+        r = client.post("/api/signal-path/apply", json={"source": "Analog", "preset": 99})
+        assert r.status_code == 422
+
+    def test_happy_path_source_and_preset(self, client, tmp_path, monkeypatch):
+        import yaml
+        from unittest.mock import AsyncMock
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({"minidsp": {"host": "localhost", "port": 5380}}))
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_file)
+
+        mock_client = AsyncMock()
+        with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+            r = client.post("/api/signal-path/apply", json={"source": "Toslink", "preset": 2})
+
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "ok"
+        assert data["source"] == "Toslink"
+        assert data["preset"] == 2
+        assert data["routing_applied"] is False
+        mock_client.switch_preset.assert_called_once_with(2)
+        mock_client.switch_source.assert_called_once_with("Toslink")
+
+    def test_applies_routing_from_config(self, client, tmp_path, monkeypatch):
+        import yaml
+        from unittest.mock import AsyncMock
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({
+            "minidsp": {
+                "host": "localhost", "port": 5380,
+                "signal_path": {
+                    "routing": [{"input": 0, "outputs": [0, 1, 2, 3]}],
+                },
+            },
+        }))
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_file)
+
+        mock_client = AsyncMock()
+        with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+            r = client.post("/api/signal-path/apply", json={})
+
+        assert r.status_code == 200
+        assert r.json()["routing_applied"] is True
+        mock_client.set_input_routing.assert_called_once_with(
+            0, {0: True, 1: True, 2: True, 3: True}
+        )
+
+    def test_minidsp_api_error_returns_502(self, client, tmp_path, monkeypatch):
+        import yaml
+        from unittest.mock import AsyncMock
+        from calibrate.adapters.minidsp import MinidspApiError
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({"minidsp": {"host": "localhost", "port": 5380}}))
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_file)
+
+        mock_client = AsyncMock()
+        mock_client.switch_preset.side_effect = MinidspApiError(502, "/devices/0/preset/1")
+        with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+            r = client.post("/api/signal-path/apply", json={"preset": 1})
+
+        assert r.status_code == 502
+
+
+class TestGetDeviceState:
+    def test_returns_master_status(self, client, tmp_path, monkeypatch):
+        import yaml
+        from unittest.mock import AsyncMock
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({"minidsp": {"host": "localhost", "port": 5380}}))
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_file)
+
+        device_status = {
+            "master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False},
+            "input_levels": [],
+            "output_levels": [],
+        }
+        mock_client = AsyncMock()
+        mock_client.get_device_status.return_value = device_status
+        with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+            r = client.get("/api/signal-path/device-state")
+
+        assert r.status_code == 200
+        data = r.json()
+        assert data["master"]["source"] == "Analog"
+        assert data["master"]["preset"] == 0
+
+    def test_minidsp_api_error_returns_502(self, client, tmp_path, monkeypatch):
+        import yaml
+        from unittest.mock import AsyncMock
+        from calibrate.adapters.minidsp import MinidspApiError
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({"minidsp": {"host": "localhost", "port": 5380}}))
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_file)
+
+        mock_client = AsyncMock()
+        mock_client.get_device_status.side_effect = MinidspApiError(503, "/devices/0")
+        with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+            r = client.get("/api/signal-path/device-state")
+
+        assert r.status_code == 502

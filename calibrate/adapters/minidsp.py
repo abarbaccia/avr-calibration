@@ -41,6 +41,12 @@ Slots 2-9 are available for amplitude EQ (ALIGNMENT_PEQ_SLOTS).
 ALIGNMENT_PEQ_SLOTS: range = range(2, 10)
 """PEQ slots used by the alignment amplitude-EQ pass."""
 
+VALID_SOURCES: frozenset[str] = frozenset({"Analog", "Toslink", "USB"})
+"""Valid input source names for the miniDSP 2x4 HD."""
+
+MAX_PRESET_INDEX: int = 3
+"""Highest valid preset slot index (miniDSP 2x4 HD has 4 presets: 0-3)."""
+
 
 # ── Exceptions ─────────────────────────────────────────────────────────────────
 
@@ -73,6 +79,8 @@ class MinidspClient:
         await client.set_output_delay(0, 4.5)
         await client.set_output_polarity(0, inverted=True)
         await client.set_input_routing(1, {0: True, 1: False, 2: True, 3: True})
+        await client.switch_preset(1)
+        await client.switch_source("Toslink")
         await client.restore_all_gains([0, 1])
     """
 
@@ -91,6 +99,14 @@ class MinidspClient:
         if response.status_code >= 400:
             raise MinidspApiError(response.status_code, path)
 
+    async def _post(self, path: str) -> None:
+        """POST with no body to *path*, raising MinidspApiError on 4xx/5xx."""
+        url = f"{self._base}{path}"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(url)
+        if response.status_code >= 400:
+            raise MinidspApiError(response.status_code, path)
+
     # ── Public API ─────────────────────────────────────────────────────────────
 
     async def get_devices(self) -> list[dict]:
@@ -100,6 +116,50 @@ class MinidspClient:
             response = await client.get(url)
         response.raise_for_status()
         return response.json()  # type: ignore[no-any-return]
+
+    async def get_device_status(self) -> dict:
+        """Return the current master status for the device.
+
+        Response shape from minidspd:
+          {
+            "master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": false},
+            "input_levels": [...],
+            "output_levels": [...]
+          }
+
+        Raises MinidspApiError on HTTP error.
+        """
+        path = f"/devices/{self._device_index}"
+        url = f"{self._base}{path}"
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(url)
+        if response.status_code >= 400:
+            raise MinidspApiError(response.status_code, path)
+        return response.json()  # type: ignore[no-any-return]
+
+    async def switch_preset(self, preset: int) -> None:
+        """Switch the active preset slot to *preset* (0-3).
+
+        Raises ValueError if preset is out of range.
+        Raises MinidspApiError on HTTP error.
+        """
+        if not (0 <= preset <= MAX_PRESET_INDEX):
+            raise ValueError(
+                f"preset={preset} out of range; must be 0-{MAX_PRESET_INDEX}"
+            )
+        await self._post(f"/devices/{self._device_index}/preset/{preset}")
+
+    async def switch_source(self, source: str) -> None:
+        """Switch the input source to *source* (Analog/Toslink/USB).
+
+        Raises ValueError if source is not in VALID_SOURCES.
+        Raises MinidspApiError on HTTP error.
+        """
+        if source not in VALID_SOURCES:
+            raise ValueError(
+                f"source={source!r} invalid; must be one of {sorted(VALID_SOURCES)}"
+            )
+        await self._post(f"/devices/{self._device_index}/source/{source}")
 
     async def set_output_gain(self, output: int, gain_db: float) -> None:
         """Set output *output* gain to *gain_db* dB.

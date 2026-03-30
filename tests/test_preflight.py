@@ -237,10 +237,11 @@ class TestRunAll:
             patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", True, "2x4HD")),
             patch.object(checker, "check_denon", return_value=CheckResult("Denon AVR", True, "X3800H")),
             patch.object(checker, "check_playback_route", return_value=CheckResult("Playback Route", True, "USB: miniDSP")),
+            patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
         ):
             results = await checker.run_all()
         assert all(r.passed for r in results)
-        assert len(results) == 5
+        assert len(results) == 6
 
     async def test_unhandled_exception_becomes_failed_result(self, config):
         checker = PreflightChecker(config)
@@ -264,9 +265,10 @@ class TestRunAll:
             patch.object(checker, "check_minidsp", side_effect=RuntimeError("err")),
             patch.object(checker, "check_denon", side_effect=RuntimeError("err")),
             patch.object(checker, "check_playback_route", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_signal_path_sync", side_effect=RuntimeError("err")),
         ):
             results = await checker.run_all()
-        assert [r.name for r in results] == ["Microphone", "miniDSP USB", "miniDSP", "Denon AVR", "Playback Route"]
+        assert [r.name for r in results] == ["Microphone", "miniDSP USB", "miniDSP", "Denon AVR", "Playback Route", "Signal Path"]
 
     async def test_partial_failure(self, config):
         checker = PreflightChecker(config)
@@ -276,6 +278,7 @@ class TestRunAll:
             patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", False, "", "start minidspd")),
             patch.object(checker, "check_denon", return_value=CheckResult("Denon AVR", True, "X3800H")),
             patch.object(checker, "check_playback_route", return_value=CheckResult("Playback Route", True, "USB")),
+            patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
         ):
             results = await checker.run_all()
         assert results[0].passed  # Microphone
@@ -283,6 +286,7 @@ class TestRunAll:
         assert not results[2].passed  # miniDSP
         assert results[3].passed  # Denon AVR
         assert results[4].passed  # Playback Route
+        assert results[5].passed  # Signal Path
 
 
 # ── Playback route checks ─────────────────────────────────────────────────────
@@ -345,3 +349,68 @@ class TestPlaybackRouteCheck:
         assert not result.passed
         assert "portaudio error" in result.error
         sys.modules["sounddevice"].query_devices.side_effect = None
+
+
+# ── Signal path sync check ────────────────────────────────────────────────────
+
+class TestSignalPathSync:
+    async def test_skipped_when_not_configured(self, config):
+        """No signal_path in config → skipped (passes)."""
+        result = await PreflightChecker(config).check_signal_path_sync()
+        assert result.passed
+        assert "skipped" in result.detail
+
+    async def test_skipped_when_no_source_or_preset(self, config):
+        config._data["minidsp"]["signal_path"] = {}
+        result = await PreflightChecker(config).check_signal_path_sync()
+        assert result.passed
+        assert "skipped" in result.detail
+
+    async def test_passes_when_device_matches_config(self, config):
+        config._data["minidsp"]["signal_path"] = {"source": "Analog", "preset": 0}
+        from unittest.mock import AsyncMock, patch
+        mock_client = AsyncMock()
+        mock_client.get_device_status.return_value = {
+            "master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False}
+        }
+        with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+            result = await PreflightChecker(config).check_signal_path_sync()
+        assert result.passed
+        assert "source=Analog" in result.detail
+        assert "preset=0" in result.detail
+
+    async def test_fails_on_source_mismatch(self, config):
+        config._data["minidsp"]["signal_path"] = {"source": "Toslink"}
+        from unittest.mock import AsyncMock, patch
+        mock_client = AsyncMock()
+        mock_client.get_device_status.return_value = {
+            "master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False}
+        }
+        with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+            result = await PreflightChecker(config).check_signal_path_sync()
+        assert not result.passed
+        assert "source" in result.detail
+        assert "signal-path apply" in result.error
+
+    async def test_fails_on_preset_mismatch(self, config):
+        config._data["minidsp"]["signal_path"] = {"preset": 2}
+        from unittest.mock import AsyncMock, patch
+        mock_client = AsyncMock()
+        mock_client.get_device_status.return_value = {
+            "master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False}
+        }
+        with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+            result = await PreflightChecker(config).check_signal_path_sync()
+        assert not result.passed
+        assert "preset" in result.detail
+
+    async def test_api_error_becomes_failed_result(self, config):
+        config._data["minidsp"]["signal_path"] = {"source": "Analog"}
+        from unittest.mock import AsyncMock, patch
+        from calibrate.adapters.minidsp import MinidspApiError
+        mock_client = AsyncMock()
+        mock_client.get_device_status.side_effect = MinidspApiError(503, "/devices/0")
+        with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+            result = await PreflightChecker(config).check_signal_path_sync()
+        assert not result.passed
+        assert result.error
