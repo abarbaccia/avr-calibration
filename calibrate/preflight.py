@@ -471,8 +471,5 @@ class PreflightChecker:
         The Config check currently validates presence of non-discoverable required fields.
         """
         host = self.config.denon.get("host")
-        notes = []
-        if not host:
-            notes.append("denon.host not set (will use SSDP auto-discovery)")
-        detail = "; ".join(notes) if notes else "All fields present"
+        detail = "denon.host not set (will use SSDP auto-discovery)" if not host else "All fields present"
         return CheckResult(name="Config", passed=True, detail=detail)
