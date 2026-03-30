@@ -20,19 +20,31 @@ Coverage diagram:
   │   ├── [TESTED] TimeoutException → fails, wait-and-retry hint
   │   ├── [TESTED] Unexpected exception → fails gracefully
   │   └── [TESTED] Custom host and port respected
+  ├── check_minidsp_combined()
+  │   ├── [TESTED] Both pass → single pass result with combined detail
+  │   ├── [TESTED] Only hidraw fails → propagates hidraw error
+  │   ├── [TESTED] Only daemon fails → propagates daemon error
+  │   └── [TESTED] Both fail → combined failure, USB error takes precedence
   ├── check_denon()
   │   ├── [TESTED] AVR online → passes with model name
   │   ├── [TESTED] model_name is None → falls back to "Denon AVR"
-  │   ├── [TESTED] host not configured → fails, edit-config hint
+  │   ├── [TESTED] host not configured → auto-discovers via SSDP
+  │   ├── [TESTED] host not configured, nothing found → fails with scan message
   │   ├── [TESTED] Connection fails → fails with host in detail
   │   └── [TESTED] Timeout → fails
+  ├── check_denon_and_playback()
+  │   ├── [TESTED] Denon passes, HDMI route → adds "HDMI playback ready"
+  │   ├── [TESTED] Denon passes, USB route, device found → combined detail
+  │   ├── [TESTED] Denon passes, USB route, device missing → fails with playback error
+  │   └── [TESTED] Denon fails → propagates failure without running playback check
   └── run_all()
-      ├── [TESTED] All pass → 5 passed results
+      ├── [TESTED] All pass → 4 passed results (Config, miniDSP, Denon AVR, Signal Path)
       ├── [TESTED] Unhandled exception → captured as failed result
       ├── [TESTED] Results named correctly even when exceptions occur
-      └── [TESTED] Partial failure (2 pass, 1 fail)
+      └── [TESTED] Partial failure (1 fail, 3 pass)
 """
 
+import asyncio
 import sys
 import pytest
 import httpx
@@ -203,12 +215,44 @@ class TestDenonCheck:
         assert result.passed
         assert "Denon AVR" in result.detail
 
-    async def test_host_not_configured(self, config):
+    async def test_host_not_configured_discovery_finds_nothing(self, config):
         config._data["denon"]["host"] = None
-        result = await PreflightChecker(config).check_denon()
+        with patch("denonavr.async_discover", new=AsyncMock(return_value=[])):
+            result = await PreflightChecker(config).check_denon()
         assert not result.passed
-        assert "not set" in result.error.lower()
-        assert "config.yaml" in result.error
+        assert "discovered" in result.detail.lower() or "found" in result.detail.lower()
+        assert "config.yaml" in result.error or "network" in result.error.lower()
+
+    async def test_host_auto_discovered_via_ssdp(self, config):
+        config._data["denon"]["host"] = None
+        mock_receiver = MagicMock()
+        mock_receiver.model_name = "Denon AVR-X3800H"
+        mock_receiver.async_setup = AsyncMock()
+        with (
+            patch("denonavr.async_discover", new=AsyncMock(return_value=[{"host": "192.168.1.42"}])),
+            patch("denonavr.DenonAVR", return_value=mock_receiver),
+        ):
+            result = await PreflightChecker(config).check_denon()
+        assert result.passed
+        assert "192.168.1.42" in result.detail
+        assert "auto-discovered" in result.detail
+
+    async def test_ssdp_discovery_timeout(self, config):
+        """SSDP discovery should fail gracefully if it takes more than 10 seconds."""
+        config._data["denon"]["host"] = None
+        with patch("denonavr.async_discover", new=AsyncMock(side_effect=asyncio.TimeoutError())):
+            result = await PreflightChecker(config).check_denon()
+        assert not result.passed
+        assert "timed out" in result.detail.lower()
+        assert "denon.host" in result.error
+
+    async def test_ssdp_device_has_no_host(self, config):
+        """SSDP returning a device with no host address should fail gracefully."""
+        config._data["denon"]["host"] = None
+        with patch("denonavr.async_discover", new=AsyncMock(return_value=[{"host": None}])):
+            result = await PreflightChecker(config).check_denon()
+        assert not result.passed
+        assert "no host address" in result.error.lower()
 
     async def test_avr_unreachable(self, config):
         mock_receiver = MagicMock()
@@ -232,67 +276,52 @@ class TestRunAll:
     async def test_all_pass(self, config):
         checker = PreflightChecker(config)
         with (
-            patch.object(checker, "check_hidraw", return_value=CheckResult("miniDSP USB", True, "/dev/hidraw0 present")),
-            patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1")),
-            patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", True, "2x4HD")),
-            patch.object(checker, "check_denon", return_value=CheckResult("Denon AVR", True, "X3800H")),
-            patch.object(checker, "check_playback_route", return_value=CheckResult("Playback Route", True, "USB: miniDSP")),
-            patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
             patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
+            patch.object(checker, "check_minidsp_combined", return_value=CheckResult("miniDSP", True, "2x4HD; /dev/hidraw0 present")),
+            patch.object(checker, "check_denon_and_playback", return_value=CheckResult("Denon AVR", True, "X3800H; USB: miniDSP")),
+            patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
         ):
             results = await checker.run_all()
         assert all(r.passed for r in results)
-        assert len(results) == 7
+        assert len(results) == 4
 
     async def test_unhandled_exception_becomes_failed_result(self, config):
         checker = PreflightChecker(config)
         with (
-            patch.object(checker, "check_hidraw", return_value=CheckResult("miniDSP USB", True, "/dev/hidraw0 present")),
-            patch.object(checker, "check_mic", side_effect=RuntimeError("boom")),
-            patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", True, "2x4HD")),
-            patch.object(checker, "check_denon", return_value=CheckResult("Denon AVR", True, "X3800H")),
-            patch.object(checker, "check_playback_route", return_value=CheckResult("Playback Route", True, "USB")),
-            patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
             patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
+            patch.object(checker, "check_minidsp_combined", side_effect=RuntimeError("boom")),
+            patch.object(checker, "check_denon_and_playback", return_value=CheckResult("Denon AVR", True, "X3800H")),
+            patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
         ):
             results = await checker.run_all()
-        mic = next(r for r in results if r.name == "Microphone")
-        assert not mic.passed
-        assert "boom" in mic.error
+        minidsp = next(r for r in results if r.name == "miniDSP")
+        assert not minidsp.passed
+        assert "boom" in minidsp.error
 
     async def test_result_names_match_expected(self, config):
         checker = PreflightChecker(config)
         with (
-            patch.object(checker, "check_hidraw", side_effect=RuntimeError("err")),
-            patch.object(checker, "check_mic", side_effect=RuntimeError("err")),
-            patch.object(checker, "check_minidsp", side_effect=RuntimeError("err")),
-            patch.object(checker, "check_denon", side_effect=RuntimeError("err")),
-            patch.object(checker, "check_playback_route", side_effect=RuntimeError("err")),
-            patch.object(checker, "check_signal_path_sync", side_effect=RuntimeError("err")),
             patch.object(checker, "check_config", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_minidsp_combined", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_denon_and_playback", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_signal_path_sync", side_effect=RuntimeError("err")),
         ):
             results = await checker.run_all()
-        assert [r.name for r in results] == ["Microphone", "miniDSP USB", "miniDSP", "Denon AVR", "Playback Route", "Signal Path", "Config"]
+        assert [r.name for r in results] == ["Config", "miniDSP", "Denon AVR", "Signal Path"]
 
     async def test_partial_failure(self, config):
         checker = PreflightChecker(config)
         with (
-            patch.object(checker, "check_hidraw", return_value=CheckResult("miniDSP USB", True, "/dev/hidraw0 present")),
-            patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1")),
-            patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", False, "", "start minidspd")),
-            patch.object(checker, "check_denon", return_value=CheckResult("Denon AVR", True, "X3800H")),
-            patch.object(checker, "check_playback_route", return_value=CheckResult("Playback Route", True, "USB")),
-            patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
             patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
+            patch.object(checker, "check_minidsp_combined", return_value=CheckResult("miniDSP", False, "", "start minidspd")),
+            patch.object(checker, "check_denon_and_playback", return_value=CheckResult("Denon AVR", True, "X3800H")),
+            patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
         ):
             results = await checker.run_all()
-        assert results[0].passed  # Microphone
-        assert results[1].passed  # miniDSP USB
-        assert not results[2].passed  # miniDSP
-        assert results[3].passed  # Denon AVR
-        assert results[4].passed  # Playback Route
-        assert results[5].passed  # Signal Path
-        assert results[6].passed  # Config
+        assert results[0].passed   # Config
+        assert not results[1].passed  # miniDSP
+        assert results[2].passed   # Denon AVR
+        assert results[3].passed   # Signal Path
 
 
 # ── Playback route checks ─────────────────────────────────────────────────────
@@ -335,9 +364,10 @@ class TestPlaybackRouteCheck:
     async def test_hdmi_route_no_denon_host(self, config):
         config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
         config._data["denon"]["host"] = None
-        result = await PreflightChecker(config).check_playback_route()
+        with patch("denonavr.async_discover", new=AsyncMock(return_value=[])):
+            result = await PreflightChecker(config).check_playback_route()
         assert not result.passed
-        assert "denon.host" in result.error
+        assert "denon.host" in result.error or "network" in result.error.lower()
 
     async def test_hdmi_route_denon_unreachable(self, config):
         config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
@@ -422,6 +452,108 @@ class TestSignalPathSync:
         assert result.error
 
 
+# ── Combined miniDSP check ────────────────────────────────────────────────────
+
+class TestMinidspCombined:
+    async def test_both_pass_combined_detail(self, config):
+        checker = PreflightChecker(config)
+        with (
+            patch.object(checker, "check_hidraw", return_value=CheckResult("miniDSP USB", True, "/dev/hidraw0 present")),
+            patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", True, "2x4HD at localhost:5380 (serial 965535)")),
+        ):
+            result = await checker.check_minidsp_combined()
+        assert result.passed
+        assert result.name == "miniDSP"
+        assert "2x4HD" in result.detail
+        assert "/dev/hidraw0" in result.detail
+
+    async def test_only_hidraw_fails(self, config):
+        checker = PreflightChecker(config)
+        with (
+            patch.object(checker, "check_hidraw", return_value=CheckResult("miniDSP USB", False, "/dev/hidraw0 not found", "OTG adapter required")),
+            patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", True, "2x4HD at localhost:5380")),
+        ):
+            result = await checker.check_minidsp_combined()
+        assert not result.passed
+        assert result.name == "miniDSP"
+        assert "OTG" in result.error
+
+    async def test_only_daemon_fails(self, config):
+        checker = PreflightChecker(config)
+        with (
+            patch.object(checker, "check_hidraw", return_value=CheckResult("miniDSP USB", True, "/dev/hidraw0 present")),
+            patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", False, "Cannot reach minidspd", "Start the daemon")),
+        ):
+            result = await checker.check_minidsp_combined()
+        assert not result.passed
+        assert result.name == "miniDSP"
+        assert "daemon" in result.error.lower() or "start" in result.error.lower()
+
+    async def test_both_fail_usb_error_takes_precedence(self, config):
+        checker = PreflightChecker(config)
+        with (
+            patch.object(checker, "check_hidraw", return_value=CheckResult("miniDSP USB", False, "/dev/hidraw0 not found", "OTG adapter required")),
+            patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", False, "Cannot reach minidspd", "Start the daemon")),
+        ):
+            result = await checker.check_minidsp_combined()
+        assert not result.passed
+        assert result.name == "miniDSP"
+        assert "OTG" in result.error  # USB issue is more fundamental
+
+
+# ── Combined Denon + Playback check ──────────────────────────────────────────
+
+class TestDenonAndPlayback:
+    async def test_hdmi_route_denon_passes_adds_playback_detail(self, config):
+        config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
+        checker = PreflightChecker(config)
+        with patch.object(checker, "check_denon", return_value=CheckResult("Denon AVR", True, "X3800H online at 192.168.1.100")):
+            result = await checker.check_denon_and_playback()
+        assert result.passed
+        assert result.name == "Denon AVR"
+        assert "HDMI playback ready" in result.detail
+        assert "X3800H" in result.detail
+
+    async def test_usb_route_both_pass_combined_detail(self, config):
+        config._data.setdefault("measurement", {})["playback_route"] = "usb"
+        checker = PreflightChecker(config)
+        with (
+            patch.object(checker, "check_denon", return_value=CheckResult("Denon AVR", True, "X3800H online at 192.168.1.100")),
+            patch.object(checker, "check_playback_route", return_value=CheckResult("Playback Route", True, "USB: miniDSP (device 1)")),
+        ):
+            result = await checker.check_denon_and_playback()
+        assert result.passed
+        assert result.name == "Denon AVR"
+        assert "X3800H" in result.detail
+        assert "USB" in result.detail
+
+    async def test_usb_route_playback_fails(self, config):
+        config._data.setdefault("measurement", {})["playback_route"] = "usb"
+        checker = PreflightChecker(config)
+        with (
+            patch.object(checker, "check_denon", return_value=CheckResult("Denon AVR", True, "X3800H online")),
+            patch.object(checker, "check_playback_route", return_value=CheckResult("Playback Route", False, 'USB: no "miniDSP" found', "Connect miniDSP via USB")),
+        ):
+            result = await checker.check_denon_and_playback()
+        assert not result.passed
+        assert result.name == "Denon AVR"
+        assert "Connect miniDSP" in result.error
+
+    async def test_denon_fails_skips_playback_check(self, config):
+        config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
+        checker = PreflightChecker(config)
+        denon_fail = CheckResult("Denon AVR", False, "Cannot connect", "AVR unreachable")
+        with (
+            patch.object(checker, "check_denon", return_value=denon_fail),
+            patch.object(checker, "check_playback_route") as mock_playback,
+        ):
+            result = await checker.check_denon_and_playback()
+        assert not result.passed
+        assert result.name == "Denon AVR"
+        assert "AVR unreachable" in result.error
+        mock_playback.assert_not_called()
+
+
 # ── Config check ──────────────────────────────────────────────────────────────
 
 class TestPreflightConfigCheck:
@@ -430,24 +562,20 @@ class TestPreflightConfigCheck:
         assert result.passed
         assert result.error is None
 
-    async def test_check_config_denon_host_none(self):
+    async def test_check_config_denon_host_none_still_passes(self):
+        """denon.host is optional — SSDP auto-discovery covers missing host."""
         from calibrate.config import Config
         cfg = Config({"denon": {"host": None}, "minidsp": {}, "mic": {}})
         result = await PreflightChecker(cfg).check_config()
-        assert not result.passed
-        assert "denon.host" in result.error
+        assert result.passed
+        assert "SSDP" in result.detail
 
     async def test_check_config_with_valid_host(self):
         from calibrate.config import Config
         cfg = Config({"denon": {"host": "192.168.1.100"}, "minidsp": {}, "mic": {}})
         result = await PreflightChecker(cfg).check_config()
         assert result.passed
-
-    async def test_check_config_missing_field_in_detail(self):
-        from calibrate.config import Config
-        cfg = Config({"denon": {"host": None}, "minidsp": {}, "mic": {}})
-        result = await PreflightChecker(cfg).check_config()
-        assert "1" in result.detail  # "1 required field(s) missing"
+        assert "All fields present" in result.detail
 
 
 # ── HDMI deduplication ────────────────────────────────────────────────────────

@@ -360,11 +360,8 @@ _HTML = """<!DOCTYPE html>
     </div>
     <div id="checkRows">
       <div class="check-row" id="check-row-config"><span class="check-badge pending" id="badge-config">&mdash;</span><div><div class="check-name">Config</div><div class="check-detail" id="detail-config">Not run yet</div></div></div>
-      <div class="check-row" id="check-row-mic"><span class="check-badge pending" id="badge-mic">&mdash;</span><div><div class="check-name">Microphone</div><div class="check-detail" id="detail-mic">Not run yet</div></div></div>
-      <div class="check-row" id="check-row-hidraw"><span class="check-badge pending" id="badge-hidraw">&mdash;</span><div><div class="check-name">miniDSP USB</div><div class="check-detail" id="detail-hidraw">Not run yet</div></div></div>
       <div class="check-row" id="check-row-minidsp"><span class="check-badge pending" id="badge-minidsp">&mdash;</span><div><div class="check-name">miniDSP</div><div class="check-detail" id="detail-minidsp">Not run yet</div></div></div>
       <div class="check-row" id="check-row-denon"><span class="check-badge pending" id="badge-denon">&mdash;</span><div><div class="check-name">Denon AVR</div><div class="check-detail" id="detail-denon">Not run yet</div></div></div>
-      <div class="check-row" id="check-row-playback"><span class="check-badge pending" id="badge-playback">&mdash;</span><div><div class="check-name">Playback Route</div><div class="check-detail" id="detail-playback">Not run yet</div></div></div>
       <div class="check-row" id="check-row-signal-path"><span class="check-badge pending" id="badge-signal-path">&mdash;</span><div><div class="check-name">Signal Path</div><div class="check-detail" id="detail-signal-path">Not run yet</div></div></div>
     </div>
     <div style="display:flex;gap:.75rem;margin-top:1.25rem">
@@ -1318,9 +1315,8 @@ _HTML = """<!DOCTYPE html>
       if (!resp.ok) throw new Error(await resp.text());
       const results = await resp.json();
       const nameToId = {
-        'Config': 'config', 'Microphone': 'mic', 'miniDSP USB': 'hidraw',
-        'miniDSP': 'minidsp', 'Denon AVR': 'denon',
-        'Playback Route': 'playback', 'Signal Path': 'signal-path',
+        'Config': 'config', 'miniDSP': 'minidsp',
+        'Denon AVR': 'denon', 'Signal Path': 'signal-path',
       };
       for (const r of results) {
         const id = nameToId[r.name];
@@ -2433,6 +2429,10 @@ async def get_device_state() -> dict:
 # ── Preflight routes ─────────────────────────────────────────────────────────
 
 _PREFLIGHT_CHECK_MAP: dict[str, str] = {
+    # Combined checks (used by run_all and the UI)
+    "minidsp-combined": "check_minidsp_combined",
+    "denon-playback": "check_denon_and_playback",
+    # Individual checks (available for debugging / later phases)
     "hidraw": "check_hidraw",
     "mic": "check_mic",
     "minidsp": "check_minidsp",
