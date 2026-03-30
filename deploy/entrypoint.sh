@@ -28,25 +28,32 @@ if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
 fi
 
 # ── minidspd ──────────────────────────────────────────────────────────────────
-# Start the minidsp HTTP daemon in the background so the web server can reach
-# the miniDSP 2x4HD via localhost:5380.
-# Requires --device=/dev/hidraw0 (or equivalent) on `docker run`.
-# If the device is absent (first boot without DSP, or Pi Zero W HID issue),
-# minidsp exits immediately and measurements will fail gracefully via HTTP error.
-if [ -e /dev/hidraw0 ]; then
-    echo "Starting minidspd on localhost:5380..."
-    minidsp server 0.0.0.0:5380 >/tmp/minidspd.log 2>&1 &
-    MINIDSPD_PID=$!
-    # Give it a moment to bind the port
-    sleep 2
-    if kill -0 "$MINIDSPD_PID" 2>/dev/null; then
-        echo "minidspd started (pid $MINIDSPD_PID)"
-    else
-        echo "WARNING: minidspd exited — DSP control unavailable. Check /tmp/minidspd.log"
-    fi
+# Start the minidspd HTTP REST daemon so the web server can control the
+# miniDSP 2x4HD via localhost:5380.
+#
+# minidspd (REST daemon) is NOT the same as `minidsp server` (deprecated TCP
+# server for the mobile app). minidspd exposes the HTTP REST API that
+# MinidspClient uses for gain/delay/PEQ/polarity control.
+#
+# Requires --privileged (or equivalent device access) on `docker run`.
+# Without device access, minidspd starts but reports no devices; DSP control
+# operations will fail gracefully via HTTP error in the web server.
+MINIDSPD_CONF=/tmp/minidspd.toml
+cat > "$MINIDSPD_CONF" << 'TOML'
+[http_server]
+bind_address = "127.0.0.1:5380"
+TOML
+
+echo "Starting minidspd (HTTP REST) on localhost:5380..."
+minidspd --config "$MINIDSPD_CONF" >/tmp/minidspd.log 2>&1 &
+MINIDSPD_PID=$!
+# Give it a moment to bind the port
+sleep 2
+if kill -0 "$MINIDSPD_PID" 2>/dev/null; then
+    echo "minidspd started (pid $MINIDSPD_PID)"
 else
-    echo "WARNING: /dev/hidraw0 not found — DSP control unavailable."
-    echo "  Add --device=/dev/hidraw0 to docker run and ensure usbhid is bound."
+    echo "WARNING: minidspd exited — DSP control unavailable. Check /tmp/minidspd.log"
+    cat /tmp/minidspd.log >&2
 fi
 
 exec python -m uvicorn calibrate.web:app \
