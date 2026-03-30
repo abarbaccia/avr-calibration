@@ -8,15 +8,15 @@ All notable changes to this project will be documented in this file.
 - **Extended target curves (F1):** HT-Aggressive and Musicality target curves join Harman and Flat in the curve selector. HT-Aggressive adds +4 dB/octave below 100 Hz for home theater content. Musicality adds a Gaussian peak at 30 Hz for music listening. Selection persists via `localStorage`.
 - **Sub Trim Advisor (F2):** Card below the plot accepts an Audyssey sub trim reading (dB) and renders a color-coded badge with guidance. Optimal: −12 to −10 dB (green). Acceptable: −10 to −5 dB (amber). Too hot: above −5 dB (red). Too low: below −12 dB (blue).
 - **Seat-to-Seat Variance (F3):** `POST /api/sessions/average` now returns `spl_variance` (per-bin standard deviation across sessions). The chart renders a transparent teal variance band (±1σ) after averaging multiple seats.
-- **Phase/Time Alignment (F4):** Stores the first 24,000 samples of the deconvolved impulse response per measurement (base64 float32 blob, ~32KB each). `POST /api/sessions/time-align` runs bandpass cross-correlation at 60–100 Hz to estimate sub/mains time offset in milliseconds and feet. Returns `offset_ms`, `offset_feet`, `sub_leads`, and a plain-language recommendation. Sessions without IR show an advisory to re-measure.
+- **Phase/Time Alignment (F4):** Each measurement now stores its impulse response. `POST /api/sessions/time-align` cross-correlates two sessions at 60–100 Hz to estimate sub/mains time offset in milliseconds and feet — and tells you which way to move the delay. Sessions captured before this version show a "re-measure to enable phase check" advisory.
 - **Dynamic EQ Advisor (F5):** Dismissable callout card (amber border, top priority) reminding users to disable Audyssey Dynamic EQ before calibration. Persists dismissal via `localStorage`.
 - **Cardioid Sub Helper (F6):** `POST /api/signal-path/cardioid` enables cardioid array mode by inverting polarity and applying computed delay (`sub_separation_m / 343 × 1000` ms) to miniDSP output 1. Gracefully falls back to advisory-only when hardware does not support polarity inversion.
-- **IR schema migration:** `sessions` table gets a new `impulse_response` column (TEXT, nullable). Existing rows get NULL; the migration is idempotent on repeat runs.
 - **`has_ir` in session list:** `GET /api/sessions` now includes `has_ir: bool` per session so the Phase Check card can show re-measure warnings inline.
 
-### Changed
+### For contributors
 - `FrequencyResponse` carries an optional `impulse_response` field (list of float, first 24,000 samples). `_compute_fr_arrays` returns a 3-tuple `(frequencies, spl, ir_samples)`.
 - `SessionStore.save_measurement()` persists the IR blob if the `FrequencyResponse` includes it.
+- `sessions` table gets a new `impulse_response` column (TEXT, nullable) via idempotent `_migrate_schema()`. Existing rows get NULL.
 
 ## [0.1.9.0] - 2026-03-30
 
