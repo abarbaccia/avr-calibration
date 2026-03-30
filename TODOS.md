@@ -112,6 +112,13 @@ alert when room response shifts significantly (furniture moved, season change, e
 
 ## Hardware & Deployment
 
+### TODO-HW1: EMI-style USB disconnect detection in preflight
+**What:** Scan `dmesg` for `disabled by hub (EMI?)` messages in `check_hidraw()`. If found, add a targeted hint to the error: "USB voltage instability detected (EMI protection tripped). Check your Pi power supply — Pi Zero 2 W needs 2.5A+ under WiFi + USB load."
+**Why:** The generic OTG adapter hint is misleading for this failure mode. Root cause is a 1A power supply causing voltage dips when WiFi and USB OTG fire simultaneously, triggering the Pi's EMI protection circuitry. Symptom: `usb usb1-port1: disabled by hub (EMI?), re-enabling...` followed by `error -71` on re-enumerate. Rebooting recovers the port; replacing the power supply prevents recurrence.
+**How to detect:** `subprocess.run(["dmesg"], capture_output=True, text=True)`, grep for `EMI` in the last 100 lines. Only add this hint when hidraw is missing AND EMI lines are present — don't fire on clean boots.
+**Note:** `check_hidraw()` is only called when minidspd daemon fails (see `check_minidsp_combined`). The EMI detection is for "USB device disappeared and daemon can't reconnect" post-failure scenarios.
+**Priority:** P3 — power supply is a one-time physical fix; hint is nice-to-have.
+
 ### TODO-4: Sweep playback routing — miniDSP USB vs. Denon HDMI
 **What:** Design and implement how the Pi plays the log sweep. Two viable approaches with different trade-offs:
 

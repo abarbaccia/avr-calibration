@@ -455,30 +455,28 @@ class TestSignalPathSync:
 # ── Combined miniDSP check ────────────────────────────────────────────────────
 
 class TestMinidspCombined:
-    async def test_both_pass_combined_detail(self, config):
+    async def test_daemon_passes_is_sufficient(self, config):
+        # Normal operating case: minidspd has claimed the device via libusb, so
+        # /dev/hidraw0 does not exist. Daemon passing is the authoritative check.
         checker = PreflightChecker(config)
-        with (
-            patch.object(checker, "check_hidraw", return_value=CheckResult("miniDSP USB", True, "/dev/hidraw0 present")),
-            patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", True, "2x4HD at localhost:5380 (serial 965535)")),
-        ):
+        with patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", True, "2x4HD at localhost:5380 (serial 965535)")):
             result = await checker.check_minidsp_combined()
         assert result.passed
         assert result.name == "miniDSP"
         assert "2x4HD" in result.detail
-        assert "/dev/hidraw0" in result.detail
 
-    async def test_only_hidraw_fails(self, config):
+    async def test_daemon_passes_hidraw_not_called(self, config):
+        # check_hidraw should not be called when the daemon passes.
         checker = PreflightChecker(config)
         with (
-            patch.object(checker, "check_hidraw", return_value=CheckResult("miniDSP USB", False, "/dev/hidraw0 not found", "OTG adapter required")),
             patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", True, "2x4HD at localhost:5380")),
+            patch.object(checker, "check_hidraw", side_effect=AssertionError("check_hidraw should not be called")),
         ):
             result = await checker.check_minidsp_combined()
-        assert not result.passed
-        assert result.name == "miniDSP"
-        assert "OTG" in result.error
+        assert result.passed
 
-    async def test_only_daemon_fails(self, config):
+    async def test_daemon_fails_hidraw_passes_shows_daemon_error(self, config):
+        # Daemon down but USB device physically present — surface the daemon error.
         checker = PreflightChecker(config)
         with (
             patch.object(checker, "check_hidraw", return_value=CheckResult("miniDSP USB", True, "/dev/hidraw0 present")),
@@ -488,6 +486,7 @@ class TestMinidspCombined:
         assert not result.passed
         assert result.name == "miniDSP"
         assert "daemon" in result.error.lower() or "start" in result.error.lower()
+        assert "USB device found" in result.detail
 
     async def test_both_fail_usb_error_takes_precedence(self, config):
         checker = PreflightChecker(config)
