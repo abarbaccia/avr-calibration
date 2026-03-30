@@ -31,7 +31,7 @@ RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \
         pip install --no-cache-dir uv && \
         uv venv /opt/venv && \
         NUMPY_VER=$(grep -A1 '^name = "numpy"$' uv.lock | grep version | grep -o '[0-9][0-9.]*') && \
-        UV_PROJECT_ENVIRONMENT=/opt/venv uv pip install \
+        VIRTUAL_ENV=/opt/venv uv pip install \
             --extra-index-url https://www.piwheels.org/simple \
             "numpy==${NUMPY_VER}" && \
         UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --extra dev --no-editable; \
