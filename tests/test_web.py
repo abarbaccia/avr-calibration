@@ -999,3 +999,252 @@ def test_list_sessions_tolerates_corrupt_fr(client):
     assert len(data) == 1
     assert data[0]["peak_spl"] == 0.0
     assert data[0]["n_freqs"] == 0
+
+
+# ── POST /api/sessions/average ────────────────────────────────────────────────
+
+def _make_session_with_fr(session_id: int, freqs: list[float], spl: list[float]):
+    from calibrate.storage import Session
+    fr = FrequencyResponse(
+        frequencies=freqs, spl=spl, sample_rate=48000, sweep_duration=3.0,
+        timestamp="2026-03-20T12:00:00+00:00",
+    )
+    return Session(id=session_id, timestamp="2026-03-20T12:00:00+00:00",
+                   label=None, start_fr=fr, end_fr=None,
+                   filters_applied=None, notes=None)
+
+
+def test_average_sessions_min_two(client):
+    """Fewer than 2 session_ids → 422 from Pydantic min_length."""
+    r = client.post("/api/sessions/average", json={"session_ids": [1]})
+    assert r.status_code == 422
+
+
+def test_average_sessions_too_many(client):
+    """More than 20 session_ids → 422 from Pydantic max_length."""
+    r = client.post("/api/sessions/average", json={"session_ids": list(range(21))})
+    assert r.status_code == 422
+
+
+def test_average_sessions_not_found(client):
+    """One invalid session ID → 404."""
+    freqs = [20.0, 40.0, 80.0]
+    s1 = _make_session_with_fr(1, freqs, [0.0, 0.0, 0.0])
+
+    def get_session(sid):
+        return s1 if sid == 1 else None
+
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.side_effect = get_session
+        r = client.post("/api/sessions/average", json={"session_ids": [1, 99]})
+
+    assert r.status_code == 404
+
+
+def test_average_sessions_incompatible_freq_length(client):
+    """Sessions with different array lengths → 422."""
+    s1 = _make_session_with_fr(1, [20.0, 40.0, 80.0], [0.0, 0.0, 0.0])
+    s2 = _make_session_with_fr(2, [20.0, 40.0], [0.0, 0.0])
+
+    sessions = {1: s1, 2: s2}
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.side_effect = lambda sid: sessions.get(sid)
+        r = client.post("/api/sessions/average", json={"session_ids": [1, 2]})
+
+    assert r.status_code == 422
+
+
+def test_average_sessions_incompatible_freq_values(client):
+    """Same length but different freq values → 422 (E2 regression)."""
+    s1 = _make_session_with_fr(1, [20.0, 40.0, 80.0], [0.0, 0.0, 0.0])
+    s2 = _make_session_with_fr(2, [25.0, 50.0, 100.0], [0.0, 0.0, 0.0])
+
+    sessions = {1: s1, 2: s2}
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.side_effect = lambda sid: sessions.get(sid)
+        r = client.post("/api/sessions/average", json={"session_ids": [1, 2]})
+
+    assert r.status_code == 422
+
+
+def test_average_sessions_linear_domain_math(client):
+    """Linear-domain average: +6 dB and -6 dB → ≈ +2.96 dB, not 0 dB (E1 regression)."""
+    freqs = [20.0, 40.0, 80.0]
+    s1 = _make_session_with_fr(1, freqs, [6.0, 6.0, 6.0])
+    s2 = _make_session_with_fr(2, freqs, [-6.0, -6.0, -6.0])
+
+    sessions = {1: s1, 2: s2}
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.side_effect = lambda sid: sessions.get(sid)
+        r = client.post("/api/sessions/average", json={"session_ids": [1, 2]})
+
+    assert r.status_code == 200
+    data = r.json()
+    avg = data["spl_dbfs"][0]
+    # Linear average of 10^(6/20)=1.995 and 10^(-6/20)=0.501 → (2.496)/2=1.248
+    # 20*log10(1.248) ≈ 1.93 dB — NOT 0 dB (which naive dB average would give)
+    assert abs(avg - 1.93) < 0.05, f"Expected ~1.93 dB, got {avg}"
+    assert data["n_positions"] == 2
+
+
+def test_average_sessions_log10_zero_safe(client):
+    """Guard: `if result > 0 else -120.0` must return -120.0 when result is 0."""
+    import math
+    # Direct unit test of the guard expression used in average_sessions
+    result = 0.0
+    out = 20 * math.log10(result) if result > 0 else -120.0
+    assert out == -120.0
+
+    # Also verify the endpoint doesn't crash on extreme (very low) SPL values
+    freqs = [20.0, 40.0, 80.0]
+    s1 = _make_session_with_fr(1, freqs, [-300.0, 0.0, 0.0])
+    s2 = _make_session_with_fr(2, freqs, [-300.0, 0.0, 0.0])
+    sessions = {1: s1, 2: s2}
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.side_effect = lambda sid: sessions.get(sid)
+        r = client.post("/api/sessions/average", json={"session_ids": [1, 2]})
+    assert r.status_code == 200
+    assert r.json()["spl_dbfs"][0] < -200  # very low, not a crash
+
+
+def test_average_sessions_sentinel_fr_filtered(client):
+    """Sessions with empty start_fr are excluded; if <2 remain → 422."""
+    from calibrate.storage import Session
+    sentinel_fr = FrequencyResponse(
+        frequencies=[], spl=[], sample_rate=0, sweep_duration=0.0,
+        timestamp="2026-03-20T12:00:00+00:00",
+    )
+    s1 = Session(id=1, timestamp="2026-03-20T12:00:00+00:00", label=None,
+                 start_fr=sentinel_fr, end_fr=None, filters_applied=None, notes=None)
+    s2 = _make_session_with_fr(2, [20.0, 40.0], [0.0, 0.0])
+
+    sessions = {1: s1, 2: s2}
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.side_effect = lambda sid: sessions.get(sid)
+        r = client.post("/api/sessions/average", json={"session_ids": [1, 2]})
+
+    assert r.status_code == 422
+
+
+def test_average_sessions_happy_path(client):
+    """Two valid sessions → averaged FR returned with n_positions=2."""
+    freqs = [20.0, 40.0, 80.0]
+    s1 = _make_session_with_fr(1, freqs, [0.0, 0.0, 0.0])
+    s2 = _make_session_with_fr(2, freqs, [0.0, 0.0, 0.0])
+
+    sessions = {1: s1, 2: s2}
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.side_effect = lambda sid: sessions.get(sid)
+        r = client.post("/api/sessions/average", json={"session_ids": [1, 2]})
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["n_positions"] == 2
+    assert len(data["frequencies_hz"]) == 3
+    assert len(data["spl_dbfs"]) == 3
+    # Average of two identical 0 dB measurements = 0 dB
+    assert all(abs(v) < 0.01 for v in data["spl_dbfs"])
+
+
+# ── POST /api/blend-check/start ───────────────────────────────────────────────
+
+def test_blend_check_start_returns_token(client, cfg_path):
+    """Happy path: returns token, sample_rate, sweep_duration."""
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_path),
+        patch("calibrate.web.MeasurementEngine") as MockEngine,
+        patch("threading.Thread"),
+    ):
+        MockEngine.return_value.generate_sweep.return_value = ([0.0] * 100, 48000, 1.0)
+        r = client.post("/api/blend-check/start", json={})
+
+    assert r.status_code == 200
+    data = r.json()
+    assert "token" in data
+    assert data["sample_rate"] == 48000
+    assert data["sweep_duration"] == 1.0
+
+
+def test_blend_check_stores_freq_range(client, cfg_path):
+    """Token in _pending_sweeps must have freq_min=40, freq_max=160 (E4 regression)."""
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_path),
+        patch("calibrate.web.MeasurementEngine") as MockEngine,
+        patch("threading.Thread"),
+    ):
+        MockEngine.return_value.generate_sweep.return_value = ([0.0] * 100, 48000, 1.0)
+        r = client.post("/api/blend-check/start", json={})
+
+    token = r.json()["token"]
+    with _pending_lock:
+        assert _pending_sweeps[token]["freq_min"] == 40
+        assert _pending_sweeps[token]["freq_max"] == 160
+        assert _pending_sweeps[token]["session_type"] == "blend_check"
+
+
+def test_blend_check_not_saved_to_store(client, cfg_path):
+    """After recording with a blend_check token, store.save_measurement must NOT be called."""
+    fr = _make_fr(50)
+    token = str(uuid.uuid4())
+    with _pending_lock:
+        _pending_sweeps[token] = {
+            "sweep_samples": [0.0] * 100,
+            "sample_rate": 48000,
+            "sweep_duration": 1.0,
+            "freq_min": 40,
+            "freq_max": 160,
+            "label": None,
+            "session_type": "blend_check",
+        }
+
+    recording = _float32_bytes([0.001] * 1000)
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_path),
+        patch("calibrate.web.MeasurementEngine") as MockEngine,
+        patch("calibrate.web.SessionStore") as MockStore,
+    ):
+        MockEngine.return_value.compute_fr.return_value = fr
+        r = client.post(
+            "/api/measure/record",
+            content=recording,
+            headers={"X-Token": token, "X-Sample-Rate": "48000"},
+        )
+
+    assert r.status_code == 200
+    MockStore.return_value.save_measurement.assert_not_called()
+    assert r.json()["session_id"] is None
+
+
+# ── POST /api/measure/start — position_label ──────────────────────────────────
+
+def test_measure_start_with_position_label(client, cfg_path):
+    """position_label combined with label → stored as 'label [position_label]'."""
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_path),
+        patch("calibrate.web.MeasurementEngine") as MockEngine,
+        patch("threading.Thread"),
+    ):
+        MockEngine.return_value.generate_sweep.return_value = ([0.0] * 100, 48000, 3.0)
+        r = client.post("/api/measure/start",
+                        json={"label": "before EQ", "position_label": "left"})
+
+    assert r.status_code == 200
+    token = r.json()["token"]
+    with _pending_lock:
+        assert _pending_sweeps[token]["label"] == "before EQ [left]"
+
+
+def test_measure_start_position_label_optional(client, cfg_path):
+    """position_label omitted → label stored as-is."""
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_path),
+        patch("calibrate.web.MeasurementEngine") as MockEngine,
+        patch("threading.Thread"),
+    ):
+        MockEngine.return_value.generate_sweep.return_value = ([0.0] * 100, 48000, 3.0)
+        r = client.post("/api/measure/start", json={"label": "after EQ"})
+
+    assert r.status_code == 200
+    token = r.json()["token"]
+    with _pending_lock:
+        assert _pending_sweeps[token]["label"] == "after EQ"

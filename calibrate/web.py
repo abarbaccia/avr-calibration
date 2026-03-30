@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import statistics
 import struct
 import threading
 import time
@@ -48,7 +50,7 @@ logger = logging.getLogger(__name__)
 import httpx
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .config import Config, CONFIG_PATH
 from .measurement import MeasurementEngine, FrequencyResponse, MeasurementQualityError
@@ -187,6 +189,25 @@ _HTML = """<!DOCTYPE html>
     .feedback-row select { width: 10rem; margin-bottom: 0; }
     .feedback-row button { background: #334155; color: #cbd5e1; white-space: nowrap; }
     .feedback-row button:hover { background: #475569; }
+    /* Target curve selector */
+    .curve-row { display: flex; align-items: center; gap: .75rem; margin-bottom: .75rem; }
+    .curve-row label { font-size: .8rem; color: #64748b; margin: 0; white-space: nowrap; }
+    .curve-row select { width: auto; margin-bottom: 0; font-size: .8rem; }
+    /* Convergence delta table */
+    .delta-tbl td { font-size: .8rem; }
+    .delta-tbl tr.ok td { color: #4ade80; }
+    .delta-tbl tr.warn td { color: #fbbf24; }
+    .delta-tbl tr.bad td { color: #f87171; }
+    /* Multi-select average */
+    .hist-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+    .hist-header h2 { margin-bottom: 0; }
+    #avgBtn { background: #334155; color: #cbd5e1; font-size: .8rem; padding: .35rem .8rem; display: none; }
+    #avgBtn:not(:disabled):hover { background: #475569; }
+    th.cb-col, td.cb-col { width: 2rem; text-align: center; padding: .4rem .25rem; cursor: default; }
+    /* Blend check */
+    #blendStatus { font-size: .8rem; color: #94a3b8; margin-top: .75rem; min-height: 1.2em; }
+    #blendBtn { background: #334155; color: #cbd5e1; font-size: .85rem; margin-top: .75rem; }
+    #blendBtn:not(:disabled):hover { background: #475569; }
   </style>
 </head>
 <body>
@@ -200,19 +221,39 @@ _HTML = """<!DOCTYPE html>
     <label for="labelInput">Session label (optional)</label>
     <input type="text" id="labelInput" placeholder="e.g. before EQ, with Atmos">
 
+    <label for="posLabel">Seat position (optional)</label>
+    <input type="text" id="posLabel" placeholder="e.g. left, center, right">
+
     <button id="measureBtn" onclick="startMeasurement()">Start Measurement</button>
 
     <div class="countdown" id="countdown"></div>
     <div id="status">Ready. Select your microphone and press Start.</div>
+
+    <button id="blendBtn" onclick="startBlendCheck()">Check Sub/Sat Blend (40–160 Hz)</button>
+    <div id="blendStatus"></div>
   </div>
 
   <div class="card" id="plotCard" style="display:none">
-    <h2>Frequency Response</h2>
+    <div class="curve-row">
+      <label for="curveSelect">Target curve:</label>
+      <select id="curveSelect" onchange="onCurveChange()">
+        <option value="harman">Harman (+3 dB/oct below 80 Hz)</option>
+        <option value="flat">Flat</option>
+      </select>
+    </div>
     <canvas id="frPlot"></canvas>
     <p id="plotStatus" style="font-size:.8rem;color:#64748b;margin-top:.5rem;text-align:center;"></p>
     <div style="text-align:right;margin-top:.5rem">
       <button id="exportBtn" onclick="exportChart()" style="background:#334155;color:#cbd5e1;font-size:.8rem;padding:.4rem .9rem">Export PNG</button>
     </div>
+  </div>
+
+  <div class="card" id="deltaCard" style="display:none">
+    <h2>Convergence vs Target</h2>
+    <table class="delta-tbl" id="deltaTable">
+      <thead><tr><th>Band (Hz)</th><th>SPL</th><th>Target</th><th>Delta</th></tr></thead>
+      <tbody id="deltaBody"></tbody>
+    </table>
   </div>
 
   <div class="card" id="feedbackCard" style="display:none">
@@ -230,10 +271,13 @@ _HTML = """<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <h2>History</h2>
+    <div class="hist-header">
+      <h2>History</h2>
+      <button id="avgBtn" onclick="averageSelected()">Average Selected</button>
+    </div>
     <table id="histTable">
       <thead>
-        <tr><th>#</th><th>Date (UTC)</th><th>Label</th><th>Peak SPL</th><th>Pts</th></tr>
+        <tr><th class="cb-col"></th><th>#</th><th>Date (UTC)</th><th>Label</th><th>Peak SPL</th><th>Pts</th></tr>
       </thead>
       <tbody id="histBody"></tbody>
     </table>
@@ -268,6 +312,7 @@ _HTML = """<!DOCTYPE html>
     setStatus('Contacting Pi…');
 
     const label = document.getElementById('labelInput').value.trim() || null;
+    const position_label = document.getElementById('posLabel').value.trim() || null;
     const micId = document.getElementById('micSelect').value;
 
     let startResp;
@@ -275,7 +320,7 @@ _HTML = """<!DOCTYPE html>
       const r = await fetch('/api/measure/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label })
+        body: JSON.stringify({ label, position_label })
       });
       if (!r.ok) throw new Error(await r.text());
       startResp = await r.json();
@@ -386,6 +431,50 @@ _HTML = """<!DOCTYPE html>
     btn.disabled = false;
   }
 
+  // ── Target curve ───────────────────────────────────────────────────────
+  let targetCurveType = localStorage.getItem('targetCurve') || 'harman';
+
+  function onCurveChange() {
+    targetCurveType = document.getElementById('curveSelect').value;
+    localStorage.setItem('targetCurve', targetCurveType);
+    if (frChart && frChart.data.labels.length) {
+      const freqs = frChart.data.labels.map(Number);
+      const spl = frChart.data.datasets[0].data;
+      renderFR(freqs, spl, null, null, frChart.data.datasets[0].label);
+    }
+  }
+
+  function getTargetCurve(freqs, spl) {
+    const sorted = [...spl].sort((a, b) => a - b);
+    const refSpl = sorted[Math.floor(sorted.length / 2)];
+    if (targetCurveType === 'flat') return freqs.map(() => refSpl);
+    // Harman: flat above 80 Hz, +3 dB/octave below 80 Hz
+    return freqs.map(f => f >= 80 ? refSpl : refSpl + 3 * Math.log2(80 / f));
+  }
+
+  // ── Convergence delta table ────────────────────────────────────────────
+  // 1/3-octave centre frequencies 25–200 Hz (ISO preferred)
+  const THIRD_OCT = [25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200];
+
+  function renderDeltaTable(freqs, spl) {
+    const target = getTargetCurve(freqs, spl);
+    const tbody = document.getElementById('deltaBody');
+    if (!tbody) return;
+    const rows = THIRD_OCT.map(fc => {
+      // find closest measured freq bin
+      let bi = 0, bd = Infinity;
+      freqs.forEach((f, i) => { const d = Math.abs(f - fc); if (d < bd) { bd = d; bi = i; } });
+      const measSpl = spl[bi];
+      const targSpl = target[bi];
+      const delta = measSpl - targSpl;
+      const cls = Math.abs(delta) <= 3 ? 'ok' : Math.abs(delta) <= 6 ? 'warn' : 'bad';
+      const sign = delta >= 0 ? '+' : '';
+      return `<tr class="${cls}"><td>${fc} Hz</td><td>${measSpl.toFixed(1)}</td><td>${targSpl.toFixed(1)}</td><td>${sign}${delta.toFixed(1)}</td></tr>`;
+    });
+    tbody.innerHTML = rows.join('');
+    document.getElementById('deltaCard').style.display = '';
+  }
+
   // ── FR plot ────────────────────────────────────────────────────────────
   function renderFR(freqs, spl, endFreqs, endSpl, label) {
     if (!freqs || !freqs.length) {
@@ -395,13 +484,14 @@ _HTML = """<!DOCTYPE html>
     }
     document.getElementById('plotCard').style.display = '';
     setPlotStatus(label || '');
+    // Sync curve selector with saved preference
+    const sel = document.getElementById('curveSelect');
+    if (sel) sel.value = targetCurveType;
+
     const ctx = document.getElementById('frPlot').getContext('2d');
     if (frChart) frChart.destroy();
 
-    // Harman sub target: flat above 80 Hz, +3 dB/octave below 80 Hz
-    const sorted = [...spl].sort((a, b) => a - b);
-    const refSpl = sorted[Math.floor(sorted.length / 2)];
-    const harmTarget = freqs.map(f => f >= 80 ? refSpl : refSpl + 3 * Math.log2(80 / f));
+    const targetLine = getTargetCurve(freqs, spl);
 
     const datasets = [
       {
@@ -415,8 +505,8 @@ _HTML = """<!DOCTYPE html>
         fill: !endFreqs,
       },
       {
-        label: 'Harman Target',
-        data: harmTarget,
+        label: targetCurveType === 'harman' ? 'Harman Target' : 'Flat Target',
+        data: targetLine,
         borderColor: '#94a3b8',
         borderDash: [5, 5],
         borderWidth: 1,
@@ -425,6 +515,8 @@ _HTML = """<!DOCTYPE html>
         fill: false,
       },
     ];
+
+    renderDeltaTable(freqs, spl);
 
     if (endFreqs && endFreqs.length) {
       datasets.push({
@@ -540,10 +632,125 @@ _HTML = """<!DOCTYPE html>
       const peak = s.peak_spl.toFixed(1) + ' dBFS';
       const sel = s.id === selectedSessionId ? ' selected' : '';
       return `<tr class="${sel}" data-session-id="${s.id}" onclick="loadSession(${s.id})">
+        <td class="cb-col" onclick="event.stopPropagation()">
+          <input type="checkbox" data-id="${s.id}" onchange="updateAvgButton()">
+        </td>
         <td>${s.id}</td><td>${ts}</td><td>${label}</td>
         <td class="peak">${peak}</td><td>${s.n_freqs}</td>
       </tr>`;
     }).join('');
+  }
+
+  function updateAvgButton() {
+    const checked = document.querySelectorAll('#histBody input[type=checkbox]:checked');
+    const btn = document.getElementById('avgBtn');
+    btn.style.display = checked.length >= 2 ? '' : 'none';
+    btn.textContent = `Average ${checked.length} Sessions`;
+  }
+
+  // ── Multi-position spatial average ────────────────────────────────────
+  async function averageSelected() {
+    const checked = [...document.querySelectorAll('#histBody input[type=checkbox]:checked')];
+    const ids = checked.map(cb => parseInt(cb.dataset.id));
+    if (ids.length < 2) return;
+    setStatus('Averaging sessions…');
+    try {
+      const r = await fetch('/api/sessions/average', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_ids: ids }),
+      });
+      if (!r.ok) { setStatus('Average failed: ' + (await r.text()), 'error'); return; }
+      const result = await r.json();
+      setStatus(`Averaged ${result.n_positions} positions`, 'ok');
+      renderFR(result.frequencies_hz, result.spl_dbfs, null, null, `Average of ${result.n_positions} positions`);
+    } catch (e) {
+      setStatus('Average error: ' + e.message, 'error');
+    }
+  }
+
+  // ── Sub/satellite blend check ──────────────────────────────────────────
+  async function startBlendCheck() {
+    const btn = document.getElementById('blendBtn');
+    const statusEl = document.getElementById('blendStatus');
+    btn.disabled = true;
+    statusEl.textContent = 'Starting blend-check sweep…';
+
+    const micId = document.getElementById('micSelect').value;
+    let startResp;
+    try {
+      const r = await fetch('/api/blend-check/start', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      if (!r.ok) throw new Error(await r.text());
+      startResp = await r.json();
+    } catch (e) {
+      statusEl.textContent = 'Failed: ' + e.message;
+      btn.disabled = false; return;
+    }
+
+    const { token, sample_rate, sweep_duration, countdown_ms } = startResp;
+    const totalRecordMs = countdown_ms + (sweep_duration + 2) * 1000;
+
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: micId ? { exact: micId } : undefined,
+          sampleRate: sample_rate, channelCount: 1,
+          echoCancellation: false, noiseSuppression: false, autoGainControl: false,
+        }
+      });
+    } catch (e) {
+      statusEl.textContent = 'Mic error: ' + e.message;
+      btn.disabled = false; return;
+    }
+
+    const audioCtx = new AudioContext({ sampleRate: sample_rate });
+    const source = audioCtx.createMediaStreamSource(stream);
+    const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    const chunks = [];
+    processor.onaudioprocess = (e) => chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    source.connect(processor); processor.connect(audioCtx.destination);
+
+    statusEl.textContent = `Recording blend check… (sweep in ${(countdown_ms/1000).toFixed(1)}s)`;
+    await new Promise(r => setTimeout(r, totalRecordMs));
+
+    source.disconnect(); processor.disconnect();
+    stream.getTracks().forEach(t => t.stop()); audioCtx.close();
+
+    const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+    const merged = new Float32Array(totalLen);
+    let off = 0; for (const c of chunks) { merged.set(c, off); off += c.length; }
+
+    let result;
+    try {
+      const r = await fetch('/api/measure/record', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream',
+                   'X-Token': token, 'X-Sample-Rate': String(sample_rate) },
+        body: merged.buffer,
+      });
+      if (!r.ok) throw new Error(await r.text());
+      result = await r.json();
+    } catch (e) {
+      statusEl.textContent = 'Analysis failed: ' + e.message;
+      btn.disabled = false; return;
+    }
+
+    const freqs = result.frequencies_hz;
+    const spl = result.spl_dbfs;
+    // Score: how close is the crossover region (40–160 Hz) to target?
+    const target = getTargetCurve(freqs, spl);
+    const xLo = freqs.findIndex(f => f >= 40);
+    let xHi = freqs.findIndex(f => f > 160);
+    const xSlice = spl.slice(xLo, xHi === -1 ? undefined : xHi);
+    const tSlice = target.slice(xLo, xHi === -1 ? undefined : xHi);
+    const rms = Math.sqrt(xSlice.reduce((s, v, i) => s + (v - tSlice[i]) ** 2, 0) / xSlice.length);
+    const grade = rms <= 3 ? 'Good' : rms <= 6 ? 'Fair' : 'Poor';
+    statusEl.textContent = `Blend: ${grade} — RMS deviation ${rms.toFixed(1)} dB vs target (40–160 Hz)`;
+
+    renderFR(freqs, spl, null, null, 'Blend check (40–160 Hz)');
+    btn.disabled = false;
   }
 
   function setStatus(msg, cls='') {
@@ -573,6 +780,11 @@ _HTML = """<!DOCTYPE html>
 
 class StartRequest(BaseModel):
     label: Optional[str] = None
+    position_label: Optional[str] = None
+
+
+class AverageRequest(BaseModel):
+    session_ids: list[int] = Field(..., min_length=2, max_length=20)
 
 
 class FeedbackRequest(BaseModel):
@@ -614,6 +826,10 @@ async def measure_start(body: StartRequest) -> dict:
         raise HTTPException(status_code=500, detail=str(exc))
 
     token = str(uuid.uuid4())
+    # Combine label + position_label for storage
+    combined_label = body.label
+    if body.position_label:
+        combined_label = f"{body.label} [{body.position_label}]" if body.label else body.position_label
     with _pending_lock:
         _pending_sweeps[token] = {
             "sweep_samples": samples,
@@ -621,7 +837,7 @@ async def measure_start(body: StartRequest) -> dict:
             "sweep_duration": sweep_duration,
             "freq_min": cfg.measurement.get("freq_min", 20),
             "freq_max": cfg.measurement.get("freq_max", 200),
-            "label": body.label,
+            "label": combined_label,
         }
 
     # Play sweep in background after countdown delay
@@ -689,6 +905,17 @@ async def measure_record(
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
+    # Blend-check sweeps are ephemeral — don't persist to store
+    if pending.get("session_type") == "blend_check":
+        return {
+            "session_id": None,
+            "frequencies_hz": fr.frequencies,
+            "spl_dbfs": fr.spl,
+            "peak_spl": fr.peak_spl,
+            "freq_at_peak": fr.freq_at_peak,
+            "warnings": fr.warnings,
+        }
+
     store = SessionStore()
     session_id = store.save_measurement(fr, label=pending["label"])
 
@@ -699,6 +926,103 @@ async def measure_record(
         "peak_spl": fr.peak_spl,
         "freq_at_peak": fr.freq_at_peak,
         "warnings": fr.warnings,
+    }
+
+
+@app.post("/api/blend-check/start")
+async def blend_check_start() -> dict:
+    """Generate a 40–160 Hz sweep for sub/sat crossover coherence checking.
+
+    The resulting token is marked session_type='blend_check' so measure_record
+    skips persisting it to the session store.
+    """
+    cfg = _load_config()
+    engine = MeasurementEngine(cfg)
+
+    try:
+        samples, sample_rate, sweep_duration = engine.generate_sweep(
+            freq_min=40, freq_max=160
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    token = str(uuid.uuid4())
+    with _pending_lock:
+        _pending_sweeps[token] = {
+            "sweep_samples": samples,
+            "sample_rate": sample_rate,
+            "sweep_duration": sweep_duration,
+            "freq_min": 40,
+            "freq_max": 160,
+            "label": None,
+            "session_type": "blend_check",
+        }
+
+    def _play():
+        time.sleep(COUNTDOWN_MS / 1000.0)
+        try:
+            engine.play_signal(samples, sample_rate)
+        except Exception as exc:
+            logger.warning("blend-check play_signal failed: %s", exc)
+
+    threading.Thread(target=_play, daemon=True).start()
+
+    return {
+        "token": token,
+        "sample_rate": sample_rate,
+        "sweep_duration": sweep_duration,
+        "countdown_ms": COUNTDOWN_MS,
+    }
+
+
+@app.post("/api/sessions/average")
+async def average_sessions(body: AverageRequest) -> dict:
+    """Average multiple sessions in the linear pressure domain.
+
+    Converts SPL to linear amplitude (10^(spl/20)), averages across positions,
+    then converts back.  Requires all sessions to share the same frequency array.
+    """
+    store = SessionStore()
+    frs: list[FrequencyResponse] = []
+    for sid in body.session_ids:
+        session = store.get_session(sid)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"Session #{sid} not found")
+        fr = session.start_fr
+        if not fr or not fr.frequencies:
+            continue  # skip sessions with empty FR (sentinel)
+        frs.append(fr)
+
+    if len(frs) < 2:
+        raise HTTPException(
+            status_code=422,
+            detail="Fewer than 2 sessions have valid frequency response data",
+        )
+
+    ref_freqs = frs[0].frequencies
+    for fr in frs[1:]:
+        if len(fr.frequencies) != len(ref_freqs):
+            raise HTTPException(
+                status_code=422,
+                detail="Sessions have different frequency array lengths — cannot average",
+            )
+        if any(abs(f - r) > 0.5 for f, r in zip(fr.frequencies, ref_freqs)):
+            raise HTTPException(
+                status_code=422,
+                detail="Sessions have incompatible frequency ranges — cannot average",
+            )
+
+    n = len(ref_freqs)
+    averaged_spl = []
+    for i in range(n):
+        linear_sum = sum(10 ** (fr.spl[i] / 20.0) for fr in frs)
+        result = linear_sum / len(frs)
+        averaged_spl.append(20 * math.log10(result) if result > 0 else -120.0)
+
+    return {
+        "frequencies_hz": ref_freqs,
+        "spl_dbfs": averaged_spl,
+        "n_positions": len(frs),
     }
 
 
