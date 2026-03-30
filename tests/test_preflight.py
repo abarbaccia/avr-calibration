@@ -238,10 +238,11 @@ class TestRunAll:
             patch.object(checker, "check_denon", return_value=CheckResult("Denon AVR", True, "X3800H")),
             patch.object(checker, "check_playback_route", return_value=CheckResult("Playback Route", True, "USB: miniDSP")),
             patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
+            patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
         ):
             results = await checker.run_all()
         assert all(r.passed for r in results)
-        assert len(results) == 6
+        assert len(results) == 7
 
     async def test_unhandled_exception_becomes_failed_result(self, config):
         checker = PreflightChecker(config)
@@ -251,6 +252,8 @@ class TestRunAll:
             patch.object(checker, "check_minidsp", return_value=CheckResult("miniDSP", True, "2x4HD")),
             patch.object(checker, "check_denon", return_value=CheckResult("Denon AVR", True, "X3800H")),
             patch.object(checker, "check_playback_route", return_value=CheckResult("Playback Route", True, "USB")),
+            patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
+            patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
         ):
             results = await checker.run_all()
         mic = next(r for r in results if r.name == "Microphone")
@@ -266,9 +269,10 @@ class TestRunAll:
             patch.object(checker, "check_denon", side_effect=RuntimeError("err")),
             patch.object(checker, "check_playback_route", side_effect=RuntimeError("err")),
             patch.object(checker, "check_signal_path_sync", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_config", side_effect=RuntimeError("err")),
         ):
             results = await checker.run_all()
-        assert [r.name for r in results] == ["Microphone", "miniDSP USB", "miniDSP", "Denon AVR", "Playback Route", "Signal Path"]
+        assert [r.name for r in results] == ["Microphone", "miniDSP USB", "miniDSP", "Denon AVR", "Playback Route", "Signal Path", "Config"]
 
     async def test_partial_failure(self, config):
         checker = PreflightChecker(config)
@@ -279,6 +283,7 @@ class TestRunAll:
             patch.object(checker, "check_denon", return_value=CheckResult("Denon AVR", True, "X3800H")),
             patch.object(checker, "check_playback_route", return_value=CheckResult("Playback Route", True, "USB")),
             patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
+            patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
         ):
             results = await checker.run_all()
         assert results[0].passed  # Microphone
@@ -287,6 +292,7 @@ class TestRunAll:
         assert results[3].passed  # Denon AVR
         assert results[4].passed  # Playback Route
         assert results[5].passed  # Signal Path
+        assert results[6].passed  # Config
 
 
 # ── Playback route checks ─────────────────────────────────────────────────────
@@ -331,7 +337,7 @@ class TestPlaybackRouteCheck:
         config._data["denon"]["host"] = None
         result = await PreflightChecker(config).check_playback_route()
         assert not result.passed
-        assert "denon.host" in result.detail
+        assert "denon.host" in result.error
 
     async def test_hdmi_route_denon_unreachable(self, config):
         config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
@@ -414,3 +420,72 @@ class TestSignalPathSync:
             result = await PreflightChecker(config).check_signal_path_sync()
         assert not result.passed
         assert result.error
+
+
+# ── Config check ──────────────────────────────────────────────────────────────
+
+class TestPreflightConfigCheck:
+    async def test_check_config_all_fields_present(self, config):
+        result = await PreflightChecker(config).check_config()
+        assert result.passed
+        assert result.error is None
+
+    async def test_check_config_denon_host_none(self):
+        from calibrate.config import Config
+        cfg = Config({"denon": {"host": None}, "minidsp": {}, "mic": {}})
+        result = await PreflightChecker(cfg).check_config()
+        assert not result.passed
+        assert "denon.host" in result.error
+
+    async def test_check_config_with_valid_host(self):
+        from calibrate.config import Config
+        cfg = Config({"denon": {"host": "192.168.1.100"}, "minidsp": {}, "mic": {}})
+        result = await PreflightChecker(cfg).check_config()
+        assert result.passed
+
+    async def test_check_config_missing_field_in_detail(self):
+        from calibrate.config import Config
+        cfg = Config({"denon": {"host": None}, "minidsp": {}, "mic": {}})
+        result = await PreflightChecker(cfg).check_config()
+        assert "1" in result.detail  # "1 required field(s) missing"
+
+
+# ── HDMI deduplication ────────────────────────────────────────────────────────
+
+class TestHdmiDeduplication:
+    async def test_hdmi_route_delegates_to_check_denon(self, config):
+        """check_playback_route(hdmi) must call self.check_denon(), not create its own DenonAVR."""
+        config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
+        config._data["denon"]["host"] = "192.168.1.100"
+        checker = PreflightChecker(config)
+        denon_result = CheckResult("Denon AVR", True, "Denon AVR-X3800H online at 192.168.1.100")
+        with patch.object(checker, "check_denon", return_value=denon_result) as mock_denon:
+            result = await checker.check_playback_route()
+        mock_denon.assert_awaited_once()
+        assert result.passed
+        assert "HDMI" in result.detail
+        assert "X3800H" in result.detail
+
+    async def test_hdmi_route_no_duplicate_denonavr_instantiation(self, config):
+        """When playback_route=hdmi, denonavr.DenonAVR must NOT be called directly."""
+        config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
+        config._data["denon"]["host"] = "192.168.1.100"
+        checker = PreflightChecker(config)
+        denon_result = CheckResult("Denon AVR", True, "X3800H online at 192.168.1.100")
+        with (
+            patch.object(checker, "check_denon", return_value=denon_result),
+            patch("denonavr.DenonAVR") as mock_avr,
+        ):
+            await checker.check_playback_route()
+        mock_avr.assert_not_called()
+
+    async def test_hdmi_route_propagates_denon_failure(self, config):
+        """HDMI route failure reflects check_denon's failure."""
+        config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
+        config._data["denon"]["host"] = "192.168.1.100"
+        checker = PreflightChecker(config)
+        denon_result = CheckResult("Denon AVR", False, "Cannot connect to Denon AVR at 192.168.1.100", "refused")
+        with patch.object(checker, "check_denon", return_value=denon_result):
+            result = await checker.check_playback_route()
+        assert not result.passed
+        assert result.error == "refused"

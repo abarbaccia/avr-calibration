@@ -61,7 +61,7 @@ A daily systemd timer that pulls the latest image and restarts if there's an upd
 | CI build workflow | `.github/workflows/docker.yml` — already adds `org.opencontainers.image.revision` label via metadata-action |
 | GHCR public image | `ghcr.io/abarbaccia/avr-calibration:latest` |
 
-## Files Changed
+## Files to Change
 
 - `Dockerfile` — add `BUILD_SHA` ARG + ENV, add `docker.io` apt package (~5 LOC)
 - `.github/workflows/docker.yml` — pass `BUILD_SHA` build arg (~3 LOC)
@@ -251,7 +251,18 @@ HOUR 6+ (polish/tests):   /api/health endpoint (new, needed by poll-until-ready 
 
 **Total: ~228 LOC across 10 files** (increased from 155 due to rollback, audit log, health endpoint)
 
-## Test Plan
+```
+Browser (workflow navigator)
+  Phase 1: Room Setup form (no API call on submit — local state only)
+  Phase 2: Equipment Verification
+    [Test Tone]     → Web Audio API oscillator (browser-only, no backend)
+    [miniDSP USB]   → GET /api/preflight/hidraw
+    [miniDSP HTTP]  → GET /api/preflight/minidsp
+    [Denon AVR]     → GET /api/preflight/denon
+    [Playback Route]→ GET /api/preflight/playback
+    [Signal Path]   → GET /api/preflight/signal-path
+  Phase 3-5: Locked (placeholder cards, no functionality)
+```
 
 ### /api/version
 - `test_version_endpoint_returns_sha` — `BUILD_SHA` env set → sha returned
@@ -509,107 +520,7 @@ GHCR API flow (inside container on /api/version):
 
 ```
 CODE PATH COVERAGE
-===========================
-
-[+] calibrate/web.py — /api/version
-    │
-    ├── GET /api/version
-    │   ├── [★★★] BUILD_SHA set → sha returned — test_version_endpoint_returns_sha
-    │   ├── [★★★] BUILD_SHA unset → "unknown" — test_version_endpoint_no_sha
-    │   ├── [★★★] GHCR matches → up_to_date: true — test_version_up_to_date
-    │   ├── [★★★] GHCR differs → up_to_date: false — test_version_update_available
-    │   ├── [★★★] GHCR timeout → latest_sha: null — test_version_ghcr_unreachable
-    │   ├── [★★★] Cache hit → no 2nd GHCR call — test_version_cache_ttl
-    │   ├── [★★★] Cache miss after TTL → re-fetches — test_version_cache_invalidated_after_ttl
-    │   ├── [★★★] GHCR 401 → fetch token first, retry — test_version_ghcr_auth_retry
-    │   └── [GAP] GHCR 429 rate limit → return cached — test_version_ghcr_rate_limited ← ADD
-
-[+] calibrate/web.py — /api/upgrade
-    │
-    ├── POST /api/upgrade
-    │   ├── [★★★] Data dir writable → trigger file written, 202 — test_upgrade_writes_trigger_file
-    │   ├── [★★★] Data dir not writable → 503 — test_upgrade_data_dir_not_writable
-    │   ├── [GAP] Trigger file already exists → overwrite or 409 — test_upgrade_already_in_progress ← ADD
-    │   └── [★★  ] Data dir path config — test_upgrade_trigger_file_path_configurable
-
-[+] calibrate/storage.py — update_events
-    │
-    ├── log_update_event()
-    │   ├── [★★★] New DB → table created, event saved — test_log_update_event
-    │   ├── [★★★] Existing DB (pre-update_events) → migration — test_update_events_migration_existing_db ← ADD
-    │   ├── [★★★] Events queryable by range — test_update_history_queryable
-    │   └── [★★★] DB locked → exception swallowed — test_update_event_db_locked_swallowed ← ADD
-
-[+] deploy/avr-calibration-update.service (shell)
-    │
-    └── [Integration — manual on Pi] pull + rollback + trigger cleanup — not in pytest scope
-
-USER FLOW COVERAGE
-===========================
-[+] Upgrade button flow
-    │
-    ├── Click Upgrade → confirmation shown — (frontend test, no backend)
-    ├── Click Confirm → POST /api/upgrade → spinner → poll /health — [→E2E]
-    ├── Poll succeeds → reload — (frontend test)
-    ├── Poll times out (180s) → error message — (frontend test)
-    └── [GAP] Double-click Confirm → two POSTs → should be idempotent ← ADD
-
-─────────────────────────────────────────────────────────────
-COVERAGE BEFORE ADDITIONS: 10/18 paths tested (56%)
-COVERAGE AFTER ADDITIONS: 16/18 paths tested (89%)
-GAPs ADDED TO TEST PLAN: +6 tests
-─────────────────────────────────────────────────────────────
-```
-
-### Updated Test Plan (additions from Phase 3)
-
-**Add to tests/test_web.py:**
-- `test_version_ghcr_auth_retry` — GHCR 401 → fetch anonymous token, retry request
-- `test_version_ghcr_rate_limited` — GHCR 429 → return cached or `latest_sha: null`
-- `test_upgrade_data_dir_not_writable` — chmod 000 data dir → 503 with message
-- `test_upgrade_already_in_progress` — trigger file already exists → 409 Conflict or idempotent 202
-
-**Add to tests/test_storage.py:**
-- `test_update_events_migration_existing_db` — pre-schema DB + SessionStore init → update_events created
-- `test_update_event_db_locked_swallowed` — mock DB lock → log_update_event() does not raise
-
-**Total tests: 6 original + 10 from eng phase = 16 tests across test_web.py + test_storage.py**
-
-### NOT in scope
-
-- `:stable` CI promotion track (taste decision → surfaced at gate)
-- E2E test for full upgrade button → health poll → reload flow (manual validation on Pi)
-- bats/shell tests for avr-calibration-update.service (integration tested on Pi)
-- Mobile-responsive footer truncation (7/10 design score, low priority)
-
-ENG DUAL VOICES — CONSENSUS TABLE:
-```
-═══════════════════════════════════════════════════════════════
-  Dimension                           Claude  Codex  Consensus
-  ──────────────────────────────────── ─────── ─────── ─────────
-  1. Architecture sound?               YES*     N/A    YES*
-  2. Test coverage sufficient?         PARTIAL→YES N/A FIXED
-  3. Performance risks addressed?      YES      N/A    YES
-  4. Security threats covered?         YES      N/A    YES
-  5. Error paths handled?              PARTIAL→YES N/A FIXED
-  6. Deployment risk manageable?       YES      N/A    YES
-═══════════════════════════════════════════════════════════════
-*with trigger-file race fix + GHCR auth + AsyncClient revisions
-Codex unavailable — [subagent-only] mode
-All high findings auto-fixed.
-```
-
-<!-- DECISION LOG continuation (Phase 3) -->
-| 17 | Eng | inotifywait startup poll + flock + trigger cleanup | Mechanical | P1 (complete) + P5 (explicit) | Race conditions: trigger written before watcher ready; concurrent upgrades | Skip |
-| 18 | Eng | GHCR: two-step token + manifest API; git SHA comparison via OCI label | Mechanical | P5 (explicit) | Multi-arch digest ≠ per-arch digest; 401 is universal not private-repo-only | Direct digest compare |
-| 19 | Eng | Use httpx.AsyncClient (already imported) | Mechanical | P5 (explicit) | Sync httpx.get() blocks async event loop on Pi Zero 2W single core | Sync client |
-| 20 | Eng | /health already exists — use it for poll-until-ready | Mechanical | P4 (DRY) | Existing route at web.py:1153; no new endpoint needed | New /api/health |
-| 21 | Eng | Add GHCR 401 auth retry test | Mechanical | P1 (complete) | Auth is required even for public repos; missing from test plan | Skip |
-| 22 | Eng | Add trigger-already-exists → 409 test | Mechanical | P1 (complete) | Double-click prevent double-upgrade | Skip |
-| 23 | Eng | Add DB migration regression test | Mechanical | P1 (complete) | Real Pi has existing DB without update_events | Skip |
-| 24 | Eng | Confirm module-level version cache (not persistent) | Mechanical | P5 (explicit) | Persistent cache would add complexity for no benefit | SQLite cache |
-| 24 | Eng | Confirm module-level version cache (not persistent) | Mechanical | P5 (explicit) | Persistent cache would add complexity for no benefit | SQLite cache |
-
+====================
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
