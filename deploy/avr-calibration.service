@@ -9,7 +9,7 @@ User=pi
 ExecStartPre=-/usr/bin/docker rm -f avr-calibration
 ExecStart=/usr/bin/docker run --rm \
     --name avr-calibration \
-    -p 8000:8000 \
+    --network=host \
     --privileged \
     -v /home/pi/.avr-calibration:/data/.avr-calibration \
     ghcr.io/abarbaccia/avr-calibration:latest
