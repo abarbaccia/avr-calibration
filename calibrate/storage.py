@@ -48,6 +48,16 @@ CREATE TABLE IF NOT EXISTS feedback (
     content_tag  TEXT,
     text         TEXT    NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS update_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp  TEXT    NOT NULL,
+    from_sha   TEXT,
+    to_sha     TEXT,
+    source     TEXT    NOT NULL,
+    success    INTEGER NOT NULL DEFAULT 1,
+    notes      TEXT
+);
 """
 
 
@@ -195,6 +205,40 @@ class SessionStore:
             rows = conn.execute(
                 "SELECT * FROM feedback WHERE session_id = ? ORDER BY id",
                 (session_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Update events ────────────────────────────────────────────────────────
+
+    def log_update_event(
+        self,
+        from_sha: Optional[str],
+        to_sha: Optional[str],
+        source: str,
+        success: bool = True,
+        notes: Optional[str] = None,
+    ) -> None:
+        """Log an auto-update or manual upgrade event. Non-critical: swallows DB errors."""
+        ts = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO update_events (timestamp, from_sha, to_sha, source, success, notes)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (ts, from_sha, to_sha, source, int(success), notes),
+                )
+        except sqlite3.OperationalError as exc:
+            logger.warning("log_update_event: DB error (non-critical): %s", exc)
+
+    def list_update_events(
+        self,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Return recent update events, most recent first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM update_events ORDER BY id DESC LIMIT ?",
+                (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
 

@@ -1,0 +1,10 @@
+[Unit]
+Description=AVR Calibration — daily Docker image update check
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1800
+Persistent=true
+
+[Install]
+WantedBy=timers.target

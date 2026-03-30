@@ -1,0 +1,88 @@
+[Unit]
+Description=AVR Calibration — Docker image updater
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+
+# Ensure inotify-tools is available (installed by install.sh)
+ExecStartPre=/usr/bin/which inotifywait
+
+ExecStart=/bin/bash -euo pipefail -c '\
+  IMAGE="ghcr.io/abarbaccia/avr-calibration:latest"; \
+  DATA_DIR="/home/pi/.avr-calibration"; \
+  TRIGGER="$DATA_DIR/upgrade-trigger"; \
+  LOCK="$DATA_DIR/.upgrade-lock"; \
+  DIGEST_FILE="$DATA_DIR/last-known-good-digest"; \
+  \
+  mkdir -p "$DATA_DIR"; \
+  \
+  # Startup poll: handle trigger written before this service started \
+  if [ ! -f "$TRIGGER" ]; then \
+    echo "Waiting for upgrade-trigger via inotifywait..."; \
+    inotifywait -m -e create,moved_to "$DATA_DIR" --format "%f" 2>/dev/null | \
+    while read -r fname; do \
+      [ "$fname" = "upgrade-trigger" ] && break; \
+    done; \
+  fi; \
+  \
+  # Acquire exclusive lock — prevents concurrent upgrades \
+  exec 9>"$LOCK"; \
+  flock -n 9 || { echo "Another upgrade is already running. Exiting."; exit 0; }; \
+  \
+  echo "Upgrade triggered. Pulling $IMAGE..."; \
+  \
+  # Record current digest before pull \
+  PREV_DIGEST=$(docker inspect --format="{{ "{{" }}.Image{{ "}}" }}" avr-calibration 2>/dev/null || echo ""); \
+  echo "$PREV_DIGEST" > "$DIGEST_FILE.prev"; \
+  \
+  # Pull latest image \
+  if ! docker pull "$IMAGE"; then \
+    echo "docker pull failed. Keeping current version."; \
+    rm -f "$TRIGGER"; \
+    exit 0; \
+  fi; \
+  \
+  # Restart the service with the new image \
+  echo "Pull complete. Restarting avr-calibration..."; \
+  systemctl restart avr-calibration; \
+  \
+  # Health-check gated rollback: poll /health for up to 30s \
+  HEALTH_URL="http://localhost:8000/health"; \
+  DEADLINE=$(( $(date +%s) + 30 )); \
+  HEALTHY=0; \
+  while [ "$(date +%s)" -lt "$DEADLINE" ]; do \
+    if curl -sf --max-time 3 "$HEALTH_URL" >/dev/null 2>&1; then \
+      HEALTHY=1; \
+      break; \
+    fi; \
+    sleep 2; \
+  done; \
+  \
+  if [ "$HEALTHY" = "1" ]; then \
+    echo "Health check passed. Update complete."; \
+    NEW_DIGEST=$(docker inspect --format="{{ "{{" }}.Image{{ "}}" }}" avr-calibration 2>/dev/null || echo ""); \
+    echo "$NEW_DIGEST" > "$DIGEST_FILE"; \
+  else \
+    echo "Health check failed after 30s. Rolling back to previous digest..."; \
+    PREV=$(cat "$DIGEST_FILE.prev" 2>/dev/null || echo ""); \
+    if [ -n "$PREV" ]; then \
+      docker pull "$PREV" && \
+      docker tag "$PREV" "$IMAGE" && \
+      systemctl restart avr-calibration && \
+      echo "Rollback complete." || \
+      echo "Rollback also failed. Manual intervention required."; \
+    else \
+      echo "No previous digest recorded. Cannot roll back."; \
+    fi; \
+  fi; \
+  \
+  # Cleanup: remove trigger, release lock \
+  rm -f "$TRIGGER"; \
+  flock -u 9; \
+'
+
+[Install]
+WantedBy=multi-user.target
