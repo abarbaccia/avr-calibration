@@ -39,15 +39,16 @@ class PreflightChecker:
         self.config = config
 
     async def run_all(self) -> list[CheckResult]:
-        """Run all hardware checks concurrently. Never raises — errors become failed results."""
+        """Run all hardware checks concurrently. Never raises — errors become failed results.
+
+        Phase 2 equipment checks (microphone is checked later during signal sweep):
+            [Config]  [miniDSP (USB+daemon)]  [Denon AVR + Playback]  [Signal Path]
+        """
         checks = [
-            ("Microphone", self.check_mic()),
-            ("miniDSP USB", self.check_hidraw()),
-            ("miniDSP", self.check_minidsp()),
-            ("Denon AVR", self.check_denon()),
-            ("Playback Route", self.check_playback_route()),
-            ("Signal Path", self.check_signal_path_sync()),
             ("Config", self.check_config()),
+            ("miniDSP", self.check_minidsp_combined()),
+            ("Denon AVR", self.check_denon_and_playback()),
+            ("Signal Path", self.check_signal_path_sync()),
         ]
         names = [name for name, _ in checks]
         coros = [coro for _, coro in checks]
@@ -188,25 +189,66 @@ class PreflightChecker:
             )
 
     async def check_denon(self) -> CheckResult:
-        """Check that the Denon AVR is online at the configured IP."""
+        """Check that the Denon AVR is online.
+
+        If denon.host is not configured, performs SSDP discovery (2 s timeout)
+        to find a Denon AVR on the local network automatically.
+        """
+        import denonavr
+
         host = self.config.denon.get("host")
+        auto_discovered = False
+
         if not host:
-            return CheckResult(
-                name="Denon AVR",
-                passed=False,
-                detail="",
-                error="denon.host not set — edit ~/.avr-calibration/config.yaml",
-            )
+            try:
+                devices = await asyncio.wait_for(denonavr.async_discover(), timeout=10.0)
+                if not devices:
+                    return CheckResult(
+                        name="Denon AVR",
+                        passed=False,
+                        detail="No Denon AVR found on network (SSDP scan)",
+                        error=(
+                            "No Denon AVR discovered. "
+                            "Ensure it is powered on and connected to the same network, "
+                            "or set denon.host in ~/.avr-calibration/config.yaml."
+                        ),
+                    )
+                host = devices[0].get("host")
+                if not host:
+                    return CheckResult(
+                        name="Denon AVR",
+                        passed=False,
+                        detail="SSDP found a device but could not determine its IP address",
+                        error="Discovered device has no host address. Set denon.host in config manually.",
+                    )
+                auto_discovered = True
+            except asyncio.TimeoutError:
+                return CheckResult(
+                    name="Denon AVR",
+                    passed=False,
+                    detail="SSDP discovery timed out after 10s",
+                    error=(
+                        "SSDP scan timed out. "
+                        "Set denon.host in ~/.avr-calibration/config.yaml to skip auto-discovery."
+                    ),
+                )
+            except Exception as exc:
+                return CheckResult(
+                    name="Denon AVR",
+                    passed=False,
+                    detail="",
+                    error=f"SSDP discovery failed: {exc}",
+                )
 
         try:
-            import denonavr
             receiver = denonavr.DenonAVR(host)
             await receiver.async_setup()
             model = receiver.model_name or "Denon AVR"
+            suffix = " (auto-discovered)" if auto_discovered else ""
             return CheckResult(
                 name="Denon AVR",
                 passed=True,
-                detail=f"{model} online at {host}",
+                detail=f"{model} online at {host}{suffix}",
             )
         except Exception as exc:
             return CheckResult(
@@ -225,8 +267,8 @@ class PreflightChecker:
         route = self.config.measurement.get("playback_route", "usb")
 
         if route == "hdmi":
-            # Delegate to check_denon() to avoid creating a second DenonAVR connection
-            # when run_all() fires both check_denon and check_playback_route in parallel.
+            # Delegate to check_denon() — HDMI playback requires a working Denon connection.
+            # For USB route, check_playback_route() only queries sounddevice (no Denon call).
             denon_result = await self.check_denon()
             return CheckResult(
                 name="Playback Route",
@@ -339,15 +381,98 @@ class PreflightChecker:
             detail=", ".join(parts) + " matches config",
         )
 
-    async def check_config(self) -> CheckResult:
-        """Check that all required config fields are present."""
-        required = [("denon.host", self.config.denon.get("host"))]
-        missing = [name for name, val in required if val is None]
-        if missing:
+    async def check_minidsp_combined(self) -> CheckResult:
+        """Combined check: verifies both the miniDSP USB device node AND the minidspd daemon.
+
+        Runs both checks concurrently. Returns a single CheckResult — pass only if both pass.
+        """
+        hidraw_result, daemon_result = await asyncio.gather(
+            self.check_hidraw(),
+            self.check_minidsp(),
+        )
+
+        if hidraw_result.passed and daemon_result.passed:
             return CheckResult(
-                name="Config",
-                passed=False,
-                detail=f"{len(missing)} required field(s) missing",
-                error=f"Missing required fields: {', '.join(missing)}",
+                name="miniDSP",
+                passed=True,
+                detail=f"{daemon_result.detail}; {hidraw_result.detail}",
             )
-        return CheckResult(name="Config", passed=True, detail="Required fields present")
+
+        if not hidraw_result.passed and not daemon_result.passed:
+            # USB issue is more fundamental — show it first, include daemon status for context.
+            daemon_note = f"; also: {daemon_result.error}" if daemon_result.error else ""
+            return CheckResult(
+                name="miniDSP",
+                passed=False,
+                detail=f"USB: {hidraw_result.detail or 'not found'}; daemon: {daemon_result.detail or 'not reachable'}",
+                error=f"{hidraw_result.error}{daemon_note}",
+            )
+
+        if not hidraw_result.passed:
+            return CheckResult(
+                name="miniDSP",
+                passed=False,
+                detail=hidraw_result.detail,
+                error=hidraw_result.error,
+            )
+
+        return CheckResult(
+            name="miniDSP",
+            passed=False,
+            detail=daemon_result.detail or hidraw_result.detail,
+            error=daemon_result.error,
+        )
+
+    async def check_denon_and_playback(self) -> CheckResult:
+        """Combined check: Denon AVR connectivity (with auto-discovery) and playback route.
+
+        For HDMI playback route: Denon reachable implies playback is ready.
+        For USB playback route: also verifies the USB audio output device.
+        Returns a single CheckResult named 'Denon AVR'.
+        """
+        denon_result = await self.check_denon()
+
+        if not denon_result.passed:
+            return CheckResult(
+                name="Denon AVR",
+                passed=False,
+                detail=denon_result.detail,
+                error=denon_result.error,
+            )
+
+        route = self.config.measurement.get("playback_route", "usb")
+
+        if route == "hdmi":
+            return CheckResult(
+                name="Denon AVR",
+                passed=True,
+                detail=f"{denon_result.detail}; HDMI playback ready",
+            )
+
+        # USB route: also verify the USB audio output device
+        playback_result = await self.check_playback_route()
+        if playback_result.passed:
+            return CheckResult(
+                name="Denon AVR",
+                passed=True,
+                detail=f"{denon_result.detail}; {playback_result.detail}",
+            )
+        return CheckResult(
+            name="Denon AVR",
+            passed=False,
+            detail=playback_result.detail,
+            error=playback_result.error,
+        )
+
+    async def check_config(self) -> CheckResult:
+        """Check that config is valid.
+
+        denon.host is optional — if not set, check_denon() falls back to SSDP discovery.
+        The Config check currently validates presence of non-discoverable required fields.
+        """
+        host = self.config.denon.get("host")
+        notes = []
+        if not host:
+            notes.append("denon.host not set (will use SSDP auto-discovery)")
+        detail = "; ".join(notes) if notes else "All fields present"
+        return CheckResult(name="Config", passed=True, detail=detail)

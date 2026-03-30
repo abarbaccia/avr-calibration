@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1.0] - 2026-03-30
+
+### Changed
+- **Preflight checks consolidated to 4:** Phase 2 equipment check row count drops from 7 to 4. Microphone check moved to signal sweep phase (Phase 3). miniDSP USB + daemon checks run concurrently and report as a single "miniDSP" row. Denon AVR + playback route checks merge into a single "Denon AVR" row.
+- **Denon auto-discovery via SSDP:** `check_denon()` now performs a 10-second SSDP scan when no `denon.host` is configured, eliminating the need to hardcode the AVR's IP address in most home network setups.
+- **Config check always passes:** `check_config()` no longer fails when `denon.host` is absent (SSDP covers it). Shows an informational note when auto-discovery will be used.
+
+### Fixed
+- SSDP discovery now has a 10-second `asyncio.wait_for()` timeout guard. Previously, a busy network with many UPnP devices could cause preflight to stall indefinitely during the HTTP SCPD-fetch phase.
+- `check_minidsp_combined()` now includes the daemon error message (not just the USB error) when both checks fail simultaneously, giving users the full picture on first failure.
+- SSDP device with a malformed or missing host address now fails with a clear diagnostic instead of passing `None` to `DenonAVR()` and producing an opaque exception.
+
 ## [0.3.0.0] - 2026-03-30
 
 ### Added
