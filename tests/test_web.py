@@ -11,8 +11,11 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+from unittest.mock import AsyncMock
+
 from calibrate.config import Config
 from calibrate.measurement import FrequencyResponse, MeasurementQualityError
+from calibrate.preflight import CheckResult
 from calibrate.web import (
     app,
     _pending_sweeps,
@@ -1718,3 +1721,143 @@ class TestGetDeviceState:
             r = client.get("/api/signal-path/device-state")
 
         assert r.status_code == 502
+
+
+# ── GET /api/preflight and /api/preflight/{check_name} ───────────────────────
+
+class TestPreflightEndpoints:
+    def _pass(self, name: str) -> CheckResult:
+        return CheckResult(name=name, passed=True, detail=f"{name} OK")
+
+    def _fail(self, name: str) -> CheckResult:
+        return CheckResult(name=name, passed=False, detail="", error=f"{name} failed")
+
+    def _all_pass_mocks(self):
+        return {
+            "check_mic": AsyncMock(return_value=self._pass("Microphone")),
+            "check_hidraw": AsyncMock(return_value=self._pass("miniDSP USB")),
+            "check_minidsp": AsyncMock(return_value=self._pass("miniDSP")),
+            "check_denon": AsyncMock(return_value=self._pass("Denon AVR")),
+            "check_playback_route": AsyncMock(return_value=self._pass("Playback Route")),
+            "check_signal_path_sync": AsyncMock(return_value=self._pass("Signal Path")),
+            "check_config": AsyncMock(return_value=self._pass("Config")),
+        }
+
+    def test_preflight_run_all_all_pass(self, client, cfg_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        mocks = self._all_pass_mocks()
+        with patch.multiple("calibrate.preflight.PreflightChecker", **mocks):
+            r = client.get("/api/preflight")
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data) == 7
+        assert all(item["passed"] for item in data)
+
+    def test_preflight_run_all_partial_fail(self, client, cfg_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        mocks = self._all_pass_mocks()
+        mocks["check_minidsp"] = AsyncMock(return_value=self._fail("miniDSP"))
+        with patch.multiple("calibrate.preflight.PreflightChecker", **mocks):
+            r = client.get("/api/preflight")
+        assert r.status_code == 200
+        data = r.json()
+        minidsp = next(item for item in data if item["name"] == "miniDSP")
+        assert not minidsp["passed"]
+        assert minidsp["error"] == "miniDSP failed"
+
+    def test_preflight_run_all_no_config(self, client, tmp_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", tmp_path / "missing.yaml")
+        r = client.get("/api/preflight")
+        assert r.status_code == 503
+
+    def test_preflight_check_hidraw_pass(self, client, cfg_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        with patch("calibrate.preflight.PreflightChecker.check_hidraw",
+                   new=AsyncMock(return_value=self._pass("miniDSP USB"))):
+            r = client.get("/api/preflight/hidraw")
+        assert r.status_code == 200
+        assert r.json()["passed"] is True
+
+    def test_preflight_check_hidraw_fail(self, client, cfg_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        with patch("calibrate.preflight.PreflightChecker.check_hidraw",
+                   new=AsyncMock(return_value=self._fail("miniDSP USB"))):
+            r = client.get("/api/preflight/hidraw")
+        assert r.status_code == 200
+        assert r.json()["passed"] is False
+
+    def test_preflight_check_minidsp_pass(self, client, cfg_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        with patch("calibrate.preflight.PreflightChecker.check_minidsp",
+                   new=AsyncMock(return_value=self._pass("miniDSP"))):
+            r = client.get("/api/preflight/minidsp")
+        assert r.status_code == 200
+        assert r.json()["passed"] is True
+
+    def test_preflight_check_minidsp_fail(self, client, cfg_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        with patch("calibrate.preflight.PreflightChecker.check_minidsp",
+                   new=AsyncMock(return_value=self._fail("miniDSP"))):
+            r = client.get("/api/preflight/minidsp")
+        assert r.status_code == 200
+        assert r.json()["passed"] is False
+
+    def test_preflight_check_denon_pass(self, client, cfg_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        with patch("calibrate.preflight.PreflightChecker.check_denon",
+                   new=AsyncMock(return_value=self._pass("Denon AVR"))):
+            r = client.get("/api/preflight/denon")
+        assert r.status_code == 200
+        assert r.json()["passed"] is True
+
+    def test_preflight_check_denon_fail(self, client, cfg_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        with patch("calibrate.preflight.PreflightChecker.check_denon",
+                   new=AsyncMock(return_value=self._fail("Denon AVR"))):
+            r = client.get("/api/preflight/denon")
+        assert r.status_code == 200
+        assert r.json()["passed"] is False
+
+    def test_preflight_check_playback_pass(self, client, cfg_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        with patch("calibrate.preflight.PreflightChecker.check_playback_route",
+                   new=AsyncMock(return_value=self._pass("Playback Route"))):
+            r = client.get("/api/preflight/playback")
+        assert r.status_code == 200
+        assert r.json()["passed"] is True
+
+    def test_preflight_check_signal_path_pass(self, client, cfg_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        with patch("calibrate.preflight.PreflightChecker.check_signal_path_sync",
+                   new=AsyncMock(return_value=self._pass("Signal Path"))):
+            r = client.get("/api/preflight/signal-path")
+        assert r.status_code == 200
+        assert r.json()["passed"] is True
+
+    def test_preflight_check_config_all_present(self, client, cfg_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        with patch("calibrate.preflight.PreflightChecker.check_config",
+                   new=AsyncMock(return_value=self._pass("Config"))):
+            r = client.get("/api/preflight/config")
+        assert r.status_code == 200
+        assert r.json()["passed"] is True
+
+    def test_preflight_check_config_missing_field(self, client, cfg_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        fail_result = CheckResult(
+            name="Config", passed=False,
+            detail="1 required field(s) missing",
+            error="Missing required fields: denon.host",
+        )
+        with patch("calibrate.preflight.PreflightChecker.check_config",
+                   new=AsyncMock(return_value=fail_result)):
+            r = client.get("/api/preflight/config")
+        assert r.status_code == 200
+        data = r.json()
+        assert not data["passed"]
+        assert "denon.host" in data["error"]
+
+    def test_preflight_unknown_check_name(self, client, cfg_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        r = client.get("/api/preflight/nonexistent-check")
+        assert r.status_code == 404
