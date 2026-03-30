@@ -69,6 +69,9 @@ Early development. Currently implemented:
 - `calibrate history` — list past sessions with timestamp, label, peak SPL, and point count
 - `calibrate show <id>` — session detail with ASCII frequency response plot; `--csv` and `--json` export
 - `calibrate web` — start web server (Pi serves UI; browser captures UMIK audio)
+  - **History viewer:** click any session row to display its frequency response curve alongside the Harman subwoofer target. Before/after EQ overlay when both measurements exist.
+  - **URL deep linking:** `?session={id}` restores the selected session on load; browser back/forward navigates history.
+  - **PNG export:** export the active FR chart as a PNG.
 - **Sub-alignment:** `POST /api/align-subs/start|record|cancel` — sweep each sub independently, extract IR, apply delays + polarity + level matching via miniDSP
 - `Dockerfile` + `.github/workflows/docker.yml` — multi-platform Docker image (arm/v7 + amd64), built and pushed to GHCR via GitHub Actions
 - `deploy/install.sh` — Pi Zero 2 W bootstrap: installs Docker, pulls GHCR image, starts systemd service
