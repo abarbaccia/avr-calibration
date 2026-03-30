@@ -212,7 +212,7 @@ class TestComputeFr:
         n = 4800
         sweep = make_signal(n)
         recording = make_signal(n)
-        freqs, spl, _ir = engine._compute_fr(np, sweep, recording, 20, 200, 48000)
+        freqs, spl = engine._compute_fr(np, sweep, recording, 20, 200, 48000)
         assert all(isinstance(f, float) for f in freqs)
         assert all(isinstance(s, float) for s in spl)
         assert all(np.isfinite(s) for s in spl)
@@ -225,13 +225,13 @@ class TestComputeFr:
         sweep = MagicMock()
         sweep.timeSignal = np.zeros((n, 1))
         recording = make_signal(n)
-        freqs, spl, _ir = engine._compute_fr(np, sweep, recording, 20, 200, 48000)
+        freqs, spl = engine._compute_fr(np, sweep, recording, 20, 200, 48000)
         assert all(np.isfinite(s) for s in spl)
 
     def test_output_frequencies_in_requested_band(self):
         engine = self._engine()
         n = 4800
-        freqs, spl, _ir = engine._compute_fr(np, make_signal(n), make_signal(n), 50, 120, 48000)
+        freqs, spl = engine._compute_fr(np, make_signal(n), make_signal(n), 50, 120, 48000)
         assert all(50 <= f <= 120 for f in freqs)
 
     def test_no_frequencies_in_band_returns_empty(self):
@@ -239,7 +239,7 @@ class TestComputeFr:
         engine = self._engine()
         n = 100
         # With sample_rate=1000 and n=100, max freq=500Hz; band [600,700] is empty
-        freqs, spl, _ir = engine._compute_fr(np, make_signal(n), make_signal(n), 600, 700, 1000)
+        freqs, spl = engine._compute_fr(np, make_signal(n), make_signal(n), 600, 700, 1000)
         assert freqs == []
         assert spl == []
 
