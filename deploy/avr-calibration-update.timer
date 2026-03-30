@@ -1,9 +1,9 @@
 [Unit]
-Description=AVR Calibration — daily Docker image update check
+Description=AVR Calibration — Docker image update check (every 10 minutes)
 
 [Timer]
-OnCalendar=daily
-RandomizedDelaySec=1800
+OnBootSec=2min
+OnUnitActiveSec=10min
 Persistent=true
 
 [Install]

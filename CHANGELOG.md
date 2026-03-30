@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1.1] - 2026-03-30
+
+### Changed
+- **Auto-update polls every 10 minutes** instead of once daily. The update timer now fires 2 minutes after boot and every 10 minutes thereafter. No-op if the GHCR SHA hasn't changed — the update service exits immediately after the manifest check.
+
 ## [0.3.1.0] - 2026-03-30
 
 ### Changed
