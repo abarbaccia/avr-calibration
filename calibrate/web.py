@@ -178,7 +178,9 @@ _HTML = """<!DOCTYPE html>
     th { color: #64748b; font-weight: 500; text-align: left; padding: .4rem .5rem;
          border-bottom: 1px solid #2d3748; }
     td { padding: .4rem .5rem; border-bottom: 1px solid #1a2030; color: #cbd5e1; }
+    tr { cursor: pointer; }
     tr:hover td { background: #1e2535; }
+    tr.selected td { background: #1e2535; border-left: 3px solid #3b82f6; }
     .peak { color: #38bdf8; }
     .feedback-row { display: flex; gap: .5rem; margin-top: .75rem; }
     .feedback-row input { flex: 1; margin-bottom: 0; }
@@ -207,6 +209,10 @@ _HTML = """<!DOCTYPE html>
   <div class="card" id="plotCard" style="display:none">
     <h2>Frequency Response</h2>
     <canvas id="frPlot"></canvas>
+    <p id="plotStatus" style="font-size:.8rem;color:#64748b;margin-top:.5rem;text-align:center;"></p>
+    <div style="text-align:right;margin-top:.5rem">
+      <button id="exportBtn" onclick="exportChart()" style="background:#334155;color:#cbd5e1;font-size:.8rem;padding:.4rem .9rem">Export PNG</button>
+    </div>
   </div>
 
   <div class="card" id="feedbackCard" style="display:none">
@@ -235,6 +241,7 @@ _HTML = """<!DOCTYPE html>
 
   <script>
   let currentSessionId = null;
+  let selectedSessionId = null;
   let frChart = null;
 
   // ── Microphone enumeration ─────────────────────────────────────────────
@@ -369,33 +376,73 @@ _HTML = """<!DOCTYPE html>
     }
 
     currentSessionId = result.session_id;
+    selectedSessionId = result.session_id;
     setStatus(`Session #${result.session_id} saved. Peak: ${result.peak_spl.toFixed(1)} dBFS at ${result.freq_at_peak.toFixed(0)} Hz`, 'ok');
 
-    renderFR(result.frequencies_hz, result.spl_dbfs);
+    renderFR(result.frequencies_hz, result.spl_dbfs, null, null, `Session #${result.session_id}`);
+    history.pushState({ session: result.session_id }, '', `?session=${result.session_id}`);
     document.getElementById('feedbackCard').style.display = '';
     loadHistory();
     btn.disabled = false;
   }
 
   // ── FR plot ────────────────────────────────────────────────────────────
-  function renderFR(freqs, spl) {
+  function renderFR(freqs, spl, endFreqs, endSpl, label) {
+    if (!freqs || !freqs.length) {
+      document.getElementById('plotCard').style.display = '';
+      setPlotStatus('No frequency data for this session.');
+      return;
+    }
     document.getElementById('plotCard').style.display = '';
+    setPlotStatus(label || '');
     const ctx = document.getElementById('frPlot').getContext('2d');
     if (frChart) frChart.destroy();
+
+    // Harman sub target: flat above 80 Hz, +3 dB/octave below 80 Hz
+    const sorted = [...spl].sort((a, b) => a - b);
+    const refSpl = sorted[Math.floor(sorted.length / 2)];
+    const harmTarget = freqs.map(f => f >= 80 ? refSpl : refSpl + 3 * Math.log2(80 / f));
+
+    const datasets = [
+      {
+        label: endFreqs ? 'Before EQ' : 'SPL (dBFS)',
+        data: spl,
+        borderColor: '#3b82f6',
+        backgroundColor: 'rgba(59,130,246,.1)',
+        borderWidth: 1.5,
+        pointRadius: 0,
+        tension: 0.3,
+        fill: !endFreqs,
+      },
+      {
+        label: 'Harman Target',
+        data: harmTarget,
+        borderColor: '#94a3b8',
+        borderDash: [5, 5],
+        borderWidth: 1,
+        pointRadius: 0,
+        tension: 0,
+        fill: false,
+      },
+    ];
+
+    if (endFreqs && endFreqs.length) {
+      datasets.push({
+        label: 'After EQ',
+        data: endSpl,
+        borderColor: '#4ade80',
+        borderWidth: 1.5,
+        pointRadius: 0,
+        tension: 0.3,
+        fill: false,
+      });
+    }
+
     frChart = new Chart(ctx, {
       type: 'line',
       data: {
         labels: freqs.map(f => f.toFixed(1)),
-        datasets: [{
-          label: 'SPL (dBFS)',
-          data: spl,
-          borderColor: '#3b82f6',
-          backgroundColor: 'rgba(59,130,246,.1)',
-          borderWidth: 1.5,
-          pointRadius: 0,
-          tension: 0.3,
-          fill: true,
-        }]
+        datasets,
       },
       options: {
         animation: false,
@@ -415,9 +462,56 @@ _HTML = """<!DOCTYPE html>
             title: { display: true, text: 'dBFS', color: '#64748b' },
           }
         },
-        plugins: { legend: { display: false } }
+        plugins: { legend: { labels: { color: '#94a3b8', font: { size: 11 } } } }
       }
     });
+  }
+
+  function setPlotStatus(msg) {
+    const el = document.getElementById('plotStatus');
+    if (el) el.textContent = msg;
+  }
+
+  function exportChart() {
+    if (!frChart) return;
+    const canvas = document.getElementById('frPlot');
+    const link = document.createElement('a');
+    link.download = `fr-session-${selectedSessionId || 'unknown'}.png`;
+    link.href = canvas.toDataURL('image/png');
+    link.click();
+  }
+
+  async function loadSession(id) {
+    selectedSessionId = id;
+    currentSessionId = id;
+    document.getElementById('feedbackCard').style.display = '';
+
+    // Update URL
+    const url = new URL(window.location);
+    url.searchParams.set('session', id);
+    history.pushState({ session: id }, '', url);
+
+    // Highlight row
+    document.querySelectorAll('#histBody tr').forEach(tr => {
+      tr.classList.toggle('selected', parseInt(tr.dataset.sessionId) === id);
+    });
+
+    try {
+      const r = await fetch(`/api/sessions/${id}`);
+      if (!r.ok) { setPlotStatus('Failed to load session ' + id); return; }
+      const s = await r.json();
+      const startFr = s.start_fr;
+      const endFr = s.end_fr;
+      renderFR(
+        startFr ? startFr.frequencies : [],
+        startFr ? startFr.spl : [],
+        endFr ? endFr.frequencies : null,
+        endFr ? endFr.spl : null,
+        s.label || `Session #${s.id}`,
+      );
+    } catch (e) {
+      setPlotStatus('Error: ' + e.message);
+    }
   }
 
   // ── Feedback ───────────────────────────────────────────────────────────
@@ -444,7 +538,8 @@ _HTML = """<!DOCTYPE html>
       const ts = s.timestamp.slice(0,19).replace('T',' ');
       const label = s.label || '—';
       const peak = s.peak_spl.toFixed(1) + ' dBFS';
-      return `<tr>
+      const sel = s.id === selectedSessionId ? ' selected' : '';
+      return `<tr class="${sel}" data-session-id="${s.id}" onclick="loadSession(${s.id})">
         <td>${s.id}</td><td>${ts}</td><td>${label}</td>
         <td class="peak">${peak}</td><td>${s.n_freqs}</td>
       </tr>`;
@@ -458,7 +553,16 @@ _HTML = """<!DOCTYPE html>
   }
 
   loadMics();
-  loadHistory();
+  loadHistory().then(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const urlSession = urlParams.get('session');
+    if (urlSession) loadSession(parseInt(urlSession, 10));
+  });
+
+  window.addEventListener('popstate', (e) => {
+    const id = e.state && e.state.session;
+    if (id) loadSession(id);
+  });
   </script>
 </body>
 </html>
@@ -615,6 +719,29 @@ async def list_sessions() -> list[dict]:
         }
         for s in sessions
     ]
+
+
+@app.get("/api/sessions/{session_id}")
+async def get_session_detail(session_id: int) -> dict:
+    """Return full frequency response data for a single session."""
+    store = SessionStore()
+    session = store.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"Session #{session_id} not found")
+    logger.info("session %d fetched", session_id)
+
+    def _fr_dict(fr: FrequencyResponse | None) -> dict | None:
+        if fr is None or not fr.frequencies:
+            return None
+        return {"frequencies": fr.frequencies, "spl": fr.spl}
+
+    return {
+        "id": session.id,
+        "label": session.label,
+        "timestamp": session.timestamp,
+        "start_fr": _fr_dict(session.start_fr),
+        "end_fr": _fr_dict(session.end_fr),
+    }
 
 
 @app.post("/api/feedback/{session_id}")
