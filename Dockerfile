@@ -69,6 +69,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
+# VERSION file is read by _read_semantic_version() to populate the UI version chip.
+COPY VERSION /app/VERSION
 ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 # Set HOME to /data so config.py finds ~/.avr-calibration at /data/.avr-calibration
