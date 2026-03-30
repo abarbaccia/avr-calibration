@@ -870,6 +870,16 @@ class TestAlignmentEndpoints:
         )
         assert r.status_code == 404
 
+    def test_align_subs_start_sweep_generation_error(self, client):
+        """generate_sweep RuntimeError → 500."""
+        with (
+            patch("calibrate.web._load_config", return_value=_make_align_config()),
+            patch("calibrate.web.MeasurementEngine") as mock_engine_cls,
+        ):
+            mock_engine_cls.return_value.generate_sweep.side_effect = RuntimeError("no audio")
+            r = client.post("/api/align-subs/start")
+        assert r.status_code == 500
+
     def test_align_subs_ttl_cleanup_restores_gains(self):
         """Expired session: _restore_sub_gains calls client.restore_all_gains."""
         from unittest.mock import AsyncMock, patch
@@ -890,3 +900,102 @@ class TestAlignmentEndpoints:
             _restore_sub_gains(session)
 
         mock_client.restore_all_gains.assert_called_once_with([0, 1])
+
+
+# ── GET /api/sessions/{session_id} ────────────────────────────────────────────
+
+def test_get_session_detail_happy_path(client):
+    from calibrate.storage import Session
+    fr = _make_fr()
+    session = Session(id=3, timestamp="2026-03-20T12:00:00+00:00", label="test",
+                      start_fr=fr, end_fr=None, filters_applied=None, notes=None)
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.return_value = session
+        r = client.get("/api/sessions/3")
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["id"] == 3
+    assert data["label"] == "test"
+    assert data["start_fr"] is not None
+    assert data["end_fr"] is None
+
+
+def test_get_session_detail_field_names(client):
+    """start_fr must use 'frequencies' and 'spl' — not 'frequencies_hz'/'spl_dbfs'."""
+    from calibrate.storage import Session
+    fr = _make_fr()
+    session = Session(id=1, timestamp="2026-03-20T12:00:00+00:00", label=None,
+                      start_fr=fr, end_fr=None, filters_applied=None, notes=None)
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.return_value = session
+        r = client.get("/api/sessions/1")
+
+    start_fr = r.json()["start_fr"]
+    assert "frequencies" in start_fr
+    assert "spl" in start_fr
+    assert "frequencies_hz" not in start_fr
+    assert "spl_dbfs" not in start_fr
+
+
+def test_get_session_detail_with_end_fr(client):
+    from calibrate.storage import Session
+    fr = _make_fr()
+    session = Session(id=2, timestamp="2026-03-20T12:00:00+00:00", label=None,
+                      start_fr=fr, end_fr=fr, filters_applied=None, notes=None)
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.return_value = session
+        r = client.get("/api/sessions/2")
+
+    data = r.json()
+    assert data["end_fr"] is not None
+    assert "frequencies" in data["end_fr"]
+    assert "spl" in data["end_fr"]
+
+
+def test_get_session_detail_404(client):
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.return_value = None
+        r = client.get("/api/sessions/999")
+    assert r.status_code == 404
+
+
+def test_get_session_detail_malformed_fr(client):
+    """Sentinel FrequencyResponse (empty lists) → start_fr returned as null."""
+    from calibrate.storage import Session
+    from calibrate.measurement import FrequencyResponse
+    sentinel = FrequencyResponse(
+        frequencies=[], spl=[], sample_rate=0, sweep_duration=0.0,
+        timestamp="2026-03-20T12:00:00+00:00",
+    )
+    session = Session(id=7, timestamp="2026-03-20T12:00:00+00:00", label=None,
+                      start_fr=sentinel, end_fr=None, filters_applied=None, notes=None)
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.return_value = session
+        r = client.get("/api/sessions/7")
+
+    assert r.status_code == 200
+    assert r.json()["start_fr"] is None
+
+
+def test_list_sessions_tolerates_corrupt_fr(client):
+    """list_sessions must not crash when a session has a sentinel start_fr."""
+    from calibrate.storage import Session
+    from calibrate.measurement import FrequencyResponse
+    sentinel = FrequencyResponse(
+        frequencies=[], spl=[], sample_rate=0, sweep_duration=0.0,
+        timestamp="2026-03-20T12:00:00+00:00",
+    )
+    sessions = [
+        Session(id=1, timestamp="2026-03-20T12:00:00+00:00", label=None,
+                start_fr=sentinel, end_fr=None, filters_applied=None, notes=None),
+    ]
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = sessions
+        r = client.get("/api/sessions")
+
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data) == 1
+    assert data[0]["peak_spl"] == 0.0
+    assert data[0]["n_freqs"] == 0

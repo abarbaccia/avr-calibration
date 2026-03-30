@@ -11,11 +11,14 @@ feedback  — zero or more subjective feedback entries per session, with an
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from .measurement import FrequencyResponse
 
@@ -157,12 +160,32 @@ class SessionStore:
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _row_to_session(self, row: sqlite3.Row) -> Session:
+        try:
+            start_fr = FrequencyResponse.from_json(row["start_fr"])
+        except (json.JSONDecodeError, TypeError, KeyError, ValueError):
+            logger.warning("session %d has corrupt start_fr; returning sentinel", row["id"])
+            start_fr = FrequencyResponse(
+                frequencies=[], spl=[], sample_rate=0, sweep_duration=0.0,
+                timestamp=row["timestamp"],
+            )
+        try:
+            end_fr = FrequencyResponse.from_json(row["end_fr"]) if row["end_fr"] else None
+        except (json.JSONDecodeError, TypeError, KeyError, ValueError):
+            logger.warning("session %d has corrupt end_fr; ignoring", row["id"])
+            end_fr = None
+
+        try:
+            filters_applied = json.loads(row["filters_applied"]) if row["filters_applied"] else None
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning("session %d has corrupt filters_applied; ignoring", row["id"])
+            filters_applied = None
+
         return Session(
             id=row["id"],
             timestamp=row["timestamp"],
             label=row["label"],
-            start_fr=FrequencyResponse.from_json(row["start_fr"]),
-            end_fr=FrequencyResponse.from_json(row["end_fr"]) if row["end_fr"] else None,
-            filters_applied=json.loads(row["filters_applied"]) if row["filters_applied"] else None,
+            start_fr=start_fr,
+            end_fr=end_fr,
+            filters_applied=filters_applied,
             notes=row["notes"],
         )

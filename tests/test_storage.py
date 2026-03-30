@@ -208,3 +208,34 @@ class TestFeedback:
         assert len(store.get_feedback(1)) == 1
         assert len(store.get_feedback(2)) == 1
         assert store.get_feedback(1)[0]["text"] == "session 1 note"
+
+
+# ── Defensive deserialization ─────────────────────────────────────────────────
+
+class TestDefensiveDeserialization:
+    def test_row_to_session_malformed_json(self, store, tmp_path):
+        """Corrupt start_fr JSON → sentinel FrequencyResponse with empty arrays."""
+        import sqlite3
+        db_path = tmp_path / "test.db"
+        store2 = SessionStore(db_path=db_path)
+        store2.save_measurement(make_fr())
+
+        # Corrupt the start_fr column directly
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE sessions SET start_fr = 'not-valid-json' WHERE id = 1")
+        conn.commit()
+        conn.close()
+
+        session = store2.get_session(1)
+        assert session is not None
+        assert session.start_fr.frequencies == []
+        assert session.start_fr.spl == []
+
+    def test_fr_peak_spl_empty_list(self):
+        """FrequencyResponse with empty spl returns 0.0 for peak_spl and freq_at_peak."""
+        fr = FrequencyResponse(
+            frequencies=[], spl=[], sample_rate=0, sweep_duration=0.0,
+            timestamp="2026-03-20T00:00:00+00:00",
+        )
+        assert fr.peak_spl == 0.0
+        assert fr.freq_at_peak == 0.0

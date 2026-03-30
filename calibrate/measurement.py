@@ -65,12 +65,14 @@ class FrequencyResponse:
 
     @property
     def peak_spl(self) -> float:
-        return max(self.spl)
+        return max(self.spl) if self.spl else 0.0
 
     @property
     def freq_at_peak(self) -> float:
-        idx = self.spl.index(self.peak_spl)
-        return self.frequencies[idx]
+        if not self.spl:
+            return 0.0
+        peak = max(self.spl)
+        return self.frequencies[self.spl.index(peak)]
 
 
 class MeasurementEngine:
