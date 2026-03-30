@@ -155,13 +155,15 @@ echo "Image pulled: $IMAGE"
 
 # ── 7. avr-calibration Docker systemd service ─────────────────────────────
 #
-# minidspd now runs INSIDE the container (not on the Pi host).
-# We pass --device=/dev/hidraw0 so the container can reach the miniDSP HID
-# interface. This is less destructive than --device=/dev/bus/usb which would
-# steal exclusive USB access from the kernel and break hidraw for the host.
+# minidspd runs INSIDE the container (not on the Pi host).
+# We use --privileged to give the container full device access, which avoids
+# the HID driver conflict where libusb steals the interface from hid-generic,
+# causing /dev/hidraw0 to disappear mid-session.
 #
-# The udev rule above ensures /dev/hidraw0 is created and group-accessible
-# whenever the miniDSP is plugged in.
+# --privileged is appropriate here because:
+#   - This is a single-purpose appliance (home theater calibration)
+#   - The Pi is on a trusted home LAN, not exposed to the internet
+#   - It's the only reliable way to use HID devices in Docker containers
 #
 # Power note: miniDSP 2x4HD requires 12V 1A minimum. 0.8A causes a boot loop.
 
@@ -178,12 +180,11 @@ Requires=docker.service
 [Service]
 Type=simple
 User=$USER
-ExecStartPre=/bin/sh -c 'for i in \$(seq 30); do [ -e /dev/hidraw0 ] && exit 0; sleep 1; done; echo "WARNING: /dev/hidraw0 not found after 30s, starting without miniDSP"; exit 0'
 ExecStartPre=-/usr/bin/docker rm -f ${SERVICE_NAME}
 ExecStart=/usr/bin/docker run --rm \\
     --name ${SERVICE_NAME} \\
     -p 8000:8000 \\
-    --device=/dev/hidraw0 \\
+    --privileged \\
     -v ${DATA_DIR}:/data/.avr-calibration \\
     ${IMAGE}
 ExecStop=/usr/bin/docker stop ${SERVICE_NAME}

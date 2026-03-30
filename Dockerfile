@@ -44,19 +44,17 @@ FROM python:3.11-slim-bookworm AS runtime
 ARG TARGETARCH
 ARG TARGETVARIANT
 
-# minidsp-rs: talks HID to the miniDSP 2x4HD — serves HTTP on localhost:5380
-# Runs inside the container (container gets --device=/dev/hidraw0 from Docker run).
-# arm/v7 uses the ARMv7-hf RPi binary; amd64 uses the Linux x86_64 build.
+# minidsp-rs: talks HID to the miniDSP 2x4HD.
+# Install from .deb so we get BOTH binaries:
+#   minidsp   — CLI (used for one-off setup commands like routing)
+#   minidspd  — HTTP REST daemon (used by MinidspClient for gain/delay/PEQ)
+# The container needs --privileged (or equivalent device access) at runtime.
 # Use Python urllib to avoid apt-get curl/tar (causes held-package resolver failures under QEMU).
 ARG MINIDSP_VERSION=0.1.12
 RUN set -e; \
     ARCH="${TARGETARCH}${TARGETVARIANT}"; \
-    if [ "$ARCH" = "amd64" ]; then \
-        URL="https://github.com/mrene/minidsp-rs/releases/download/v${MINIDSP_VERSION}/minidsp.x86_64-unknown-linux-gnu.tar.gz"; \
-    else \
-        URL="https://github.com/mrene/minidsp-rs/releases/download/v${MINIDSP_VERSION}/minidsp.arm-linux-gnueabihf-rpi.tar.gz"; \
-    fi; \
-    URL_EXPORT="$URL" python3 -c "import urllib.request, tarfile, os; url = os.environ['URL_EXPORT']; urllib.request.urlretrieve(url, '/tmp/minidsp.tar.gz'); tf = tarfile.open('/tmp/minidsp.tar.gz'); tf.extract('minidsp', '/tmp/'); tf.close(); os.rename('/tmp/minidsp', '/usr/local/bin/minidsp'); os.chmod('/usr/local/bin/minidsp', 0o755)"
+    if [ "$ARCH" = "amd64" ]; then DEB_ARCH="amd64"; else DEB_ARCH="armhf"; fi; \
+    DEB_ARCH_EXPORT="$DEB_ARCH" MINIDSP_VERSION_EXPORT="$MINIDSP_VERSION" python3 -c "import urllib.request, subprocess, os; ver=os.environ['MINIDSP_VERSION_EXPORT']; arch=os.environ['DEB_ARCH_EXPORT']; url=f'https://github.com/mrene/minidsp-rs/releases/download/v{ver}/minidsp_{ver}-1_{arch}.deb'; urllib.request.urlretrieve(url, '/tmp/minidsp.deb'); subprocess.run(['dpkg','-x','/tmp/minidsp.deb','/tmp/minidsp-pkg'],check=True); os.rename('/tmp/minidsp-pkg/usr/bin/minidsp','/usr/local/bin/minidsp'); os.rename('/tmp/minidsp-pkg/usr/bin/minidspd','/usr/local/bin/minidspd'); os.chmod('/usr/local/bin/minidsp',0o755); os.chmod('/usr/local/bin/minidspd',0o755); os.remove('/tmp/minidsp.deb')"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libportaudio2 \
