@@ -3161,23 +3161,26 @@ async def test_signal_path() -> dict:
                       "detail": f"Denon unreachable: {exc}"})
         return {"passed": False, "steps": steps}
 
-    # ── Step 2: Configure miniDSP and get baseline ──────────────────────────
+    # ── Step 2: Verify miniDSP is reachable (retry once on transient 500) ──
     minidsp_host = cfg.minidsp.get("host", "localhost")
     minidsp_port = cfg.minidsp.get("port", 5380)
-    sp = cfg.minidsp.get("signal_path") or {}
-    configured_source = sp.get("source")
-    configured_preset = cfg.minidsp.get("active_preset")
     client = MinidspClient(host=minidsp_host, port=minidsp_port)
-    try:
-        if configured_preset is not None:
-            await client.switch_preset(int(configured_preset))
-        if configured_source:
-            await client.switch_source(configured_source)
-        await client.get_device_status()  # confirm reachable
-    except (MinidspApiError, Exception) as exc:
+    status = None
+    _dsp_exc: Exception | None = None
+    for _attempt in range(3):
+        try:
+            status = await client.get_device_status()
+            _dsp_exc = None
+            break
+        except (MinidspApiError, Exception) as exc:
+            _dsp_exc = exc
+            await asyncio.sleep(1.5)
+    if status is None:
         steps.append({"name": "DSP Input", "passed": False,
-                      "detail": f"miniDSP unreachable: {exc}"})
+                      "detail": f"miniDSP unreachable: {_dsp_exc}"})
         return {"passed": False, "steps": steps}
+    preset_now = (status.get("master") or {}).get("preset", "?")
+    source_now = (status.get("master") or {}).get("source", "?")
 
     # ── Steps 2+3: Play 60 Hz tone, sample miniDSP levels mid-tone ─────────
     async def _play_60hz_tone() -> Optional[str]:
@@ -3220,15 +3223,23 @@ async def test_signal_path() -> dict:
     tone_task = asyncio.create_task(_play_60hz_tone())
     await asyncio.sleep(1.5)  # sample mid-tone while it's playing
 
-    try:
-        mid = await client.get_device_status()
-        mid_inputs: list[float] = mid.get("input_levels", [-128.0, -128.0])
-        mid_outputs: list[float] = mid.get("output_levels", [-128.0] * 4)
-    except Exception as exc:
+    mid: dict | None = None
+    _mid_exc: Exception | None = None
+    for _attempt in range(3):
+        try:
+            mid = await client.get_device_status()
+            _mid_exc = None
+            break
+        except Exception as exc:
+            _mid_exc = exc
+            await asyncio.sleep(1.0)
+    if mid is None:
         tone_task.cancel()
         steps.append({"name": "DSP Input", "passed": False,
-                      "detail": f"Cannot read mid-tone levels: {exc}"})
+                      "detail": f"Cannot read mid-tone levels: {_mid_exc}"})
         return {"passed": False, "steps": steps}
+    mid_inputs: list[float] = mid.get("input_levels", [-128.0, -128.0])
+    mid_outputs: list[float] = mid.get("output_levels", [-128.0] * 4)
 
     tone_error = await tone_task
 

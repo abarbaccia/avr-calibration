@@ -3300,3 +3300,299 @@ def test_signal_chain_get_old_inputs_read_exception(client, tmp_path, monkeypatc
         r = client.get("/api/signal-chain")
 
     assert r.status_code == 200
+
+
+# ── POST /api/signal-path/test ────────────────────────────────────────────────
+
+def _signal_path_cfg(tmp_path, *, denon_host="192.168.1.100", sweep_input="HDMI 1"):
+    """Write a config.yaml suitable for signal-path/test and return the path."""
+    import yaml
+    p = tmp_path / "config.yaml"
+    p.write_text(yaml.safe_dump({
+        "denon": {"host": denon_host},
+        "minidsp": {"host": "localhost", "port": 5380},
+        "measurement": {"denon_sweep_input": sweep_input},
+    }))
+    return p
+
+
+def test_signal_path_test_missing_config(client, tmp_path, monkeypatch):
+    """Config missing denon host and sweep_input → Denon step fails immediately."""
+    import yaml
+    p = tmp_path / "config.yaml"
+    p.write_text(yaml.safe_dump({"denon": {}, "minidsp": {}, "measurement": {}}))
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", p)
+
+    r = client.post("/api/signal-path/test")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passed"] is False
+    assert body["steps"][0]["name"] == "Denon"
+    assert body["steps"][0]["passed"] is False
+    assert "Not configured" in body["steps"][0]["detail"]
+
+
+def test_signal_path_test_denon_unreachable(client, tmp_path, monkeypatch):
+    """Denon connection fails → Denon step fails, no DSP steps attempted."""
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", _signal_path_cfg(tmp_path))
+    receiver = AsyncMock()
+    receiver.async_setup.side_effect = OSError("timeout")
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        r = client.post("/api/signal-path/test")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passed"] is False
+    steps = {s["name"]: s for s in body["steps"]}
+    assert steps["Denon"]["passed"] is False
+    assert "Denon unreachable" in steps["Denon"]["detail"]
+    assert "DSP Input" not in steps
+
+
+def test_signal_path_test_minidsp_unreachable_after_retries(client, tmp_path, monkeypatch):
+    """miniDSP returns 500 on all retries → DSP Input step fails."""
+    import respx, httpx
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", _signal_path_cfg(tmp_path))
+    receiver = AsyncMock()
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        with patch("asyncio.sleep", new=AsyncMock()):  # skip retry delays
+            with respx.mock:
+                respx.get("http://localhost:5380/devices/0").mock(
+                    return_value=httpx.Response(500)
+                )
+                r = client.post("/api/signal-path/test")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passed"] is False
+    steps = {s["name"]: s for s in body["steps"]}
+    assert steps["DSP Input"]["passed"] is False
+    assert "miniDSP unreachable" in steps["DSP Input"]["detail"]
+
+
+def test_signal_path_test_minidsp_recovers_on_retry(client, tmp_path, monkeypatch):
+    """miniDSP returns 500 on first attempt but 200 on retry → proceeds to tone test."""
+    import respx, httpx
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", _signal_path_cfg(tmp_path))
+    receiver = AsyncMock()
+
+    call_count = {"n": 0}
+
+    def _side_effect(req):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return httpx.Response(500)
+        payload = {
+            "master": {"preset": 0, "source": "Analog"},
+            "input_levels": [-80.0, -80.0],
+            "output_levels": [-80.0, -80.0, -80.0, -80.0],
+        }
+        return httpx.Response(200, json=payload)
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        with patch("asyncio.sleep", new=AsyncMock()):
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            with patch("asyncio.to_thread", new=AsyncMock(return_value=mock_proc)):
+                with respx.mock:
+                    respx.get("http://localhost:5380/devices/0").mock(side_effect=_side_effect)
+                    r = client.post("/api/signal-path/test")
+
+    assert r.status_code == 200
+    body = r.json()
+    # retry succeeded — should reach signal check steps (not fail at DSP connectivity)
+    steps = {s["name"]: s for s in body["steps"]}
+    assert "miniDSP unreachable" not in steps.get("DSP Input", {}).get("detail", "")
+
+
+def test_signal_path_test_tone_failure(client, tmp_path, monkeypatch):
+    """aplay returns non-zero → DSP Input step fails with tone error."""
+    import respx, httpx
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", _signal_path_cfg(tmp_path))
+    receiver = AsyncMock()
+    device_payload = {
+        "master": {"preset": 0, "source": "Analog"},
+        "input_levels": [-128.0, -128.0],
+        "output_levels": [-128.0, -128.0, -128.0, -128.0],
+    }
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 1
+    mock_proc.stderr = b"aplay: error opening device"
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        with patch("asyncio.sleep", new=AsyncMock()):
+            with patch("asyncio.to_thread", new=AsyncMock(return_value=mock_proc)):
+                with respx.mock:
+                    respx.get("http://localhost:5380/devices/0").mock(
+                        return_value=httpx.Response(200, json=device_payload)
+                    )
+                    r = client.post("/api/signal-path/test")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passed"] is False
+    steps = {s["name"]: s for s in body["steps"]}
+    assert "Tone playback failed" in steps["DSP Input"]["detail"]
+
+
+def test_signal_path_test_no_input_signal(client, tmp_path, monkeypatch):
+    """miniDSP input levels at noise floor → DSP Input step fails with cable hint."""
+    import respx, httpx
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", _signal_path_cfg(tmp_path))
+    receiver = AsyncMock()
+    device_payload = {
+        "master": {"preset": 0, "source": "Analog"},
+        "input_levels": [-128.0, -128.0],
+        "output_levels": [-128.0, -128.0, -128.0, -128.0],
+    }
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        with patch("asyncio.sleep", new=AsyncMock()):
+            with patch("asyncio.to_thread", new=AsyncMock(return_value=mock_proc)):
+                with respx.mock:
+                    respx.get("http://localhost:5380/devices/0").mock(
+                        return_value=httpx.Response(200, json=device_payload)
+                    )
+                    r = client.post("/api/signal-path/test")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passed"] is False
+    steps = {s["name"]: s for s in body["steps"]}
+    assert steps["DSP Input"]["passed"] is False
+    assert "no signal detected" in steps["DSP Input"]["detail"]
+
+
+def test_signal_path_test_no_output_signal(client, tmp_path, monkeypatch):
+    """Input signal present but outputs flat → DSP Output step fails with routing hint."""
+    import respx, httpx
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", _signal_path_cfg(tmp_path))
+    receiver = AsyncMock()
+    device_payload = {
+        "master": {"preset": 0, "source": "Analog"},
+        "input_levels": [-80.0, -80.0],   # signal present
+        "output_levels": [-128.0, -128.0, -128.0, -128.0],  # routing broken
+    }
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        with patch("asyncio.sleep", new=AsyncMock()):
+            with patch("asyncio.to_thread", new=AsyncMock(return_value=mock_proc)):
+                with respx.mock:
+                    respx.get("http://localhost:5380/devices/0").mock(
+                        return_value=httpx.Response(200, json=device_payload)
+                    )
+                    r = client.post("/api/signal-path/test")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passed"] is False
+    steps = {s["name"]: s for s in body["steps"]}
+    assert steps["DSP Input"]["passed"] is True
+    assert steps["DSP Output"]["passed"] is False
+    assert "routing" in steps["DSP Output"]["detail"].lower()
+
+
+def test_signal_path_test_full_pass(client, tmp_path, monkeypatch):
+    """Signal present at both input and output → all steps pass."""
+    import respx, httpx
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", _signal_path_cfg(tmp_path))
+    receiver = AsyncMock()
+    device_payload = {
+        "master": {"preset": 0, "source": "Analog"},
+        "input_levels": [-70.0, -72.0],
+        "output_levels": [-71.0, -128.0, -128.0, -128.0],
+    }
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        with patch("asyncio.sleep", new=AsyncMock()):
+            with patch("asyncio.to_thread", new=AsyncMock(return_value=mock_proc)):
+                with respx.mock:
+                    respx.get("http://localhost:5380/devices/0").mock(
+                        return_value=httpx.Response(200, json=device_payload)
+                    )
+                    r = client.post("/api/signal-path/test")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passed"] is True
+    steps = {s["name"]: s for s in body["steps"]}
+    assert steps["Denon"]["passed"] is True
+    assert steps["DSP Input"]["passed"] is True
+    assert steps["DSP Output"]["passed"] is True
+
+
+def test_signal_path_test_tone_exception(client, tmp_path, monkeypatch):
+    """Exception inside _play_60hz_tone (e.g. tempfile fails) → DSP Input fails."""
+    import respx, httpx
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", _signal_path_cfg(tmp_path))
+    receiver = AsyncMock()
+    device_payload = {
+        "master": {"preset": 0, "source": "Analog"},
+        "input_levels": [-70.0, -70.0],
+        "output_levels": [-70.0, -70.0, -70.0, -70.0],
+    }
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        with patch("asyncio.sleep", new=AsyncMock()):
+            with patch("asyncio.to_thread", side_effect=OSError("disk full")):
+                with respx.mock:
+                    respx.get("http://localhost:5380/devices/0").mock(
+                        return_value=httpx.Response(200, json=device_payload)
+                    )
+                    r = client.post("/api/signal-path/test")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passed"] is False
+    steps = {s["name"]: s for s in body["steps"]}
+    assert "Tone playback failed" in steps["DSP Input"]["detail"]
+
+
+def test_signal_path_test_mid_tone_levels_fail(client, tmp_path, monkeypatch):
+    """get_device_status raises during mid-tone sampling → DSP Input fails."""
+    import respx, httpx
+    from calibrate.adapters.minidsp import MinidspApiError
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", _signal_path_cfg(tmp_path))
+    receiver = AsyncMock()
+    ok_payload = {
+        "master": {"preset": 0, "source": "Analog"},
+        "input_levels": [-70.0, -70.0],
+        "output_levels": [-70.0, -70.0, -70.0, -70.0],
+    }
+
+    call_count = {"n": 0}
+
+    def _side_effect(req):
+        call_count["n"] += 1
+        if call_count["n"] <= 1:
+            return httpx.Response(200, json=ok_payload)  # connectivity check OK
+        return httpx.Response(500)  # mid-tone sampling fails
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        with patch("asyncio.sleep", new=AsyncMock()):
+            with patch("asyncio.to_thread", new=AsyncMock(return_value=mock_proc)):
+                with respx.mock:
+                    respx.get("http://localhost:5380/devices/0").mock(side_effect=_side_effect)
+                    r = client.post("/api/signal-path/test")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passed"] is False
+    steps = {s["name"]: s for s in body["steps"]}
+    assert "Cannot read mid-tone levels" in steps["DSP Input"]["detail"]
