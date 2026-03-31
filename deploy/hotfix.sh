@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-PI_HOST="${PI_HOST:-avr-cal.local}"
+PI_HOST="${PI_HOST:-192.168.1.126}"
 PI_USER="${PI_USER:-pi}"
 CONTAINER="avr-calibration"
 IMAGE="${IMAGE:-ghcr.io/abarbaccia/avr-calibration:latest}"

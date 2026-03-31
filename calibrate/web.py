@@ -1352,6 +1352,8 @@ _HTML = """<!DOCTYPE html>
       input_labels: {},
       routing: JSON.parse(JSON.stringify(_DEFAULT_ROUTING)),
       output_slots: [0,1,2,3].map(i => ({ index: i, label: '', location: '', preset: '' })),
+      preset_labels: ['', '', '', ''],
+      active_preset: null,
     },
   };
   let _chainDenonHost = null;
@@ -1372,7 +1374,7 @@ _HTML = """<!DOCTYPE html>
         const d = await r.json();
         _chainState = d;
         if (!_chainState.minidsp) {
-          _chainState.minidsp = { input_labels: {}, routing: JSON.parse(JSON.stringify(_DEFAULT_ROUTING)), output_slots: [0,1,2,3].map(i=>({index:i,label:'',location:'',preset:''})) };
+          _chainState.minidsp = { input_labels: {}, routing: JSON.parse(JSON.stringify(_DEFAULT_ROUTING)), output_slots: [0,1,2,3].map(i=>({index:i,label:'',location:'',preset:''})), preset_labels: ['','','',''], active_preset: null };
         }
         if (!(_chainState.minidsp.routing || []).length) {
           _chainState.minidsp.routing = JSON.parse(JSON.stringify(_DEFAULT_ROUTING));
@@ -1467,6 +1469,8 @@ _HTML = """<!DOCTYPE html>
         input_labels: {},
         routing: JSON.parse(JSON.stringify(_DEFAULT_ROUTING)),
         output_slots: [0,1,2,3].map(i => ({ index: i, label: '', location: '', preset: '' })),
+        preset_labels: ['', '', '', ''],
+        active_preset: null,
       };
     }
     renderChain();
@@ -1488,7 +1492,7 @@ _HTML = """<!DOCTYPE html>
       return '';
     }).join('');
     // Post-render initialization
-    if (_chainDevices.includes('minidsp')) renderChainSlots();
+    if (_chainDevices.includes('minidsp')) { renderChainSlots(); _renderPresetTiles(null); }
     if (_chainDevices.includes('denon') && _chainDenonInputs.length) {
       _chainPopulateDenonInputs(_chainDenonInputs, _chainDenonConfirmedInput);
     }
@@ -1587,7 +1591,7 @@ _HTML = """<!DOCTYPE html>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem">
         <h2 style="margin:0;font-size:1rem">miniDSP 2x4 HD</h2>
         <div style="display:flex;gap:.5rem;align-items:center">
-          <span id="chainDspBadge" class="check-badge pending">&mdash;</span>
+          <span id="chainDspBadge" class="check-badge pending" onclick="chainDspAutoTest()" title="Click to retest connection" style="cursor:pointer">&mdash;</span>
           <button onclick="chainRemoveDevice('minidsp')" style="background:transparent;color:#475569;border:none;font-size:1.1rem;cursor:pointer;padding:.1rem .3rem" title="Remove">&times;</button>
         </div>
       </div>
@@ -1601,8 +1605,12 @@ _HTML = """<!DOCTYPE html>
           <div style="font-size:.78rem;color:#475569">Loading\u2026</div>
         </div>
       </div>
+      <div style="margin-bottom:.75rem">
+        <div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.07em;color:#64748b;margin-bottom:.4rem">Device Presets</div>
+        <div id="chainDspPresets" style="display:grid;grid-template-columns:repeat(4,1fr);gap:.4rem"></div>
+        <div style="font-size:.7rem;color:#475569;margin-top:.35rem">Click a preset to select it as active \u2014 Save Changes will switch the device.</div>
+      </div>
       <div style="display:flex;gap:.5rem;justify-content:flex-end;margin-top:.5rem">
-        <button onclick="chainDspAutoTest()" style="background:#334155;color:#cbd5e1">Test Connection</button>
         <button onclick="chainSaveDspSection()" style="background:#2dd4bf;color:#0d0f14;font-weight:600">Save Changes</button>
       </div>
       <div id="chainDspStatus" style="font-size:.78rem;margin-top:.4rem;color:#94a3b8"></div>
@@ -1629,6 +1637,15 @@ _HTML = """<!DOCTYPE html>
       if (el) labels[String(i)] = el.value.trim();
     });
     if (_chainState.minidsp) _chainState.minidsp.input_labels = labels;
+    // Sync preset label inputs
+    if (_chainState.minidsp) {
+      const pl = [];
+      [0, 1, 2, 3].forEach(i => {
+        const el = document.getElementById('chainPresetLabel' + i);
+        pl.push(el ? el.value.trim() : (_chainState.minidsp.preset_labels || [])[i] || '');
+      });
+      _chainState.minidsp.preset_labels = pl;
+    }
   }
 
   function renderChainSlots() {
@@ -1758,7 +1775,23 @@ _HTML = """<!DOCTYPE html>
 
   async function chainSaveDspSection() {
     _syncDspLabelsToState();
-    await chainSaveWithStatus(document.getElementById('chainDspStatus'));
+    const statusEl = document.getElementById('chainDspStatus');
+    await chainSaveWithStatus(statusEl);
+    // Switch device to selected preset if one is chosen
+    const activePreset = (_chainState.minidsp || {}).active_preset;
+    if (activePreset !== null && activePreset !== undefined) {
+      try {
+        const r = await fetch('/api/signal-path/apply', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ preset: activePreset }),
+        });
+        if (r.ok && statusEl) {
+          statusEl.textContent = `Saved \u2014 device switched to Preset ${activePreset + 1}`;
+          statusEl.style.color = '#4ade80';
+        }
+      } catch (_) {}
+    }
   }
 
   async function chainDenonDiscover() {
@@ -1891,10 +1924,47 @@ _HTML = """<!DOCTYPE html>
       const d = await r.json();
       if (badge) { badge.className = 'check-badge ' + (d.passed ? 'pass' : 'fail'); badge.textContent = d.passed ? 'OK' : 'FAIL'; }
       if (status) { status.textContent = d.detail || ''; status.style.color = d.passed ? '#4ade80' : '#f87171'; }
+      if (d.passed) {
+        // Fetch live device state to highlight the active preset
+        try {
+          const sr = await fetch('/api/signal-path/device-state');
+          if (sr.ok) {
+            const sd = await sr.json();
+            const livePreset = (sd.master || {}).preset;
+            if (livePreset !== undefined && livePreset !== null) {
+              _renderPresetTiles(livePreset);
+            }
+          }
+        } catch (_) {}
+      }
     } catch (e) {
       if (badge) { badge.className = 'check-badge fail'; badge.textContent = 'ERR'; }
       if (status) { status.textContent = e.message; status.style.color = '#f87171'; }
     }
+  }
+
+  function chainDspSelectPreset(n) {
+    if (_chainState.minidsp) _chainState.minidsp.active_preset = n;
+    _renderPresetTiles(null);  // re-render with selected state, no live override
+  }
+
+  function _renderPresetTiles(livePreset) {
+    const container = document.getElementById('chainDspPresets');
+    if (!container) return;
+    const labels = (_chainState.minidsp || {}).preset_labels || ['', '', '', ''];
+    const selected = (_chainState.minidsp || {}).active_preset;
+    container.innerHTML = [0, 1, 2, 3].map(i => {
+      const isSelected = selected === i;
+      const isLive = livePreset !== null && livePreset !== undefined && livePreset === i;
+      const border = isSelected ? '2px solid #2dd4bf' : (isLive ? '2px solid #4ade80' : '2px solid #1e293b');
+      const bg = isSelected ? '#0d2d2a' : '#131720';
+      return `<div onclick="chainDspSelectPreset(${i})" style="cursor:pointer;background:${bg};border:${border};border-radius:6px;padding:.5rem .6rem">
+        <div style="font-size:.65rem;color:#64748b;margin-bottom:.3rem">Preset ${i + 1}${isLive ? ' \u25cf' : ''}</div>
+        <input id="chainPresetLabel${i}" type="text" value="${labels[i] || ''}" placeholder="Name\u2026"
+          onclick="event.stopPropagation()"
+          style="width:100%;box-sizing:border-box;font-size:.75rem;margin-bottom:0;background:transparent;border:none;border-bottom:1px solid #334155;border-radius:0;padding:.1rem 0;color:#cbd5e1">
+      </div>`;
+    }).join('');
   }
 
   function _checkChainGate() {
@@ -3285,6 +3355,8 @@ class SignalChainMinidsp(BaseModel):
     input_labels: dict = {}
     routing: list[SignalChainInputRoute] = []
     output_slots: list[SignalChainSlot] = []
+    preset_labels: list[str] = ["", "", "", ""]
+    active_preset: Optional[int] = None
 
 
 class SignalChainBody(BaseModel):
@@ -3346,12 +3418,20 @@ async def signal_chain_get() -> dict:
     default_routing = [{"input": 0, "outputs": [0, 1, 2, 3]}, {"input": 1, "outputs": [0, 1, 2, 3]}]
     input_routing = minidsp.get("input_routing") or default_routing
 
+    preset_labels = minidsp.get("preset_labels") or ["", "", "", ""]
+    # Pad to 4 in case config has fewer entries
+    while len(preset_labels) < 4:
+        preset_labels.append("")
+    active_preset = minidsp.get("active_preset")
+
     return {
         "denon": denon_node,
         "minidsp": {
             "input_labels": input_labels,
             "routing": input_routing,
             "output_slots": output_slots,
+            "preset_labels": preset_labels,
+            "active_preset": active_preset,
         },
     }
 
@@ -3378,6 +3458,8 @@ async def signal_chain_post(body: SignalChainBody) -> dict:
         updates["minidsp"] = {
             "input_labels": body.minidsp.input_labels,
             "output_slots": slots,
+            "preset_labels": body.minidsp.preset_labels,
+            "active_preset": body.minidsp.active_preset,
         }
         if body.minidsp.routing:
             updates["minidsp"]["input_routing"] = [r.model_dump() for r in body.minidsp.routing]

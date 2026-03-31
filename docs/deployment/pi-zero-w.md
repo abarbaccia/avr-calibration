@@ -188,6 +188,37 @@ sudo systemctl restart avr-calibration
 
 ## Troubleshooting
 
+**miniDSP goes offline after ~20 minutes (DeviceNotReady / 502 errors):**
+
+This is a kernel-level bug in the `dwc_otg` USB OTG driver used by the Pi Zero 2 W.
+After sustained USB activity, the FIQ (Fast Interrupt Request) handler in the driver
+corrupts an internal register offset, causing the USB bus to hang. Symptom in `dmesg`:
+
+```
+dwc_otg 3f980000.usb: Invalid offset (0xffffffff)
+```
+
+After this, minidspd reports `DeviceNotReady` on all requests and the web UI returns
+502 errors for any miniDSP operation.
+
+**Workaround:** Restart the service to re-initialize the USB connection:
+
+```bash
+sudo systemctl restart avr-calibration
+```
+
+The `dwc_otg.fiq_enable=0` kernel cmdline parameter is **not effective** on Pi Zero 2 W —
+the Pi firmware ignores it at boot and forces FIQ on regardless. This is a known
+limitation of the closed-source VideoCore firmware bundled with Raspberry Pi OS.
+
+**Long-term fix:** If this becomes disruptive, add a cron job to watch for 502s and
+auto-restart:
+
+```bash
+# /etc/cron.d/avr-watchdog — restart if miniDSP unreachable
+* * * * * root curl -fsk https://localhost:8000/api/preflight/minidsp-combined | grep -q '"passed":true' || systemctl restart avr-calibration
+```
+
 **miniDSP not detected / `calibrate check` shows "miniDSP USB … not found":**
 
 The most common cause on Pi Zero 2 W is using the wrong cable. You **must** use a
