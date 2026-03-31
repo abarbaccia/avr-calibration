@@ -159,7 +159,7 @@ _HTML = """<!DOCTYPE html>
       padding: 2rem 1rem;
     }
     h1 { font-size: 1.4rem; font-weight: 600; color: #94a3b8; letter-spacing: .05em;
-         text-transform: uppercase; margin-bottom: 2rem; }
+         text-transform: uppercase; margin-bottom: 2rem; padding-right: 8rem; }
     .card {
       background: #1a1f2e; border: 1px solid #2d3748; border-radius: 12px;
       padding: 1.5rem; width: 100%; max-width: 760px; margin-bottom: 1.5rem;
@@ -1507,7 +1507,7 @@ _HTML = """<!DOCTYPE html>
         : `<div style="margin-bottom:.65rem">
              <label style="font-size:.75rem;color:#64748b">IP address not detected — enter manually</label>
              <div style="display:flex;gap:.5rem;margin-top:.3rem">
-               <input type="text" id="chainDenonHostManual" placeholder="192.168.x.x" style="flex:1">
+               <input type="text" id="chainDenonHostManual" placeholder="192.168.x.x" style="flex:1;margin-bottom:0">
                <button onclick="chainDenonConnectManual()" id="chainDenonConnectBtn">Connect</button>
              </div>
              <div id="chainDenonConnectStatus" style="font-size:.78rem;color:#94a3b8;margin-top:.3rem"></div>
@@ -1515,7 +1515,7 @@ _HTML = """<!DOCTYPE html>
       <div id="chainDenonInputSection" style="${disc ? '' : 'display:none'}">
         <label for="chainDenonInput" style="font-size:.75rem">Which Denon input is the Pi connected to?</label>
         <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.4rem">
-          <select id="chainDenonInput" style="flex:1"><option value="">— loading inputs —</option></select>
+          <select id="chainDenonInput" style="flex:1;margin-bottom:0"><option value="">— loading inputs —</option></select>
           <button id="chainDenonTestBtn" onclick="chainDenonTestInput()">Test</button>
         </div>
         <div id="chainDenonTestStatus" style="font-size:.78rem;color:${_chainDenonConfirmedInput ? '#4ade80' : '#94a3b8'};margin-bottom:.3rem">${_chainDenonConfirmedInput ? '\u2713 Confirmed: Pi \u2192 ' + _chainDenonConfirmedInput : ''}</div>
@@ -1575,7 +1575,7 @@ _HTML = """<!DOCTYPE html>
         <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.45rem">
           <span style="background:${isOn ? '#134e3e' : '#2a0e0e'};color:${isOn ? '#4ade80' : '#f87171'};font-size:.65rem;padding:.15rem .4rem;border-radius:3px;font-weight:600;white-space:nowrap">${isOn ? 'ON' : 'OFF'}</span>
           <span style="font-size:.8rem;color:#94a3b8;font-weight:500;white-space:nowrap">Input ${inp + 1}</span>
-          <input type="text" id="chainDspInLabel${inp}" value="${label}" placeholder="Label (e.g. LFE from Denon)" style="flex:1;font-size:.78rem">
+          <input type="text" id="chainDspInLabel${inp}" value="${label}" placeholder="Label (e.g. LFE from Denon)" style="flex:1;font-size:.78rem;margin-bottom:0">
         </div>
         <div style="display:flex;gap:.35rem;flex-wrap:wrap">${outBtns}</div>
       </div>`;
@@ -1656,17 +1656,17 @@ _HTML = """<!DOCTYPE html>
           <div style="display:grid;gap:.4rem;margin-bottom:.5rem">
             <div>
               <label style="font-size:.72rem;color:#64748b">Label</label>
-              <input type="text" id="chainSlotLabel${slot.index}" placeholder="e.g. Sub Left" style="width:100%;box-sizing:border-box">
+              <input type="text" id="chainSlotLabel${slot.index}" placeholder="e.g. Sub Left" style="width:100%;box-sizing:border-box;margin-bottom:0">
             </div>
             <div>
               <label style="font-size:.72rem;color:#64748b">Room Location</label>
-              <select id="chainSlotLoc${slot.index}" style="width:100%;box-sizing:border-box">
+              <select id="chainSlotLoc${slot.index}" style="width:100%;box-sizing:border-box;margin-bottom:0">
                 <option value="">— select —</option>${locOptions}
               </select>
             </div>
             <div>
               <label style="font-size:.72rem;color:#64748b">Speaker Preset</label>
-              <select id="chainSlotPreset${slot.index}" style="width:100%;box-sizing:border-box">
+              <select id="chainSlotPreset${slot.index}" style="width:100%;box-sizing:border-box;margin-bottom:0">
                 <option value="">— select —</option>${presetOptions}
               </select>
             </div>
@@ -1791,9 +1791,11 @@ _HTML = """<!DOCTYPE html>
   function _chainPopulateDenonInputs(inputs, selectedInput) {
     const sel = document.getElementById('chainDenonInput');
     if (!sel) return;
+    // Use the provided selectedInput, or fall back to the already-confirmed input
+    const toSelect = selectedInput || _chainDenonConfirmedInput;
     sel.innerHTML = '<option value="">— select input —</option>' +
       (inputs || []).map(inp =>
-        `<option value="${inp}"${inp === selectedInput ? ' selected' : ''}>${inp}</option>`
+        `<option value="${inp}"${inp === toSelect ? ' selected' : ''}>${inp}</option>`
       ).join('');
     if (selectedInput) _chainDenonConfirmedInput = selectedInput;
   }
@@ -3071,7 +3073,7 @@ async def equipment_denon_state() -> dict:
                 "current_input": receiver.input_func,
                 "inputs": sorted(receiver.input_func_list or []),
                 "volume": receiver.volume,
-                "mute": receiver.mute,
+                "mute": receiver.muted,
                 "configured_sweep_input": cfg.measurement.get("denon_sweep_input"),
             }
         return await asyncio.wait_for(_fetch(), timeout=5.0)

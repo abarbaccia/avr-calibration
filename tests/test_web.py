@@ -1756,18 +1756,22 @@ class TestApiVersion:
         assert r.json()["current_sha"] == "unknown"
 
     def test_version_up_to_date(self, client, monkeypatch, clear_version_cache):
+        import time
         sha = "deadbeefdeadbeef"
         monkeypatch.setenv("BUILD_SHA", sha)
-        with patch("calibrate.web._fetch_latest_sha", new=AsyncMock(return_value=sha)):
-            r = client.get("/api/version")
+        # Pre-warm cache — background task won't complete in sync TestClient
+        _version_cache["result"] = {"latest_sha": sha, "expires": time.time() + 3600, "checked_at": time.time()}
+        r = client.get("/api/version")
         data = r.json()
         assert data["up_to_date"] is True
         assert data["latest_sha"] == sha
 
     def test_version_update_available(self, client, monkeypatch, clear_version_cache):
+        import time
         monkeypatch.setenv("BUILD_SHA", "oldsha123")
-        with patch("calibrate.web._fetch_latest_sha", new=AsyncMock(return_value="newsha456")):
-            r = client.get("/api/version")
+        # Pre-warm cache — background task won't complete in sync TestClient
+        _version_cache["result"] = {"latest_sha": "newsha456", "expires": time.time() + 3600, "checked_at": time.time()}
+        r = client.get("/api/version")
         data = r.json()
         assert data["up_to_date"] is False
         assert data["latest_sha"] == "newsha456"
