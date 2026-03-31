@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0.0] - 2026-03-31
+
+### Added
+- **Equipment Setup page (Phase 1):** Replaces the old Room Setup + Equipment Verification two-step flow with a single Equipment Setup phase. Three cards — Denon AVR, miniDSP 2x4 HD, and Speakers & Subs — let you configure and save your full signal chain before calibration.
+- **Denon AVR card:** SSDP auto-discovery finds your AVR on the LAN with one click. After discovery, the live input list is pulled directly from the AVR so you can select which input the Pi HDMI cable is connected to. A test tone (440 Hz via Pi HDMI) lets you confirm the input by ear, then saves `denon.host` and `measurement.denon_sweep_input` to `config.yaml`.
+- **miniDSP 2x4 HD card:** Label each of the four inputs and four outputs (e.g. "Denon LFE L", "SVS PB12-NSD"). Labels are saved under `connections.minidsp.inputs/outputs` in `config.yaml` for use in the signal path block diagram.
+- **Speakers & Subs card:** Add any speaker or subwoofer with a flexible JSON data blob — type, label, room location, port tune frequency, or any future field you want. Stored in a new `equipment` SQLite table with full CRUD via `/api/equipment/speakers`.
+- **Signal path block diagram:** The miniDSP card now renders a live input/output block diagram with per-channel level meters (dBFS bars), updated every 2 seconds. Polling stops automatically when you navigate away from the phase.
+- **`connections` config property:** `Config.connections` exposes the new `connections` section in `config.yaml` for miniDSP I/O labels and Denon connection info.
+- **`update_config()` helper:** Deep-merges a partial dict into `config.yaml` preserving all unrelated keys. Used by all new equipment save endpoints.
+- **New API endpoints:** `GET/POST /api/equipment/denon/state`, `/api/equipment/denon/discover`, `/api/equipment/denon/save`, `/api/equipment/denon/test-input`, `/api/equipment/minidsp/save-labels`, `GET/POST/PUT/DELETE /api/equipment/speakers`.
+
+### Fixed
+- `update_equipment()` with no fields now returns the existing row instead of `None`, preventing a spurious 404 from the PUT endpoint when the request body contains only `type` (no label/data to update).
+- `denonDiscover()` now checks `r2.ok` before parsing the state re-fetch response, so a 500 on the state endpoint shows a proper error instead of silently leaving the input dropdown empty.
+- Level meter polling timer (`_spLevelTimer`) is now cleared when navigating away from Phase 2, eliminating continuous `/api/signal-path/device-state` requests while on other phases.
+- `deleteSpeaker()` now checks the HTTP response status and surfaces errors to the user instead of silently reloading after a failed delete.
+- `equipment_minidsp_save_labels` now merges input/output labels into the existing `connections.minidsp` object instead of replacing it, preserving any other fields in that config section.
+- Corrupt `data` JSON in an equipment row now logs a warning instead of silently returning `{}`.
+
 ## [0.3.1.3] - 2026-03-30
 
 ### Fixed
