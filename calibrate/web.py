@@ -3170,37 +3170,34 @@ async def equipment_denon_test_input(body: DenonTestInputBody) -> dict:
     tone_played = False
     tone_error = None
     try:
-        import numpy as np
-        import sounddevice as sd
+        import array, math, subprocess
 
+        # Generate 440 Hz tone as raw S16_LE PCM — no numpy/PortAudio needed
+        sample_rate = 44100
         duration = 2.0
+        n = int(sample_rate * duration)
+        samples: array.array = array.array("h")
+        for i in range(n):
+            t = i / sample_rate
+            env = min(t / 0.05, 1.0, (duration - t) / 0.05)
+            samples.append(int(math.sin(2 * math.pi * 440 * t) * env * 0.4 * 32767))
+        pcm = samples.tobytes()
 
-        # Prefer configured HDMI device; fall back to first HDMI output found
+        # aplay with plughw bypasses PortAudio; plughw adds ALSA format conversion
+        # so the vc4-hdmi device (which rejects float32/int16 via hw:) works fine
         cfg = _load_config()
-        configured_hdmi = cfg.measurement.get("hdmi_playback_device")
-        hdmi_device = None
-        devices = sd.query_devices()
-        if configured_hdmi:
-            for idx, dev in enumerate(devices):
-                if dev["max_output_channels"] > 0 and configured_hdmi.lower() in dev["name"].lower():
-                    hdmi_device = idx
-                    break
-        if hdmi_device is None:
-            for idx, dev in enumerate(devices):
-                if dev["max_output_channels"] > 0 and "hdmi" in dev["name"].lower():
-                    hdmi_device = idx
-                    break
-
-        # Use device's native sample rate to avoid format errors on hardware devices
-        dev_info = sd.query_devices(hdmi_device) if hdmi_device is not None else sd.query_devices(kind="output")
-        sample_rate = int(dev_info["default_samplerate"])
-        t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
-        # 440 Hz with 50 ms fade-in/out; int16 for broadest device compatibility
-        env = np.minimum(np.minimum(t / 0.05, 1.0), (duration - t) / 0.05)
-        tone = (np.sin(2 * np.pi * 440 * t) * env * 0.4 * 32767).astype(np.int16)
-
-        await asyncio.to_thread(sd.play, tone.reshape(-1, 1), sample_rate, device=hdmi_device)
-        await asyncio.to_thread(sd.wait)
+        hdmi_card = cfg.measurement.get("hdmi_playback_device") or "plughw:1,0"
+        if not hdmi_card.startswith("plughw:") and not hdmi_card.startswith("hw:"):
+            hdmi_card = "plughw:1,0"
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["aplay", "-D", hdmi_card, "-f", "S16_LE", "-r", str(sample_rate), "-c", "1"],
+            input=pcm,
+            timeout=duration + 3,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.decode(errors="replace").strip() or "aplay failed")
         tone_played = True
     except Exception as exc:
         tone_error = str(exc)

@@ -71,6 +71,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libportaudio2 \
     libatlas3-base \
     libopenblas0 \
+    alsa-utils \
     openssl \
     && rm -rf /var/lib/apt/lists/*
 
