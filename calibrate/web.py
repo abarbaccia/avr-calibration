@@ -1355,7 +1355,8 @@ _HTML = """<!DOCTYPE html>
     },
   };
   let _chainDenonHost = null;
-  let _chainDenonConfirmedInput = null;
+  let _chainDenonConfirmedInput = null;  // set only when user clicks "Yes, I heard it"
+  let _chainDenonSavedInput = null;      // pre-loaded from config for dropdown pre-selection only
   let _chainDenonInputs = [];       // cached Denon input list for re-renders
   let _chainExpandedSlot = null;    // DSP slot index with open picker
   let _chainDevices = [];           // ordered device types: ['denon', 'minidsp']
@@ -1377,7 +1378,8 @@ _HTML = """<!DOCTYPE html>
           _chainState.minidsp.routing = JSON.parse(JSON.stringify(_DEFAULT_ROUTING));
         }
         _chainDenonHost = (d.denon || {}).host || null;
-        _chainDenonConfirmedInput = (d.denon || {}).sweep_input || null;
+        _chainDenonSavedInput = (d.denon || {}).sweep_input || null;
+        _chainDenonConfirmedInput = null;  // never pre-confirmed — user must test each session
         _chainDevices = [];
       }
     } catch (_) {}
@@ -1458,7 +1460,7 @@ _HTML = """<!DOCTYPE html>
     _chainDevices = _chainDevices.filter(t => t !== type);
     if (type === 'denon') {
       _chainState.denon = { host: null, sweep_input: null };
-      _chainDenonHost = null; _chainDenonConfirmedInput = null; _chainDenonInputs = [];
+      _chainDenonHost = null; _chainDenonConfirmedInput = null; _chainDenonSavedInput = null; _chainDenonInputs = [];
     }
     if (type === 'minidsp') {
       _chainState.minidsp = {
@@ -1791,13 +1793,12 @@ _HTML = """<!DOCTYPE html>
   function _chainPopulateDenonInputs(inputs, selectedInput) {
     const sel = document.getElementById('chainDenonInput');
     if (!sel) return;
-    // Use the provided selectedInput, or fall back to the already-confirmed input
-    const toSelect = selectedInput || _chainDenonConfirmedInput;
+    // Pre-select: explicit arg > previously confirmed > saved from config (for convenience only)
+    const toSelect = selectedInput || _chainDenonConfirmedInput || _chainDenonSavedInput;
     sel.innerHTML = '<option value="">— select input —</option>' +
       (inputs || []).map(inp =>
         `<option value="${inp}"${inp === toSelect ? ' selected' : ''}>${inp}</option>`
       ).join('');
-    if (selectedInput) _chainDenonConfirmedInput = selectedInput;
   }
 
   async function chainDenonTestInput() {
@@ -3172,13 +3173,7 @@ async def equipment_denon_test_input(body: DenonTestInputBody) -> dict:
         import numpy as np
         import sounddevice as sd
 
-        sample_rate = 48000
         duration = 2.0
-        t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
-        # 440 Hz with 50 ms fade-in/out to avoid clicks
-        tone = (np.sin(2 * np.pi * 440 * t) * 0.4).astype(np.float32)
-        env = np.minimum(np.minimum(t / 0.05, 1.0), (duration - t) / 0.05).astype(np.float32)
-        tone *= env
 
         # Prefer configured HDMI device; fall back to first HDMI output found
         cfg = _load_config()
@@ -3195,6 +3190,14 @@ async def equipment_denon_test_input(body: DenonTestInputBody) -> dict:
                 if dev["max_output_channels"] > 0 and "hdmi" in dev["name"].lower():
                     hdmi_device = idx
                     break
+
+        # Use device's native sample rate to avoid format errors on hardware devices
+        dev_info = sd.query_devices(hdmi_device) if hdmi_device is not None else sd.query_devices(kind="output")
+        sample_rate = int(dev_info["default_samplerate"])
+        t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
+        # 440 Hz with 50 ms fade-in/out; int16 for broadest device compatibility
+        env = np.minimum(np.minimum(t / 0.05, 1.0), (duration - t) / 0.05)
+        tone = (np.sin(2 * np.pi * 440 * t) * env * 0.4 * 32767).astype(np.int16)
 
         await asyncio.to_thread(sd.play, tone.reshape(-1, 1), sample_rate, device=hdmi_device)
         await asyncio.to_thread(sd.wait)
