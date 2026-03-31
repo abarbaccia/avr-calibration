@@ -23,24 +23,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
+# Step 1: install external deps only (no project source needed).
+# This layer only rebuilds when pyproject.toml or uv.lock changes — not on every
+# calibrate/ source edit. On the Pi, this is the slow extraction step; keep it stable.
 COPY pyproject.toml uv.lock ./
-COPY calibrate/ ./calibrate/
 
 RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \
-        echo "ARMv7 (Pi Zero 2 W): pre-install numpy from piwheels, then uv sync for everything else" && \
+        echo "ARMv7 (Pi Zero 2 W): pre-install numpy from piwheels, then deps" && \
         pip install --no-cache-dir uv && \
         uv venv /opt/venv && \
         NUMPY_VER=$(grep -A1 '^name = "numpy"$' uv.lock | grep version | grep -o '[0-9][0-9.]*') && \
         VIRTUAL_ENV=/opt/venv uv pip install \
             --extra-index-url https://www.piwheels.org/simple \
             "numpy==${NUMPY_VER}" && \
-        UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --extra dev --no-editable; \
+        UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --no-dev --no-install-project; \
     else \
         echo "amd64: full deps including pytta (measurement extra)" && \
         pip install --no-cache-dir uv && \
         uv venv /opt/venv && \
-        UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --extra dev --extra measurement --no-editable; \
+        UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --no-dev --extra measurement --no-install-project; \
     fi
+
+# Step 2: copy source and install the project itself.
+# This layer re-runs on every calibrate/ change but is fast (no third-party downloads).
+COPY calibrate/ ./calibrate/
+RUN UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --no-dev --no-editable
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM python:3.11-slim-bookworm AS runtime
