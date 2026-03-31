@@ -1412,7 +1412,7 @@ _HTML = """<!DOCTYPE html>
         // Auto-populate cards from saved config — no scan needed if already configured
         _chainDevices = [];
         if (_chainDenonHost) _chainDevices.push('denon');
-        if ((d.minidsp || {}).host) _chainDevices.push('minidsp');
+        if (d.minidsp && Object.keys(d.minidsp).length) _chainDevices.push('minidsp');
       }
     } catch (_) {}
     renderChain();
