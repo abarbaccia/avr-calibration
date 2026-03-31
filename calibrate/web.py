@@ -339,18 +339,19 @@ _HTML = """<!DOCTYPE html>
       <div>
         <span style="font-size:.72rem;text-transform:uppercase;letter-spacing:.07em;color:#64748b">Calibration Host</span>
         <div style="font-size:.82rem;color:#94a3b8;margin-top:.15rem">AVR Calibration &mdash; measurement only, not in listening path</div>
+        <div id="chainScanStatus" style="font-size:.72rem;color:#475569;margin-top:.3rem"></div>
       </div>
-      <span class="check-badge pass" style="font-size:.7rem">Online</span>
+      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:.4rem">
+        <span class="check-badge pass" style="font-size:.7rem">Online</span>
+        <button id="chainScanBtn" onclick="chainScanDevices()" style="background:transparent;color:#64748b;border:1px solid #334155;border-radius:4px;font-size:.7rem;padding:.2rem .5rem;cursor:pointer;white-space:nowrap">&#8635; Scan</button>
+      </div>
     </div>
 
     <!-- Dynamic device chain rendered by JS -->
     <div id="chainDeviceList"></div>
 
-    <!-- Add device -->
-    <div id="chainAddRow" style="margin:.75rem 0 .5rem">
-      <button id="chainAddBtn" onclick="chainTogglePicker()" style="width:100%;background:#0d0f14;color:#64748b;border:1px dashed #334155;border-radius:8px;padding:.65rem;font-size:.85rem">&#43; Add Device</button>
-      <div id="chainDevicePicker" style="display:none;background:#131720;border-radius:8px;border:1px solid #1e2537;overflow:hidden;margin-top:.25rem"></div>
-    </div>
+    <!-- Add device buttons — one per available device, rendered by JS after scan -->
+    <div id="chainAddRow" style="margin:.5rem 0"></div>
 
     <!-- Continue (gate: at least one device + one speaker configured) -->
     <div style="padding-bottom:.25rem">
@@ -1395,60 +1396,62 @@ _HTML = """<!DOCTYPE html>
       denon:   { scanning: true, found: false, host: null },
       minidsp: { scanning: true, found: false },
     };
-    _renderPicker();
+    const scanBtn = document.getElementById('chainScanBtn');
+    const scanStatus = document.getElementById('chainScanStatus');
+    if (scanBtn) { scanBtn.disabled = true; scanBtn.innerHTML = '\u21bb Scanning\u2026'; }
+    if (scanStatus) { scanStatus.textContent = 'Scanning\u2026'; scanStatus.style.color = '#475569'; }
+    _renderAddButtons();
+    // Denon: SSDP discover (up to 10s); miniDSP: preflight check (fast) — run in parallel
     const [dr, mr] = await Promise.allSettled([
-      fetch('/api/equipment/denon/state').then(r => r.json()),
+      fetch('/api/equipment/denon/discover', { method: 'POST' }).then(r => r.json()),
       fetch('/api/preflight/minidsp-combined').then(r => r.json()),
     ]);
     _chainScanResults.denon = {
       scanning: false,
-      found: dr.status === 'fulfilled' && !!dr.value.connected,
+      found: dr.status === 'fulfilled' && !!dr.value.host,
       host: dr.status === 'fulfilled' ? (dr.value.host || null) : null,
     };
     _chainScanResults.minidsp = {
       scanning: false,
       found: mr.status === 'fulfilled' && !!mr.value.passed,
     };
-    _renderPicker();
+    if (scanBtn) { scanBtn.disabled = false; scanBtn.innerHTML = '\u21bb Scan'; }
+    const found = [
+      _chainScanResults.denon.found ? 'Denon AVR' : null,
+      _chainScanResults.minidsp.found ? 'miniDSP 2x4 HD' : null,
+    ].filter(Boolean);
+    if (scanStatus) {
+      scanStatus.textContent = found.length ? 'Found: ' + found.join(', ') : 'No devices found';
+      scanStatus.style.color = found.length ? '#4ade80' : '#475569';
+    }
+    _renderAddButtons();
   }
 
-  function _renderPicker() {
-    const p = document.getElementById('chainDevicePicker');
-    if (!p) return;
+  function _renderAddButtons() {
+    const row = document.getElementById('chainAddRow');
+    if (!row) return;
     const allDevices = [
-      { type: 'denon',   label: 'Denon AVR',       scan: _chainScanResults.denon },
-      { type: 'minidsp', label: 'miniDSP 2x4 HD',  scan: _chainScanResults.minidsp },
+      { type: 'denon',   label: 'Denon AVR',      scan: _chainScanResults.denon },
+      { type: 'minidsp', label: 'miniDSP 2x4 HD', scan: _chainScanResults.minidsp },
     ];
     const available = allDevices.filter(d => !_chainDevices.includes(d.type));
-    if (!available.length) {
-      p.innerHTML = '<div style="padding:.6rem 1rem;font-size:.82rem;color:#475569">All devices added.</div>';
-      return;
-    }
-    const rows = available.map((d, i) => {
-      const s = d.scan;
-      const isLast = i === available.length - 1;
-      const badge = s.scanning
-        ? `<span style="font-size:.65rem;color:#94a3b8">scanning\u2026</span>`
-        : s.found
-          ? `<span style="font-size:.65rem;color:#4ade80;font-weight:600">\u25cf Found${s.host ? ' \u00b7 ' + s.host : ''}</span>`
-          : `<span style="font-size:.65rem;color:#475569">not found</span>`;
-      return `<button onclick="chainAddDevice('${d.type}')" style="width:100%;background:transparent;color:${s.found ? '#cbd5e1' : '#64748b'};border:none;border-bottom:${isLast ? '0' : '1px solid #1e2537'};padding:.6rem 1rem;text-align:left;cursor:pointer;font-size:.85rem;display:flex;justify-content:space-between;align-items:center">
-        <span>${d.label}</span>${badge}
-      </button>`;
-    }).join('');
-    const rescanRow = `<button onclick="chainScanDevices()" style="width:100%;background:transparent;color:#475569;border:none;border-top:1px solid #1e2537;padding:.45rem 1rem;text-align:left;cursor:pointer;font-size:.75rem">\u21bb Re-scan</button>`;
-    p.innerHTML = rows + rescanRow;
-  }
-
-  function chainTogglePicker() {
-    const p = document.getElementById('chainDevicePicker');
-    if (p) p.style.display = (p.style.display === 'none' ? '' : 'none');
+    if (!available.length) { row.innerHTML = ''; return; }
+    row.innerHTML = '<div style="display:flex;gap:.5rem;flex-wrap:wrap;padding:.5rem 0">' +
+      available.map(d => {
+        const s = d.scan;
+        const found = !s.scanning && s.found;
+        const sublabel = (d.type === 'denon' && s.host) ? ' \u00b7 ' + s.host : '';
+        return `<button onclick="chainAddDevice('${d.type}')" style="background:${found ? '#0d2e2a' : '#131720'};color:${found ? '#2dd4bf' : '#475569'};border:1px solid ${found ? '#2dd4bf' : '#334155'};border-radius:6px;padding:.4rem .85rem;font-size:.82rem;cursor:pointer">&#43; ${d.label}${sublabel}</button>`;
+      }).join('') + '</div>';
   }
 
   function chainAddDevice(type) {
     if (!_chainDevices.includes(type)) _chainDevices.push(type);
-    const p = document.getElementById('chainDevicePicker');
-    if (p) p.style.display = 'none';
+    // Pre-populate Denon host from scan results so card shows it immediately
+    if (type === 'denon' && _chainScanResults.denon.host && !_chainDenonHost) {
+      _chainDenonHost = _chainScanResults.denon.host;
+      _chainState.denon.host = _chainScanResults.denon.host;
+    }
     renderChain();
     _checkChainGate();
     if (type === 'minidsp') chainDspAutoTest();
@@ -1478,11 +1481,8 @@ _HTML = """<!DOCTYPE html>
   function renderChain() {
     const container = document.getElementById('chainDeviceList');
     if (!container) return;
-    // Hide "+" button when all device types are in the chain
-    const addBtn = document.getElementById('chainAddBtn');
-    if (addBtn) addBtn.style.display = (_chainDevices.includes('denon') && _chainDevices.includes('minidsp')) ? 'none' : '';
-    // Refresh picker content (removes newly-added device from list)
-    _renderPicker();
+    // Refresh add-buttons (removes newly-added device from list)
+    _renderAddButtons();
     // Render device cards
     container.innerHTML = _chainDevices.map(type => {
       if (type === 'denon') return _CONNECTOR + _renderDenonCard();
@@ -1506,12 +1506,16 @@ _HTML = """<!DOCTYPE html>
           <button onclick="chainRemoveDevice('denon')" style="background:transparent;color:#475569;border:none;font-size:1.1rem;cursor:pointer;padding:.1rem .3rem" title="Remove">&times;</button>
         </div>
       </div>
-      ${!disc ? `<div style="background:#0d0f14;border-radius:6px;padding:.65rem .75rem;margin-bottom:.65rem;font-size:.82rem;color:#64748b">Click Discover to find your Denon AVR on the network.</div>` : `<div style="font-size:.78rem;color:#4ade80;margin-bottom:.65rem">&#10003; Found at ${_chainDenonHost}</div>`}
-      <div style="display:flex;gap:.5rem;margin-bottom:.5rem">
-        <input type="text" id="chainDenonHost" placeholder="192.168.x.x (or click Discover)" value="${_chainDenonHost || ''}" style="flex:1">
-        <button id="chainDenonDiscoverBtn" onclick="chainDenonDiscover()">Discover</button>
-      </div>
-      <div id="chainDenonDiscoverStatus" style="font-size:.78rem;color:#94a3b8;margin-bottom:.4rem"></div>
+      ${disc
+        ? `<div style="font-size:.78rem;color:#4ade80;margin-bottom:.75rem">&#10003; ${_chainDenonHost}</div>`
+        : `<div style="margin-bottom:.65rem">
+             <label style="font-size:.75rem;color:#64748b">IP address not detected — enter manually</label>
+             <div style="display:flex;gap:.5rem;margin-top:.3rem">
+               <input type="text" id="chainDenonHostManual" placeholder="192.168.x.x" style="flex:1">
+               <button onclick="chainDenonConnectManual()" id="chainDenonConnectBtn">Connect</button>
+             </div>
+             <div id="chainDenonConnectStatus" style="font-size:.78rem;color:#94a3b8;margin-top:.3rem"></div>
+           </div>`}
       <div id="chainDenonInputSection" style="${disc ? '' : 'display:none'}">
         <label for="chainDenonInput" style="font-size:.75rem">Which Denon input is the Pi connected to?</label>
         <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.4rem">
@@ -1536,6 +1540,24 @@ _HTML = """<!DOCTYPE html>
       </div>
       <div id="chainDenonSaveStatus" style="font-size:.78rem;margin-top:.3rem;color:#94a3b8"></div>
     </div>`;
+  }
+
+  async function chainDenonConnectManual() {
+    const ip = ((document.getElementById('chainDenonHostManual') || {}).value || '').trim();
+    if (!ip) return;
+    const btn = document.getElementById('chainDenonConnectBtn');
+    const status = document.getElementById('chainDenonConnectStatus');
+    btn.disabled = true; btn.textContent = 'Connecting\u2026';
+    _chainDenonHost = ip;
+    _chainState.denon.host = ip;
+    try {
+      await chainSave();
+      chainPollBadges();
+      renderChain();
+    } catch (e) {
+      if (status) { status.textContent = 'Error: ' + e.message; status.style.color = '#f87171'; }
+      btn.disabled = false; btn.textContent = 'Connect';
+    }
   }
 
   function _renderMinidspCard() {
@@ -1937,6 +1959,13 @@ _HTML = """<!DOCTYPE html>
         upgradeBtn.style.display = '';
         upgradeConfirm.style.display = 'none';
         _setChip('v' + semver + ' \u25b2', 'update-available', 'v' + semver + ' (' + sha7 + ') \u2014 Update available');
+      } else if (d.checking) {
+        // Background GHCR check still in flight — show semver immediately, retry in 8s
+        versionBadge.innerHTML = '<span class="badge badge-empty">v' + sha7 + '</span>';
+        upgradeBtn.style.display = 'none';
+        upgradeConfirm.style.display = 'none';
+        _setChip('v' + semver, null, 'v' + semver + ' (' + sha7 + ')');
+        setTimeout(loadVersion, 8000);
       } else {
         versionBadge.innerHTML = '<span class="badge badge-empty">v' + sha7 + ' \u2014 Version check unavailable</span>';
         upgradeBtn.style.display = 'none';
@@ -2161,16 +2190,9 @@ def _read_semantic_version() -> str:
     return _SEMANTIC_VERSION
 
 
-@app.get("/api/version")
-async def api_version() -> dict:
-    """Return current and latest git SHAs plus the semantic version. Cached for 1 hour."""
-    current_sha = os.environ.get("BUILD_SHA", "unknown")
-
-    cached = _version_cache.get("result")
-    if cached and cached.get("expires", 0) > time.time():
-        latest_sha = cached.get("latest_sha")
-        checked_at = cached.get("checked_at")
-    else:
+async def _fetch_and_cache_version() -> None:
+    """Background task: fetch the latest SHA from GHCR and populate _version_cache."""
+    try:
         latest_sha = await _fetch_latest_sha()
         checked_at = time.time()
         _version_cache["result"] = {
@@ -2178,6 +2200,33 @@ async def api_version() -> dict:
             "expires": checked_at + _VERSION_CACHE_TTL,
             "checked_at": checked_at,
         }
+    finally:
+        _version_cache.pop("fetching", None)
+
+
+@app.get("/api/version")
+async def api_version() -> dict:
+    """Return current and latest git SHAs plus the semantic version. Cached for 1 hour.
+
+    On a cold cache the GHCR check is fired as a background task so this endpoint
+    returns immediately. Callers should check ``checking: true`` and retry after a
+    few seconds to pick up the result.
+    """
+    current_sha = os.environ.get("BUILD_SHA", "unknown")
+
+    cached = _version_cache.get("result")
+    if cached and cached.get("expires", 0) > time.time():
+        latest_sha = cached.get("latest_sha")
+        checked_at = cached.get("checked_at")
+        checking = False
+    else:
+        # Fire background fetch only if one isn't already running.
+        if not _version_cache.get("fetching"):
+            _version_cache["fetching"] = True
+            asyncio.create_task(_fetch_and_cache_version())
+        latest_sha = None
+        checked_at = time.time()
+        checking = True
 
     up_to_date = (
         current_sha != "unknown"
@@ -2191,6 +2240,7 @@ async def api_version() -> dict:
         "up_to_date": up_to_date,
         "latest_checked_at": checked_at,
         "semantic_version": _read_semantic_version(),
+        "checking": checking,
     }
 
 
