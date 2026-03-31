@@ -349,10 +349,7 @@ _HTML = """<!DOCTYPE html>
     <!-- Add device -->
     <div id="chainAddRow" style="margin:.75rem 0 .5rem">
       <button id="chainAddBtn" onclick="chainTogglePicker()" style="width:100%;background:#0d0f14;color:#64748b;border:1px dashed #334155;border-radius:8px;padding:.65rem;font-size:.85rem">&#43; Add Device</button>
-      <div id="chainDevicePicker" style="display:none;background:#131720;border-radius:8px;border:1px solid #1e2537;overflow:hidden;margin-top:.25rem">
-        <button id="chainPickerDenon" onclick="chainAddDevice('denon')" style="width:100%;background:transparent;color:#cbd5e1;border:none;border-bottom:1px solid #1e2537;padding:.65rem 1rem;text-align:left;cursor:pointer;font-size:.85rem">Denon AVR</button>
-        <button id="chainPickerMinidsp" onclick="chainAddDevice('minidsp')" style="width:100%;background:transparent;color:#cbd5e1;border:none;padding:.65rem 1rem;text-align:left;cursor:pointer;font-size:.85rem">miniDSP 2x4 HD</button>
-      </div>
+      <div id="chainDevicePicker" style="display:none;background:#131720;border-radius:8px;border:1px solid #1e2537;overflow:hidden;margin-top:.25rem"></div>
     </div>
 
     <!-- Continue (gate: at least one device + one speaker configured) -->
@@ -1361,6 +1358,10 @@ _HTML = """<!DOCTYPE html>
   let _chainDenonInputs = [];       // cached Denon input list for re-renders
   let _chainExpandedSlot = null;    // DSP slot index with open picker
   let _chainDevices = [];           // ordered device types: ['denon', 'minidsp']
+  let _chainScanResults = {         // live device scan state
+    denon:   { scanning: false, found: false, host: null },
+    minidsp: { scanning: false, found: false },
+  };
 
   async function initChainBuilder() {
     try {
@@ -1386,6 +1387,57 @@ _HTML = """<!DOCTYPE html>
     renderChain();
     _checkChainGate();
     chainPollBadges();
+    chainScanDevices();  // background scan — populates the + picker
+  }
+
+  async function chainScanDevices() {
+    _chainScanResults = {
+      denon:   { scanning: true, found: false, host: null },
+      minidsp: { scanning: true, found: false },
+    };
+    _renderPicker();
+    const [dr, mr] = await Promise.allSettled([
+      fetch('/api/equipment/denon/state').then(r => r.json()),
+      fetch('/api/preflight/minidsp-combined').then(r => r.json()),
+    ]);
+    _chainScanResults.denon = {
+      scanning: false,
+      found: dr.status === 'fulfilled' && !!dr.value.connected,
+      host: dr.status === 'fulfilled' ? (dr.value.host || null) : null,
+    };
+    _chainScanResults.minidsp = {
+      scanning: false,
+      found: mr.status === 'fulfilled' && !!mr.value.passed,
+    };
+    _renderPicker();
+  }
+
+  function _renderPicker() {
+    const p = document.getElementById('chainDevicePicker');
+    if (!p) return;
+    const allDevices = [
+      { type: 'denon',   label: 'Denon AVR',       scan: _chainScanResults.denon },
+      { type: 'minidsp', label: 'miniDSP 2x4 HD',  scan: _chainScanResults.minidsp },
+    ];
+    const available = allDevices.filter(d => !_chainDevices.includes(d.type));
+    if (!available.length) {
+      p.innerHTML = '<div style="padding:.6rem 1rem;font-size:.82rem;color:#475569">All devices added.</div>';
+      return;
+    }
+    const rows = available.map((d, i) => {
+      const s = d.scan;
+      const isLast = i === available.length - 1;
+      const badge = s.scanning
+        ? `<span style="font-size:.65rem;color:#94a3b8">scanning\u2026</span>`
+        : s.found
+          ? `<span style="font-size:.65rem;color:#4ade80;font-weight:600">\u25cf Found${s.host ? ' \u00b7 ' + s.host : ''}</span>`
+          : `<span style="font-size:.65rem;color:#475569">not found</span>`;
+      return `<button onclick="chainAddDevice('${d.type}')" style="width:100%;background:transparent;color:${s.found ? '#cbd5e1' : '#64748b'};border:none;border-bottom:${isLast ? '0' : '1px solid #1e2537'};padding:.6rem 1rem;text-align:left;cursor:pointer;font-size:.85rem;display:flex;justify-content:space-between;align-items:center">
+        <span>${d.label}</span>${badge}
+      </button>`;
+    }).join('');
+    const rescanRow = `<button onclick="chainScanDevices()" style="width:100%;background:transparent;color:#475569;border:none;border-top:1px solid #1e2537;padding:.45rem 1rem;text-align:left;cursor:pointer;font-size:.75rem">\u21bb Re-scan</button>`;
+    p.innerHTML = rows + rescanRow;
   }
 
   function chainTogglePicker() {
@@ -1426,13 +1478,11 @@ _HTML = """<!DOCTYPE html>
   function renderChain() {
     const container = document.getElementById('chainDeviceList');
     if (!container) return;
-    // Update picker option visibility (hide already-added device types)
-    const dBtn = document.getElementById('chainPickerDenon');
-    const mBtn = document.getElementById('chainPickerMinidsp');
-    if (dBtn) dBtn.style.display = _chainDevices.includes('denon') ? 'none' : '';
-    if (mBtn) mBtn.style.display = _chainDevices.includes('minidsp') ? 'none' : '';
+    // Hide "+" button when all device types are in the chain
     const addBtn = document.getElementById('chainAddBtn');
     if (addBtn) addBtn.style.display = (_chainDevices.includes('denon') && _chainDevices.includes('minidsp')) ? 'none' : '';
+    // Refresh picker content (removes newly-added device from list)
+    _renderPicker();
     // Render device cards
     container.innerHTML = _chainDevices.map(type => {
       if (type === 'denon') return _CONNECTOR + _renderDenonCard();
