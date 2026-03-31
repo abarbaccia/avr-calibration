@@ -3387,6 +3387,7 @@ def test_signal_path_test_minidsp_unreachable_after_retries(client, tmp_path, mo
     with patch("denonavr.DenonAVR", return_value=receiver):
         with patch("asyncio.sleep", new=AsyncMock()):  # skip retry delays
             with respx.mock:
+                respx.post("http://localhost:5380/devices/0").mock(return_value=httpx.Response(200))
                 respx.get("http://localhost:5380/devices/0").mock(
                     return_value=httpx.Response(500)
                 )
@@ -3425,6 +3426,7 @@ def test_signal_path_test_minidsp_recovers_on_retry(client, tmp_path, monkeypatc
             mock_proc.returncode = 0
             with patch("asyncio.to_thread", new=AsyncMock(return_value=mock_proc)):
                 with respx.mock:
+                    respx.post("http://localhost:5380/devices/0").mock(return_value=httpx.Response(200))
                     respx.get("http://localhost:5380/devices/0").mock(side_effect=_side_effect)
                     r = client.post("/api/signal-path/test")
 
@@ -3454,6 +3456,7 @@ def test_signal_path_test_tone_failure(client, tmp_path, monkeypatch):
         with patch("asyncio.sleep", new=AsyncMock()):
             with patch("asyncio.to_thread", new=AsyncMock(return_value=mock_proc)):
                 with respx.mock:
+                    respx.post("http://localhost:5380/devices/0").mock(return_value=httpx.Response(200))
                     respx.get("http://localhost:5380/devices/0").mock(
                         return_value=httpx.Response(200, json=device_payload)
                     )
@@ -3464,6 +3467,92 @@ def test_signal_path_test_tone_failure(client, tmp_path, monkeypatch):
     assert body["passed"] is False
     steps = {s["name"]: s for s in body["steps"]}
     assert "Tone playback failed" in steps["DSP Input"]["detail"]
+
+
+def test_signal_path_test_switches_to_analog_by_default(client, tmp_path, monkeypatch):
+    """signal-path/test switches miniDSP to Analog (default) before measuring."""
+    import respx, httpx, yaml
+    p = tmp_path / "config.yaml"
+    p.write_text(yaml.safe_dump({
+        "denon": {"host": "192.168.1.100"},
+        "minidsp": {"host": "localhost", "port": 5380},
+        "measurement": {"denon_sweep_input": "HDMI 1"},
+        # no signal_path.source set → should default to Analog
+    }))
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", p)
+    receiver = AsyncMock()
+    device_payload = {
+        "master": {"preset": 0, "source": "Usb"},  # starts on USB
+        "input_levels": [-70.0, -70.0],
+        "output_levels": [-70.0, -128.0, -128.0, -128.0],
+    }
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    post_calls = []
+
+    def _post_side_effect(req):
+        post_calls.append(req)
+        return httpx.Response(200)
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        with patch("asyncio.sleep", new=AsyncMock()):
+            with patch("asyncio.to_thread", new=AsyncMock(return_value=mock_proc)):
+                with respx.mock:
+                    respx.post("http://localhost:5380/devices/0").mock(side_effect=_post_side_effect)
+                    respx.get("http://localhost:5380/devices/0").mock(
+                        return_value=httpx.Response(200, json=device_payload)
+                    )
+                    r = client.post("/api/signal-path/test")
+
+    assert r.status_code == 200
+    body = r.json()
+    steps = {s["name"]: s for s in body["steps"]}
+    assert steps["DSP Source"]["passed"] is True
+    assert "Analog" in steps["DSP Source"]["detail"]
+    # Confirm switch_source was actually called (POST body had source=Analog)
+    assert any(b"Analog" in c.content for c in post_calls)
+
+
+def test_signal_path_test_uses_configured_source(client, tmp_path, monkeypatch):
+    """signal-path/test uses signal_path.source from config when set (e.g. Toslink)."""
+    import respx, httpx, yaml
+    p = tmp_path / "config.yaml"
+    p.write_text(yaml.safe_dump({
+        "denon": {"host": "192.168.1.100"},
+        "minidsp": {"host": "localhost", "port": 5380, "signal_path": {"source": "Toslink"}},
+        "measurement": {"denon_sweep_input": "HDMI 1"},
+    }))
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", p)
+    receiver = AsyncMock()
+    device_payload = {
+        "master": {"preset": 0, "source": "Analog"},
+        "input_levels": [-70.0, -70.0],
+        "output_levels": [-70.0, -128.0, -128.0, -128.0],
+    }
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    post_calls = []
+
+    def _post_side_effect(req):
+        post_calls.append(req)
+        return httpx.Response(200)
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        with patch("asyncio.sleep", new=AsyncMock()):
+            with patch("asyncio.to_thread", new=AsyncMock(return_value=mock_proc)):
+                with respx.mock:
+                    respx.post("http://localhost:5380/devices/0").mock(side_effect=_post_side_effect)
+                    respx.get("http://localhost:5380/devices/0").mock(
+                        return_value=httpx.Response(200, json=device_payload)
+                    )
+                    r = client.post("/api/signal-path/test")
+
+    assert r.status_code == 200
+    body = r.json()
+    steps = {s["name"]: s for s in body["steps"]}
+    assert steps["DSP Source"]["passed"] is True
+    assert "Toslink" in steps["DSP Source"]["detail"]
+    assert any(b"Toslink" in c.content for c in post_calls)
 
 
 def test_signal_path_test_no_input_signal(client, tmp_path, monkeypatch):
@@ -3484,6 +3573,7 @@ def test_signal_path_test_no_input_signal(client, tmp_path, monkeypatch):
         with patch("asyncio.sleep", new=AsyncMock()):
             with patch("asyncio.to_thread", new=AsyncMock(return_value=mock_proc)):
                 with respx.mock:
+                    respx.post("http://localhost:5380/devices/0").mock(return_value=httpx.Response(200))
                     respx.get("http://localhost:5380/devices/0").mock(
                         return_value=httpx.Response(200, json=device_payload)
                     )
@@ -3515,6 +3605,7 @@ def test_signal_path_test_no_output_signal(client, tmp_path, monkeypatch):
         with patch("asyncio.sleep", new=AsyncMock()):
             with patch("asyncio.to_thread", new=AsyncMock(return_value=mock_proc)):
                 with respx.mock:
+                    respx.post("http://localhost:5380/devices/0").mock(return_value=httpx.Response(200))
                     respx.get("http://localhost:5380/devices/0").mock(
                         return_value=httpx.Response(200, json=device_payload)
                     )
@@ -3547,6 +3638,7 @@ def test_signal_path_test_full_pass(client, tmp_path, monkeypatch):
         with patch("asyncio.sleep", new=AsyncMock()):
             with patch("asyncio.to_thread", new=AsyncMock(return_value=mock_proc)):
                 with respx.mock:
+                    respx.post("http://localhost:5380/devices/0").mock(return_value=httpx.Response(200))
                     respx.get("http://localhost:5380/devices/0").mock(
                         return_value=httpx.Response(200, json=device_payload)
                     )
@@ -3576,6 +3668,7 @@ def test_signal_path_test_tone_exception(client, tmp_path, monkeypatch):
         with patch("asyncio.sleep", new=AsyncMock()):
             with patch("asyncio.to_thread", side_effect=OSError("disk full")):
                 with respx.mock:
+                    respx.post("http://localhost:5380/devices/0").mock(return_value=httpx.Response(200))
                     respx.get("http://localhost:5380/devices/0").mock(
                         return_value=httpx.Response(200, json=device_payload)
                     )
@@ -3615,6 +3708,7 @@ def test_signal_path_test_mid_tone_levels_fail(client, tmp_path, monkeypatch):
         with patch("asyncio.sleep", new=AsyncMock()):
             with patch("asyncio.to_thread", new=AsyncMock(return_value=mock_proc)):
                 with respx.mock:
+                    respx.post("http://localhost:5380/devices/0").mock(return_value=httpx.Response(200))
                     respx.get("http://localhost:5380/devices/0").mock(side_effect=_side_effect)
                     r = client.post("/api/signal-path/test")
 

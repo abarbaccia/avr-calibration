@@ -365,7 +365,7 @@ _HTML = """<!DOCTYPE html>
         <span id="chainTestBadge" class="check-badge pending">&mdash;</span>
       </div>
       <div style="font-size:.8rem;color:#64748b;margin-bottom:.75rem">
-        Switches devices to calibration inputs, plays a 60 Hz tone, and verifies signal flows through the full chain to the sub output.
+        Switches Denon to sweep input and miniDSP to <span id="chainTestSourceLabel">Analog</span> input, plays a 60 Hz tone, and verifies signal flows through the full chain to the sub output.
       </div>
       <div id="chainTestSteps" style="display:none;margin-bottom:.75rem"></div>
       <div id="chainTestAudible" style="display:none;background:#0d2d2a;border:1px solid #2dd4bf;border-radius:6px;padding:.75rem;margin-bottom:.75rem">
@@ -1330,6 +1330,9 @@ _HTML = """<!DOCTYPE html>
       } else {
         status.textContent = `Applied — source: ${d.source}, preset: ${d.preset}${d.routing_applied ? ', routing matrix set' : ''}.`;
         status.style.color = '#4ade80';
+        // Keep signal path test description in sync
+        const lbl = document.getElementById('chainTestSourceLabel');
+        if (lbl && d.source) lbl.textContent = d.source;
         // Refresh diagram to reflect new device state
         setTimeout(_refreshLevels, 300);
       }
@@ -1972,16 +1975,22 @@ _HTML = """<!DOCTYPE html>
       if (badge) { badge.className = 'check-badge ' + (d.passed ? 'pass' : 'fail'); badge.textContent = d.passed ? 'OK' : 'FAIL'; }
       if (status) { status.textContent = d.detail || ''; status.style.color = d.passed ? '#4ade80' : '#f87171'; }
       if (d.passed) {
-        // Fetch device info (product name, serial) and live preset state in parallel
+        // Fetch device info (product name, serial), live preset state, and signal path config in parallel
         try {
-          const [sr, ir] = await Promise.allSettled([
+          const [sr, ir, spr] = await Promise.allSettled([
             fetch('/api/signal-path/device-state'),
             fetch('/api/equipment/minidsp/state'),
+            fetch('/api/signal-path'),
           ]);
           if (sr.status === 'fulfilled' && sr.value.ok) {
             const sd = await sr.value.json();
             const livePreset = (sd.master || {}).preset;
             if (livePreset !== undefined && livePreset !== null) _renderPresetTiles(livePreset);
+          }
+          if (spr.status === 'fulfilled' && spr.value.ok) {
+            const spd = await spr.value.json();
+            const lbl = document.getElementById('chainTestSourceLabel');
+            if (lbl) lbl.textContent = spd.source || 'Analog';
           }
           if (ir.status === 'fulfilled' && ir.value.ok) {
             const id = await ir.value.json();
@@ -3215,7 +3224,22 @@ async def test_signal_path() -> dict:
     preset_now = (status.get("master") or {}).get("preset", "?")
     source_now = (status.get("master") or {}).get("source", "?")
 
-    # ── Steps 2+3: Play 60 Hz tone, sample miniDSP levels mid-tone ─────────
+    # ── Step 2b: Switch miniDSP to configured input source ─────────────────
+    # Denon sub pre-out arrives on the analog input by default; SPDIF/optical
+    # users can override via signal_path.source in config.
+    sp_cfg = cfg.minidsp.get("signal_path") or {}
+    target_source = sp_cfg.get("source") or "Analog"
+    try:
+        await client.switch_source(target_source)
+        await asyncio.sleep(0.4)  # let hardware settle before tone plays
+        steps.append({"name": "DSP Source", "passed": True,
+                      "detail": f"Switched to {target_source}"})
+    except Exception as exc:
+        steps.append({"name": "DSP Source", "passed": False,
+                      "detail": f"Could not switch to {target_source}: {exc}"})
+        return {"passed": False, "steps": steps}
+
+    # ── Steps 3+4: Play 60 Hz tone, sample miniDSP levels mid-tone ─────────
     async def _play_60hz_tone() -> Optional[str]:
         try:
             import array, math, struct, subprocess, os, tempfile
