@@ -2857,6 +2857,12 @@ class SpeakerBody(BaseModel):
     data: Optional[dict] = None  # open blob: manufacturer, model, room_location, port_tune_hz, etc.
 
 
+class SpeakerUpdateBody(BaseModel):
+    type: Optional[str] = None
+    label: Optional[str] = None
+    data: Optional[dict] = None
+
+
 @app.get("/api/equipment/denon/state")
 async def equipment_denon_state() -> dict:
     """Live Denon AVR state: model, current input, all inputs, volume, mute."""
@@ -3007,7 +3013,7 @@ async def equipment_speakers_create(body: SpeakerBody) -> dict:
 
 
 @app.put("/api/equipment/speakers/{speaker_id}")
-async def equipment_speakers_update(speaker_id: int, body: SpeakerBody) -> dict:
+async def equipment_speakers_update(speaker_id: int, body: SpeakerUpdateBody) -> dict:
     result = SessionStore().update_equipment(speaker_id, label=body.label, data=body.data)
     if result is None:
         raise HTTPException(status_code=404, detail=f"Speaker {speaker_id} not found")
