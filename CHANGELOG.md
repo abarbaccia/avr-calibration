@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1.0] - 2026-03-31
+
+### Added
+- **Signal chain builder (Phase 1 redesign):** Replaces the three independent CRUD cards (Denon, miniDSP, Speakers) with a vertical signal-chain builder that traces the audio path from the Pi outward, node by node. The Pi root is shown as a fixed header; Denon and miniDSP appear as full cards below it.
+- **Output slot speaker picker:** Each of the four miniDSP output slots has a "+ Add speaker" affordance that expands inline with label, room location (front-left, front-right, rear-left, rear-right, center, other), and speaker preset (SVS PB-12 NSD). Clicking × on a configured slot clears it.
+- **SVS PB-12 NSD speaker preset:** First preset in the library. Extensible to additional models without schema changes.
+- **Live connectivity badges with 5s timeout:** The Denon badge now uses `asyncio.wait_for(..., timeout=5.0)` so an unreachable AVR shows FAIL within 5 seconds instead of hanging. The frontend AbortController mirrors this with a 5.5s client-side limit.
+- **Offline recovery UX:** When the Denon is unreachable, an amber warning row appears inline with a Retry button. The "Change host" affordance remains available.
+- **Setup gate:** "Continue to Baseline" is disabled until Denon host is saved AND at least one output slot has a speaker configured.
+- **`GET /api/signal-chain`:** Synthesizes the full chain from flat config + speakers. Includes migration tombstone: reads old `connections.minidsp.outputs` labels into `output_slots` on first load.
+- **`POST /api/signal-chain`:** Writes `denon.*`, `minidsp.input_labels`, `minidsp.output_slots`, and **derives `measurement.sub_outputs`** from non-empty slots — keeping the calibration loop in sync with the new UI. Tombstones `connections.minidsp` to prevent dual-read.
+- **`minidsp.output_slots` config defaults:** `DEFAULT_CONFIG` now includes four empty output slots so new users get a valid structure without a config migration.
+- **13 new tests:** Cover GET/POST /api/signal-chain, migration tombstone, sub_outputs derivation, preset/location round-trip, setup gate logic, and config defaults.
+
+### Changed
+- `DEFAULT_CONFIG.minidsp` now includes `input_labels: {}` and `output_slots: [4 empty slots]`.
+- Equipment Setup phase no longer stores speaker room location in `equipment.data` — `output_slots[].location` in config.yaml is the single source of truth.
+
+### Fixed
+- `equipment_denon_state()` now wraps Denon AVR calls in `asyncio.wait_for(..., timeout=5.0)`, preventing the phase from hanging when the AVR is offline.
+
 ## [0.4.0.0] - 2026-03-31
 
 ### Added

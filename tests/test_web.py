@@ -2197,3 +2197,240 @@ class TestMinidspSaveLabels:
         assert data["connections"]["minidsp"]["inputs"]["0"] == "Denon LFE L"
         assert data["connections"]["minidsp"]["outputs"]["0"] == "Sub L"
         assert "2" not in data["connections"]["minidsp"]["outputs"]  # empty strings skipped
+
+
+# ── Signal Chain ──────────────────────────────────────────────────────────────
+
+
+def _empty_slots() -> list[dict]:
+    return [{"index": i, "label": "", "location": "", "preset": ""} for i in range(4)]
+
+
+def _full_chain_body() -> dict:
+    return {
+        "denon": {"host": "192.168.1.100", "sweep_input": "HDMI 1"},
+        "minidsp": {
+            "input_labels": {"0": "LFE L", "1": "LFE R"},
+            "output_slots": [
+                {"index": 0, "label": "Sub L", "location": "front-left", "preset": "pb12-nsd"},
+                {"index": 1, "label": "Sub R", "location": "front-right", "preset": "pb12-nsd"},
+                {"index": 2, "label": "", "location": "", "preset": ""},
+                {"index": 3, "label": "", "location": "", "preset": ""},
+            ],
+        },
+    }
+
+
+class TestSignalChainGet:
+    def test_get_empty_returns_pi_only(self, client, tmp_path, monkeypatch):
+        """GET returns empty chain structure when no config exists."""
+        empty_cfg = tmp_path / "config.yaml"
+        empty_cfg.write_text("denon:\n  host: null\nminidsp:\n  host: localhost\n  port: 5380\n")
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", empty_cfg)
+        monkeypatch.setattr("calibrate.config.CONFIG_PATH", empty_cfg)
+        r = client.get("/api/signal-chain")
+        assert r.status_code == 200
+        d = r.json()
+        assert "denon" in d
+        assert "minidsp" in d
+        assert d["denon"]["host"] is None
+        assert len(d["minidsp"]["output_slots"]) == 4
+
+    def test_get_populated_returns_full_chain(self, client, tmp_path, monkeypatch):
+        """GET synthesizes chain from existing config."""
+        import yaml
+        cfg_data = {
+            "denon": {"host": "192.168.1.100"},
+            "measurement": {"denon_sweep_input": "HDMI 1", "sub_outputs": [0, 1]},
+            "minidsp": {
+                "host": "localhost", "port": 5380,
+                "input_labels": {"0": "LFE L", "1": "LFE R"},
+                "output_slots": [
+                    {"index": 0, "label": "Sub L", "location": "front-left", "preset": "pb12-nsd"},
+                    {"index": 1, "label": "Sub R", "location": "front-right", "preset": "pb12-nsd"},
+                    {"index": 2, "label": "", "location": "", "preset": ""},
+                    {"index": 3, "label": "", "location": "", "preset": ""},
+                ],
+            },
+        }
+        p = tmp_path / "config.yaml"
+        p.write_text(yaml.safe_dump(cfg_data))
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", p)
+        monkeypatch.setattr("calibrate.config.CONFIG_PATH", p)
+        r = client.get("/api/signal-chain")
+        assert r.status_code == 200
+        d = r.json()
+        assert d["denon"]["host"] == "192.168.1.100"
+        assert d["denon"]["sweep_input"] == "HDMI 1"
+        assert d["minidsp"]["output_slots"][0]["label"] == "Sub L"
+        assert d["minidsp"]["output_slots"][0]["location"] == "front-left"
+
+    def test_get_partial_slots_returns_four(self, client, tmp_path, monkeypatch):
+        """Config with 2 of 4 slots filled returns all 4 slots."""
+        import yaml
+        cfg_data = {
+            "denon": {"host": "192.168.1.100"},
+            "minidsp": {
+                "host": "localhost", "port": 5380,
+                "output_slots": [
+                    {"index": 0, "label": "Sub L", "location": "front-left", "preset": "pb12-nsd"},
+                    {"index": 1, "label": "Sub R", "location": "front-right", "preset": "pb12-nsd"},
+                ],
+            },
+        }
+        p = tmp_path / "config.yaml"
+        p.write_text(yaml.safe_dump(cfg_data))
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", p)
+        monkeypatch.setattr("calibrate.config.CONFIG_PATH", p)
+        r = client.get("/api/signal-chain")
+        assert r.status_code == 200
+        # Only 2 slots in config — returned as-is (not padded to 4 by GET)
+        d = r.json()
+        assert len(d["minidsp"]["output_slots"]) == 2
+
+    def test_get_migration_tombstone_old_outputs(self, client, tmp_path, monkeypatch):
+        """Old connections.minidsp.outputs labels migrate into output_slots on GET."""
+        import yaml
+        cfg_data = {
+            "denon": {"host": "192.168.1.100"},
+            "minidsp": {"host": "localhost", "port": 5380},
+            "connections": {"minidsp": {"outputs": {"0": "Sub L", "1": "Sub R"}}},
+        }
+        p = tmp_path / "config.yaml"
+        p.write_text(yaml.safe_dump(cfg_data))
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", p)
+        monkeypatch.setattr("calibrate.config.CONFIG_PATH", p)
+        r = client.get("/api/signal-chain")
+        assert r.status_code == 200
+        d = r.json()
+        # Labels from old key should appear in slots
+        slot0 = next((s for s in d["minidsp"]["output_slots"] if s["index"] == 0), None)
+        assert slot0 is not None
+        assert slot0["label"] == "Sub L"
+
+
+class TestSignalChainPost:
+    def test_post_round_trips(self, client, cfg_path, monkeypatch):
+        """POST writes denon + minidsp, GET reads them back."""
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        monkeypatch.setattr("calibrate.config.CONFIG_PATH", cfg_path)
+        r = client.post("/api/signal-chain", json=_full_chain_body())
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
+        import yaml
+        data = yaml.safe_load(cfg_path.read_text())
+        assert data["denon"]["host"] == "192.168.1.100"
+        assert data["minidsp"]["output_slots"][0]["label"] == "Sub L"
+
+    def test_post_derives_sub_outputs(self, client, cfg_path, monkeypatch):
+        """POST with 2 non-empty slots writes measurement.sub_outputs=[0,1]."""
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        monkeypatch.setattr("calibrate.config.CONFIG_PATH", cfg_path)
+        r = client.post("/api/signal-chain", json=_full_chain_body())
+        assert r.status_code == 200
+        assert r.json()["sub_outputs"] == [0, 1]
+        import yaml
+        data = yaml.safe_load(cfg_path.read_text())
+        assert data["measurement"]["sub_outputs"] == [0, 1]
+
+    def test_post_all_empty_slots_clears_sub_outputs(self, client, cfg_path, monkeypatch):
+        """POST with all empty slots writes measurement.sub_outputs=[]."""
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        monkeypatch.setattr("calibrate.config.CONFIG_PATH", cfg_path)
+        body = {
+            "denon": {"host": "192.168.1.100", "sweep_input": None},
+            "minidsp": {"input_labels": {}, "output_slots": _empty_slots()},
+        }
+        r = client.post("/api/signal-chain", json=body)
+        assert r.status_code == 200
+        assert r.json()["sub_outputs"] == []
+        import yaml
+        data = yaml.safe_load(cfg_path.read_text())
+        assert data["measurement"]["sub_outputs"] == []
+
+    def test_post_speaker_preset_and_location(self, client, cfg_path, monkeypatch):
+        """Slot with preset + location round-trips correctly."""
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        monkeypatch.setattr("calibrate.config.CONFIG_PATH", cfg_path)
+        r = client.post("/api/signal-chain", json=_full_chain_body())
+        assert r.status_code == 200
+        import yaml
+        data = yaml.safe_load(cfg_path.read_text())
+        slot0 = data["minidsp"]["output_slots"][0]
+        assert slot0["preset"] == "pb12-nsd"
+        assert slot0["location"] == "front-left"
+
+    def test_post_tombstones_old_connections_key(self, client, tmp_path, monkeypatch):
+        """POST clears connections.minidsp to avoid dual-read confusion."""
+        import yaml
+        cfg_data = {
+            "denon": {"host": "192.168.1.100"},
+            "minidsp": {"host": "localhost", "port": 5380},
+            "connections": {"minidsp": {"outputs": {"0": "Sub L"}}},
+        }
+        p = tmp_path / "config.yaml"
+        p.write_text(yaml.safe_dump(cfg_data))
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", p)
+        monkeypatch.setattr("calibrate.config.CONFIG_PATH", p)
+        r = client.post("/api/signal-chain", json=_full_chain_body())
+        assert r.status_code == 200
+        data = yaml.safe_load(p.read_text())
+        # Old outputs key should be gone (tombstoned)
+        assert not data.get("connections", {}).get("minidsp", {}).get("outputs")
+
+    def test_post_nothing_returns_422(self, client, cfg_path, monkeypatch):
+        """POST with empty body returns 422."""
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        r = client.post("/api/signal-chain", json={})
+        assert r.status_code == 422
+
+
+class TestSignalChainGate:
+    def test_gate_condition_denon_plus_speaker(self, client, cfg_path, monkeypatch):
+        """POST with Denon host + 1 speaker → sub_outputs populated."""
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        monkeypatch.setattr("calibrate.config.CONFIG_PATH", cfg_path)
+        body = {
+            "denon": {"host": "192.168.1.100", "sweep_input": "HDMI 1"},
+            "minidsp": {
+                "input_labels": {},
+                "output_slots": [
+                    {"index": 0, "label": "Sub", "location": "front-left", "preset": "pb12-nsd"},
+                    {"index": 1, "label": "", "location": "", "preset": ""},
+                    {"index": 2, "label": "", "location": "", "preset": ""},
+                    {"index": 3, "label": "", "location": "", "preset": ""},
+                ],
+            },
+        }
+        r = client.post("/api/signal-chain", json=body)
+        assert r.status_code == 200
+        assert r.json()["sub_outputs"] == [0]
+
+
+class TestConfigOutputSlots:
+    def test_default_config_has_output_slots(self):
+        """DEFAULT_CONFIG.minidsp has 4 empty output_slots."""
+        from calibrate.config import DEFAULT_CONFIG
+        slots = DEFAULT_CONFIG["minidsp"]["output_slots"]
+        assert len(slots) == 4
+        assert all(s["label"] == "" for s in slots)
+        assert all(s["preset"] == "" for s in slots)
+
+    def test_config_load_preserves_output_slots(self, tmp_path):
+        """Config.load reads output_slots from YAML correctly."""
+        import yaml
+        from calibrate.config import Config
+        cfg_data = {
+            "minidsp": {
+                "host": "localhost", "port": 5380,
+                "output_slots": [
+                    {"index": 0, "label": "Sub L", "location": "front-left", "preset": "pb12-nsd"},
+                ],
+            },
+        }
+        p = tmp_path / "config.yaml"
+        p.write_text(yaml.safe_dump(cfg_data))
+        cfg = Config.load(p)
+        slots = cfg.minidsp.get("output_slots")
+        assert slots is not None
+        assert slots[0]["label"] == "Sub L"
