@@ -3172,8 +3172,9 @@ async def equipment_denon_test_input(body: DenonTestInputBody) -> dict:
     try:
         import array, math, subprocess
 
-        # Generate 440 Hz tone as raw S16_LE stereo PCM — no numpy/PortAudio needed
-        # IEC958 requires stereo; duplicate mono to both channels
+        import os, tempfile, wave
+
+        # Generate 440 Hz stereo tone as WAV (IEC958 device needs file, hangs on stdin pipe)
         sample_rate = 44100
         duration = 2.0
         n = int(sample_rate * duration)
@@ -3182,24 +3183,31 @@ async def equipment_denon_test_input(body: DenonTestInputBody) -> dict:
             t = i / sample_rate
             env = min(t / 0.05, 1.0, (duration - t) / 0.05)
             val = int(math.sin(2 * math.pi * 440 * t) * env * 0.4 * 32767)
-            samples.append(val)   # left
-            samples.append(val)   # right
-        pcm = samples.tobytes()
+            samples.append(val)  # left
+            samples.append(val)  # right
 
-        # vc4-hdmi on Pi only accepts IEC958_SUBFRAME_LE at the hw level.
-        # The 'iec958' ALSA virtual device wraps it and accepts standard PCM,
-        # handling IEC958 encapsulation transparently.
-        cfg = _load_config()
-        hdmi_card = cfg.measurement.get("hdmi_playback_device") or "iec958"
-        result = await asyncio.to_thread(
-            subprocess.run,
-            ["aplay", "-D", hdmi_card, "-f", "S16_LE", "-r", str(sample_rate), "-c", "2"],
-            input=pcm,
-            timeout=duration + 3,
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.decode(errors="replace").strip() or "aplay failed")
+        fd, wav_path = tempfile.mkstemp(suffix=".wav")
+        try:
+            os.close(fd)
+            with wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(2)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(samples.tobytes())
+
+            # vc4-hdmi only accepts IEC958_SUBFRAME_LE; 'iec958' virtual device wraps it
+            cfg = _load_config()
+            hdmi_card = cfg.measurement.get("hdmi_playback_device") or "iec958"
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["aplay", "-D", hdmi_card, wav_path],
+                timeout=duration + 5,
+                capture_output=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.decode(errors="replace").strip() or "aplay failed")
+        finally:
+            os.unlink(wav_path)
         tone_played = True
     except Exception as exc:
         tone_error = str(exc)
