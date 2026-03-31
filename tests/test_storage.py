@@ -371,3 +371,90 @@ class TestUpdateEvents:
             mock_conn_ctx.return_value = mock_conn
             # Must not raise
             store.log_update_event("a", "b", "timer")
+
+
+# ── Equipment CRUD ───────────────────────────────────────────────────────────
+#
+# list_equipment     [TESTED] empty list on fresh store
+#                    [TESTED] returns inserted rows
+#                    [TESTED] data blob is decoded to dict
+# save_equipment     [TESTED] returns dict with id and decoded data
+#                    [TESTED] stores arbitrary fields in data blob
+#                    [TESTED] label and data default to None / {}
+# update_equipment   [TESTED] updates label
+#                    [TESTED] updates data blob (merge is caller's job)
+#                    [TESTED] returns None for unknown id
+# delete_equipment   [TESTED] returns True when row deleted
+#                    [TESTED] returns False for unknown id
+
+class TestEquipmentCrud:
+    def test_list_empty(self, store):
+        assert store.list_equipment() == []
+
+    def test_save_returns_row(self, store):
+        row = store.save_equipment(type="subwoofer", label="SVS PB12-NSD")
+        assert row["id"] >= 1
+        assert row["type"] == "subwoofer"
+        assert row["label"] == "SVS PB12-NSD"
+        assert row["data"] == {}
+
+    def test_save_data_blob(self, store):
+        data = {"room_location": "front left corner", "port_tune_hz": 22.0}
+        row = store.save_equipment(type="subwoofer", label="SVS", data=data)
+        assert row["data"]["room_location"] == "front left corner"
+        assert row["data"]["port_tune_hz"] == 22.0
+
+    def test_save_arbitrary_fields_in_data(self, store):
+        data = {"sensitivity_db": 87, "impedance_ohms": 4, "future_field": "anything"}
+        row = store.save_equipment(type="front_l", data=data)
+        assert row["data"]["future_field"] == "anything"
+
+    def test_save_defaults(self, store):
+        row = store.save_equipment(type="center")
+        assert row["label"] is None
+        assert row["data"] == {}
+
+    def test_list_returns_all_ordered(self, store):
+        store.save_equipment(type="subwoofer", label="Sub 1")
+        store.save_equipment(type="front_l", label="Front L")
+        store.save_equipment(type="subwoofer", label="Sub 2")
+        rows = store.list_equipment()
+        assert len(rows) == 3
+        # Ordered by type then id: front_l first, then subwoofers
+        assert rows[0]["type"] == "front_l"
+        assert rows[1]["type"] == "subwoofer"
+
+    def test_update_label(self, store):
+        row = store.save_equipment(type="center", label="Old Name")
+        updated = store.update_equipment(row["id"], label="New Name")
+        assert updated["label"] == "New Name"
+
+    def test_update_data_blob(self, store):
+        row = store.save_equipment(type="subwoofer", data={"port_tune_hz": 22.0})
+        new_data = {"port_tune_hz": 24.0, "room_location": "corner"}
+        updated = store.update_equipment(row["id"], data=new_data)
+        assert updated["data"]["port_tune_hz"] == 24.0
+        assert updated["data"]["room_location"] == "corner"
+
+    def test_update_unknown_id_returns_none(self, store):
+        result = store.update_equipment(9999, label="Ghost")
+        assert result is None
+
+    def test_delete_returns_true(self, store):
+        row = store.save_equipment(type="surround_l")
+        assert store.delete_equipment(row["id"]) is True
+        assert store.list_equipment() == []
+
+    def test_delete_unknown_returns_false(self, store):
+        assert store.delete_equipment(9999) is False
+
+    def test_update_no_fields_returns_existing_row(self, store):
+        """update_equipment with no label/data should return the existing row, not None."""
+        row = store.save_equipment(type="center", label="Original")
+        result = store.update_equipment(row["id"])
+        assert result is not None
+        assert result["label"] == "Original"
+
+    def test_update_no_fields_unknown_id_returns_none(self, store):
+        result = store.update_equipment(9999)
+        assert result is None

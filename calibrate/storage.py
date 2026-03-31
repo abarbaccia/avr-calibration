@@ -58,6 +58,15 @@ CREATE TABLE IF NOT EXISTS update_events (
     success    INTEGER NOT NULL DEFAULT 1,
     notes      TEXT
 );
+
+CREATE TABLE IF NOT EXISTS equipment (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    type       TEXT    NOT NULL,
+    label      TEXT,
+    data       TEXT,
+    created_at TEXT    NOT NULL,
+    updated_at TEXT    NOT NULL
+);
 """
 
 
@@ -241,6 +250,68 @@ class SessionStore:
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Equipment ─────────────────────────────────────────────────────────────
+    #
+    # The `data` column is a JSON blob — no fixed schema beyond type + label.
+    # Add any new fields (distance, sensitivity, port_tune_hz, etc.) to `data`
+    # without schema migrations.
+
+    def list_equipment(self) -> list[dict]:
+        """Return all equipment rows ordered by type then id."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM equipment ORDER BY type, id"
+            ).fetchall()
+        return [self._equipment_row(r) for r in rows]
+
+    def save_equipment(self, type: str, label: Optional[str] = None, data: Optional[dict] = None) -> dict:
+        """Insert a new equipment record. `data` is an open JSON blob."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO equipment (type, label, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (type, label, json.dumps(data or {}), now, now),
+            )
+            row = conn.execute("SELECT * FROM equipment WHERE id=?", (cur.lastrowid,)).fetchone()
+        return self._equipment_row(row)
+
+    def update_equipment(self, equipment_id: int, label: Optional[str] = None, data: Optional[dict] = None) -> Optional[dict]:
+        """Update label and/or data blob. Returns None if not found, or existing row if nothing to update."""
+        fields: dict = {}
+        if label is not None:
+            fields["label"] = label
+        if data is not None:
+            fields["data"] = json.dumps(data)
+        with self._connect() as conn:
+            if not fields:
+                # No-op: return current row (or None if not found)
+                row = conn.execute("SELECT * FROM equipment WHERE id=?", (equipment_id,)).fetchone()
+                return self._equipment_row(row) if row else None
+            fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+            sets = ", ".join(f"{k}=?" for k in fields)
+            vals = list(fields.values()) + [equipment_id]
+            conn.execute(f"UPDATE equipment SET {sets} WHERE id=?", vals)
+            row = conn.execute("SELECT * FROM equipment WHERE id=?", (equipment_id,)).fetchone()
+        return self._equipment_row(row) if row else None
+
+    def delete_equipment(self, equipment_id: int) -> bool:
+        """Delete equipment by id. Returns True if a row was deleted."""
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM equipment WHERE id=?", (equipment_id,))
+        return cur.rowcount > 0
+
+    def _equipment_row(self, row: sqlite3.Row) -> dict:
+        d = dict(row)
+        if d.get("data"):
+            try:
+                d["data"] = json.loads(d["data"])
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("equipment row %s has corrupt data JSON; returning {}", d.get("id"))
+                d["data"] = {}
+        else:
+            d["data"] = {}
+        return d
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 

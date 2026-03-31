@@ -100,6 +100,10 @@ class Config:
     def measurement(self) -> dict:
         return self._data.get("measurement", {})
 
+    @property
+    def connections(self) -> dict:
+        return self._data.get("connections", {})
+
     @classmethod
     def load(cls, path: Path = CONFIG_PATH) -> "Config":
         if not path.exists():
@@ -123,3 +127,24 @@ class Config:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             f.write(CONFIG_TEMPLATE)
+
+
+def update_config(updates: dict, path: Path = CONFIG_PATH) -> None:
+    """Deep-merge `updates` into the on-disk config.yaml.
+
+    Existing keys not mentioned in `updates` are preserved verbatim.
+    Nested dicts are shallow-merged one level deep (sub-keys are replaced, not recursed).
+    """
+    if path.exists():
+        with open(path) as f:
+            data: dict = yaml.safe_load(f) or {}
+    else:
+        data = {}
+    for key, val in updates.items():
+        if isinstance(val, dict) and isinstance(data.get(key), dict):
+            data[key] = {**data[key], **val}
+        else:
+            data[key] = val
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        yaml.safe_dump(data, f, default_flow_style=False, allow_unicode=True)
