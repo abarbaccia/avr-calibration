@@ -1515,8 +1515,8 @@ _HTML = """<!DOCTYPE html>
       <div id="chainDenonInputSection" style="${disc ? '' : 'display:none'}">
         <label for="chainDenonInput" style="font-size:.75rem">Which Denon input is the Pi connected to?</label>
         <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.4rem">
-          <select id="chainDenonInput" style="flex:1;margin-bottom:0"><option value="">— loading inputs —</option></select>
-          <button id="chainDenonTestBtn" onclick="chainDenonTestInput()">Test</button>
+          <select id="chainDenonInput" style="flex:1;margin-bottom:0;height:2.4rem"><option value="">— loading inputs —</option></select>
+          <button id="chainDenonTestBtn" onclick="chainDenonTestInput()" style="height:2.4rem;white-space:nowrap">Test</button>
         </div>
         <div id="chainDenonTestStatus" style="font-size:.78rem;color:${_chainDenonConfirmedInput ? '#4ade80' : '#94a3b8'};margin-bottom:.3rem">${_chainDenonConfirmedInput ? '\u2713 Confirmed: Pi \u2192 ' + _chainDenonConfirmedInput : ''}</div>
         <div id="chainDenonHearRow" style="display:none;background:#131720;border-radius:6px;padding:.6rem .75rem;margin-bottom:.4rem">
