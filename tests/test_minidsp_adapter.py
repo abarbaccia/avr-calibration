@@ -3,9 +3,9 @@
 All HTTP calls are intercepted with respx (same pattern as test_preflight.py).
 No hardware or real network access is required.
 
-The minidspd REST API uses a single POST /devices/{idx}/config endpoint for all
-mutating operations, plus POST /devices/{idx}/preset/{n} and
-POST /devices/{idx}/source/{s} for signal path switching.
+The minidspd REST API uses POST /devices/{idx}/config for EQ/routing mutations
+and POST /devices/{idx} with a MasterStatus body for preset/source switching.
+The /preset/:n and /source/:s path endpoints do not exist in minidspd 0.1.x.
 """
 
 import pytest
@@ -24,8 +24,6 @@ from calibrate.adapters.minidsp import (
 
 BASE = "http://localhost:5380"
 CONFIG_URL = f"{BASE}/devices/0/config"
-PRESET_BASE = f"{BASE}/devices/0/preset"
-SOURCE_BASE = f"{BASE}/devices/0/source"
 DEVICE_URL = f"{BASE}/devices/0"
 
 
@@ -286,15 +284,17 @@ async def test_switch_preset_negative(client: MinidspClient) -> None:
 @respx.mock
 @pytest.mark.asyncio
 async def test_switch_preset_happy_path(client: MinidspClient) -> None:
-    route = respx.post(f"{PRESET_BASE}/2").mock(return_value=httpx.Response(200))
+    route = respx.post(DEVICE_URL).mock(return_value=httpx.Response(200))
     await client.switch_preset(2)
     assert route.called
+    import json
+    assert json.loads(route.calls[0].request.content) == {"preset": 2}
 
 
 @respx.mock
 @pytest.mark.asyncio
 async def test_switch_preset_api_error(client: MinidspClient) -> None:
-    respx.post(f"{PRESET_BASE}/1").mock(return_value=httpx.Response(500))
+    respx.post(DEVICE_URL).mock(return_value=httpx.Response(500))
     with pytest.raises(MinidspApiError) as exc_info:
         await client.switch_preset(1)
     assert exc_info.value.status_code == 500
@@ -312,15 +312,17 @@ async def test_switch_source_invalid(client: MinidspClient) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["Analog", "Toslink", "USB"])
 async def test_switch_source_happy_path(client: MinidspClient, source: str) -> None:
-    route = respx.post(f"{SOURCE_BASE}/{source}").mock(return_value=httpx.Response(200))
+    route = respx.post(DEVICE_URL).mock(return_value=httpx.Response(200))
     await client.switch_source(source)
     assert route.called
+    import json
+    assert json.loads(route.calls[0].request.content) == {"source": source}
 
 
 @respx.mock
 @pytest.mark.asyncio
 async def test_switch_source_api_error(client: MinidspClient) -> None:
-    respx.post(f"{SOURCE_BASE}/Toslink").mock(return_value=httpx.Response(502))
+    respx.post(DEVICE_URL).mock(return_value=httpx.Response(502))
     with pytest.raises(MinidspApiError) as exc_info:
         await client.switch_source("Toslink")
     assert exc_info.value.status_code == 502

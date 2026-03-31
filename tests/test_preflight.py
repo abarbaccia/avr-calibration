@@ -616,3 +616,40 @@ class TestHdmiDeduplication:
             result = await checker.check_playback_route()
         assert not result.passed
         assert result.error == "refused"
+
+
+# ── SSDP generic exception (lines 235-236) ───────────────────────────────────
+
+class TestSsdpGenericException:
+    async def test_ssdp_generic_exception_returns_failed_result(self, config):
+        """Generic (non-TimeoutError) exception during SSDP → failed CheckResult (lines 235-236)."""
+        from unittest.mock import AsyncMock, patch
+        config._data["denon"]["host"] = None
+        with patch("denonavr.async_discover", new=AsyncMock(side_effect=OSError("network unreachable"))):
+            result = await PreflightChecker(config).check_denon()
+        assert not result.passed
+        assert "SSDP discovery failed" in result.error
+
+
+# ── check_signal_path_sync — source/preset both None (line 328) ──────────────
+
+class TestSignalPathSyncEdgeCases:
+    async def test_skipped_when_signal_path_has_no_source_or_preset(self, config):
+        """signal_path set but both source and preset are None → skipped (line 328)."""
+        # signal_path must be truthy (non-empty) to bypass the `if not sp` check,
+        # but must have no source or preset.
+        config._data["minidsp"]["signal_path"] = {"routing": [{"input": 0, "outputs": [0, 1]}]}
+        result = await PreflightChecker(config).check_signal_path_sync()
+        assert result.passed
+        assert "skipped" in result.detail
+
+    async def test_generic_exception_returns_failed_result(self, config):
+        """Generic exception during miniDSP status fetch → failed CheckResult (lines 347-348)."""
+        from unittest.mock import AsyncMock, patch
+        config._data["minidsp"]["signal_path"] = {"source": "Analog"}
+        mock_client = AsyncMock()
+        mock_client.get_device_status.side_effect = OSError("network unreachable")
+        with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+            result = await PreflightChecker(config).check_signal_path_sync()
+        assert not result.passed
+        assert "Cannot reach miniDSP daemon" in result.error
