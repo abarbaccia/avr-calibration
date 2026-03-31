@@ -331,134 +331,105 @@ _HTML = """<!DOCTYPE html>
     <div class="step locked" id="navStep4">4 Feedback</div>
   </div>
 
-  <!-- Phase 1: Equipment Setup -->
+  <!-- Phase 1: Equipment Setup — Signal Chain Builder -->
   <div id="phase1Content" style="display:block">
 
-    <!-- Denon AVR Card -->
-    <div class="card" id="eqDenonCard">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
-        <h2 style="margin:0">Denon AVR</h2>
-        <span id="eqDenonBadge" class="check-badge pending">&mdash;</span>
+    <!-- Pi root header (always present) -->
+    <div style="background:#131720;border-radius:8px;padding:.6rem 1rem;margin-bottom:.5rem;display:flex;align-items:center;justify-content:space-between">
+      <div>
+        <span style="font-size:.72rem;text-transform:uppercase;letter-spacing:.07em;color:#64748b">Calibration Host</span>
+        <div style="font-size:.82rem;color:#94a3b8;margin-top:.15rem">Raspberry Pi &mdash; measurement only, not in listening path</div>
+      </div>
+      <span class="check-badge pass" style="font-size:.7rem">Online</span>
+    </div>
+    <div style="width:2px;height:.65rem;background:#1e2537;margin:0 auto"></div>
+
+    <!-- Denon card -->
+    <div class="card" id="chainDenonCard">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem">
+        <h2 style="margin:0;font-size:1rem">Denon X3800H</h2>
+        <span id="chainDenonBadge" class="check-badge pending">&mdash;</span>
       </div>
 
-      <!-- Discover / host row -->
-      <div style="display:flex;gap:.5rem;margin-bottom:.75rem">
-        <input type="text" id="eqDenonHost" placeholder="192.168.x.x (or click Discover)" style="flex:1">
-        <button id="eqDenonDiscoverBtn" onclick="denonDiscover()">Discover</button>
+      <div id="chainDenonEmpty" style="display:none;background:#0d0f14;border-radius:6px;padding:.65rem .75rem;margin-bottom:.65rem;font-size:.82rem;color:#64748b">
+        Click Discover to find your Denon AVR on the network.
       </div>
-      <div id="eqDenonDiscoverStatus" style="font-size:.78rem;color:#94a3b8;margin-bottom:.5rem"></div>
 
-      <!-- Input selector (shown after host is known) -->
-      <div id="eqDenonInputSection" style="display:none">
-        <label for="eqDenonInput" style="font-size:.75rem">Which Denon input is the Pi HDMI cable connected to?</label>
-        <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.5rem">
-          <select id="eqDenonInput" style="flex:1">
-            <option value="">— loading inputs —</option>
-          </select>
-          <button id="eqDenonTestBtn" onclick="denonTestInput()">Test</button>
+      <div style="display:flex;gap:.5rem;margin-bottom:.5rem">
+        <input type="text" id="chainDenonHost" placeholder="192.168.x.x (or click Discover)" style="flex:1">
+        <button id="chainDenonDiscoverBtn" onclick="chainDenonDiscover()">Discover</button>
+      </div>
+      <div id="chainDenonDiscoverStatus" style="font-size:.78rem;color:#94a3b8;margin-bottom:.4rem"></div>
+
+      <div id="chainDenonInputSection" style="display:none">
+        <label for="chainDenonInput" style="font-size:.75rem">Which Denon input is the Pi HDMI cable connected to?</label>
+        <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.4rem">
+          <select id="chainDenonInput" style="flex:1"><option value="">— loading inputs —</option></select>
+          <button id="chainDenonTestBtn" onclick="chainDenonTestInput()">Test</button>
         </div>
-        <div id="eqDenonTestStatus" style="font-size:.78rem;color:#94a3b8;margin-bottom:.4rem"></div>
-        <!-- Hear confirmation — shown while tone plays -->
-        <div id="eqDenonHearRow" style="display:none;background:#131720;border-radius:6px;padding:.6rem .75rem;margin-bottom:.5rem">
-          <div style="font-size:.82rem;color:#94a3b8;margin-bottom:.4rem">Playing 440 Hz tone via Pi HDMI&hellip; Did you hear it through your speakers?</div>
+        <div id="chainDenonTestStatus" style="font-size:.78rem;color:#94a3b8;margin-bottom:.3rem"></div>
+        <div id="chainDenonHearRow" style="display:none;background:#131720;border-radius:6px;padding:.6rem .75rem;margin-bottom:.4rem">
+          <div style="font-size:.82rem;color:#94a3b8;margin-bottom:.4rem">Playing 440 Hz tone via Pi HDMI&hellip; Did you hear it?</div>
           <div style="display:flex;gap:.5rem">
-            <button onclick="denonConfirmInput(true)" style="background:#22c55e;color:#0d0f14;font-weight:600">&#10003; Yes</button>
-            <button onclick="denonConfirmInput(false)" style="background:#334155;color:#cbd5e1">&#10007; No — try another</button>
+            <button onclick="chainDenonConfirmInput(true)" style="background:#22c55e;color:#0d0f14;font-weight:600">&#10003; Yes</button>
+            <button onclick="chainDenonConfirmInput(false)" style="background:#334155;color:#cbd5e1">&#10007; No</button>
           </div>
         </div>
       </div>
 
-      <div style="display:flex;justify-content:flex-end;margin-top:.75rem">
-        <button id="eqDenonSaveBtn" onclick="denonSave()" style="background:#2dd4bf;color:#0d0f14;font-weight:600" disabled>Save</button>
+      <div id="chainDenonOfflineRow" style="display:none;background:#1a0a0a;border-radius:6px;padding:.55rem .75rem;margin-bottom:.5rem;font-size:.82rem;color:#f87171">
+        &#9888; Cannot reach Denon (timeout 5s) &mdash;
+        <button onclick="chainPollBadges()" style="background:transparent;color:#f87171;border:none;text-decoration:underline;cursor:pointer;padding:0">Retry</button>
       </div>
-      <div id="eqDenonSaveStatus" style="font-size:.78rem;margin-top:.35rem;color:#94a3b8"></div>
+
+      <div style="display:flex;justify-content:flex-end;margin-top:.5rem">
+        <button id="chainDenonSaveBtn" onclick="chainSaveDenonSection()" style="background:#2dd4bf;color:#0d0f14;font-weight:600" disabled>Save</button>
+      </div>
+      <div id="chainDenonSaveStatus" style="font-size:.78rem;margin-top:.3rem;color:#94a3b8"></div>
     </div>
 
-    <!-- miniDSP 2x4 HD Card -->
-    <div class="card" id="eqDspCard">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
-        <h2 style="margin:0">miniDSP 2x4 HD</h2>
-        <span id="eqDspBadge" class="check-badge pending">&mdash;</span>
+    <div style="width:2px;height:.65rem;background:#1e2537;margin:0 auto"></div>
+
+    <!-- miniDSP card -->
+    <div class="card" id="chainDspCard">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem">
+        <h2 style="margin:0;font-size:1rem">miniDSP 2x4 HD</h2>
+        <span id="chainDspBadge" class="check-badge pending">&mdash;</span>
       </div>
 
       <div style="margin-bottom:.75rem">
         <div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.07em;color:#64748b;margin-bottom:.4rem">Input Labels</div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
-          <input type="text" id="eqDspIn0" placeholder="Input 1 (e.g. Denon LFE L)">
-          <input type="text" id="eqDspIn1" placeholder="Input 2 (e.g. Denon LFE R)">
+          <input type="text" id="chainDspIn0" placeholder="Input 1 (e.g. LFE L)">
+          <input type="text" id="chainDspIn1" placeholder="Input 2 (e.g. LFE R)">
         </div>
       </div>
+
       <div style="margin-bottom:.75rem">
-        <div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.07em;color:#64748b;margin-bottom:.4rem">Output Labels</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
-          <input type="text" id="eqDspOut0" placeholder="Output 1 (e.g. Sub L)">
-          <input type="text" id="eqDspOut1" placeholder="Output 2 (e.g. Sub R)">
-          <input type="text" id="eqDspOut2" placeholder="Output 3">
-          <input type="text" id="eqDspOut3" placeholder="Output 4">
+        <div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.07em;color:#64748b;margin-bottom:.4rem">Output Slots &rarr; Speakers</div>
+        <div id="chainDspSlots" style="display:flex;flex-direction:column;gap:.5rem">
+          <div style="font-size:.78rem;color:#475569">Loading&hellip;</div>
         </div>
       </div>
-      <div style="display:flex;justify-content:space-between;align-items:center">
-        <button id="eqDspTestBtn" onclick="dspTest()" style="background:#334155;color:#cbd5e1">Test Connection</button>
-        <button id="eqDspSaveBtn" onclick="dspSave()" style="background:#2dd4bf;color:#0d0f14;font-weight:600">Save Labels</button>
+
+      <div style="display:flex;gap:.5rem;justify-content:flex-end;margin-top:.5rem">
+        <button onclick="chainDspTest()" style="background:#334155;color:#cbd5e1">Test Connection</button>
+        <button onclick="chainSaveDspSection()" style="background:#2dd4bf;color:#0d0f14;font-weight:600">Save Changes</button>
       </div>
-      <div id="eqDspStatus" style="font-size:.78rem;margin-top:.4rem;color:#94a3b8"></div>
+      <div id="chainDspStatus" style="font-size:.78rem;margin-top:.4rem;color:#94a3b8"></div>
     </div>
 
-    <!-- Speakers & Subs Card -->
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
-        <h2 style="margin:0">Speakers &amp; Subs</h2>
-        <button id="eqAddSpeakerBtn" onclick="toggleAddSpeaker()" style="background:#334155;color:#cbd5e1;font-size:.82rem">+ Add</button>
-      </div>
-
-      <!-- Add speaker form (collapsed by default) -->
-      <div id="eqAddSpeakerForm" style="display:none;background:#131720;border-radius:8px;padding:.75rem;margin-bottom:.75rem">
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-bottom:.5rem">
-          <div>
-            <label for="eqSpkType" style="font-size:.75rem">Type</label>
-            <select id="eqSpkType">
-              <option value="subwoofer">Subwoofer</option>
-              <option value="front_l">Front Left</option>
-              <option value="front_r">Front Right</option>
-              <option value="center">Center</option>
-              <option value="surround_l">Surround Left</option>
-              <option value="surround_r">Surround Right</option>
-              <option value="height_l">Height Left</option>
-              <option value="height_r">Height Right</option>
-              <option value="bass_shaker">Bass Shaker</option>
-            </select>
-          </div>
-          <div>
-            <label for="eqSpkLabel" style="font-size:.75rem">Name / Model</label>
-            <input type="text" id="eqSpkLabel" placeholder="e.g. SVS PB12-NSD">
-          </div>
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-bottom:.5rem">
-          <div>
-            <label for="eqSpkLocation" style="font-size:.75rem">Room Location</label>
-            <input type="text" id="eqSpkLocation" placeholder="e.g. front left corner">
-          </div>
-          <div id="eqSpkPortRow">
-            <label for="eqSpkPortTune" style="font-size:.75rem">Port Tune (Hz)</label>
-            <input type="number" id="eqSpkPortTune" placeholder="e.g. 22" step="0.5">
-          </div>
-        </div>
-        <div style="display:flex;gap:.5rem;justify-content:flex-end">
-          <button onclick="toggleAddSpeaker()" style="background:#334155;color:#cbd5e1">Cancel</button>
-          <button onclick="saveSpeaker()" style="background:#3b82f6;color:#fff;font-weight:600">Add Speaker</button>
-        </div>
-      </div>
-
-      <!-- Speaker list -->
-      <div id="eqSpeakerList" style="display:flex;flex-direction:column;gap:.5rem"></div>
-      <div id="eqSpeakerEmpty" style="font-size:.82rem;color:#475569;text-align:center;padding:1rem 0">
-        No speakers added yet.
-      </div>
+    <!-- Save Chain CTA -->
+    <div style="padding:.5rem 0 .25rem">
+      <button onclick="chainSaveWithStatus(document.getElementById('chainSaveStatus'))" style="background:#2dd4bf;color:#0d0f14;width:100%;padding:.75rem;font-weight:600">
+        Save Chain
+      </button>
+      <div id="chainSaveStatus" style="font-size:.78rem;margin-top:.4rem;color:#94a3b8;text-align:center"></div>
     </div>
 
-    <!-- Continue -->
+    <!-- Continue (gate: Denon saved + at least one speaker configured) -->
     <div style="padding-bottom:.25rem">
-      <button onclick="showPhase(2)" style="background:#3b82f6;color:#fff;width:100%;padding:.75rem;font-weight:600">
+      <button id="chainContinueBtn" onclick="showPhase(2)" style="background:#3b82f6;color:#fff;width:100%;padding:.75rem;font-weight:600" disabled>
         Continue to Baseline &rarr;
       </button>
     </div>
@@ -1432,313 +1403,349 @@ _HTML = """<!DOCTYPE html>
       else if (i === n) s.classList.add('active');
       else s.classList.add('locked');
     });
-    if (n === 1) initEquipmentSetup();
+    if (n === 1) initChainBuilder();
     if (n === 2) loadSignalPathConfig();
   }
 
-  // ── Equipment Setup ──────────────────────────────────────────────────────
-  let _denonHost = null;
-  let _denonInputs = [];
-  let _denonConfirmedInput = null;
+  // ── Signal Chain Builder ─────────────────────────────────────────────────────
 
-  async function initEquipmentSetup() {
-    // Load existing Denon state from config
+  const SPEAKER_PRESETS = {
+    'pb12-nsd': 'SVS PB-12 NSD (12\u2033 ported, ~22\u202fHz)',
+  };
+  const ROOM_LOCATIONS = ['front-left', 'front-right', 'rear-left', 'rear-right', 'center', 'other'];
+
+  // In-memory chain state — single JS source of truth for all saves.
+  let _chainState = {
+    denon: { host: null, sweep_input: null },
+    minidsp: {
+      input_labels: {},
+      output_slots: [0,1,2,3].map(i => ({ index: i, label: '', location: '', preset: '' })),
+    },
+  };
+  let _chainDenonHost = null;
+  let _chainDenonConfirmedInput = null;
+  let _chainExpandedSlot = null;  // index of slot with open picker
+
+  async function initChainBuilder() {
+    renderChainSlots();
     try {
-      const r = await fetch('/api/equipment/denon/state');
-      const d = await r.json();
-      if (d.connected) {
-        _denonHost = d.host;
-        document.getElementById('eqDenonHost').value = d.host || '';
-        _populateDenonInputs(d.inputs, d.configured_sweep_input);
-        document.getElementById('eqDenonInputSection').style.display = '';
-        document.getElementById('eqDenonBadge').className = 'check-badge pass';
-        document.getElementById('eqDenonBadge').textContent = 'OK';
-        document.getElementById('eqDenonSaveBtn').disabled = false;
-      } else if (d.host) {
-        document.getElementById('eqDenonHost').value = d.host;
-        document.getElementById('eqDenonDiscoverStatus').textContent = d.error || 'Offline';
+      const r = await fetch('/api/signal-chain');
+      if (r.ok) {
+        const d = await r.json();
+        _chainState = d;
+        _chainDenonHost = (d.denon || {}).host || null;
+        _chainDenonConfirmedInput = (d.denon || {}).sweep_input || null;
+        _populateChainDenonFields();
+        _populateChainDspFields();
+        renderChainSlots();
+        _checkChainGate();
       }
     } catch (_) {}
-
-    // Load miniDSP status + label config
-    dspTest(true);  // silent initial check
-
-    // Load speakers from DB
-    _loadSpeakers();
+    chainPollBadges();
   }
 
-  async function denonDiscover() {
-    const btn = document.getElementById('eqDenonDiscoverBtn');
-    const status = document.getElementById('eqDenonDiscoverStatus');
-    btn.disabled = true;
-    btn.textContent = 'Scanning…';
-    status.textContent = 'Running SSDP discovery (up to 10s)…';
-    status.style.color = '#94a3b8';
+  function _populateChainDenonFields() {
+    const d = _chainState.denon || {};
+    const hostEl = document.getElementById('chainDenonHost');
+    if (hostEl && d.host) hostEl.value = d.host;
+    if (d.host) {
+      const saveBtn = document.getElementById('chainDenonSaveBtn');
+      if (saveBtn) saveBtn.disabled = false;
+    }
+  }
+
+  function _populateChainDspFields() {
+    const labels = (_chainState.minidsp || {}).input_labels || {};
+    const in0 = document.getElementById('chainDspIn0');
+    const in1 = document.getElementById('chainDspIn1');
+    if (in0) in0.value = labels['0'] || '';
+    if (in1) in1.value = labels['1'] || '';
+  }
+
+  function renderChainSlots() {
+    const slots = (_chainState.minidsp || {}).output_slots || [];
+    const container = document.getElementById('chainDspSlots');
+    if (!container) return;
+    container.innerHTML = slots.map(slot => {
+      const hasSpk = slot.label || slot.preset;
+      const locLabel = slot.location ? slot.location.replace('-', '\u00a0') : '';
+      const presetLabel = SPEAKER_PRESETS[slot.preset] || slot.preset || '';
+      if (hasSpk) {
+        return `<div style="display:flex;align-items:center;gap:.5rem;background:#131720;border-radius:6px;padding:.5rem .75rem">
+          <div style="flex:1">
+            <div style="font-size:.75rem;color:#64748b">Out ${slot.index + 1}</div>
+            <div style="font-size:.85rem;color:#cbd5e1;font-weight:500">${slot.label || '(no label)'}</div>
+            <div style="font-size:.72rem;color:#64748b">${locLabel ? locLabel + ' &middot; ' : ''}${presetLabel}</div>
+          </div>
+          <button onclick="chainRemoveSpeakerFromSlot(${slot.index})" style="background:transparent;color:#475569;border:none;font-size:1rem;cursor:pointer;padding:.2rem .4rem" title="Remove">&times;</button>
+        </div>`;
+      } else if (_chainExpandedSlot === slot.index) {
+        const locOptions = ROOM_LOCATIONS.map(l =>
+          `<option value="${l}">${l.replace('-', ' ')}</option>`).join('');
+        const presetOptions = Object.entries(SPEAKER_PRESETS).map(([k, v]) =>
+          `<option value="${k}">${v}</option>`).join('');
+        return `<div style="background:#131720;border-radius:6px;padding:.75rem">
+          <div style="font-size:.78rem;color:#94a3b8;margin-bottom:.5rem">Out ${slot.index + 1} &rarr; Add Speaker</div>
+          <div style="display:grid;gap:.4rem;margin-bottom:.5rem">
+            <div>
+              <label style="font-size:.72rem;color:#64748b">Label</label>
+              <input type="text" id="chainSlotLabel${slot.index}" placeholder="e.g. Sub Left" style="width:100%;box-sizing:border-box">
+            </div>
+            <div>
+              <label style="font-size:.72rem;color:#64748b">Room Location</label>
+              <select id="chainSlotLoc${slot.index}" style="width:100%;box-sizing:border-box">
+                <option value="">— select —</option>${locOptions}
+              </select>
+            </div>
+            <div>
+              <label style="font-size:.72rem;color:#64748b">Speaker Preset</label>
+              <select id="chainSlotPreset${slot.index}" style="width:100%;box-sizing:border-box">
+                <option value="">— select —</option>${presetOptions}
+              </select>
+            </div>
+          </div>
+          <div style="display:flex;gap:.5rem;justify-content:flex-end">
+            <button onclick="chainCancelSlotPicker()" style="background:#334155;color:#cbd5e1;font-size:.82rem">Cancel</button>
+            <button onclick="chainSaveSpeakerToSlot(${slot.index})" style="background:#3b82f6;color:#fff;font-weight:600;font-size:.82rem">Save</button>
+          </div>
+        </div>`;
+      } else {
+        return `<div style="display:flex;align-items:center;gap:.5rem;background:#0d0f14;border-radius:6px;padding:.5rem .75rem">
+          <div style="flex:1;font-size:.78rem;color:#475569">Out ${slot.index + 1} &rarr; (empty)</div>
+          <button onclick="chainOpenSlotPicker(${slot.index})" style="background:#334155;color:#cbd5e1;font-size:.78rem;padding:.25rem .6rem">+ Add speaker</button>
+        </div>`;
+      }
+    }).join('');
+  }
+
+  function chainOpenSlotPicker(index) {
+    _chainExpandedSlot = index;
+    renderChainSlots();
+  }
+
+  function chainCancelSlotPicker() {
+    _chainExpandedSlot = null;
+    renderChainSlots();
+  }
+
+  function chainSaveSpeakerToSlot(index) {
+    const label = (document.getElementById('chainSlotLabel' + index) || {}).value || '';
+    const location = (document.getElementById('chainSlotLoc' + index) || {}).value || '';
+    const preset = (document.getElementById('chainSlotPreset' + index) || {}).value || '';
+    const slots = (_chainState.minidsp || {}).output_slots || [];
+    const slot = slots.find(s => s.index === index);
+    if (slot) { slot.label = label.trim(); slot.location = location; slot.preset = preset; }
+    _chainExpandedSlot = null;
+    renderChainSlots();
+    _checkChainGate();
+    chainSave();
+  }
+
+  function chainRemoveSpeakerFromSlot(index) {
+    const slots = (_chainState.minidsp || {}).output_slots || [];
+    const slot = slots.find(s => s.index === index);
+    if (slot) { slot.label = ''; slot.location = ''; slot.preset = ''; }
+    renderChainSlots();
+    _checkChainGate();
+    chainSave();
+  }
+
+  function _syncFormToState() {
+    const hostEl = document.getElementById('chainDenonHost');
+    if (hostEl) _chainState.denon.host = hostEl.value.trim() || _chainDenonHost;
+    _chainState.denon.sweep_input = _chainDenonConfirmedInput ||
+      (document.getElementById('chainDenonInput') || {}).value || null;
+    const in0 = document.getElementById('chainDspIn0');
+    const in1 = document.getElementById('chainDspIn1');
+    _chainState.minidsp.input_labels = {
+      '0': in0 ? in0.value.trim() : '',
+      '1': in1 ? in1.value.trim() : '',
+    };
+  }
+
+  async function chainSave() {
+    _syncFormToState();
+    const r = await fetch('/api/signal-chain', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_chainState),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    _checkChainGate();
+  }
+
+  async function chainSaveWithStatus(statusEl) {
+    if (statusEl) { statusEl.textContent = 'Saving\u2026'; statusEl.style.color = '#94a3b8'; }
+    try {
+      await chainSave();
+      if (statusEl) { statusEl.textContent = 'Saved'; statusEl.style.color = '#4ade80'; }
+    } catch (e) {
+      if (statusEl) { statusEl.textContent = 'Error: ' + e.message; statusEl.style.color = '#f87171'; }
+    }
+  }
+
+  async function chainSaveDenonSection() {
+    const btn = document.getElementById('chainDenonSaveBtn');
+    if (btn) btn.disabled = true;
+    await chainSaveWithStatus(document.getElementById('chainDenonSaveStatus'));
+    if (btn) btn.disabled = false;
+  }
+
+  async function chainSaveDspSection() {
+    await chainSaveWithStatus(document.getElementById('chainDspStatus'));
+  }
+
+  async function chainDenonDiscover() {
+    const btn = document.getElementById('chainDenonDiscoverBtn');
+    const status = document.getElementById('chainDenonDiscoverStatus');
+    btn.disabled = true; btn.textContent = 'Scanning\u2026';
+    status.textContent = 'Running SSDP discovery (up to 10s)\u2026'; status.style.color = '#94a3b8';
     try {
       const r = await fetch('/api/equipment/denon/discover', { method: 'POST' });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || r.statusText);
-      _denonHost = d.host;
-      document.getElementById('eqDenonHost').value = d.host;
-      status.textContent = `Found at ${d.host}`;
-      status.style.color = '#4ade80';
-      // Fetch live state to get input list
+      _chainDenonHost = d.host;
+      document.getElementById('chainDenonHost').value = d.host;
+      status.textContent = 'Found at ' + d.host; status.style.color = '#4ade80';
       const r2 = await fetch('/api/equipment/denon/state');
-      if (!r2.ok) throw new Error(`State fetch failed: ${r2.status}`);
       const d2 = await r2.json();
       if (d2.connected) {
-        _populateDenonInputs(d2.inputs, d2.configured_sweep_input);
-        document.getElementById('eqDenonInputSection').style.display = '';
-        document.getElementById('eqDenonBadge').className = 'check-badge pass';
-        document.getElementById('eqDenonBadge').textContent = 'OK';
-        document.getElementById('eqDenonSaveBtn').disabled = false;
+        _chainPopulateDenonInputs(d2.inputs, d2.configured_sweep_input);
+        document.getElementById('chainDenonInputSection').style.display = '';
+        document.getElementById('chainDenonBadge').className = 'check-badge pass';
+        document.getElementById('chainDenonBadge').textContent = 'OK';
+        document.getElementById('chainDenonSaveBtn').disabled = false;
+        document.getElementById('chainDenonOfflineRow').style.display = 'none';
       }
     } catch (e) {
-      status.textContent = 'Error: ' + e.message;
-      status.style.color = '#f87171';
+      status.textContent = 'Error: ' + e.message; status.style.color = '#f87171';
     }
-    btn.disabled = false;
-    btn.textContent = 'Discover';
+    btn.disabled = false; btn.textContent = 'Discover';
   }
 
-  function _populateDenonInputs(inputs, selectedInput) {
-    const sel = document.getElementById('eqDenonInput');
-    _denonInputs = inputs || [];
+  function _chainPopulateDenonInputs(inputs, selectedInput) {
+    const sel = document.getElementById('chainDenonInput');
+    if (!sel) return;
     sel.innerHTML = '<option value="">— select input —</option>' +
-      _denonInputs.map(inp => `<option value="${inp}"${inp === selectedInput ? ' selected' : ''}>${inp}</option>`).join('');
-    if (selectedInput) _denonConfirmedInput = selectedInput;
+      (inputs || []).map(inp =>
+        `<option value="${inp}"${inp === selectedInput ? ' selected' : ''}>${inp}</option>`
+      ).join('');
+    if (selectedInput) _chainDenonConfirmedInput = selectedInput;
   }
 
-  async function denonTestInput() {
-    const host = document.getElementById('eqDenonHost').value.trim() || _denonHost;
-    const input = document.getElementById('eqDenonInput').value;
+  async function chainDenonTestInput() {
+    const host = document.getElementById('chainDenonHost').value.trim() || _chainDenonHost;
+    const input = document.getElementById('chainDenonInput').value;
     if (!host || !input) {
-      document.getElementById('eqDenonTestStatus').textContent = 'Select an input first.';
+      document.getElementById('chainDenonTestStatus').textContent = 'Select an input first.';
       return;
     }
-    const btn = document.getElementById('eqDenonTestBtn');
-    const status = document.getElementById('eqDenonTestStatus');
-    btn.disabled = true;
-    btn.textContent = 'Switching…';
+    const btn = document.getElementById('chainDenonTestBtn');
+    const status = document.getElementById('chainDenonTestStatus');
+    btn.disabled = true; btn.textContent = 'Switching\u2026';
     status.textContent = '';
-    document.getElementById('eqDenonHearRow').style.display = 'none';
+    document.getElementById('chainDenonHearRow').style.display = 'none';
     try {
       const r = await fetch('/api/equipment/denon/test-input', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ host, input }),
       });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || r.statusText);
-      if (d.tone_played) {
-        status.textContent = `Switched to ${input} and played 440 Hz tone via Pi HDMI.`;
-      } else {
-        status.textContent = `Switched to ${input}. (Tone not played: ${d.tone_error || 'no HDMI audio device'})`;
-      }
+      status.textContent = d.tone_played
+        ? `Switched to ${input} and played 440\u202fHz tone via Pi HDMI.`
+        : `Switched to ${input}. (Tone not played: ${d.tone_error || 'no HDMI audio device'})`;
       status.style.color = '#94a3b8';
-      document.getElementById('eqDenonHearRow').style.display = '';
+      document.getElementById('chainDenonHearRow').style.display = '';
     } catch (e) {
-      status.textContent = 'Error: ' + e.message;
-      status.style.color = '#f87171';
+      status.textContent = 'Error: ' + e.message; status.style.color = '#f87171';
     }
-    btn.disabled = false;
-    btn.textContent = 'Test';
+    btn.disabled = false; btn.textContent = 'Test';
   }
 
-  function denonConfirmInput(heard) {
-    const input = document.getElementById('eqDenonInput').value;
-    document.getElementById('eqDenonHearRow').style.display = 'none';
+  function chainDenonConfirmInput(heard) {
+    const input = document.getElementById('chainDenonInput').value;
+    document.getElementById('chainDenonHearRow').style.display = 'none';
     if (heard) {
-      _denonConfirmedInput = input;
-      document.getElementById('eqDenonTestStatus').textContent = `✓ Confirmed: Pi HDMI → ${input}`;
-      document.getElementById('eqDenonTestStatus').style.color = '#4ade80';
-      document.getElementById('eqDenonSaveBtn').disabled = false;
+      _chainDenonConfirmedInput = input;
+      document.getElementById('chainDenonTestStatus').textContent = `\u2713 Confirmed: Pi HDMI \u2192 ${input}`;
+      document.getElementById('chainDenonTestStatus').style.color = '#4ade80';
+      document.getElementById('chainDenonSaveBtn').disabled = false;
     } else {
-      document.getElementById('eqDenonTestStatus').textContent = 'Try another input from the dropdown.';
-      document.getElementById('eqDenonTestStatus').style.color = '#f87171';
+      document.getElementById('chainDenonTestStatus').textContent = 'Try another input.';
+      document.getElementById('chainDenonTestStatus').style.color = '#f87171';
     }
   }
 
-  async function denonSave() {
-    const host = document.getElementById('eqDenonHost').value.trim() || _denonHost;
-    const sweepInput = _denonConfirmedInput || document.getElementById('eqDenonInput').value || null;
-    const btn = document.getElementById('eqDenonSaveBtn');
-    const status = document.getElementById('eqDenonSaveStatus');
-    btn.disabled = true;
-    try {
-      const r = await fetch('/api/equipment/denon/save', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ host: host || null, sweep_input: sweepInput }),
-      });
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.detail || r.statusText);
-      status.textContent = 'Saved to config.yaml';
-      status.style.color = '#4ade80';
-      document.getElementById('eqDenonBadge').className = 'check-badge pass';
-      document.getElementById('eqDenonBadge').textContent = 'Saved';
-    } catch (e) {
-      status.textContent = 'Error: ' + e.message;
-      status.style.color = '#f87171';
+  async function chainPollBadges() {
+    const denonBadge = document.getElementById('chainDenonBadge');
+    if (denonBadge) {
+      denonBadge.className = 'check-badge running'; denonBadge.textContent = '\u2026';
+      try {
+        const ctrl = new AbortController();
+        const tid = setTimeout(() => ctrl.abort(), 5500);
+        const r = await fetch('/api/equipment/denon/state', { signal: ctrl.signal });
+        clearTimeout(tid);
+        const d = await r.json();
+        if (d.connected) {
+          denonBadge.className = 'check-badge pass'; denonBadge.textContent = 'OK';
+          _chainPopulateDenonInputs(d.inputs, d.configured_sweep_input);
+          document.getElementById('chainDenonInputSection').style.display = '';
+          document.getElementById('chainDenonOfflineRow').style.display = 'none';
+          document.getElementById('chainDenonEmpty').style.display = 'none';
+          document.getElementById('chainDenonSaveBtn').disabled = false;
+        } else {
+          denonBadge.className = 'check-badge fail'; denonBadge.textContent = 'FAIL';
+          if (d.host) {
+            document.getElementById('chainDenonOfflineRow').style.display = '';
+          } else {
+            document.getElementById('chainDenonEmpty').style.display = '';
+          }
+        }
+      } catch (_) {
+        denonBadge.className = 'check-badge fail'; denonBadge.textContent = 'FAIL';
+        document.getElementById('chainDenonOfflineRow').style.display = '';
+      }
     }
-    btn.disabled = false;
+    const dspBadge = document.getElementById('chainDspBadge');
+    if (dspBadge) {
+      dspBadge.className = 'check-badge running'; dspBadge.textContent = '\u2026';
+      try {
+        const r = await fetch('/api/preflight/minidsp-combined');
+        const d = await r.json();
+        dspBadge.className = 'check-badge ' + (d.passed ? 'pass' : 'fail');
+        dspBadge.textContent = d.passed ? 'OK' : 'FAIL';
+      } catch (_) {
+        dspBadge.className = 'check-badge fail'; dspBadge.textContent = 'ERR';
+      }
+    }
   }
 
-  async function dspTest(silent = false) {
-    const badge = document.getElementById('eqDspBadge');
-    const status = document.getElementById('eqDspStatus');
-    if (!silent) {
-      badge.className = 'check-badge running';
-      badge.textContent = '…';
-      status.textContent = 'Connecting…';
-      status.style.color = '#94a3b8';
-    }
+  async function chainDspTest() {
+    const badge = document.getElementById('chainDspBadge');
+    const status = document.getElementById('chainDspStatus');
+    badge.className = 'check-badge running'; badge.textContent = '\u2026';
+    status.textContent = 'Connecting\u2026'; status.style.color = '#94a3b8';
     try {
       const r = await fetch('/api/preflight/minidsp-combined');
       const d = await r.json();
       badge.className = 'check-badge ' + (d.passed ? 'pass' : 'fail');
       badge.textContent = d.passed ? 'OK' : 'FAIL';
-      if (!silent) {
-        status.textContent = d.detail || '';
-        status.style.color = d.passed ? '#4ade80' : '#f87171';
-      }
-      // Load existing labels from config
-      if (d.passed) _loadDspLabels();
+      status.textContent = d.detail || '';
+      status.style.color = d.passed ? '#4ade80' : '#f87171';
     } catch (e) {
-      badge.className = 'check-badge fail';
-      badge.textContent = 'ERR';
-      if (!silent) { status.textContent = e.message; status.style.color = '#f87171'; }
+      badge.className = 'check-badge fail'; badge.textContent = 'ERR';
+      status.textContent = e.message; status.style.color = '#f87171';
     }
   }
 
-  async function _loadDspLabels() {
-    try {
-      const r = await fetch('/api/signal-path');
-      if (!r.ok) return;
-      const cfg = await r.json();
-      const conn = (cfg.connections || {}).minidsp || {};
-      const inputs = conn.inputs || {};
-      const outputs = conn.outputs || {};
-      if (inputs['0']) document.getElementById('eqDspIn0').value = inputs['0'];
-      if (inputs['1']) document.getElementById('eqDspIn1').value = inputs['1'];
-      if (outputs['0']) document.getElementById('eqDspOut0').value = outputs['0'];
-      if (outputs['1']) document.getElementById('eqDspOut1').value = outputs['1'];
-      if (outputs['2']) document.getElementById('eqDspOut2').value = outputs['2'];
-      if (outputs['3']) document.getElementById('eqDspOut3').value = outputs['3'];
-    } catch (_) {}
-  }
-
-  async function dspSave() {
-    const btn = document.getElementById('eqDspSaveBtn');
-    const status = document.getElementById('eqDspStatus');
-    btn.disabled = true;
-    try {
-      const r = await fetch('/api/equipment/minidsp/save-labels', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          inputs: [
-            document.getElementById('eqDspIn0').value,
-            document.getElementById('eqDspIn1').value,
-          ],
-          outputs: [
-            document.getElementById('eqDspOut0').value,
-            document.getElementById('eqDspOut1').value,
-            document.getElementById('eqDspOut2').value,
-            document.getElementById('eqDspOut3').value,
-          ],
-        }),
-      });
-      if (!r.ok) throw new Error(await r.text());
-      status.textContent = 'Labels saved to config.yaml';
-      status.style.color = '#4ade80';
-    } catch (e) {
-      status.textContent = 'Error: ' + e.message;
-      status.style.color = '#f87171';
-    }
-    btn.disabled = false;
-  }
-
-  // Speaker management
-  let _speakers = [];
-
-  async function _loadSpeakers() {
-    try {
-      const r = await fetch('/api/equipment/speakers');
-      _speakers = await r.json();
-    } catch (_) { _speakers = []; }
-    _renderSpeakers();
-  }
-
-  const SPK_TYPE_LABELS = {
-    subwoofer: 'Subwoofer', front_l: 'Front L', front_r: 'Front R',
-    center: 'Center', surround_l: 'Surround L', surround_r: 'Surround R',
-    height_l: 'Height L', height_r: 'Height R', bass_shaker: 'Bass Shaker',
-  };
-
-  function _renderSpeakers() {
-    const list = document.getElementById('eqSpeakerList');
-    const empty = document.getElementById('eqSpeakerEmpty');
-    empty.style.display = _speakers.length ? 'none' : '';
-    list.innerHTML = _speakers.map(s => {
-      const d = s.data || {};
-      const meta = [d.room_location, d.port_tune_hz ? `${d.port_tune_hz} Hz tune` : null].filter(Boolean).join(' · ');
-      return `<div style="display:flex;align-items:center;gap:.5rem;background:#131720;border-radius:6px;padding:.5rem .75rem">
-        <div style="flex:1">
-          <div style="font-size:.82rem;color:#cbd5e1;font-weight:500">${SPK_TYPE_LABELS[s.type] || s.type} — ${s.label || '(no label)'}</div>
-          ${meta ? `<div style="font-size:.72rem;color:#64748b;margin-top:.1rem">${meta}</div>` : ''}
-        </div>
-        <button onclick="deleteSpeaker(${s.id})" style="background:transparent;color:#475569;border:none;font-size:1rem;padding:.2rem .4rem;cursor:pointer" title="Remove">&times;</button>
-      </div>`;
-    }).join('');
-  }
-
-  function toggleAddSpeaker() {
-    const form = document.getElementById('eqAddSpeakerForm');
-    form.style.display = form.style.display === 'none' ? '' : 'none';
-    // Show/hide port tune for subwoofer types
-    document.getElementById('eqSpkType').onchange = () => {
-      const t = document.getElementById('eqSpkType').value;
-      document.getElementById('eqSpkPortRow').style.display =
-        (t === 'subwoofer' || t === 'bass_shaker') ? '' : 'none';
-    };
-    document.getElementById('eqSpkType').dispatchEvent(new Event('change'));
-  }
-
-  async function saveSpeaker() {
-    const type = document.getElementById('eqSpkType').value;
-    const label = document.getElementById('eqSpkLabel').value.trim();
-    const location = document.getElementById('eqSpkLocation').value.trim();
-    const portTune = parseFloat(document.getElementById('eqSpkPortTune').value);
-    const data = {};
-    if (location) data.room_location = location;
-    if (!isNaN(portTune)) data.port_tune_hz = portTune;
-    try {
-      const r = await fetch('/api/equipment/speakers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type, label: label || null, data }),
-      });
-      if (!r.ok) throw new Error(await r.text());
-      // Reset and close form
-      document.getElementById('eqSpkLabel').value = '';
-      document.getElementById('eqSpkLocation').value = '';
-      document.getElementById('eqSpkPortTune').value = '';
-      toggleAddSpeaker();
-      await _loadSpeakers();
-    } catch (e) {
-      alert('Error saving speaker: ' + e.message);
-    }
-  }
-
-  async function deleteSpeaker(id) {
-    try {
-      const r = await fetch('/api/equipment/speakers/' + id, { method: 'DELETE' });
-      if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || r.statusText); }
-      await _loadSpeakers();
-    } catch (e) {
-      alert('Error deleting: ' + e.message);
-    }
+  function _checkChainGate() {
+    const hostEl = document.getElementById('chainDenonHost');
+    const denonHost = ((_chainState.denon || {}).host) || (hostEl ? hostEl.value.trim() : '');
+    const slots = ((_chainState.minidsp || {}).output_slots) || [];
+    const hasSpk = slots.some(s => s.label || s.preset);
+    const btn = document.getElementById('chainContinueBtn');
+    if (btn) btn.disabled = !(denonHost && hasSpk);
   }
 
   // Restore phase from localStorage on load
@@ -2872,19 +2879,23 @@ async def equipment_denon_state() -> dict:
     if not host:
         return {"connected": False, "error": "No host configured — use discover first"}
     try:
-        receiver = denonavr.DenonAVR(host)
-        await receiver.async_setup()
-        await receiver.async_update()
-        return {
-            "connected": True,
-            "host": host,
-            "model": receiver.model_name,
-            "current_input": receiver.input_func,
-            "inputs": sorted(receiver.input_func_list or []),
-            "volume": receiver.volume,
-            "mute": receiver.mute,
-            "configured_sweep_input": cfg.measurement.get("denon_sweep_input"),
-        }
+        async def _fetch() -> dict:
+            receiver = denonavr.DenonAVR(host)
+            await receiver.async_setup()
+            await receiver.async_update()
+            return {
+                "connected": True,
+                "host": host,
+                "model": receiver.model_name,
+                "current_input": receiver.input_func,
+                "inputs": sorted(receiver.input_func_list or []),
+                "volume": receiver.volume,
+                "mute": receiver.mute,
+                "configured_sweep_input": cfg.measurement.get("denon_sweep_input"),
+            }
+        return await asyncio.wait_for(_fetch(), timeout=5.0)
+    except asyncio.TimeoutError:
+        return {"connected": False, "host": host, "error": "Timeout after 5s — Denon unreachable"}
     except Exception as exc:
         return {"connected": False, "host": host, "error": str(exc)}
 
@@ -3025,6 +3036,128 @@ async def equipment_speakers_delete(speaker_id: int) -> dict:
     if not SessionStore().delete_equipment(speaker_id):
         raise HTTPException(status_code=404, detail=f"Speaker {speaker_id} not found")
     return {"status": "deleted", "id": speaker_id}
+
+
+# ── Signal chain routes ───────────────────────────────────────────────────────
+
+
+class SignalChainSlot(BaseModel):
+    index: int
+    label: str = ""
+    location: str = ""
+    preset: str = ""
+
+
+class SignalChainDenon(BaseModel):
+    host: Optional[str] = None
+    sweep_input: Optional[str] = None
+
+
+class SignalChainMinidsp(BaseModel):
+    input_labels: dict = {}
+    output_slots: list[SignalChainSlot] = []
+
+
+class SignalChainBody(BaseModel):
+    denon: Optional[SignalChainDenon] = None
+    minidsp: Optional[SignalChainMinidsp] = None
+
+
+@app.get("/api/signal-chain")
+async def signal_chain_get() -> dict:
+    """Synthesize the signal chain from flat config + speakers (computed, not stored)."""
+    import yaml as _yaml
+    try:
+        cfg = Config.load(CONFIG_PATH)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Config read error: {exc}")
+
+    # Denon node
+    denon_node = {
+        "host": cfg.denon.get("host"),
+        "sweep_input": cfg.measurement.get("denon_sweep_input"),
+    }
+
+    # miniDSP node — merge defaults + config
+    minidsp = cfg.minidsp
+    output_slots: list[dict] = minidsp.get("output_slots") or [
+        {"index": i, "label": "", "location": "", "preset": ""} for i in range(4)
+    ]
+    # Deep-copy so we don't mutate DEFAULT_CONFIG in-place
+    output_slots = [dict(s) for s in output_slots]
+
+    # Migration tombstone: Config.load() excludes unknown top-level keys (like "connections"),
+    # so read the raw YAML directly to find old connections.minidsp.outputs.
+    old_outputs: dict = {}
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as _f:
+                _raw = _yaml.safe_load(_f) or {}
+            old_outputs = _raw.get("connections", {}).get("minidsp", {}).get("outputs", {})
+        except Exception:
+            pass
+    if old_outputs and all(not s.get("label") for s in output_slots):
+        for slot in output_slots:
+            idx = str(slot["index"])
+            if idx in old_outputs:
+                slot["label"] = old_outputs[idx]
+
+    # Input labels: prefer minidsp.input_labels, fall back to connections.minidsp.inputs
+    old_inputs: dict = {}
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as _f2:
+                _raw2 = _yaml.safe_load(_f2) or {}
+            old_inputs = _raw2.get("connections", {}).get("minidsp", {}).get("inputs", {})
+        except Exception:
+            pass
+    input_labels = minidsp.get("input_labels") or old_inputs
+
+    return {
+        "denon": denon_node,
+        "minidsp": {
+            "input_labels": input_labels,
+            "output_slots": output_slots,
+        },
+    }
+
+
+@app.post("/api/signal-chain")
+async def signal_chain_post(body: SignalChainBody) -> dict:
+    """Write signal chain topology to config.yaml; derives measurement.sub_outputs."""
+    updates: dict = {}
+
+    if body.denon is not None:
+        if body.denon.host is not None:
+            updates["denon"] = {"host": body.denon.host}
+        if body.denon.sweep_input is not None:
+            updates.setdefault("measurement", {})["denon_sweep_input"] = body.denon.sweep_input
+
+    if body.minidsp is not None:
+        slots = [s.model_dump() for s in body.minidsp.output_slots]
+        # CRITICAL: derive measurement.sub_outputs from non-empty slots so calibration loop
+        # stays in sync with the new UI.
+        sub_outputs = [s["index"] for s in slots if s.get("label") or s.get("preset")]
+        updates.setdefault("measurement", {})["sub_outputs"] = sub_outputs
+
+        # Preserve existing minidsp keys (host, port, signal_path) — only overwrite what we own.
+        updates["minidsp"] = {
+            "input_labels": body.minidsp.input_labels,
+            "output_slots": slots,
+        }
+        # Tombstone old connections.minidsp.outputs key to avoid dual-read confusion.
+        updates["connections"] = {"minidsp": {}}
+
+    if not updates:
+        raise HTTPException(status_code=422, detail="Nothing to save")
+
+    try:
+        update_config(updates, path=CONFIG_PATH)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to write config: {exc}")
+
+    sub_outputs = updates.get("measurement", {}).get("sub_outputs", [])
+    return {"status": "ok", "sub_outputs": sub_outputs}
 
 
 # ── Preflight routes ─────────────────────────────────────────────────────────

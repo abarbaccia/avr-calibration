@@ -13,6 +13,13 @@ DEFAULT_CONFIG: dict = {
         "host": "localhost",
         "port": 5380,
         "signal_path": None,
+        "input_labels": {},
+        "output_slots": [
+            {"index": 0, "label": "", "location": "", "preset": ""},
+            {"index": 1, "label": "", "location": "", "preset": ""},
+            {"index": 2, "label": "", "location": "", "preset": ""},
+            {"index": 3, "label": "", "location": "", "preset": ""},
+        ],
     },
     "mic": {
         "name": "UMIK",
