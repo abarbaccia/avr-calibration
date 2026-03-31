@@ -3183,12 +3183,11 @@ async def equipment_denon_test_input(body: DenonTestInputBody) -> dict:
             samples.append(int(math.sin(2 * math.pi * 440 * t) * env * 0.4 * 32767))
         pcm = samples.tobytes()
 
-        # aplay with plughw bypasses PortAudio; plughw adds ALSA format conversion
-        # so the vc4-hdmi device (which rejects float32/int16 via hw:) works fine
+        # vc4-hdmi on Pi only accepts IEC958_SUBFRAME_LE at the hw level.
+        # The 'iec958' ALSA virtual device wraps it and accepts standard PCM,
+        # handling IEC958 encapsulation transparently.
         cfg = _load_config()
-        hdmi_card = cfg.measurement.get("hdmi_playback_device") or "plughw:1,0"
-        if not hdmi_card.startswith("plughw:") and not hdmi_card.startswith("hw:"):
-            hdmi_card = "plughw:1,0"
+        hdmi_card = cfg.measurement.get("hdmi_playback_device") or "iec958"
         result = await asyncio.to_thread(
             subprocess.run,
             ["aplay", "-D", hdmi_card, "-f", "S16_LE", "-r", str(sample_rate), "-c", "1"],
