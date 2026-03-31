@@ -208,3 +208,174 @@ async def test_level_match_already_matched() -> None:
     trims = await level_match_subs(results, [0, 1], client)
 
     assert all(abs(t) < 0.01 for t in trims)
+
+
+# ── level_match_subs — empty / error paths ────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_level_match_empty_results() -> None:
+    """Empty ir_results → returns empty list without calling client."""
+    client = AsyncMock()
+    trims = await level_match_subs([], [0, 1], client)
+    assert trims == []
+    client.set_output_gain.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_level_match_set_output_gain_failure_logged() -> None:
+    """set_output_gain failure is logged as warning but trim is still appended."""
+    client = AsyncMock()
+    client.set_output_gain.side_effect = Exception("hardware error")
+    results = [
+        SubIRResult(sub_index=0, peak_time_s=0.010, peak_sign=1, polarity_inverted=False, spl_db=-20.0),
+        SubIRResult(sub_index=1, peak_time_s=0.012, peak_sign=1, polarity_inverted=False, spl_db=-23.0),
+    ]
+    trims = await level_match_subs(results, [0, 1], client)
+    # Even when calls fail, the trims are computed and returned
+    assert len(trims) == 2
+    assert abs(trims[1] - 3.0) < 0.01
+
+
+# ── measure_sub_ir — numpy import error ───────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_measure_sub_ir_numpy_import_error() -> None:
+    """If numpy cannot be imported, RuntimeError is raised."""
+    import sys
+
+    engine = _make_engine_mock()
+    sweep = [0.1, -0.1] * 100
+    rec = [0.05] * 200
+
+    real_numpy = sys.modules.get("numpy")
+    sys.modules["numpy"] = None  # type: ignore
+    try:
+        with pytest.raises((RuntimeError, ImportError)):
+            await measure_sub_ir(engine, rec, sweep, 48000, sub_index=0)
+    finally:
+        if real_numpy is not None:
+            sys.modules["numpy"] = real_numpy
+        else:
+            sys.modules.pop("numpy", None)
+
+
+def test_extract_ir_numpy_import_error() -> None:
+    """extract_ir raises RuntimeError when numpy is not importable (lines 96-97)."""
+    import sys
+    from calibrate.alignment import extract_ir
+
+    real_numpy = sys.modules.get("numpy")
+    sys.modules["numpy"] = None  # type: ignore
+    try:
+        with pytest.raises(RuntimeError, match="numpy is required"):
+            extract_ir([0.1, -0.1], [0.05, -0.05], 48000)
+    finally:
+        if real_numpy is not None:
+            sys.modules["numpy"] = real_numpy
+        else:
+            sys.modules.pop("numpy", None)
+
+
+# ── detect_and_correct_polarity — empty / error paths ────────────────────────
+
+@pytest.mark.asyncio
+async def test_polarity_empty_results() -> None:
+    """Empty ir_results → returns empty list unchanged."""
+    client = AsyncMock()
+    result = await detect_and_correct_polarity([], [0, 1], client)
+    assert result == []
+    client.set_output_polarity.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_polarity_set_polarity_failure_appends_original() -> None:
+    """set_output_polarity failure → warning logged, original result preserved."""
+    client = AsyncMock()
+    client.set_output_polarity.side_effect = Exception("connection refused")
+    results = [
+        SubIRResult(sub_index=0, peak_time_s=0.010, peak_sign=1, polarity_inverted=False, spl_db=-20.0),
+        SubIRResult(sub_index=1, peak_time_s=0.012, peak_sign=-1, polarity_inverted=False, spl_db=-20.0),
+    ]
+    updated = await detect_and_correct_polarity(results, [0, 1], client)
+    # Sub 1 is not inverted because the call failed — the original is preserved
+    assert not updated[1].polarity_inverted
+
+
+# ── apply_delays ──────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_apply_delays_normal() -> None:
+    """Positive delay → set_output_delay called for the lagging sub."""
+    from calibrate.alignment import apply_delays
+
+    client = AsyncMock()
+    results = [
+        SubIRResult(sub_index=0, peak_time_s=0.010, peak_sign=1, polarity_inverted=False, spl_db=-20.0),
+        SubIRResult(sub_index=1, peak_time_s=0.012, peak_sign=1, polarity_inverted=False, spl_db=-20.0),
+    ]
+    await apply_delays([2.0, 0.0], results, [0, 1], client)
+    client.set_output_delay.assert_called_once_with(0, 2.0)
+
+
+@pytest.mark.asyncio
+async def test_apply_delays_exceeds_max_clamped() -> None:
+    """Delay exceeding hardware max is clamped to MAX_DELAY_MS."""
+    from calibrate.alignment import apply_delays
+    from calibrate.adapters.minidsp import MAX_DELAY_MS
+
+    client = AsyncMock()
+    results = [
+        SubIRResult(sub_index=0, peak_time_s=0.0, peak_sign=1, polarity_inverted=False, spl_db=-20.0),
+    ]
+    huge_delay = MAX_DELAY_MS + 100.0
+    await apply_delays([huge_delay], results, [0], client)
+    client.set_output_delay.assert_called_once_with(0, MAX_DELAY_MS)
+
+
+@pytest.mark.asyncio
+async def test_apply_delays_zero_skipped() -> None:
+    """Zero delay (reference sub) → set_output_delay not called."""
+    from calibrate.alignment import apply_delays
+
+    client = AsyncMock()
+    results = [
+        SubIRResult(sub_index=0, peak_time_s=0.012, peak_sign=1, polarity_inverted=False, spl_db=-20.0),
+    ]
+    await apply_delays([0.0], results, [0], client)
+    client.set_output_delay.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_apply_delays_client_failure_logged() -> None:
+    """set_output_delay failure → warning logged, no exception raised."""
+    from calibrate.alignment import apply_delays
+
+    client = AsyncMock()
+    client.set_output_delay.side_effect = Exception("write error")
+    results = [
+        SubIRResult(sub_index=0, peak_time_s=0.010, peak_sign=1, polarity_inverted=False, spl_db=-20.0),
+    ]
+    # Must not raise — failure is swallowed with a warning
+    await apply_delays([5.0], results, [0], client)
+
+
+# ── run_alignment_phases ───────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_run_alignment_phases_returns_summary() -> None:
+    """run_alignment_phases runs all four phases and returns an AlignmentSummary."""
+    from calibrate.alignment import run_alignment_phases, AlignmentSummary
+
+    client = AsyncMock()
+    results = [
+        SubIRResult(sub_index=0, peak_time_s=0.010, peak_sign=1, polarity_inverted=False, spl_db=-20.0),
+        SubIRResult(sub_index=1, peak_time_s=0.012, peak_sign=1, polarity_inverted=False, spl_db=-22.0),
+    ]
+    summary = await run_alignment_phases(results, [0, 1], client)
+    assert isinstance(summary, AlignmentSummary)
+    assert len(summary.sub_results) == 2
+    assert len(summary.delay_offsets_ms) == 2
+    assert len(summary.gain_trims_db) == 2
+    # Sub 0 needs +2 ms delay; sub 1 is reference (0.0)
+    assert abs(summary.delay_offsets_ms[0] - 2.0) < 0.01
+    assert abs(summary.delay_offsets_ms[1]) < 0.01

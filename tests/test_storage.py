@@ -458,3 +458,94 @@ class TestEquipmentCrud:
     def test_update_no_fields_unknown_id_returns_none(self, store):
         result = store.update_equipment(9999)
         assert result is None
+
+    def test_equipment_row_corrupt_data_json_returns_empty_dict(self, tmp_path):
+        """_equipment_row with corrupt data JSON → data becomes {} (lines 309-313)."""
+        import sqlite3
+        from datetime import datetime, timezone
+        db_path = tmp_path / "eq.db"
+        store = SessionStore(db_path=db_path)
+        # Insert a row with corrupt JSON in data column directly
+        now = datetime.now(timezone.utc).isoformat()
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO equipment (type, label, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("subwoofer", "SVS", "not-valid-json{{{", now, now),
+        )
+        conn.commit()
+        conn.close()
+
+        rows = store.list_equipment()
+        assert len(rows) == 1
+        assert rows[0]["data"] == {}
+
+
+# ── _row_to_session — corrupt end_fr / filters_applied / impulse_response ────
+
+class TestRowToSessionCorruption:
+
+    def test_corrupt_end_fr_returns_none(self, tmp_path):
+        """Corrupt end_fr JSON → end_fr is None (lines 329-331)."""
+        import sqlite3
+        db_path = tmp_path / "sess.db"
+        store = SessionStore(db_path=db_path)
+        store.save_measurement(make_fr())
+        # Corrupt end_fr
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE sessions SET end_fr = 'bad-json' WHERE id = 1")
+        conn.commit()
+        conn.close()
+
+        session = store.get_session(1)
+        assert session is not None
+        assert session.end_fr is None
+
+    def test_corrupt_filters_applied_returns_none(self, tmp_path):
+        """Corrupt filters_applied JSON → filters_applied is None (lines 335-337)."""
+        import sqlite3
+        db_path = tmp_path / "sess.db"
+        store = SessionStore(db_path=db_path)
+        store.save_measurement(make_fr())
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE sessions SET filters_applied = '{bad:json}' WHERE id = 1")
+        conn.commit()
+        conn.close()
+
+        session = store.get_session(1)
+        assert session is not None
+        assert session.filters_applied is None
+
+    def test_corrupt_impulse_response_returns_none(self, tmp_path):
+        """Corrupt impulse_response blob → impulse_response is None (lines 344-345)."""
+        import sqlite3
+        db_path = tmp_path / "sess.db"
+        store = SessionStore(db_path=db_path)
+        store.save_measurement(make_fr())
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE sessions SET impulse_response = 'not-a-valid-blob' WHERE id = 1")
+        conn.commit()
+        conn.close()
+
+        session = store.get_session(1)
+        assert session is not None
+        assert session.impulse_response is None
+
+    def test_equipment_row_null_data_returns_empty_dict(self, tmp_path):
+        """_equipment_row with NULL data column → data becomes {} (line 313)."""
+        import sqlite3
+        from datetime import datetime, timezone
+        db_path = tmp_path / "eq_null.db"
+        store = SessionStore(db_path=db_path)
+        # Insert a row with NULL in data column — hits the else branch (line 313)
+        now = datetime.now(timezone.utc).isoformat()
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO equipment (type, label, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("subwoofer", "SVS", None, now, now),
+        )
+        conn.commit()
+        conn.close()
+
+        rows = store.list_equipment()
+        assert len(rows) == 1
+        assert rows[0]["data"] == {}

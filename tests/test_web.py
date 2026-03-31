@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import struct
 import json
 import uuid
@@ -2313,6 +2314,30 @@ class TestSignalChainGet:
         assert slot0["label"] == "Sub L"
 
 
+    def test_get_preset_labels_padded_when_fewer_than_four(self, client, tmp_path, monkeypatch):
+        """preset_labels shorter than 4 in config are padded to 4 on GET."""
+        import yaml
+        cfg_data = {
+            "denon": {"host": "192.168.1.100"},
+            "minidsp": {
+                "host": "localhost", "port": 5380,
+                "preset_labels": ["Movie", "Music"],  # only 2 entries
+            },
+        }
+        p = tmp_path / "config.yaml"
+        p.write_text(yaml.safe_dump(cfg_data))
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", p)
+        monkeypatch.setattr("calibrate.config.CONFIG_PATH", p)
+        r = client.get("/api/signal-chain")
+        assert r.status_code == 200
+        labels = r.json()["minidsp"]["preset_labels"]
+        assert len(labels) == 4
+        assert labels[0] == "Movie"
+        assert labels[1] == "Music"
+        assert labels[2] == ""
+        assert labels[3] == ""
+
+
 class TestSignalChainPost:
     def test_post_round_trips(self, client, cfg_path, monkeypatch):
         """POST writes denon + minidsp, GET reads them back."""
@@ -2438,3 +2463,840 @@ class TestConfigOutputSlots:
         slots = cfg.minidsp.get("output_slots")
         assert slots is not None
         assert slots[0]["label"] == "Sub L"
+
+
+# ── _alignment_cleanup_loop — daemon thread body (lines 112-123) ─────────────
+
+def test_alignment_cleanup_loop_evicts_expired_sessions():
+    """_alignment_cleanup_loop evicts expired sessions and calls _restore_sub_gains (lines 112-123).
+
+    Drive one iteration by making time.sleep raise StopIteration on the second call,
+    which breaks the while-True loop.
+    """
+    import calibrate.web as web_mod
+
+    session = _AlignmentSession(
+        token="expiredtoken1234",
+        created_at=0.0,  # far in the past → expired immediately
+        sub_outputs=[0],
+        sweep_samples=[],
+        sample_rate=48000,
+        sweep_duration=0.05,
+        step=0,
+    )
+
+    sleep_calls = {"n": 0}
+
+    def _one_iteration_sleep(_):
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] >= 2:
+            raise StopIteration("done after one iteration")
+
+    restore_calls = []
+
+    with (
+        patch("calibrate.web.time.sleep", side_effect=_one_iteration_sleep),
+        patch("calibrate.web.time.time", return_value=web_mod.ALIGNMENT_SESSION_TTL_S + 1),
+        patch("calibrate.web._restore_sub_gains", side_effect=restore_calls.append),
+        patch.dict(web_mod._pending_alignments, {"expiredtoken1234": session}, clear=True),
+    ):
+        try:
+            web_mod._alignment_cleanup_loop()
+        except StopIteration:
+            pass
+
+    # Session should have been evicted and restore called
+    assert len(restore_calls) == 1
+    assert restore_calls[0].token == "expiredtoken1234"
+    # Session removed from pending dict
+    assert "expiredtoken1234" not in web_mod._pending_alignments
+
+
+# ── _restore_sub_gains error path ────────────────────────────────────────────
+
+def test_restore_sub_gains_exception_logged():
+    """_restore_sub_gains swallows exceptions from client (line 134-135)."""
+    from calibrate.web import _restore_sub_gains, _AlignmentSession
+
+    session = _AlignmentSession(
+        token="test-token",
+        created_at=0.0,
+        sub_outputs=[0, 1],
+        sweep_samples=[],
+        sample_rate=48000,
+        sweep_duration=0.05,
+        step=0,
+    )
+    with patch("calibrate.adapters.minidsp.MinidspClient") as mock_client_cls:
+        mock_client = MagicMock()
+        # restore_all_gains raises when run_until_complete is called
+        mock_client.restore_all_gains.side_effect = RuntimeError("connection refused")
+        mock_client_cls.return_value = mock_client
+        # Must not raise — error is logged
+        _restore_sub_gains(session)
+
+
+# ── _read_semantic_version ────────────────────────────────────────────────────
+
+def test_read_semantic_version_from_env_var(monkeypatch):
+    """APP_VERSION env var → returned immediately (lines 2179-2181)."""
+    import calibrate.web as web_mod
+    orig = web_mod._SEMANTIC_VERSION
+    web_mod._SEMANTIC_VERSION = None
+    monkeypatch.setenv("APP_VERSION", "1.2.3")
+    try:
+        from calibrate.web import _read_semantic_version
+        result = _read_semantic_version()
+        assert result == "1.2.3"
+    finally:
+        web_mod._SEMANTIC_VERSION = orig
+        monkeypatch.delenv("APP_VERSION", raising=False)
+
+
+def test_read_semantic_version_fallback_to_unknown(monkeypatch):
+    """If no env var and no VERSION file → returns 'unknown' (lines 2188-2189)."""
+    import calibrate.web as web_mod
+    import pathlib
+
+    orig = web_mod._SEMANTIC_VERSION
+    monkeypatch.delenv("APP_VERSION", raising=False)
+    try:
+        web_mod._SEMANTIC_VERSION = None
+        from calibrate.web import _read_semantic_version
+        # Patch pathlib.Path.read_text to always raise FileNotFoundError
+        with patch.object(pathlib.Path, "read_text", side_effect=FileNotFoundError("no file")):
+            result = _read_semantic_version()
+        assert result == "unknown"
+    finally:
+        web_mod._SEMANTIC_VERSION = orig
+
+
+# ── _fetch_latest_sha ────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_fetch_latest_sha_timeout():
+    """httpx.TimeoutException in _fetch_latest_sha → returns None."""
+    import httpx
+    from calibrate.web import _fetch_latest_sha
+    with patch("httpx.AsyncClient") as MockClient:
+        mock = AsyncMock()
+        mock.__aenter__ = AsyncMock(return_value=mock)
+        mock.__aexit__ = AsyncMock(return_value=None)
+        mock.get.side_effect = httpx.TimeoutException("timeout")
+        MockClient.return_value = mock
+        result = await _fetch_latest_sha()
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_latest_sha_401_returns_none():
+    """401 on token request → returns None (lines 2133-2136)."""
+    from calibrate.web import _fetch_latest_sha
+    with patch("httpx.AsyncClient") as MockClient:
+        mock = AsyncMock()
+        mock.__aenter__ = AsyncMock(return_value=mock)
+        mock.__aexit__ = AsyncMock(return_value=None)
+        token_resp = MagicMock()
+        token_resp.status_code = 401
+        mock.get.return_value = token_resp
+        MockClient.return_value = mock
+        result = await _fetch_latest_sha()
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_latest_sha_429_returns_none():
+    """429 on manifest → returns None (lines 2148-2150)."""
+    import json as json_mod
+    from calibrate.web import _fetch_latest_sha
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+
+        # Token response succeeds
+        token_resp = MagicMock()
+        token_resp.status_code = 200
+        token_resp.raise_for_status = MagicMock()
+        token_resp.json.return_value = {"token": "abc123"}
+
+        # Manifest response is 429
+        manifest_resp = MagicMock()
+        manifest_resp.status_code = 429
+
+        mock_client.get.side_effect = [token_resp, manifest_resp]
+        MockClient.return_value = mock_client
+
+        result = await _fetch_latest_sha()
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_latest_sha_generic_exception_returns_none():
+    """Generic exception → returns None (lines 2157-2159)."""
+    from calibrate.web import _fetch_latest_sha
+    with patch("httpx.AsyncClient") as MockClient:
+        mock = AsyncMock()
+        mock.__aenter__ = AsyncMock(return_value=mock)
+        mock.__aexit__ = AsyncMock(return_value=None)
+        mock.get.side_effect = OSError("network unreachable")
+        MockClient.return_value = mock
+        result = await _fetch_latest_sha()
+    assert result is None
+
+
+# ── api_upgrade — OSError ENOSPC path ────────────────────────────────────────
+
+def test_upgrade_oserror_enospc(client, tmp_path, monkeypatch):
+    """OSError errno=28 (disk full) → 503 with 'disk full' detail (lines 2267-2269)."""
+    import errno
+    import calibrate.web as web_mod
+    monkeypatch.setattr(web_mod, "_DATA_DIR", tmp_path)
+    err = OSError()
+    err.errno = errno.ENOSPC
+    with patch("pathlib.Path.touch", side_effect=err):
+        r = client.post("/api/upgrade")
+    assert r.status_code == 503
+    assert "disk full" in r.json()["detail"]
+
+
+def test_upgrade_oserror_generic(client, tmp_path, monkeypatch):
+    """Generic OSError → 503 with error text (line 2270)."""
+    import calibrate.web as web_mod
+    monkeypatch.setattr(web_mod, "_DATA_DIR", tmp_path)
+    err = OSError("some other error")
+    err.errno = 99
+    with patch("pathlib.Path.touch", side_effect=err):
+        r = client.post("/api/upgrade")
+    assert r.status_code == 503
+    assert "Upgrade unavailable" in r.json()["detail"]
+
+
+# ── blend_check_start error ────────────────────────────────────────────────────
+
+def test_blend_check_start_engine_error(client, cfg_path):
+    """RuntimeError from generate_sweep → 500 (lines 2410-2411)."""
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_path),
+        patch("calibrate.web.MeasurementEngine") as MockEngine,
+    ):
+        MockEngine.return_value.generate_sweep.side_effect = RuntimeError("audio init failed")
+        r = client.post("/api/blend-check/start")
+    assert r.status_code == 500
+
+
+def test_blend_check_start_play_thread_exception_logged(client, cfg_path):
+    """_play() in blend-check start logs exceptions without crashing (lines 2426-2430)."""
+    captured_fn = {}
+
+    def capture_thread(target=None, daemon=False):
+        captured_fn["fn"] = target
+        m = MagicMock()
+        m.start = MagicMock()
+        return m
+
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_path),
+        patch("calibrate.web.MeasurementEngine") as MockEngine,
+        patch("calibrate.web.threading.Thread", side_effect=capture_thread),
+        patch("calibrate.web.time.sleep"),
+    ):
+        MockEngine.return_value.generate_sweep.return_value = ([0.0] * 100, 48000, 1.0)
+        MockEngine.return_value.play_signal.side_effect = RuntimeError("device busy")
+        client.post("/api/blend-check/start")
+
+    assert captured_fn.get("fn") is not None
+    captured_fn["fn"]()  # must not raise
+
+
+# ── time_align — sub lags recommendation ─────────────────────────────────────
+
+def test_time_align_sub_lags_recommendation(client):
+    """sub_leads=False → recommendation says 'lags' (line 2572).
+
+    offset_ms = lag_samples / sr * 1000 where lag_samples = argmax(corr) - (len(bp2)-1).
+    To get sub_leads=False we need offset_ms <= 0.
+    If sub IR is delayed relative to mains, argmax of cross-corr is < (len-1), giving negative lag.
+    """
+    # Directly patch compute_time_offset_ms to return a negative value (sub lags)
+    s_sub = _make_session_with_ir(1, [0.0] * 100)
+    s_mains = _make_session_with_ir(2, [0.0] * 100)
+
+    sessions = {1: s_sub, 2: s_mains}
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.side_effect = lambda sid: sessions.get(sid)
+        with patch("calibrate.web.compute_time_offset_ms", return_value=-10.0):
+            r = client.post("/api/sessions/time-align",
+                            json={"sub_session_id": 1, "mains_session_id": 2})
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["sub_leads"] is False
+    assert "lags" in data["recommendation"]
+
+
+# ── cardioid — non-404 MinidspApiError → 502 ─────────────────────────────────
+
+def test_cardioid_502_non_404_error(client, tmp_path):
+    """MinidspApiError with status != 404 → 502 (line 2633)."""
+    from calibrate.adapters.minidsp import MinidspApiError
+    cfg_p = _make_cardioid_config(tmp_path)
+    with (
+        patch("calibrate.web.CONFIG_PATH", cfg_p),
+        patch("calibrate.adapters.minidsp.MinidspClient") as MockClient,
+    ):
+        mc = MagicMock()
+        mc.set_output_polarity = AsyncMock(
+            side_effect=MinidspApiError(500, "/output/1/polarity")
+        )
+        MockClient.return_value = mc
+        r = client.post("/api/signal-path/cardioid", json={"enabled": True})
+
+    assert r.status_code == 502
+
+
+# ── align-subs start — MinidspApiError 503 ────────────────────────────────────
+
+def test_align_subs_start_minidsp_api_error(client):
+    """MinidspApiError on mute → 503 (lines 2743-2744)."""
+    from calibrate.adapters.minidsp import MinidspApiError
+
+    with (
+        patch("calibrate.web._load_config", return_value=_make_align_config()),
+        patch("calibrate.web.MeasurementEngine") as mock_engine_cls,
+        patch("calibrate.adapters.minidsp.MinidspClient") as mock_client_cls,
+    ):
+        mock_engine_cls.return_value.generate_sweep.return_value = ([0.0] * 100, 48000, 0.5)
+        mock_client = AsyncMock()
+        mock_client.set_output_gain.side_effect = MinidspApiError(503, "/output/1/gain")
+        mock_client_cls.return_value = mock_client
+        r = client.post("/api/align-subs/start")
+
+    assert r.status_code == 503
+
+
+def test_align_subs_start_play_thread_exception_logged(client):
+    """align-subs _play thread logs play_signal exceptions (lines 2764-2767)."""
+    captured_fn = {}
+
+    def capture_thread(target=None, daemon=False):
+        captured_fn["fn"] = target
+        m = MagicMock()
+        m.start = MagicMock()
+        return m
+
+    with (
+        patch("calibrate.web._load_config", return_value=_make_align_config()),
+        patch("calibrate.web.MeasurementEngine") as mock_engine_cls,
+        patch("calibrate.adapters.minidsp.MinidspClient") as mock_client_cls,
+        patch("calibrate.web.threading.Thread", side_effect=capture_thread),
+        patch("calibrate.web.time.sleep"),
+    ):
+        mock_engine_cls.return_value.generate_sweep.return_value = ([0.0] * 100, 48000, 0.5)
+        mock_engine_cls.return_value.play_signal.side_effect = RuntimeError("device busy")
+        mock_client = AsyncMock()
+        mock_client_cls.return_value = mock_client
+        client.post("/api/align-subs/start")
+
+    assert captured_fn.get("fn") is not None
+    captured_fn["fn"]()  # must not raise
+
+
+# ── align-subs record — short body ────────────────────────────────────────────
+
+def test_align_subs_record_short_body(client):
+    """Recording body < 4 bytes → 400 (line 2807)."""
+    import time as _time
+    token = str(uuid.uuid4())
+    session = _AlignmentSession(
+        token=token,
+        created_at=_time.time(),
+        sub_outputs=[0, 1],
+        sweep_samples=[0.0] * 100,
+        sample_rate=48000,
+        sweep_duration=0.05,
+        step=0,
+    )
+    with _align_lock:
+        _pending_alignments[token] = session
+
+    r = client.post(
+        "/api/align-subs/record",
+        content=b"\x00\x00",
+        headers={"X-Token": token, "X-Step": "0"},
+    )
+    assert r.status_code == 400
+
+
+# ── align-subs record — advance_subs failure ──────────────────────────────────
+
+def test_align_subs_record_advance_subs_failure_logged(client):
+    """advance_subs failure → logged as warning, response still returns next_step (lines 2858-2859)."""
+    import time as _time
+    token = str(uuid.uuid4())
+    session = _AlignmentSession(
+        token=token,
+        created_at=_time.time(),
+        sub_outputs=[0, 1],
+        sweep_samples=[0.001] * 2400,
+        sample_rate=48000,
+        sweep_duration=0.05,
+        step=0,
+    )
+    with _align_lock:
+        _pending_alignments[token] = session
+
+    with (
+        patch("calibrate.web._load_config", return_value=_make_align_config()),
+        patch("calibrate.web.MeasurementEngine"),
+        patch("calibrate.alignment.measure_sub_ir") as mock_measure,
+        patch("calibrate.adapters.minidsp.MinidspClient") as mock_client_cls,
+    ):
+        mock_measure.return_value = _make_ir_result(0)
+        mock_client = AsyncMock()
+        mock_client.set_output_gain.side_effect = Exception("write error")
+        mock_client_cls.return_value = mock_client
+
+        r = client.post(
+            "/api/align-subs/record",
+            content=_make_recording_bytes(),
+            headers={"X-Token": token, "X-Step": "0"},
+        )
+
+    # Even with advance failure, the response should indicate the next step
+    assert r.status_code == 200
+    assert r.json()["next_step"] == 1
+
+
+def test_align_subs_record_play_next_exception_logged(client):
+    """_play_next thread logs play exceptions without raising (lines 2863-2866)."""
+    import time as _time
+    captured_fn = {}
+
+    real_thread = __import__("threading").Thread
+
+    def capture_thread(target=None, daemon=False):
+        captured_fn["fn"] = target
+        m = MagicMock()
+        m.start = MagicMock()
+        return m
+
+    token = str(uuid.uuid4())
+    session = _AlignmentSession(
+        token=token,
+        created_at=_time.time(),
+        sub_outputs=[0, 1],
+        sweep_samples=[0.001] * 2400,
+        sample_rate=48000,
+        sweep_duration=0.05,
+        step=0,
+    )
+    with _align_lock:
+        _pending_alignments[token] = session
+
+    with (
+        patch("calibrate.web._load_config", return_value=_make_align_config()),
+        patch("calibrate.web.MeasurementEngine") as mock_engine_cls,
+        patch("calibrate.alignment.measure_sub_ir") as mock_measure,
+        patch("calibrate.adapters.minidsp.MinidspClient") as mock_client_cls,
+        patch("calibrate.web.threading.Thread", side_effect=capture_thread),
+        patch("calibrate.web.time.sleep"),
+    ):
+        mock_measure.return_value = _make_ir_result(0)
+        mock_engine_cls.return_value.play_signal.side_effect = RuntimeError("audio error")
+        mock_client = AsyncMock()
+        mock_client_cls.return_value = mock_client
+
+        client.post(
+            "/api/align-subs/record",
+            content=_make_recording_bytes(),
+            headers={"X-Token": token, "X-Step": "0"},
+        )
+
+    assert captured_fn.get("fn") is not None
+    captured_fn["fn"]()  # must not raise
+
+
+# ── get_device_state — generic exception → 502 ───────────────────────────────
+
+def test_get_device_state_generic_exception(client, tmp_path, monkeypatch):
+    """Generic exception → 502 with 'Cannot reach miniDSP' (lines 3021-3022)."""
+    import yaml
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(yaml.dump({"minidsp": {"host": "localhost", "port": 5380}}))
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_file)
+
+    mock_client = AsyncMock()
+    mock_client.get_device_status.side_effect = OSError("connection timed out")
+    with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+        r = client.get("/api/signal-path/device-state")
+
+    assert r.status_code == 502
+    assert "Cannot reach" in r.json()["detail"]
+
+
+# ── equipment_denon_state ─────────────────────────────────────────────────────
+
+def test_denon_state_no_host(client, cfg_path, monkeypatch):
+    """No Denon host configured → connected=False (line 3064)."""
+    import yaml
+    no_host_cfg = cfg_path.parent / "no_host.yaml"
+    no_host_cfg.write_text(yaml.dump({
+        "denon": {"host": None},
+        "minidsp": {"host": "localhost", "port": 5380},
+        "mic": {"name": "UMIK"},
+    }))
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", no_host_cfg)
+    r = client.get("/api/equipment/denon/state")
+    assert r.status_code == 200
+    assert r.json()["connected"] is False
+    assert "No host configured" in r.json()["error"]
+
+
+def test_denon_state_connected(client, cfg_path, monkeypatch):
+    """Happy path: DenonAVR fetches state correctly (lines 3066-3080)."""
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+    receiver = AsyncMock()
+    receiver.model_name = "X3800H"
+    receiver.input_func = "HDMI 1"
+    receiver.input_func_list = ["HDMI 1", "HDMI 2"]
+    receiver.volume = -30.0
+    receiver.muted = False
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        r = client.get("/api/equipment/denon/state")
+
+    assert r.status_code == 200
+    d = r.json()
+    assert d["connected"] is True
+    assert d["model"] == "X3800H"
+    assert "HDMI 1" in d["inputs"]
+
+
+def test_denon_state_timeout(client, cfg_path, monkeypatch):
+    """asyncio.TimeoutError → connected=False with timeout message (lines 3081-3082)."""
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+    receiver = AsyncMock()
+    receiver.async_setup.side_effect = asyncio.TimeoutError()
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError()):
+            r = client.get("/api/equipment/denon/state")
+
+    assert r.status_code == 200
+    assert r.json()["connected"] is False
+    assert "Timeout" in r.json()["error"]
+
+
+def test_denon_state_generic_exception(client, cfg_path, monkeypatch):
+    """Generic exception → connected=False with error string (lines 3083-3084)."""
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+    receiver = AsyncMock()
+    receiver.async_setup.side_effect = OSError("connection refused")
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        with patch("asyncio.wait_for", side_effect=OSError("connection refused")):
+            r = client.get("/api/equipment/denon/state")
+
+    assert r.status_code == 200
+    assert r.json()["connected"] is False
+    assert "connection refused" in r.json()["error"]
+
+
+# ── equipment_denon_discover ──────────────────────────────────────────────────
+
+def test_denon_discover_found_via_configured_host(client, cfg_path, monkeypatch):
+    """Configured host is reachable → returns that host (lines 3092-3103)."""
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+    receiver = AsyncMock()
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        with patch("denonavr.async_discover", return_value=AsyncMock(return_value=[])):
+            r = client.post("/api/equipment/denon/discover")
+
+    # The configured host in cfg_path is 192.168.1.100
+    assert r.status_code == 200
+    assert r.json()["host"] == "192.168.1.100"
+
+
+def test_denon_discover_no_host_found(client, tmp_path, monkeypatch):
+    """Neither configured host nor SSDP → 404 (lines 3128-3129)."""
+    import yaml
+    no_host = tmp_path / "config.yaml"
+    no_host.write_text(yaml.dump({
+        "denon": {"host": None},
+        "minidsp": {"host": "localhost", "port": 5380},
+        "mic": {"name": "UMIK"},
+    }))
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", no_host)
+
+    with patch("denonavr.DenonAVR", side_effect=OSError("refused")):
+        with patch("denonavr.async_discover", side_effect=OSError("no ssdp")):
+            r = client.post("/api/equipment/denon/discover")
+
+    assert r.status_code == 404
+
+
+# ── equipment_denon_save — write failure ─────────────────────────────────────
+
+def test_denon_save_write_failure(client, cfg_path, monkeypatch):
+    """update_config raising exception → 500 (lines 3145-3146)."""
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+    with patch("calibrate.web.update_config", side_effect=OSError("disk full")):
+        r = client.post("/api/equipment/denon/save",
+                        json={"host": "192.168.1.50", "sweep_input": None})
+    assert r.status_code == 500
+    assert "Failed to write config" in r.json()["detail"]
+
+
+# ── equipment_denon_test_input ────────────────────────────────────────────────
+
+def test_denon_test_input_success_tone_played(client, cfg_path, monkeypatch):
+    """Happy path: input switched and aplay succeeds → tone_played=True (lines 3159-3215)."""
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+    receiver = AsyncMock()
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        with patch("subprocess.run") as mock_run:
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_run.return_value = mock_proc
+            with patch("asyncio.to_thread", new=AsyncMock(return_value=mock_proc)):
+                r = client.post("/api/equipment/denon/test-input",
+                                json={"host": "192.168.1.100", "input": "HDMI 1"})
+
+    assert r.status_code == 200
+    d = r.json()
+    assert d["switched"] is True
+    assert d["input"] == "HDMI 1"
+
+
+def test_denon_test_input_denon_failure(client, cfg_path, monkeypatch):
+    """Denon control failure → 502 (lines 3167-3168)."""
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+    receiver = AsyncMock()
+    receiver.async_setup.side_effect = OSError("connection refused")
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        r = client.post("/api/equipment/denon/test-input",
+                        json={"host": "192.168.1.100", "input": "HDMI 1"})
+
+    assert r.status_code == 502
+    assert "Denon control failed" in r.json()["detail"]
+
+
+def test_denon_test_input_aplay_fails(client, cfg_path, monkeypatch):
+    """aplay non-zero returncode → tone_played=False, tone_error set (lines 3207-3208)."""
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+    receiver = AsyncMock()
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.stderr = b"aplay: device not found"
+        with patch("asyncio.to_thread", new=AsyncMock(return_value=mock_proc)):
+            r = client.post("/api/equipment/denon/test-input",
+                            json={"host": "192.168.1.100", "input": "HDMI 1"})
+
+    assert r.status_code == 200
+    d = r.json()
+    assert d["tone_played"] is False
+    assert d["tone_error"] is not None
+
+
+# ── save-labels — write failure ────────────────────────────────────────────────
+
+def test_minidsp_save_labels_write_failure(client, cfg_path, monkeypatch):
+    """update_config exception → 500 (lines 3234-3235)."""
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+    with patch("calibrate.web.update_config", side_effect=OSError("disk full")):
+        r = client.post("/api/equipment/minidsp/save-labels", json={
+            "inputs": ["LFE L"],
+            "outputs": ["Sub L"],
+        })
+    assert r.status_code == 500
+    assert "Failed to write config" in r.json()["detail"]
+
+
+# ── signal_chain_get — config read error ─────────────────────────────────────
+
+def test_signal_chain_get_config_error(client, cfg_path, monkeypatch):
+    """Config.load raises exception → 500 with 'Config read error' (lines 3301-3302)."""
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+    with patch("calibrate.web.Config.load", side_effect=Exception("YAML parse error")):
+        r = client.get("/api/signal-chain")
+    assert r.status_code == 500
+    assert "Config read error" in r.json()["detail"]
+
+
+# ── signal_chain_post — routing and write failure ────────────────────────────
+
+def test_signal_chain_post_with_routing(client, cfg_path, monkeypatch):
+    """POST with routing → input_routing saved (line 3383)."""
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+    monkeypatch.setattr("calibrate.config.CONFIG_PATH", cfg_path)
+    body = {
+        "denon": {"host": "192.168.1.100", "sweep_input": None},
+        "minidsp": {
+            "input_labels": {},
+            "routing": [{"input": 0, "outputs": [0, 1, 2, 3]}],
+            "output_slots": _empty_slots(),
+        },
+    }
+    r = client.post("/api/signal-chain", json=body)
+    assert r.status_code == 200
+    import yaml
+    data = yaml.safe_load(cfg_path.read_text())
+    assert "input_routing" in data.get("minidsp", {})
+
+
+def test_signal_chain_post_write_failure(client, cfg_path, monkeypatch):
+    """update_config exception → 500 (lines 3392-3393)."""
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+    with patch("calibrate.web.update_config", side_effect=OSError("disk full")):
+        r = client.post("/api/signal-chain", json=_full_chain_body())
+    assert r.status_code == 500
+    assert "Failed to write config" in r.json()["detail"]
+
+
+# ── _fetch_latest_sha — manifest happy path ───────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_fetch_latest_sha_happy_path():
+    """Token + manifest both succeed → returns revision SHA (lines 2151-2153)."""
+    from calibrate.web import _fetch_latest_sha
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+
+        token_resp = MagicMock()
+        token_resp.status_code = 200
+        token_resp.raise_for_status = MagicMock()
+        token_resp.json.return_value = {"token": "abc123"}
+
+        manifest_resp = MagicMock()
+        manifest_resp.status_code = 200
+        manifest_resp.raise_for_status = MagicMock()
+        manifest_resp.json.return_value = {
+            "annotations": {"org.opencontainers.image.revision": "deadbeef1234"}
+        }
+
+        mock_client.get.side_effect = [token_resp, manifest_resp]
+        MockClient.return_value = mock_client
+
+        result = await _fetch_latest_sha()
+    assert result == "deadbeef1234"
+
+
+# ── time_align — sub session not found (line 2542) ───────────────────────────
+
+def test_time_align_sub_session_not_found(client):
+    """sub_session_id not found → 404 (line 2542)."""
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.return_value = None
+        r = client.post("/api/sessions/time-align",
+                        json={"sub_session_id": 999, "mains_session_id": 2})
+    assert r.status_code == 404
+    assert "999" in r.json()["detail"]
+
+
+# ── time_align — sub leads mains recommendation (line 2572) ──────────────────
+
+def test_time_align_sub_leads_recommendation(client):
+    """sub_leads=True → recommendation says 'leads' (line 2572)."""
+    s_sub = _make_session_with_ir(1, [0.0] * 100)
+    s_mains = _make_session_with_ir(2, [0.0] * 100)
+
+    sessions = {1: s_sub, 2: s_mains}
+    with patch("calibrate.web.SessionStore") as MockStore:
+        MockStore.return_value.get_session.side_effect = lambda sid: sessions.get(sid)
+        with patch("calibrate.web.compute_time_offset_ms", return_value=10.0):
+            r = client.post("/api/sessions/time-align",
+                            json={"sub_session_id": 1, "mains_session_id": 2})
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["sub_leads"] is True
+    assert "leads" in data["recommendation"]
+
+
+# ── equipment_denon_discover — configured host raises exception (line 3102-3103)
+
+def test_denon_discover_configured_host_exception_falls_back_to_ssdp(client, cfg_path, monkeypatch):
+    """Configured host setup raises exception → _check_configured_host returns None,
+    SSDP succeeds (lines 3102-3103)."""
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+
+    receiver = AsyncMock()
+    receiver.async_setup.side_effect = OSError("connection refused")
+
+    with (
+        patch("denonavr.DenonAVR", return_value=receiver),
+        patch("denonavr.async_discover", new=AsyncMock(return_value=[{"host": "10.0.0.5"}])),
+    ):
+        r = client.post("/api/equipment/denon/discover")
+
+    assert r.status_code == 200
+    assert r.json()["host"] == "10.0.0.5"
+
+
+# ── signal_chain_get — old_outputs read exception (lines 3326-3327) ──────────
+
+def test_signal_chain_get_old_outputs_read_exception(client, cfg_path, monkeypatch):
+    """Exception reading raw YAML for old_outputs migration → silently caught (lines 3326-3327)."""
+    import yaml as _yaml_mod
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+    monkeypatch.setattr("calibrate.config.CONFIG_PATH", cfg_path)
+
+    call_count = {"n": 0}
+    real_safe_load = _yaml_mod.safe_load
+
+    def _patched_safe_load(stream):
+        call_count["n"] += 1
+        # First call is Config.load (config.py); second+ are the migration reads in web.py
+        if call_count["n"] >= 2:
+            raise OSError("permission denied")
+        return real_safe_load(stream)
+
+    with patch("yaml.safe_load", side_effect=_patched_safe_load):
+        r = client.get("/api/signal-chain")
+
+    # Exception is caught; route still returns 200
+    assert r.status_code == 200
+
+
+# ── signal_chain_get — old_inputs read exception (lines 3341-3342) ───────────
+
+def test_signal_chain_get_old_inputs_read_exception(client, tmp_path, monkeypatch):
+    """Exception reading raw YAML for old_inputs → silently caught (lines 3341-3342)."""
+    import yaml
+    import yaml as _yaml_mod
+    # Config with old connections.minidsp.outputs so first migration read returns data,
+    # triggering the second migration read (for old_inputs) to also run.
+    cfg_data = {
+        "denon": {"host": "192.168.1.100"},
+        "minidsp": {"host": "localhost", "port": 5380},
+        "connections": {"minidsp": {"outputs": {"0": "Sub L"}}},
+    }
+    p = tmp_path / "config.yaml"
+    p.write_text(yaml.safe_dump(cfg_data))
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", p)
+    monkeypatch.setattr("calibrate.config.CONFIG_PATH", p)
+
+    call_count = {"n": 0}
+    real_safe_load = _yaml_mod.safe_load
+
+    def _patched_safe_load(stream):
+        call_count["n"] += 1
+        # Call 1: Config.load in config.py (succeeds)
+        # Call 2: first migration tombstone (old_outputs — succeeds, returns connections data)
+        # Call 3: second migration tombstone (old_inputs — raises)
+        if call_count["n"] >= 3:
+            raise OSError("permission denied on inputs read")
+        return real_safe_load(stream)
+
+    with patch("yaml.safe_load", side_effect=_patched_safe_load):
+        r = client.get("/api/signal-chain")
+
+    assert r.status_code == 200
