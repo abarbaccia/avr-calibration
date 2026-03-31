@@ -334,100 +334,28 @@ _HTML = """<!DOCTYPE html>
   <!-- Phase 1: Equipment Setup — Signal Chain Builder -->
   <div id="phase1Content" style="display:block">
 
-    <!-- Pi root header (always present) -->
-    <div style="background:#131720;border-radius:8px;padding:.6rem 1rem;margin-bottom:.5rem;display:flex;align-items:center;justify-content:space-between">
+    <!-- Pi root node -->
+    <div style="background:#131720;border-radius:8px;padding:.6rem 1rem;display:flex;align-items:center;justify-content:space-between">
       <div>
         <span style="font-size:.72rem;text-transform:uppercase;letter-spacing:.07em;color:#64748b">Calibration Host</span>
-        <div style="font-size:.82rem;color:#94a3b8;margin-top:.15rem">Raspberry Pi &mdash; measurement only, not in listening path</div>
+        <div style="font-size:.82rem;color:#94a3b8;margin-top:.15rem">AVR Calibration &mdash; measurement only, not in listening path</div>
       </div>
       <span class="check-badge pass" style="font-size:.7rem">Online</span>
     </div>
-    <div style="width:2px;height:.65rem;background:#1e2537;margin:0 auto"></div>
 
-    <!-- Denon card -->
-    <div class="card" id="chainDenonCard">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem">
-        <h2 style="margin:0;font-size:1rem">Denon X3800H</h2>
-        <span id="chainDenonBadge" class="check-badge pending">&mdash;</span>
-      </div>
+    <!-- Dynamic device chain rendered by JS -->
+    <div id="chainDeviceList"></div>
 
-      <div id="chainDenonEmpty" style="display:none;background:#0d0f14;border-radius:6px;padding:.65rem .75rem;margin-bottom:.65rem;font-size:.82rem;color:#64748b">
-        Click Discover to find your Denon AVR on the network.
+    <!-- Add device -->
+    <div id="chainAddRow" style="margin:.75rem 0 .5rem">
+      <button id="chainAddBtn" onclick="chainTogglePicker()" style="width:100%;background:#0d0f14;color:#64748b;border:1px dashed #334155;border-radius:8px;padding:.65rem;font-size:.85rem">&#43; Add Device</button>
+      <div id="chainDevicePicker" style="display:none;background:#131720;border-radius:8px;border:1px solid #1e2537;overflow:hidden;margin-top:.25rem">
+        <button id="chainPickerDenon" onclick="chainAddDevice('denon')" style="width:100%;background:transparent;color:#cbd5e1;border:none;border-bottom:1px solid #1e2537;padding:.65rem 1rem;text-align:left;cursor:pointer;font-size:.85rem">Denon AVR</button>
+        <button id="chainPickerMinidsp" onclick="chainAddDevice('minidsp')" style="width:100%;background:transparent;color:#cbd5e1;border:none;padding:.65rem 1rem;text-align:left;cursor:pointer;font-size:.85rem">miniDSP 2x4 HD</button>
       </div>
-
-      <div style="display:flex;gap:.5rem;margin-bottom:.5rem">
-        <input type="text" id="chainDenonHost" placeholder="192.168.x.x (or click Discover)" style="flex:1">
-        <button id="chainDenonDiscoverBtn" onclick="chainDenonDiscover()">Discover</button>
-      </div>
-      <div id="chainDenonDiscoverStatus" style="font-size:.78rem;color:#94a3b8;margin-bottom:.4rem"></div>
-
-      <div id="chainDenonInputSection" style="display:none">
-        <label for="chainDenonInput" style="font-size:.75rem">Which Denon input is the Pi HDMI cable connected to?</label>
-        <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.4rem">
-          <select id="chainDenonInput" style="flex:1"><option value="">— loading inputs —</option></select>
-          <button id="chainDenonTestBtn" onclick="chainDenonTestInput()">Test</button>
-        </div>
-        <div id="chainDenonTestStatus" style="font-size:.78rem;color:#94a3b8;margin-bottom:.3rem"></div>
-        <div id="chainDenonHearRow" style="display:none;background:#131720;border-radius:6px;padding:.6rem .75rem;margin-bottom:.4rem">
-          <div style="font-size:.82rem;color:#94a3b8;margin-bottom:.4rem">Playing 440 Hz tone via Pi HDMI&hellip; Did you hear it?</div>
-          <div style="display:flex;gap:.5rem">
-            <button onclick="chainDenonConfirmInput(true)" style="background:#22c55e;color:#0d0f14;font-weight:600">&#10003; Yes</button>
-            <button onclick="chainDenonConfirmInput(false)" style="background:#334155;color:#cbd5e1">&#10007; No</button>
-          </div>
-        </div>
-      </div>
-
-      <div id="chainDenonOfflineRow" style="display:none;background:#1a0a0a;border-radius:6px;padding:.55rem .75rem;margin-bottom:.5rem;font-size:.82rem;color:#f87171">
-        &#9888; Cannot reach Denon (timeout 5s) &mdash;
-        <button onclick="chainPollBadges()" style="background:transparent;color:#f87171;border:none;text-decoration:underline;cursor:pointer;padding:0">Retry</button>
-      </div>
-
-      <div style="display:flex;justify-content:flex-end;margin-top:.5rem">
-        <button id="chainDenonSaveBtn" onclick="chainSaveDenonSection()" style="background:#2dd4bf;color:#0d0f14;font-weight:600" disabled>Save</button>
-      </div>
-      <div id="chainDenonSaveStatus" style="font-size:.78rem;margin-top:.3rem;color:#94a3b8"></div>
     </div>
 
-    <div style="width:2px;height:.65rem;background:#1e2537;margin:0 auto"></div>
-
-    <!-- miniDSP card -->
-    <div class="card" id="chainDspCard">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem">
-        <h2 style="margin:0;font-size:1rem">miniDSP 2x4 HD</h2>
-        <span id="chainDspBadge" class="check-badge pending">&mdash;</span>
-      </div>
-
-      <div style="margin-bottom:.75rem">
-        <div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.07em;color:#64748b;margin-bottom:.4rem">Input Labels</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
-          <input type="text" id="chainDspIn0" placeholder="Input 1 (e.g. LFE L)">
-          <input type="text" id="chainDspIn1" placeholder="Input 2 (e.g. LFE R)">
-        </div>
-      </div>
-
-      <div style="margin-bottom:.75rem">
-        <div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.07em;color:#64748b;margin-bottom:.4rem">Output Slots &rarr; Speakers</div>
-        <div id="chainDspSlots" style="display:flex;flex-direction:column;gap:.5rem">
-          <div style="font-size:.78rem;color:#475569">Loading&hellip;</div>
-        </div>
-      </div>
-
-      <div style="display:flex;gap:.5rem;justify-content:flex-end;margin-top:.5rem">
-        <button onclick="chainDspTest()" style="background:#334155;color:#cbd5e1">Test Connection</button>
-        <button onclick="chainSaveDspSection()" style="background:#2dd4bf;color:#0d0f14;font-weight:600">Save Changes</button>
-      </div>
-      <div id="chainDspStatus" style="font-size:.78rem;margin-top:.4rem;color:#94a3b8"></div>
-    </div>
-
-    <!-- Save Chain CTA -->
-    <div style="padding:.5rem 0 .25rem">
-      <button onclick="chainSaveWithStatus(document.getElementById('chainSaveStatus'))" style="background:#2dd4bf;color:#0d0f14;width:100%;padding:.75rem;font-weight:600">
-        Save Chain
-      </button>
-      <div id="chainSaveStatus" style="font-size:.78rem;margin-top:.4rem;color:#94a3b8;text-align:center"></div>
-    </div>
-
-    <!-- Continue (gate: Denon saved + at least one speaker configured) -->
+    <!-- Continue (gate: at least one device + one speaker configured) -->
     <div style="padding-bottom:.25rem">
       <button id="chainContinueBtn" onclick="showPhase(2)" style="background:#3b82f6;color:#fff;width:100%;padding:.75rem;font-weight:600" disabled>
         Continue to Baseline &rarr;
@@ -1414,52 +1342,223 @@ _HTML = """<!DOCTYPE html>
   };
   const ROOM_LOCATIONS = ['front-left', 'front-right', 'rear-left', 'rear-right', 'center', 'other'];
 
+  const _DEFAULT_ROUTING = [
+    { input: 0, outputs: [0, 1, 2, 3] },
+    { input: 1, outputs: [0, 1, 2, 3] },
+  ];
+
   // In-memory chain state — single JS source of truth for all saves.
   let _chainState = {
     denon: { host: null, sweep_input: null },
     minidsp: {
       input_labels: {},
+      routing: JSON.parse(JSON.stringify(_DEFAULT_ROUTING)),
       output_slots: [0,1,2,3].map(i => ({ index: i, label: '', location: '', preset: '' })),
     },
   };
   let _chainDenonHost = null;
   let _chainDenonConfirmedInput = null;
-  let _chainExpandedSlot = null;  // index of slot with open picker
+  let _chainDenonInputs = [];       // cached Denon input list for re-renders
+  let _chainExpandedSlot = null;    // DSP slot index with open picker
+  let _chainDevices = [];           // ordered device types: ['denon', 'minidsp']
 
   async function initChainBuilder() {
-    renderChainSlots();
     try {
       const r = await fetch('/api/signal-chain');
       if (r.ok) {
         const d = await r.json();
         _chainState = d;
+        if (!_chainState.minidsp) {
+          _chainState.minidsp = { input_labels: {}, routing: JSON.parse(JSON.stringify(_DEFAULT_ROUTING)), output_slots: [0,1,2,3].map(i=>({index:i,label:'',location:'',preset:''})) };
+        }
+        if (!(_chainState.minidsp.routing || []).length) {
+          _chainState.minidsp.routing = JSON.parse(JSON.stringify(_DEFAULT_ROUTING));
+        }
         _chainDenonHost = (d.denon || {}).host || null;
         _chainDenonConfirmedInput = (d.denon || {}).sweep_input || null;
-        _populateChainDenonFields();
-        _populateChainDspFields();
-        renderChainSlots();
-        _checkChainGate();
+        _chainDevices = [];
+        if (_chainDenonHost) _chainDevices.push('denon');
+        const slots = (_chainState.minidsp || {}).output_slots || [];
+        const hasLabels = Object.values((_chainState.minidsp || {}).input_labels || {}).some(v => !!v);
+        if (slots.some(s => s.label || s.preset) || hasLabels) _chainDevices.push('minidsp');
       }
     } catch (_) {}
+    renderChain();
+    _checkChainGate();
     chainPollBadges();
   }
 
-  function _populateChainDenonFields() {
-    const d = _chainState.denon || {};
-    const hostEl = document.getElementById('chainDenonHost');
-    if (hostEl && d.host) hostEl.value = d.host;
-    if (d.host) {
-      const saveBtn = document.getElementById('chainDenonSaveBtn');
-      if (saveBtn) saveBtn.disabled = false;
+  function chainTogglePicker() {
+    const p = document.getElementById('chainDevicePicker');
+    if (p) p.style.display = (p.style.display === 'none' ? '' : 'none');
+  }
+
+  function chainAddDevice(type) {
+    if (!_chainDevices.includes(type)) _chainDevices.push(type);
+    const p = document.getElementById('chainDevicePicker');
+    if (p) p.style.display = 'none';
+    renderChain();
+    _checkChainGate();
+    if (type === 'minidsp') chainDspAutoTest();
+    if (type === 'denon') chainPollBadges();
+  }
+
+  function chainRemoveDevice(type) {
+    _chainDevices = _chainDevices.filter(t => t !== type);
+    if (type === 'denon') {
+      _chainState.denon = { host: null, sweep_input: null };
+      _chainDenonHost = null; _chainDenonConfirmedInput = null; _chainDenonInputs = [];
+    }
+    if (type === 'minidsp') {
+      _chainState.minidsp = {
+        input_labels: {},
+        routing: JSON.parse(JSON.stringify(_DEFAULT_ROUTING)),
+        output_slots: [0,1,2,3].map(i => ({ index: i, label: '', location: '', preset: '' })),
+      };
+    }
+    renderChain();
+    _checkChainGate();
+    chainSave().catch(() => {});
+  }
+
+  const _CONNECTOR = '<div style="width:2px;height:.65rem;background:#1e2537;margin:0 auto"></div>';
+
+  function renderChain() {
+    const container = document.getElementById('chainDeviceList');
+    if (!container) return;
+    // Update picker option visibility (hide already-added device types)
+    const dBtn = document.getElementById('chainPickerDenon');
+    const mBtn = document.getElementById('chainPickerMinidsp');
+    if (dBtn) dBtn.style.display = _chainDevices.includes('denon') ? 'none' : '';
+    if (mBtn) mBtn.style.display = _chainDevices.includes('minidsp') ? 'none' : '';
+    const addBtn = document.getElementById('chainAddBtn');
+    if (addBtn) addBtn.style.display = (_chainDevices.includes('denon') && _chainDevices.includes('minidsp')) ? 'none' : '';
+    // Render device cards
+    container.innerHTML = _chainDevices.map(type => {
+      if (type === 'denon') return _CONNECTOR + _renderDenonCard();
+      if (type === 'minidsp') return _CONNECTOR + _renderMinidspCard();
+      return '';
+    }).join('');
+    // Post-render initialization
+    if (_chainDevices.includes('minidsp')) renderChainSlots();
+    if (_chainDevices.includes('denon') && _chainDenonInputs.length) {
+      _chainPopulateDenonInputs(_chainDenonInputs, _chainDenonConfirmedInput);
     }
   }
 
-  function _populateChainDspFields() {
+  function _renderDenonCard() {
+    const disc = !!_chainDenonHost;
+    return `<div class="card" id="chainDenonCard">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem">
+        <h2 style="margin:0;font-size:1rem">Denon AVR</h2>
+        <div style="display:flex;gap:.5rem;align-items:center">
+          <span id="chainDenonBadge" class="check-badge ${disc ? 'pass' : 'pending'}">${disc ? 'OK' : '\u2014'}</span>
+          <button onclick="chainRemoveDevice('denon')" style="background:transparent;color:#475569;border:none;font-size:1.1rem;cursor:pointer;padding:.1rem .3rem" title="Remove">&times;</button>
+        </div>
+      </div>
+      ${!disc ? `<div style="background:#0d0f14;border-radius:6px;padding:.65rem .75rem;margin-bottom:.65rem;font-size:.82rem;color:#64748b">Click Discover to find your Denon AVR on the network.</div>` : `<div style="font-size:.78rem;color:#4ade80;margin-bottom:.65rem">&#10003; Found at ${_chainDenonHost}</div>`}
+      <div style="display:flex;gap:.5rem;margin-bottom:.5rem">
+        <input type="text" id="chainDenonHost" placeholder="192.168.x.x (or click Discover)" value="${_chainDenonHost || ''}" style="flex:1">
+        <button id="chainDenonDiscoverBtn" onclick="chainDenonDiscover()">Discover</button>
+      </div>
+      <div id="chainDenonDiscoverStatus" style="font-size:.78rem;color:#94a3b8;margin-bottom:.4rem"></div>
+      <div id="chainDenonInputSection" style="${disc ? '' : 'display:none'}">
+        <label for="chainDenonInput" style="font-size:.75rem">Which Denon input is the Pi connected to?</label>
+        <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.4rem">
+          <select id="chainDenonInput" style="flex:1"><option value="">— loading inputs —</option></select>
+          <button id="chainDenonTestBtn" onclick="chainDenonTestInput()">Test</button>
+        </div>
+        <div id="chainDenonTestStatus" style="font-size:.78rem;color:${_chainDenonConfirmedInput ? '#4ade80' : '#94a3b8'};margin-bottom:.3rem">${_chainDenonConfirmedInput ? '\u2713 Confirmed: Pi \u2192 ' + _chainDenonConfirmedInput : ''}</div>
+        <div id="chainDenonHearRow" style="display:none;background:#131720;border-radius:6px;padding:.6rem .75rem;margin-bottom:.4rem">
+          <div style="font-size:.82rem;color:#94a3b8;margin-bottom:.4rem">Playing 440\u202fHz tone via Pi HDMI\u2026 Did you hear it?</div>
+          <div style="display:flex;gap:.5rem">
+            <button onclick="chainDenonConfirmInput(true)" style="background:#22c55e;color:#0d0f14;font-weight:600">&#10003; Yes</button>
+            <button onclick="chainDenonConfirmInput(false)" style="background:#334155;color:#cbd5e1">&#10007; No</button>
+          </div>
+        </div>
+      </div>
+      <div id="chainDenonOfflineRow" style="display:none;background:#1a0a0a;border-radius:6px;padding:.55rem .75rem;margin-bottom:.5rem;font-size:.82rem;color:#f87171">
+        &#9888; Cannot reach Denon (timeout 5s) \u2014
+        <button onclick="chainPollBadges()" style="background:transparent;color:#f87171;border:none;text-decoration:underline;cursor:pointer;padding:0">Retry</button>
+      </div>
+      <div style="display:flex;justify-content:flex-end;margin-top:.5rem">
+        <button id="chainDenonSaveBtn" onclick="chainSaveDenonSection()" style="background:#2dd4bf;color:#0d0f14;font-weight:600"${disc ? '' : ' disabled'}>Save</button>
+      </div>
+      <div id="chainDenonSaveStatus" style="font-size:.78rem;margin-top:.3rem;color:#94a3b8"></div>
+    </div>`;
+  }
+
+  function _renderMinidspCard() {
     const labels = (_chainState.minidsp || {}).input_labels || {};
-    const in0 = document.getElementById('chainDspIn0');
-    const in1 = document.getElementById('chainDspIn1');
-    if (in0) in0.value = labels['0'] || '';
-    if (in1) in1.value = labels['1'] || '';
+    const routing = (_chainState.minidsp || {}).routing || JSON.parse(JSON.stringify(_DEFAULT_ROUTING));
+    const slots = (_chainState.minidsp || {}).output_slots || [];
+
+    const routingRows = [0, 1].map(inp => {
+      const route = routing.find(r => r.input === inp) || { input: inp, outputs: [0, 1, 2, 3] };
+      const isOn = (route.outputs || []).length > 0;
+      const label = labels[String(inp)] || '';
+      const outBtns = [0, 1, 2, 3].map(out => {
+        const spk = (slots[out] || {}).label;
+        const btnLabel = spk || ('Out ' + (out + 1));
+        const active = (route.outputs || []).includes(out);
+        return `<button onclick="chainDspToggleRoute(${inp},${out})" style="background:${active ? '#2dd4bf' : '#334155'};color:${active ? '#0d0f14' : '#94a3b8'};font-size:.75rem;padding:.3rem .55rem">${btnLabel}</button>`;
+      }).join('');
+      return `<div style="background:#0d0f14;border-radius:6px;padding:.6rem .75rem;margin-bottom:.4rem">
+        <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.45rem">
+          <span style="background:${isOn ? '#134e3e' : '#2a0e0e'};color:${isOn ? '#4ade80' : '#f87171'};font-size:.65rem;padding:.15rem .4rem;border-radius:3px;font-weight:600;white-space:nowrap">${isOn ? 'ON' : 'OFF'}</span>
+          <span style="font-size:.8rem;color:#94a3b8;font-weight:500;white-space:nowrap">Input ${inp + 1}</span>
+          <input type="text" id="chainDspInLabel${inp}" value="${label}" placeholder="Label (e.g. LFE from Denon)" style="flex:1;font-size:.78rem">
+        </div>
+        <div style="display:flex;gap:.35rem;flex-wrap:wrap">${outBtns}</div>
+      </div>`;
+    }).join('');
+
+    return `<div class="card" id="chainDspCard">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem">
+        <h2 style="margin:0;font-size:1rem">miniDSP 2x4 HD</h2>
+        <div style="display:flex;gap:.5rem;align-items:center">
+          <span id="chainDspBadge" class="check-badge pending">&mdash;</span>
+          <button onclick="chainRemoveDevice('minidsp')" style="background:transparent;color:#475569;border:none;font-size:1.1rem;cursor:pointer;padding:.1rem .3rem" title="Remove">&times;</button>
+        </div>
+      </div>
+      <div style="margin-bottom:.75rem">
+        <div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.07em;color:#64748b;margin-bottom:.4rem">Input Routing</div>
+        ${routingRows}
+      </div>
+      <div style="margin-bottom:.75rem">
+        <div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.07em;color:#64748b;margin-bottom:.4rem">Output Slots \u2192 Speakers</div>
+        <div id="chainDspSlots" style="display:flex;flex-direction:column;gap:.5rem">
+          <div style="font-size:.78rem;color:#475569">Loading\u2026</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:.5rem;justify-content:flex-end;margin-top:.5rem">
+        <button onclick="chainDspAutoTest()" style="background:#334155;color:#cbd5e1">Test Connection</button>
+        <button onclick="chainSaveDspSection()" style="background:#2dd4bf;color:#0d0f14;font-weight:600">Save Changes</button>
+      </div>
+      <div id="chainDspStatus" style="font-size:.78rem;margin-top:.4rem;color:#94a3b8"></div>
+    </div>`;
+  }
+
+  function chainDspToggleRoute(inputIdx, outputIdx) {
+    const routing = (_chainState.minidsp || {}).routing || [];
+    let route = routing.find(r => r.input === inputIdx);
+    if (!route) { route = { input: inputIdx, outputs: [] }; routing.push(route); }
+    const i = (route.outputs || []).indexOf(outputIdx);
+    if (i >= 0) route.outputs.splice(i, 1);
+    else route.outputs.push(outputIdx);
+    _syncDspLabelsToState();
+    renderChain();
+    _checkChainGate();
+    chainSave().catch(() => {});
+  }
+
+  function _syncDspLabelsToState() {
+    const labels = {};
+    [0, 1].forEach(i => {
+      const el = document.getElementById('chainDspInLabel' + i);
+      if (el) labels[String(i)] = el.value.trim();
+    });
+    if (_chainState.minidsp) _chainState.minidsp.input_labels = labels;
   }
 
   function renderChainSlots() {
@@ -1475,7 +1574,7 @@ _HTML = """<!DOCTYPE html>
           <div style="flex:1">
             <div style="font-size:.75rem;color:#64748b">Out ${slot.index + 1}</div>
             <div style="font-size:.85rem;color:#cbd5e1;font-weight:500">${slot.label || '(no label)'}</div>
-            <div style="font-size:.72rem;color:#64748b">${locLabel ? locLabel + ' &middot; ' : ''}${presetLabel}</div>
+            <div style="font-size:.72rem;color:#64748b">${locLabel ? locLabel + ' \u00b7 ' : ''}${presetLabel}</div>
           </div>
           <button onclick="chainRemoveSpeakerFromSlot(${slot.index})" style="background:transparent;color:#475569;border:none;font-size:1rem;cursor:pointer;padding:.2rem .4rem" title="Remove">&times;</button>
         </div>`;
@@ -1485,7 +1584,7 @@ _HTML = """<!DOCTYPE html>
         const presetOptions = Object.entries(SPEAKER_PRESETS).map(([k, v]) =>
           `<option value="${k}">${v}</option>`).join('');
         return `<div style="background:#131720;border-radius:6px;padding:.75rem">
-          <div style="font-size:.78rem;color:#94a3b8;margin-bottom:.5rem">Out ${slot.index + 1} &rarr; Add Speaker</div>
+          <div style="font-size:.78rem;color:#94a3b8;margin-bottom:.5rem">Out ${slot.index + 1} \u2192 Add Speaker</div>
           <div style="display:grid;gap:.4rem;margin-bottom:.5rem">
             <div>
               <label style="font-size:.72rem;color:#64748b">Label</label>
@@ -1511,7 +1610,7 @@ _HTML = """<!DOCTYPE html>
         </div>`;
       } else {
         return `<div style="display:flex;align-items:center;gap:.5rem;background:#0d0f14;border-radius:6px;padding:.5rem .75rem">
-          <div style="flex:1;font-size:.78rem;color:#475569">Out ${slot.index + 1} &rarr; (empty)</div>
+          <div style="flex:1;font-size:.78rem;color:#475569">Out ${slot.index + 1} \u2192 (empty)</div>
           <button onclick="chainOpenSlotPicker(${slot.index})" style="background:#334155;color:#cbd5e1;font-size:.78rem;padding:.25rem .6rem">+ Add speaker</button>
         </div>`;
       }
@@ -1552,15 +1651,11 @@ _HTML = """<!DOCTYPE html>
 
   function _syncFormToState() {
     const hostEl = document.getElementById('chainDenonHost');
-    if (hostEl) _chainState.denon.host = hostEl.value.trim() || _chainDenonHost;
+    if (hostEl && hostEl.value.trim()) _chainState.denon.host = hostEl.value.trim();
+    else if (_chainDenonHost) _chainState.denon.host = _chainDenonHost;
     _chainState.denon.sweep_input = _chainDenonConfirmedInput ||
       (document.getElementById('chainDenonInput') || {}).value || null;
-    const in0 = document.getElementById('chainDspIn0');
-    const in1 = document.getElementById('chainDspIn1');
-    _chainState.minidsp.input_labels = {
-      '0': in0 ? in0.value.trim() : '',
-      '1': in1 ? in1.value.trim() : '',
-    };
+    _syncDspLabelsToState();
   }
 
   async function chainSave() {
@@ -1592,6 +1687,7 @@ _HTML = """<!DOCTYPE html>
   }
 
   async function chainSaveDspSection() {
+    _syncDspLabelsToState();
     await chainSaveWithStatus(document.getElementById('chainDspStatus'));
   }
 
@@ -1610,6 +1706,7 @@ _HTML = """<!DOCTYPE html>
       const r2 = await fetch('/api/equipment/denon/state');
       const d2 = await r2.json();
       if (d2.connected) {
+        _chainDenonInputs = d2.inputs || [];
         _chainPopulateDenonInputs(d2.inputs, d2.configured_sweep_input);
         document.getElementById('chainDenonInputSection').style.display = '';
         document.getElementById('chainDenonBadge').className = 'check-badge pass';
@@ -1634,8 +1731,8 @@ _HTML = """<!DOCTYPE html>
   }
 
   async function chainDenonTestInput() {
-    const host = document.getElementById('chainDenonHost').value.trim() || _chainDenonHost;
-    const input = document.getElementById('chainDenonInput').value;
+    const host = ((document.getElementById('chainDenonHost') || {}).value || '').trim() || _chainDenonHost;
+    const input = (document.getElementById('chainDenonInput') || {}).value || '';
     if (!host || !input) {
       document.getElementById('chainDenonTestStatus').textContent = 'Select an input first.';
       return;
@@ -1664,11 +1761,11 @@ _HTML = """<!DOCTYPE html>
   }
 
   function chainDenonConfirmInput(heard) {
-    const input = document.getElementById('chainDenonInput').value;
+    const input = (document.getElementById('chainDenonInput') || {}).value || '';
     document.getElementById('chainDenonHearRow').style.display = 'none';
     if (heard) {
       _chainDenonConfirmedInput = input;
-      document.getElementById('chainDenonTestStatus').textContent = `\u2713 Confirmed: Pi HDMI \u2192 ${input}`;
+      document.getElementById('chainDenonTestStatus').textContent = '\u2713 Confirmed: Pi \u2192 ' + input;
       document.getElementById('chainDenonTestStatus').style.color = '#4ade80';
       document.getElementById('chainDenonSaveBtn').disabled = false;
     } else {
@@ -1678,74 +1775,63 @@ _HTML = """<!DOCTYPE html>
   }
 
   async function chainPollBadges() {
-    const denonBadge = document.getElementById('chainDenonBadge');
-    if (denonBadge) {
-      denonBadge.className = 'check-badge running'; denonBadge.textContent = '\u2026';
-      try {
-        const ctrl = new AbortController();
-        const tid = setTimeout(() => ctrl.abort(), 5500);
-        const r = await fetch('/api/equipment/denon/state', { signal: ctrl.signal });
-        clearTimeout(tid);
-        const d = await r.json();
-        if (d.connected) {
-          denonBadge.className = 'check-badge pass'; denonBadge.textContent = 'OK';
-          _chainPopulateDenonInputs(d.inputs, d.configured_sweep_input);
-          document.getElementById('chainDenonInputSection').style.display = '';
-          document.getElementById('chainDenonOfflineRow').style.display = 'none';
-          document.getElementById('chainDenonEmpty').style.display = 'none';
-          document.getElementById('chainDenonSaveBtn').disabled = false;
-        } else {
-          denonBadge.className = 'check-badge fail'; denonBadge.textContent = 'FAIL';
-          if (d.host) {
-            document.getElementById('chainDenonOfflineRow').style.display = '';
+    if (_chainDevices.includes('denon')) {
+      const denonBadge = document.getElementById('chainDenonBadge');
+      if (denonBadge) {
+        denonBadge.className = 'check-badge running'; denonBadge.textContent = '\u2026';
+        try {
+          const ctrl = new AbortController();
+          const tid = setTimeout(() => ctrl.abort(), 5500);
+          const r = await fetch('/api/equipment/denon/state', { signal: ctrl.signal });
+          clearTimeout(tid);
+          const d = await r.json();
+          if (d.connected) {
+            denonBadge.className = 'check-badge pass'; denonBadge.textContent = 'OK';
+            _chainDenonInputs = d.inputs || [];
+            _chainPopulateDenonInputs(d.inputs, d.configured_sweep_input);
+            const sec = document.getElementById('chainDenonInputSection');
+            if (sec) sec.style.display = '';
+            const off = document.getElementById('chainDenonOfflineRow');
+            if (off) off.style.display = 'none';
+            const saveBtn = document.getElementById('chainDenonSaveBtn');
+            if (saveBtn) saveBtn.disabled = false;
           } else {
-            document.getElementById('chainDenonEmpty').style.display = '';
+            denonBadge.className = 'check-badge fail'; denonBadge.textContent = 'FAIL';
+            const off = document.getElementById('chainDenonOfflineRow');
+            if (off && d.host) off.style.display = '';
           }
+        } catch (_) {
+          denonBadge.className = 'check-badge fail'; denonBadge.textContent = 'FAIL';
+          const off = document.getElementById('chainDenonOfflineRow');
+          if (off) off.style.display = '';
         }
-      } catch (_) {
-        denonBadge.className = 'check-badge fail'; denonBadge.textContent = 'FAIL';
-        document.getElementById('chainDenonOfflineRow').style.display = '';
       }
     }
-    const dspBadge = document.getElementById('chainDspBadge');
-    if (dspBadge) {
-      dspBadge.className = 'check-badge running'; dspBadge.textContent = '\u2026';
-      try {
-        const r = await fetch('/api/preflight/minidsp-combined');
-        const d = await r.json();
-        dspBadge.className = 'check-badge ' + (d.passed ? 'pass' : 'fail');
-        dspBadge.textContent = d.passed ? 'OK' : 'FAIL';
-      } catch (_) {
-        dspBadge.className = 'check-badge fail'; dspBadge.textContent = 'ERR';
-      }
-    }
+    if (_chainDevices.includes('minidsp')) chainDspAutoTest();
   }
 
-  async function chainDspTest() {
+  async function chainDspAutoTest() {
     const badge = document.getElementById('chainDspBadge');
     const status = document.getElementById('chainDspStatus');
-    badge.className = 'check-badge running'; badge.textContent = '\u2026';
-    status.textContent = 'Connecting\u2026'; status.style.color = '#94a3b8';
+    if (badge) { badge.className = 'check-badge running'; badge.textContent = '\u2026'; }
+    if (status) { status.textContent = 'Connecting\u2026'; status.style.color = '#94a3b8'; }
     try {
       const r = await fetch('/api/preflight/minidsp-combined');
       const d = await r.json();
-      badge.className = 'check-badge ' + (d.passed ? 'pass' : 'fail');
-      badge.textContent = d.passed ? 'OK' : 'FAIL';
-      status.textContent = d.detail || '';
-      status.style.color = d.passed ? '#4ade80' : '#f87171';
+      if (badge) { badge.className = 'check-badge ' + (d.passed ? 'pass' : 'fail'); badge.textContent = d.passed ? 'OK' : 'FAIL'; }
+      if (status) { status.textContent = d.detail || ''; status.style.color = d.passed ? '#4ade80' : '#f87171'; }
     } catch (e) {
-      badge.className = 'check-badge fail'; badge.textContent = 'ERR';
-      status.textContent = e.message; status.style.color = '#f87171';
+      if (badge) { badge.className = 'check-badge fail'; badge.textContent = 'ERR'; }
+      if (status) { status.textContent = e.message; status.style.color = '#f87171'; }
     }
   }
 
   function _checkChainGate() {
-    const hostEl = document.getElementById('chainDenonHost');
-    const denonHost = ((_chainState.denon || {}).host) || (hostEl ? hostEl.value.trim() : '');
     const slots = ((_chainState.minidsp || {}).output_slots) || [];
     const hasSpk = slots.some(s => s.label || s.preset);
+    const hasDevice = _chainDevices.length > 0;
     const btn = document.getElementById('chainContinueBtn');
-    if (btn) btn.disabled = !(denonHost && hasSpk);
+    if (btn) btn.disabled = !(hasDevice && hasSpk);
   }
 
   // Restore phase from localStorage on load
@@ -3052,8 +3138,14 @@ class SignalChainDenon(BaseModel):
     sweep_input: Optional[str] = None
 
 
+class SignalChainInputRoute(BaseModel):
+    input: int
+    outputs: list[int] = [0, 1, 2, 3]
+
+
 class SignalChainMinidsp(BaseModel):
     input_labels: dict = {}
+    routing: list[SignalChainInputRoute] = []
     output_slots: list[SignalChainSlot] = []
 
 
@@ -3112,10 +3204,15 @@ async def signal_chain_get() -> dict:
             pass
     input_labels = minidsp.get("input_labels") or old_inputs
 
+    # Input routing: prefer minidsp.input_routing, fall back to signal_path.routing, then default
+    default_routing = [{"input": 0, "outputs": [0, 1, 2, 3]}, {"input": 1, "outputs": [0, 1, 2, 3]}]
+    input_routing = minidsp.get("input_routing") or default_routing
+
     return {
         "denon": denon_node,
         "minidsp": {
             "input_labels": input_labels,
+            "routing": input_routing,
             "output_slots": output_slots,
         },
     }
@@ -3144,6 +3241,8 @@ async def signal_chain_post(body: SignalChainBody) -> dict:
             "input_labels": body.minidsp.input_labels,
             "output_slots": slots,
         }
+        if body.minidsp.routing:
+            updates["minidsp"]["input_routing"] = [r.model_dump() for r in body.minidsp.routing]
         # Tombstone old connections.minidsp.outputs key to avoid dual-read confusion.
         updates["connections"] = {"minidsp": {}}
 
