@@ -99,11 +99,17 @@ class MinidspClient:
         if response.status_code >= 400:
             raise MinidspApiError(response.status_code, path)
 
-    async def _post(self, path: str) -> None:
-        """POST with no body to *path*, raising MinidspApiError on 4xx/5xx."""
+    async def _patch_master(self, fields: dict[str, Any]) -> None:
+        """POST master-status fields to /devices/{idx}.
+
+        minidspd 0.1.x uses POST /devices/{idx} with a MasterStatus body
+        to mutate preset, source, volume, or mute.  Only the supplied fields
+        are changed; omitted fields are ignored by the daemon.
+        """
+        path = f"/devices/{self._device_index}"
         url = f"{self._base}{path}"
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(url)
+            response = await client.post(url, json=fields)
         if response.status_code >= 400:
             raise MinidspApiError(response.status_code, path)
 
@@ -140,6 +146,9 @@ class MinidspClient:
     async def switch_preset(self, preset: int) -> None:
         """Switch the active preset slot to *preset* (0-3).
 
+        Uses POST /devices/{idx} with {"preset": N} — the correct API for
+        minidspd 0.1.x (the /preset/:n path endpoint does not exist).
+
         Raises ValueError if preset is out of range.
         Raises MinidspApiError on HTTP error.
         """
@@ -147,10 +156,13 @@ class MinidspClient:
             raise ValueError(
                 f"preset={preset} out of range; must be 0-{MAX_PRESET_INDEX}"
             )
-        await self._post(f"/devices/{self._device_index}/preset/{preset}")
+        await self._patch_master({"preset": preset})
 
     async def switch_source(self, source: str) -> None:
         """Switch the input source to *source* (Analog/Toslink/USB).
+
+        Uses POST /devices/{idx} with {"source": name} — same pattern as
+        switch_preset.
 
         Raises ValueError if source is not in VALID_SOURCES.
         Raises MinidspApiError on HTTP error.
@@ -159,7 +171,7 @@ class MinidspClient:
             raise ValueError(
                 f"source={source!r} invalid; must be one of {sorted(VALID_SOURCES)}"
             )
-        await self._post(f"/devices/{self._device_index}/source/{source}")
+        await self._patch_master({"source": source})
 
     async def set_output_gain(self, output: int, gain_db: float) -> None:
         """Set output *output* gain to *gain_db* dB.
