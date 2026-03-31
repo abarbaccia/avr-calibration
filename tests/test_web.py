@@ -2115,6 +2115,19 @@ class TestEquipmentSpeakersApi:
         assert r.status_code == 200
         assert r.json()["label"] == "New"
 
+    def test_update_partial_label_only(self, client, tmp_path, monkeypatch):
+        """PUT with only label (no type) must succeed — type is optional for updates."""
+        from calibrate.storage import SessionStore
+        db = tmp_path / "eq.db"
+        monkeypatch.setattr("calibrate.web.SessionStore",
+                            lambda: SessionStore(db_path=db))
+        create = client.post("/api/equipment/speakers", json={"type": "sub", "label": "Original"})
+        spk_id = create.json()["id"]
+        r = client.put(f"/api/equipment/speakers/{spk_id}", json={"label": "Renamed"})
+        assert r.status_code == 200
+        assert r.json()["label"] == "Renamed"
+        assert r.json()["type"] == "sub"  # type unchanged
+
     def test_update_unknown_returns_404(self, client, tmp_path, monkeypatch):
         from calibrate.storage import SessionStore
         monkeypatch.setattr("calibrate.web.SessionStore",
