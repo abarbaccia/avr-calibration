@@ -1,5 +1,37 @@
 # TODOS
 
+## Deferred from /autoplan (2026-03-31) — Signal Path Builder
+
+### TODO-SP1: Atomic YAML write in update_config()
+**What:** Replace non-atomic `open(path, "w") + yaml.safe_dump()` with write-to-temp + `os.replace()`. `os.replace` is atomic on Linux (same filesystem).
+**Why:** Pi Zero 2W on SD card + Docker = routine unclean shutdowns. Current pattern can produce zero-byte config on power loss, silently resetting all user config to defaults.
+**Effort:** S (4-line change in `calibrate/config.py:update_config()`)
+**Priority:** P2 — data loss risk, but predates this feature.
+
+### TODO-SP2: Keyboard navigation for chain builder
+**What:** Add `tabindex=0`, `role=button`, `onkeydown` (Enter/Space) to all interactive chain elements (node cards, "+ Add" slots, Remove buttons). The entire codebase uses `onclick` on divs with zero keyboard nav.
+**Why:** Inaccessible for keyboard-only users. Lowest-friction setup device (no mouse needed on Pi-attached screen).
+**Effort:** M — needs systematic pass over all onclick handlers in chain builder JS.
+**Priority:** P3 — accessibility, no functional impact.
+
+### TODO-SP3: Atomic multi-store write for POST /api/signal-chain
+**What:** SQLite speaker writes and YAML config writes are not transactional across stores. A failed YAML write after successful SQLite write leaves split state. Fix: write SQLite first (in a transaction with rollback), then YAML. If YAML fails, re-run SQLite rollback manually.
+**Why:** Edge case, but split state is hard to debug and self-heal.
+**Effort:** M — needs wrapper in the chain POST handler.
+**Priority:** P2 — data integrity.
+
+### TODO-SP4: Safe SQL in SessionStore.update_equipment()
+**What:** `update_equipment()` builds SQL with f-string over hardcoded key names. Not injectable today (keys are hardcoded `label`, `data`, `updated_at`) but pattern is dangerous if future contributors add user-controlled keys to the fields dict.
+**Why:** Pattern will fail a security scan and will encourage copy-paste of the unsafe pattern.
+**Effort:** S (replace with explicit column list in UPDATE).
+**Priority:** P3 — no active risk, preventive.
+
+### TODO-SP5: Speaker preset library (additional models)
+**What:** Add more speaker presets beyond PB12-NSD: SVS SB-16 Ultra, REL T/9x, SVS PC-4000, etc. Data model is ready (preset field exists).
+**Why:** Most users have a different sub. PB12-NSD is the owner's sub; preset library makes the system usable by others.
+**Effort:** S (add preset definitions to a presets.py or presets.json, wire into the UI dropdown)
+**Priority:** P2 — usability for anyone other than the owner.
+
 ## Deferred from /autoplan (2026-03-30) — Full-Room Measurement
 
 ### TODO-R1: Resolve sweep delivery for multi-channel measurement
