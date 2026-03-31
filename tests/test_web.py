@@ -2030,3 +2030,157 @@ class TestPreflightEndpoints:
         monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
         r = client.get("/api/preflight/nonexistent-check")
         assert r.status_code == 404
+
+
+# ── update_config ─────────────────────────────────────────────────────────────
+
+class TestUpdateConfig:
+    def test_writes_new_keys(self, tmp_path):
+        from calibrate.config import update_config
+        import yaml
+        p = tmp_path / "config.yaml"
+        update_config({"denon": {"host": "10.0.0.1"}}, path=p)
+        data = yaml.safe_load(p.read_text())
+        assert data["denon"]["host"] == "10.0.0.1"
+
+    def test_merges_into_existing_section(self, tmp_path):
+        from calibrate.config import update_config
+        import yaml
+        p = tmp_path / "config.yaml"
+        p.write_text(yaml.dump({"denon": {"host": "old", "other": "keep"}}))
+        update_config({"denon": {"host": "new"}}, path=p)
+        data = yaml.safe_load(p.read_text())
+        assert data["denon"]["host"] == "new"
+        assert data["denon"]["other"] == "keep"
+
+    def test_creates_file_if_missing(self, tmp_path):
+        from calibrate.config import update_config
+        import yaml
+        p = tmp_path / "subdir" / "config.yaml"
+        update_config({"measurement": {"denon_sweep_input": "AUX1"}}, path=p)
+        data = yaml.safe_load(p.read_text())
+        assert data["measurement"]["denon_sweep_input"] == "AUX1"
+
+    def test_preserves_unrelated_sections(self, tmp_path):
+        from calibrate.config import update_config
+        import yaml
+        p = tmp_path / "config.yaml"
+        p.write_text(yaml.dump({"minidsp": {"host": "localhost"}, "mic": {"name": "UMIK"}}))
+        update_config({"denon": {"host": "10.0.0.1"}}, path=p)
+        data = yaml.safe_load(p.read_text())
+        assert data["minidsp"]["host"] == "localhost"
+        assert data["mic"]["name"] == "UMIK"
+
+
+# ── Equipment API endpoints ───────────────────────────────────────────────────
+
+class TestEquipmentSpeakersApi:
+    def test_list_empty(self, client, tmp_path, monkeypatch):
+        from calibrate.storage import SessionStore
+        monkeypatch.setattr("calibrate.web.SessionStore",
+                            lambda: SessionStore(db_path=tmp_path / "eq.db"))
+        r = client.get("/api/equipment/speakers")
+        assert r.status_code == 200
+        assert r.json() == []
+
+    def test_create_and_list(self, client, tmp_path, monkeypatch):
+        from calibrate.storage import SessionStore
+        db = tmp_path / "eq.db"
+        monkeypatch.setattr("calibrate.web.SessionStore",
+                            lambda: SessionStore(db_path=db))
+        r = client.post("/api/equipment/speakers", json={
+            "type": "subwoofer",
+            "label": "SVS PB12-NSD",
+            "data": {"room_location": "corner", "port_tune_hz": 22.0},
+        })
+        assert r.status_code == 200
+        body = r.json()
+        assert body["type"] == "subwoofer"
+        assert body["data"]["port_tune_hz"] == 22.0
+
+        r2 = client.get("/api/equipment/speakers")
+        assert len(r2.json()) == 1
+
+    def test_update(self, client, tmp_path, monkeypatch):
+        from calibrate.storage import SessionStore
+        db = tmp_path / "eq.db"
+        monkeypatch.setattr("calibrate.web.SessionStore",
+                            lambda: SessionStore(db_path=db))
+        create = client.post("/api/equipment/speakers", json={"type": "center", "label": "Old"})
+        spk_id = create.json()["id"]
+        r = client.put(f"/api/equipment/speakers/{spk_id}", json={
+            "type": "center", "label": "New",
+            "data": {"room_location": "front wall"},
+        })
+        assert r.status_code == 200
+        assert r.json()["label"] == "New"
+
+    def test_update_unknown_returns_404(self, client, tmp_path, monkeypatch):
+        from calibrate.storage import SessionStore
+        monkeypatch.setattr("calibrate.web.SessionStore",
+                            lambda: SessionStore(db_path=tmp_path / "eq.db"))
+        r = client.put("/api/equipment/speakers/9999", json={"type": "center"})
+        assert r.status_code == 404
+
+    def test_delete(self, client, tmp_path, monkeypatch):
+        from calibrate.storage import SessionStore
+        db = tmp_path / "eq.db"
+        monkeypatch.setattr("calibrate.web.SessionStore",
+                            lambda: SessionStore(db_path=db))
+        create = client.post("/api/equipment/speakers", json={"type": "front_l"})
+        spk_id = create.json()["id"]
+        r = client.delete(f"/api/equipment/speakers/{spk_id}")
+        assert r.status_code == 200
+        assert r.json()["status"] == "deleted"
+        assert client.get("/api/equipment/speakers").json() == []
+
+    def test_delete_unknown_returns_404(self, client, tmp_path, monkeypatch):
+        from calibrate.storage import SessionStore
+        monkeypatch.setattr("calibrate.web.SessionStore",
+                            lambda: SessionStore(db_path=tmp_path / "eq.db"))
+        r = client.delete("/api/equipment/speakers/9999")
+        assert r.status_code == 404
+
+
+class TestDenonSaveApi:
+    def test_save_host(self, client, cfg_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        monkeypatch.setattr("calibrate.config.CONFIG_PATH", cfg_path)
+        r = client.post("/api/equipment/denon/save",
+                        json={"host": "192.168.1.50", "sweep_input": None})
+        assert r.status_code == 200
+        import yaml
+        data = yaml.safe_load(cfg_path.read_text())
+        assert data["denon"]["host"] == "192.168.1.50"
+
+    def test_save_sweep_input(self, client, cfg_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        monkeypatch.setattr("calibrate.config.CONFIG_PATH", cfg_path)
+        r = client.post("/api/equipment/denon/save",
+                        json={"host": None, "sweep_input": "AUX1"})
+        assert r.status_code == 200
+        import yaml
+        data = yaml.safe_load(cfg_path.read_text())
+        assert data["measurement"]["denon_sweep_input"] == "AUX1"
+
+    def test_save_nothing_returns_422(self, client, cfg_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        r = client.post("/api/equipment/denon/save",
+                        json={"host": None, "sweep_input": None})
+        assert r.status_code == 422
+
+
+class TestMinidspSaveLabels:
+    def test_saves_labels(self, client, cfg_path, monkeypatch):
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+        monkeypatch.setattr("calibrate.config.CONFIG_PATH", cfg_path)
+        r = client.post("/api/equipment/minidsp/save-labels", json={
+            "inputs": ["Denon LFE L", "Denon LFE R"],
+            "outputs": ["Sub L", "Sub R", "", ""],
+        })
+        assert r.status_code == 200
+        import yaml
+        data = yaml.safe_load(cfg_path.read_text())
+        assert data["connections"]["minidsp"]["inputs"]["0"] == "Denon LFE L"
+        assert data["connections"]["minidsp"]["outputs"]["0"] == "Sub L"
+        assert "2" not in data["connections"]["minidsp"]["outputs"]  # empty strings skipped

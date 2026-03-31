@@ -112,6 +112,36 @@ alert when room response shifts significantly (furniture moved, season change, e
 
 ## Hardware & Deployment
 
+### TODO-HW2: Equipment labeling — miniDSP I/O and Denon connections
+**What:** Add a `connections` config section in `config.yaml` (and display it in the signal path card) so each physical I/O port has a human label:
+
+```yaml
+connections:
+  minidsp:
+    inputs:
+      0: "Denon bass mgmt L (XLR)"
+      1: "Denon bass mgmt R (XLR)"
+    outputs:
+      0: "SVS PB12-NSD (LFE, XLR)"
+      1: "Spare / not used"
+      2: "Spare / not used"
+      3: "Spare / not used"
+  denon:
+    sweep_input: "AUX1"   # which Denon input the Pi HDMI is connected to
+    outputs:
+      fl: "Klipsch RP-8000F L"
+      fr: "Klipsch RP-8000F R"
+      c: "Klipsch RP-504C"
+      sl: "Klipsch RP-502S L"
+      sr: "Klipsch RP-502S R"
+      sub: "miniDSP 2x4 HD"
+```
+
+Render labels in `#spInputs` / `#spOutputs` in the signal path card instead of generic "Input 1 / Output 2" names. Also surface `denon.sweep_input` in the Denon preflight card so it's clear which input will be selected for sweep playback.
+
+**Why:** Without labels, the block diagram shows "Input L / Input R / Out 1…4" with no physical meaning. The user can't tell which output goes to the sub vs. a satellite. Also needed for sweep routing — we have to know which Denon input the Pi HDMI cable is plugged into before we can auto-select it.
+**Priority:** P2 — not blocking calibration, but the signal path card is confusing without it.
+
 ### TODO-HW1: EMI-style USB disconnect detection in preflight
 **What:** Scan `dmesg` for `disabled by hub (EMI?)` messages in `check_hidraw()`. If found, add a targeted hint to the error: "USB voltage instability detected (EMI protection tripped). Check your Pi power supply — Pi Zero 2 W needs 2.5A+ under WiFi + USB load."
 **Why:** The generic OTG adapter hint is misleading for this failure mode. Root cause is a 1A power supply causing voltage dips when WiFi and USB OTG fire simultaneously, triggering the Pi's EMI protection circuitry. Symptom: `usb usb1-port1: disabled by hub (EMI?), re-enabling...` followed by `error -71` on re-enumerate. Rebooting recovers the port; replacing the power supply prevents recurrence.
