@@ -353,8 +353,32 @@ _HTML = """<!DOCTYPE html>
     <!-- Add device buttons — one per available device, rendered by JS after scan -->
     <div id="chainAddRow" style="margin:.5rem 0"></div>
 
-    <!-- Continue (gate: at least one device + one speaker configured) -->
-    <div style="padding-bottom:.25rem">
+    <!-- Signal Path Test (gate: must pass before continuing) -->
+    <div class="card" id="chainTestCard" style="margin-top:.75rem;display:none">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.6rem">
+        <h2 style="margin:0;font-size:1rem">Signal Path Test</h2>
+        <span id="chainTestBadge" class="check-badge pending">&mdash;</span>
+      </div>
+      <div style="font-size:.8rem;color:#64748b;margin-bottom:.75rem">
+        Switches devices to calibration inputs, plays a 60 Hz tone, and verifies signal flows through the full chain to the sub output.
+      </div>
+      <div id="chainTestSteps" style="display:none;margin-bottom:.75rem"></div>
+      <div id="chainTestAudible" style="display:none;background:#0d2d2a;border:1px solid #2dd4bf;border-radius:6px;padding:.75rem;margin-bottom:.75rem">
+        <div style="font-size:.85rem;color:#2dd4bf;font-weight:600;margin-bottom:.4rem">Did you hear the subwoofer?</div>
+        <div style="font-size:.78rem;color:#94a3b8;margin-bottom:.6rem">The 60 Hz test tone should have produced an audible bass pulse from your sub.</div>
+        <div style="display:flex;gap:.5rem">
+          <button onclick="chainTestAudibleResult(true)" style="background:#2dd4bf;color:#0d0f14;font-weight:600;flex:1">Yes, I heard it</button>
+          <button onclick="chainTestAudibleResult(false)" style="background:#334155;color:#cbd5e1;flex:1">No, nothing</button>
+        </div>
+      </div>
+      <button id="chainTestRunBtn" onclick="runSignalPathTest()" style="width:100%;background:#334155;color:#cbd5e1">
+        Run Signal Path Test
+      </button>
+      <div id="chainTestStatus" style="font-size:.78rem;margin-top:.4rem;color:#94a3b8"></div>
+    </div>
+
+    <!-- Continue (gate: devices configured + signal path test passed) -->
+    <div style="padding-bottom:.25rem;margin-top:.5rem">
       <button id="chainContinueBtn" onclick="showPhase(2)" style="background:#3b82f6;color:#fff;width:100%;padding:.75rem;font-weight:600" disabled>
         Continue to Baseline &rarr;
       </button>
@@ -1362,6 +1386,7 @@ _HTML = """<!DOCTYPE html>
   let _chainDenonInputs = [];       // cached Denon input list for re-renders
   let _chainExpandedSlot = null;    // DSP slot index with open picker
   let _chainDevices = [];           // ordered device types: ['denon', 'minidsp']
+  let _signalPathTestPassed = false; // true only after automated + audible test pass
   let _chainScanResults = {         // live device scan state
     denon:   { scanning: false, found: false, host: null },
     minidsp: { scanning: false, found: false },
@@ -1971,8 +1996,94 @@ _HTML = """<!DOCTYPE html>
     const slots = ((_chainState.minidsp || {}).output_slots) || [];
     const hasSpk = slots.some(s => s.label || s.preset);
     const hasDevice = _chainDevices.length > 0;
+    const ready = hasDevice && hasSpk;
+    // Show/hide test card
+    const testCard = document.getElementById('chainTestCard');
+    if (testCard) testCard.style.display = ready ? '' : 'none';
+    // Continue only unlocks after signal path test passes
     const btn = document.getElementById('chainContinueBtn');
-    if (btn) btn.disabled = !(hasDevice && hasSpk);
+    if (btn) btn.disabled = !_signalPathTestPassed;
+  }
+
+  async function runSignalPathTest() {
+    _signalPathTestPassed = false;
+    const badge = document.getElementById('chainTestBadge');
+    const stepsEl = document.getElementById('chainTestSteps');
+    const audibleEl = document.getElementById('chainTestAudible');
+    const runBtn = document.getElementById('chainTestRunBtn');
+    const statusEl = document.getElementById('chainTestStatus');
+
+    if (badge) { badge.className = 'check-badge running'; badge.textContent = '\u2026'; }
+    if (stepsEl) { stepsEl.style.display = 'none'; stepsEl.innerHTML = ''; }
+    if (audibleEl) audibleEl.style.display = 'none';
+    if (runBtn) { runBtn.disabled = true; runBtn.textContent = 'Running\u2026'; }
+    if (statusEl) { statusEl.textContent = 'Playing 60 Hz tone through chain\u2026'; statusEl.style.color = '#94a3b8'; }
+    _checkChainGate();
+
+    let result;
+    try {
+      const r = await fetch('/api/signal-path/test', { method: 'POST' });
+      result = await r.json();
+    } catch (e) {
+      if (badge) { badge.className = 'check-badge fail'; badge.textContent = 'ERR'; }
+      if (statusEl) { statusEl.textContent = e.message; statusEl.style.color = '#f87171'; }
+      if (runBtn) { runBtn.disabled = false; runBtn.textContent = 'Run Signal Path Test'; }
+      return;
+    }
+
+    // Reveal steps one by one
+    if (stepsEl) {
+      stepsEl.style.display = '';
+      stepsEl.innerHTML = '';
+      for (const step of (result.steps || [])) {
+        await new Promise(r => setTimeout(r, 400));
+        const icon = step.passed ? '\u2713' : '\u2717';
+        const color = step.passed ? '#4ade80' : '#f87171';
+        const row = document.createElement('div');
+        row.style.cssText = `display:flex;gap:.5rem;align-items:flex-start;padding:.4rem 0;border-bottom:1px solid #1e293b`;
+        row.innerHTML = `<span style="color:${color};font-weight:700;min-width:1rem">${icon}</span>
+          <div>
+            <div style="font-size:.82rem;color:${color};font-weight:600">${step.name}</div>
+            <div style="font-size:.75rem;color:#64748b;margin-top:.1rem">${step.detail || ''}</div>
+          </div>`;
+        stepsEl.appendChild(row);
+      }
+    }
+
+    if (runBtn) { runBtn.disabled = false; runBtn.textContent = 'Run Again'; }
+
+    if (!result.passed) {
+      if (badge) { badge.className = 'check-badge fail'; badge.textContent = 'FAIL'; }
+      if (statusEl) { statusEl.textContent = 'Fix the issue above and run again.'; statusEl.style.color = '#f87171'; }
+      _checkChainGate();
+      return;
+    }
+
+    // Automated checks passed — ask for audible confirmation
+    if (badge) { badge.className = 'check-badge running'; badge.textContent = '\u2026'; }
+    if (statusEl) { statusEl.textContent = ''; }
+    await new Promise(r => setTimeout(r, 400));
+    if (audibleEl) audibleEl.style.display = '';
+  }
+
+  function chainTestAudibleResult(heard) {
+    const badge = document.getElementById('chainTestBadge');
+    const audibleEl = document.getElementById('chainTestAudible');
+    const statusEl = document.getElementById('chainTestStatus');
+    if (audibleEl) audibleEl.style.display = 'none';
+    if (heard) {
+      _signalPathTestPassed = true;
+      if (badge) { badge.className = 'check-badge pass'; badge.textContent = 'OK'; }
+      if (statusEl) { statusEl.textContent = 'Signal path confirmed \u2014 ready to calibrate.'; statusEl.style.color = '#4ade80'; }
+    } else {
+      _signalPathTestPassed = false;
+      if (badge) { badge.className = 'check-badge fail'; badge.textContent = 'FAIL'; }
+      if (statusEl) {
+        statusEl.textContent = 'Sub not audible \u2014 check sub power, amplifier gain, and speaker cable.';
+        statusEl.style.color = '#f87171';
+      }
+    }
+    _checkChainGate();
   }
 
   // Restore phase from localStorage on load
@@ -2999,6 +3110,166 @@ async def align_subs_cancel(x_token: str = Header(...)) -> dict:
 class SignalPathApplyRequest(BaseModel):
     source: Optional[str] = None   # Analog | Toslink | USB
     preset: Optional[int] = None   # 0-3
+
+
+@app.post("/api/signal-path/test")
+async def test_signal_path() -> dict:
+    """End-to-end signal path test: configure devices, play 60 Hz tone, verify miniDSP sees signal.
+
+    Steps:
+      1. Validate config (sweep_input + denon host present)
+      2. Apply miniDSP source + preset from config
+      3. Switch Denon to configured sweep input
+      4. Play a 60 Hz tone via Pi HDMI (low enough to pass a typical 80 Hz sub crossover)
+      5. Sample miniDSP input/output levels 1.5 s into the 3 s tone
+      6. Pass if any input level > -90 dBFS (signal flowing in) and
+         any output level > -90 dBFS (routing matrix active)
+
+    Returns {"passed": bool, "steps": [{"name", "passed", "detail"}, ...]}
+    """
+    from .adapters.minidsp import MinidspClient, MinidspApiError
+
+    SIGNAL_THRESHOLD_DBFS = -90.0
+    steps: list[dict] = []
+
+    # ── Step 1: Config ──────────────────────────────────────────────────────
+    cfg = _load_config()
+    sweep_input = cfg.measurement.get("denon_sweep_input")
+    denon_host = cfg.denon.get("host")
+    if not sweep_input or not denon_host:
+        missing = []
+        if not denon_host:
+            missing.append("Denon host")
+        if not sweep_input:
+            missing.append("Denon sweep input")
+        steps.append({"name": "Denon", "passed": False,
+                      "detail": f"Not configured: {', '.join(missing)}"})
+        return {"passed": False, "steps": steps}
+
+    # ── Step 1: Connect Denon and switch to sweep input ─────────────────────
+    try:
+        import denonavr as _denonavr
+        receiver = _denonavr.DenonAVR(denon_host)
+        await asyncio.wait_for(receiver.async_setup(), timeout=5.0)
+        await receiver.async_update()
+        await receiver.async_set_input_func(sweep_input)
+        await asyncio.sleep(0.8)
+        steps.append({"name": "Denon", "passed": True,
+                      "detail": f"Connected at {denon_host}, switched to {sweep_input}"})
+    except Exception as exc:
+        steps.append({"name": "Denon", "passed": False,
+                      "detail": f"Denon unreachable: {exc}"})
+        return {"passed": False, "steps": steps}
+
+    # ── Step 2: Configure miniDSP and get baseline ──────────────────────────
+    minidsp_host = cfg.minidsp.get("host", "localhost")
+    minidsp_port = cfg.minidsp.get("port", 5380)
+    sp = cfg.minidsp.get("signal_path") or {}
+    configured_source = sp.get("source")
+    configured_preset = cfg.minidsp.get("active_preset")
+    client = MinidspClient(host=minidsp_host, port=minidsp_port)
+    try:
+        if configured_preset is not None:
+            await client.switch_preset(int(configured_preset))
+        if configured_source:
+            await client.switch_source(configured_source)
+        await client.get_device_status()  # confirm reachable
+    except (MinidspApiError, Exception) as exc:
+        steps.append({"name": "DSP Input", "passed": False,
+                      "detail": f"miniDSP unreachable: {exc}"})
+        return {"passed": False, "steps": steps}
+
+    # ── Steps 2+3: Play 60 Hz tone, sample miniDSP levels mid-tone ─────────
+    async def _play_60hz_tone() -> Optional[str]:
+        try:
+            import array, math, subprocess, os, tempfile, wave
+            sample_rate = 44100
+            duration = 3.0
+            freq = 60.0
+            n = int(sample_rate * duration)
+            samples: array.array = array.array("h")
+            for i in range(n):
+                t = i / sample_rate
+                env = min(t / 0.05, 1.0, (duration - t) / 0.05)
+                val = int(math.sin(2 * math.pi * freq * t) * env * 0.7 * 32767)
+                samples.append(val)
+                samples.append(val)
+            fd, wav_path = tempfile.mkstemp(suffix=".wav")
+            try:
+                os.close(fd)
+                with wave.open(wav_path, "wb") as wf:
+                    wf.setnchannels(2)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sample_rate)
+                    wf.writeframes(samples.tobytes())
+                hdmi_card = cfg.measurement.get("hdmi_playback_device") or "iec958"
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    ["aplay", "-D", hdmi_card, wav_path],
+                    timeout=duration + 5,
+                    capture_output=True,
+                )
+                if result.returncode != 0:
+                    return result.stderr.decode(errors="replace").strip() or "aplay failed"
+            finally:
+                os.unlink(wav_path)
+            return None
+        except Exception as exc:
+            return str(exc)
+
+    tone_task = asyncio.create_task(_play_60hz_tone())
+    await asyncio.sleep(1.5)  # sample mid-tone while it's playing
+
+    try:
+        mid = await client.get_device_status()
+        mid_inputs: list[float] = mid.get("input_levels", [-128.0, -128.0])
+        mid_outputs: list[float] = mid.get("output_levels", [-128.0] * 4)
+    except Exception as exc:
+        tone_task.cancel()
+        steps.append({"name": "DSP Input", "passed": False,
+                      "detail": f"Cannot read mid-tone levels: {exc}"})
+        return {"passed": False, "steps": steps}
+
+    tone_error = await tone_task
+
+    if tone_error:
+        steps.append({"name": "DSP Input", "passed": False,
+                      "detail": f"Tone playback failed: {tone_error}"})
+        return {"passed": False, "steps": steps}
+
+    peak_in = max(mid_inputs)
+    peak_out = max(mid_outputs)
+
+    if peak_in < SIGNAL_THRESHOLD_DBFS:
+        steps.append({
+            "name": "DSP Input",
+            "passed": False,
+            "detail": (
+                f"miniDSP input flat ({peak_in:.1f} dBFS) — no signal detected. "
+                "Check Denon sub pre-out \u2192 miniDSP analog input cable and "
+                "Denon bass management settings."
+            ),
+        })
+        return {"passed": False, "steps": steps}
+
+    steps.append({"name": "DSP Input", "passed": True,
+                  "detail": f"Signal at input: {peak_in:.1f} dBFS"})
+
+    if peak_out < SIGNAL_THRESHOLD_DBFS:
+        steps.append({
+            "name": "DSP Output",
+            "passed": False,
+            "detail": (
+                f"miniDSP output flat ({peak_out:.1f} dBFS) — "
+                "check routing matrix (Input \u2192 Output assignment)."
+            ),
+        })
+        return {"passed": False, "steps": steps}
+
+    steps.append({"name": "DSP Output", "passed": True,
+                  "detail": f"Signal at output: {peak_out:.1f} dBFS"})
+
+    return {"passed": True, "steps": steps}
 
 
 @app.get("/api/signal-path")
