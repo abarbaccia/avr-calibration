@@ -219,6 +219,26 @@ auto-restart:
 * * * * * root curl -fsk https://localhost:8000/api/preflight/minidsp-combined | grep -q '"passed":true' || systemctl restart avr-calibration
 ```
 
+**Permanent fix — upgrade to Pi 4 or Pi 5:**
+
+The `dwc_otg` bug is specific to the Pi Zero / Pi Zero 2 W family, which has a
+single OTG-only USB port that forces the `dwc_otg` driver. The Pi 3B+ routes USB
+through a LAN951x hub chip (same underlying driver), so it has the same bug.
+
+| Board | USB controller | dwc_otg bug? |
+|---|---|---|
+| Pi Zero 2 W | dwc_otg (OTG port only) | **Yes** |
+| Pi 3B / 3B+ | dwc_otg via LAN951x | **Yes** |
+| Pi 4B | VL805 (USB-A ports) | **No** |
+| Pi 5 | RP1 | **No** |
+
+A **Pi 4B** (any RAM variant) with a standard USB-A to USB-A cable to the miniDSP
+eliminates this bug entirely. The Pi 4B is also significantly faster (quad-core A72
+vs quad-core A53 on Pi Zero 2 W), which reduces tone playback and measurement latency.
+The same Docker image and `install.sh` script work on Pi 4B — just change the
+`linux/arm/v7` to `linux/arm64` if you want the native 64-bit image, or keep `arm/v7`
+(it runs fine under 32-bit compatibility mode).
+
 **miniDSP not detected / `calibrate check` shows "miniDSP USB … not found":**
 
 The most common cause on Pi Zero 2 W is using the wrong cable. You **must** use a
