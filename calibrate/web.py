@@ -353,6 +353,11 @@ _HTML = """<!DOCTYPE html>
     <!-- Add device buttons — one per available device, rendered by JS after scan -->
     <div id="chainAddRow" style="margin:.5rem 0"></div>
 
+    <!-- Hint shown when devices are added but no output slots are labeled yet -->
+    <div id="chainSpkHint" style="display:none;margin-top:.75rem;background:#131720;border:1px solid #334155;border-radius:8px;padding:.75rem 1rem;font-size:.8rem;color:#94a3b8">
+      &#8593; Label at least one Output Slot above to unlock the Signal Path Test.
+    </div>
+
     <!-- Signal Path Test (gate: must pass before continuing) -->
     <div class="card" id="chainTestCard" style="margin-top:.75rem;display:none">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.6rem">
@@ -1926,7 +1931,7 @@ _HTML = """<!DOCTYPE html>
         denonBadge.className = 'check-badge running'; denonBadge.textContent = '\u2026';
         try {
           const ctrl = new AbortController();
-          const tid = setTimeout(() => ctrl.abort(), 5500);
+          const tid = setTimeout(() => ctrl.abort(), 9000);
           const r = await fetch('/api/equipment/denon/state', { signal: ctrl.signal });
           clearTimeout(tid);
           const d = await r.json();
@@ -2022,6 +2027,9 @@ _HTML = """<!DOCTYPE html>
     const hasSpk = slots.some(s => s.label || s.preset);
     const hasDevice = _chainDevices.length > 0;
     const ready = hasDevice && hasSpk;
+    // Show hint when devices are added but no speaker slots labeled yet
+    const hint = document.getElementById('chainSpkHint');
+    if (hint) hint.style.display = (hasDevice && !hasSpk) ? '' : 'none';
     // Show/hide test card
     const testCard = document.getElementById('chainTestCard');
     if (testCard) testCard.style.display = ready ? '' : 'none';
@@ -3573,11 +3581,15 @@ async def equipment_denon_test_input(body: DenonTestInputBody) -> dict:
     import denonavr
 
     try:
-        receiver = denonavr.DenonAVR(body.host)
-        await receiver.async_setup()
-        await receiver.async_update()
-        await receiver.async_set_input_func(body.input)
-        await asyncio.sleep(0.8)
+        async def _switch() -> None:
+            receiver = denonavr.DenonAVR(body.host)
+            await receiver.async_setup()
+            await receiver.async_update()
+            await receiver.async_set_input_func(body.input)
+            await asyncio.sleep(0.8)
+        await asyncio.wait_for(_switch(), timeout=5.0)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Denon control timed out after 5s")
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Denon control failed: {exc}")
 

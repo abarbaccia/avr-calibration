@@ -106,6 +106,19 @@ def test_index_contains_measure_button(client):
     assert "startMeasurement" in r.text
 
 
+def test_index_contains_spk_hint(client):
+    """chainSpkHint div is present in HTML (shown by JS when devices added but no slots labeled)."""
+    r = client.get("/")
+    assert "chainSpkHint" in r.text
+
+
+def test_index_spk_hint_hidden_by_default(client):
+    """chainSpkHint starts hidden via inline style."""
+    r = client.get("/")
+    assert 'id="chainSpkHint"' in r.text
+    assert 'display:none' in r.text
+
+
 # ── GET /health ────────────────────────────────────────────────────────────────
 
 def test_health(client):
@@ -3102,6 +3115,20 @@ def test_denon_test_input_aplay_fails(client, cfg_path, monkeypatch):
     d = r.json()
     assert d["tone_played"] is False
     assert d["tone_error"] is not None
+
+
+def test_denon_test_input_timeout(client, cfg_path, monkeypatch):
+    """async_setup timeout → 504 (regression: was no timeout, browser AbortController fired first)."""
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+    receiver = AsyncMock()
+    receiver.async_setup.side_effect = asyncio.TimeoutError()
+
+    with patch("denonavr.DenonAVR", return_value=receiver):
+        r = client.post("/api/equipment/denon/test-input",
+                        json={"host": "192.168.1.100", "input": "HDMI 1"})
+
+    assert r.status_code == 504
+    assert "timed out" in r.json()["detail"]
 
 
 # ── save-labels — write failure ────────────────────────────────────────────────
