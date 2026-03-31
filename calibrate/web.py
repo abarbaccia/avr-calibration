@@ -1418,7 +1418,9 @@ _HTML = """<!DOCTYPE html>
     renderChain();
     _checkChainGate();
     chainPollBadges();
-    chainScanDevices();  // background scan — populates the + picker
+    // Only scan when devices aren't already configured — avoids concurrent Denon connections
+    const _allKnown = ['denon', 'minidsp'].every(t => _chainDevices.includes(t));
+    if (!_allKnown) chainScanDevices();
   }
 
   async function chainScanDevices() {
@@ -1930,8 +1932,8 @@ _HTML = """<!DOCTYPE html>
           const d = await r.json();
           if (d.connected) {
             denonBadge.className = 'check-badge pass'; denonBadge.textContent = 'OK';
+            _chainDenonInputs = d.inputs || [];  // set before renderChain so re-renders can populate
             if (d.model) { _chainDenonModel = d.model; renderChain(); }
-            _chainDenonInputs = d.inputs || [];
             _chainPopulateDenonInputs(d.inputs, d.configured_sweep_input);
             const sec = document.getElementById('chainDenonInputSection');
             if (sec) sec.style.display = '';
