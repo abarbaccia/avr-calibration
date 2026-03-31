@@ -3172,7 +3172,8 @@ async def equipment_denon_test_input(body: DenonTestInputBody) -> dict:
     try:
         import array, math, subprocess
 
-        # Generate 440 Hz tone as raw S16_LE PCM — no numpy/PortAudio needed
+        # Generate 440 Hz tone as raw S16_LE stereo PCM — no numpy/PortAudio needed
+        # IEC958 requires stereo; duplicate mono to both channels
         sample_rate = 44100
         duration = 2.0
         n = int(sample_rate * duration)
@@ -3180,7 +3181,9 @@ async def equipment_denon_test_input(body: DenonTestInputBody) -> dict:
         for i in range(n):
             t = i / sample_rate
             env = min(t / 0.05, 1.0, (duration - t) / 0.05)
-            samples.append(int(math.sin(2 * math.pi * 440 * t) * env * 0.4 * 32767))
+            val = int(math.sin(2 * math.pi * 440 * t) * env * 0.4 * 32767)
+            samples.append(val)   # left
+            samples.append(val)   # right
         pcm = samples.tobytes()
 
         # vc4-hdmi on Pi only accepts IEC958_SUBFRAME_LE at the hw level.
@@ -3190,7 +3193,7 @@ async def equipment_denon_test_input(body: DenonTestInputBody) -> dict:
         hdmi_card = cfg.measurement.get("hdmi_playback_device") or "iec958"
         result = await asyncio.to_thread(
             subprocess.run,
-            ["aplay", "-D", hdmi_card, "-f", "S16_LE", "-r", str(sample_rate), "-c", "1"],
+            ["aplay", "-D", hdmi_card, "-f", "S16_LE", "-r", str(sample_rate), "-c", "2"],
             input=pcm,
             timeout=duration + 3,
             capture_output=True,
