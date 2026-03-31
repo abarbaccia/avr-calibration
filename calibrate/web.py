@@ -1381,9 +1381,11 @@ _HTML = """<!DOCTYPE html>
     },
   };
   let _chainDenonHost = null;
+  let _chainDenonModel = null;      // fetched from /api/equipment/denon/state on badge poll
   let _chainDenonConfirmedInput = null;  // set only when user clicks "Yes, I heard it"
   let _chainDenonSavedInput = null;      // pre-loaded from config for dropdown pre-selection only
   let _chainDenonInputs = [];       // cached Denon input list for re-renders
+  let _chainDspInfo = null;         // { product_name, serial } fetched after DSP connects
   let _chainExpandedSlot = null;    // DSP slot index with open picker
   let _chainDevices = [];           // ordered device types: ['denon', 'minidsp']
   let _signalPathTestPassed = false; // true only after automated + audible test pass
@@ -1407,7 +1409,10 @@ _HTML = """<!DOCTYPE html>
         _chainDenonHost = (d.denon || {}).host || null;
         _chainDenonSavedInput = (d.denon || {}).sweep_input || null;
         _chainDenonConfirmedInput = null;  // never pre-confirmed — user must test each session
+        // Auto-populate cards from saved config — no scan needed if already configured
         _chainDevices = [];
+        if (_chainDenonHost) _chainDevices.push('denon');
+        if ((d.minidsp || {}).host) _chainDevices.push('minidsp');
       }
     } catch (_) {}
     renderChain();
@@ -1527,7 +1532,10 @@ _HTML = """<!DOCTYPE html>
     const disc = !!_chainDenonHost;
     return `<div class="card" id="chainDenonCard">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem">
-        <h2 style="margin:0;font-size:1rem">Denon AVR</h2>
+        <div>
+          <h2 style="margin:0;font-size:1rem">Denon AVR</h2>
+          ${_chainDenonModel ? `<div style="font-size:.72rem;color:#64748b;margin-top:.15rem">${_chainDenonModel}</div>` : ''}
+        </div>
         <div style="display:flex;gap:.5rem;align-items:center">
           <span id="chainDenonBadge" class="check-badge ${disc ? 'pass' : 'pending'}">${disc ? 'OK' : '\u2014'}</span>
           <button onclick="chainRemoveDevice('denon')" style="background:transparent;color:#475569;border:none;font-size:1.1rem;cursor:pointer;padding:.1rem .3rem" title="Remove">&times;</button>
@@ -1612,9 +1620,15 @@ _HTML = """<!DOCTYPE html>
       </div>`;
     }).join('');
 
+    const dspSubtitle = _chainDspInfo
+      ? [_chainDspInfo.product_name, _chainDspInfo.serial ? 's/n\u202f' + _chainDspInfo.serial : ''].filter(Boolean).join(' \u00b7 ')
+      : '';
     return `<div class="card" id="chainDspCard">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem">
-        <h2 style="margin:0;font-size:1rem">miniDSP 2x4 HD</h2>
+        <div>
+          <h2 style="margin:0;font-size:1rem">miniDSP 2x4 HD</h2>
+          ${dspSubtitle ? `<div style="font-size:.72rem;color:#64748b;margin-top:.15rem">${dspSubtitle}</div>` : ''}
+        </div>
         <div style="display:flex;gap:.5rem;align-items:center">
           <span id="chainDspBadge" class="check-badge pending" onclick="chainDspAutoTest()" title="Click to retest connection" style="cursor:pointer">&mdash;</span>
           <button onclick="chainRemoveDevice('minidsp')" style="background:transparent;color:#475569;border:none;font-size:1.1rem;cursor:pointer;padding:.1rem .3rem" title="Remove">&times;</button>
@@ -1916,6 +1930,7 @@ _HTML = """<!DOCTYPE html>
           const d = await r.json();
           if (d.connected) {
             denonBadge.className = 'check-badge pass'; denonBadge.textContent = 'OK';
+            if (d.model) { _chainDenonModel = d.model; renderChain(); }
             _chainDenonInputs = d.inputs || [];
             _chainPopulateDenonInputs(d.inputs, d.configured_sweep_input);
             const sec = document.getElementById('chainDenonInputSection');
@@ -1950,14 +1965,22 @@ _HTML = """<!DOCTYPE html>
       if (badge) { badge.className = 'check-badge ' + (d.passed ? 'pass' : 'fail'); badge.textContent = d.passed ? 'OK' : 'FAIL'; }
       if (status) { status.textContent = d.detail || ''; status.style.color = d.passed ? '#4ade80' : '#f87171'; }
       if (d.passed) {
-        // Fetch live device state to highlight the active preset
+        // Fetch device info (product name, serial) and live preset state in parallel
         try {
-          const sr = await fetch('/api/signal-path/device-state');
-          if (sr.ok) {
-            const sd = await sr.json();
+          const [sr, ir] = await Promise.allSettled([
+            fetch('/api/signal-path/device-state'),
+            fetch('/api/equipment/minidsp/state'),
+          ]);
+          if (sr.status === 'fulfilled' && sr.value.ok) {
+            const sd = await sr.value.json();
             const livePreset = (sd.master || {}).preset;
-            if (livePreset !== undefined && livePreset !== null) {
-              _renderPresetTiles(livePreset);
+            if (livePreset !== undefined && livePreset !== null) _renderPresetTiles(livePreset);
+          }
+          if (ir.status === 'fulfilled' && ir.value.ok) {
+            const id = await ir.value.json();
+            if (id.product_name || id.serial) {
+              _chainDspInfo = { product_name: id.product_name, serial: id.serial };
+              renderChain();
             }
           }
         } catch (_) {}
@@ -3185,37 +3208,50 @@ async def test_signal_path() -> dict:
     # ── Steps 2+3: Play 60 Hz tone, sample miniDSP levels mid-tone ─────────
     async def _play_60hz_tone() -> Optional[str]:
         try:
-            import array, math, subprocess, os, tempfile, wave
-            sample_rate = 44100
+            import array, math, struct, subprocess, os, tempfile
+            sample_rate = 48000  # vc4hdmi prefers 48 kHz
             duration = 3.0
             freq = 60.0
             n = int(sample_rate * duration)
-            samples: array.array = array.array("h")
+
+            hdmi_card = cfg.measurement.get("hdmi_playback_device") or "hw:vc4hdmi"
+
+            # vc4-hdmi only accepts IEC958_SUBFRAME_LE: each stereo frame is two
+            # 32-bit LE words where bits [27:4] hold the 24-bit sample (we shift
+            # our 16-bit value left by 12), bits [28:31] are V/U/C/P status.
+            # For consumer linear PCM all status bits are 0 (V=0 means "valid").
+            iec_frames = array.array("I")  # unsigned 32-bit
             for i in range(n):
                 t = i / sample_rate
                 env = min(t / 0.05, 1.0, (duration - t) / 0.05)
-                val = int(math.sin(2 * math.pi * freq * t) * env * 0.7 * 32767)
-                samples.append(val)
-                samples.append(val)
-            fd, wav_path = tempfile.mkstemp(suffix=".wav")
+                val16 = int(math.sin(2 * math.pi * freq * t) * env * 0.7 * 32767)
+                # Pack 16-bit sample into bits [27:12] of a 32-bit subframe
+                subframe = (val16 & 0xFFFF) << 12
+                iec_frames.append(subframe)  # left channel
+                iec_frames.append(subframe)  # right channel (same for mono tone)
+
+            fd, raw_path = tempfile.mkstemp(suffix=".raw")
             try:
                 os.close(fd)
-                with wave.open(wav_path, "wb") as wf:
-                    wf.setnchannels(2)
-                    wf.setsampwidth(2)
-                    wf.setframerate(sample_rate)
-                    wf.writeframes(samples.tobytes())
-                hdmi_card = cfg.measurement.get("hdmi_playback_device") or "iec958"
+                with open(raw_path, "wb") as f:
+                    f.write(iec_frames.tobytes())
                 result = await asyncio.to_thread(
                     subprocess.run,
-                    ["aplay", "-D", hdmi_card, wav_path],
+                    [
+                        "aplay",
+                        "-D", hdmi_card,
+                        "--format=IEC958_SUBFRAME_LE",
+                        "--rate", str(sample_rate),
+                        "--channels", "2",
+                        raw_path,
+                    ],
                     timeout=duration + 5,
                     capture_output=True,
                 )
                 if result.returncode != 0:
                     return result.stderr.decode(errors="replace").strip() or "aplay failed"
             finally:
-                os.unlink(wav_path)
+                os.unlink(raw_path)
             return None
         except Exception as exc:
             return str(exc)
@@ -3434,6 +3470,30 @@ async def equipment_denon_state() -> dict:
         return {"connected": False, "host": host, "error": "Timeout after 5s — Denon unreachable"}
     except Exception as exc:
         return {"connected": False, "host": host, "error": str(exc)}
+
+
+@app.get("/api/equipment/minidsp/state")
+async def equipment_minidsp_state() -> dict:
+    """Live miniDSP device state: product name, serial, master status."""
+    from .adapters.minidsp import MinidspClient, MinidspApiError
+    cfg = _load_config()
+    host = cfg.minidsp.get("host", "localhost")
+    port = cfg.minidsp.get("port", 5380)
+    client = MinidspClient(host=host, port=port)
+    try:
+        devices = await client.get_devices()
+        device = devices[0] if devices else {}
+        status = await client.get_device_status()
+        return {
+            "connected": True,
+            "host": host,
+            "port": port,
+            "product_name": device.get("product_name") or "miniDSP 2x4 HD",
+            "serial": str((device.get("version") or {}).get("serial", "")),
+            "master": status.get("master"),
+        }
+    except Exception as exc:
+        return {"connected": False, "host": host, "port": port, "error": str(exc)}
 
 
 @app.post("/api/equipment/denon/discover")

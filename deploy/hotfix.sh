@@ -85,6 +85,7 @@ $SSH "sudo docker run -d \
     --name ${CONTAINER} \
     -p 8000:8000 \
     --device=/dev/bus/usb \
+    --device=/dev/snd \
     -v \$HOME/.avr-calibration:/data/.avr-calibration \
     ${MOUNT_ARGS} \
     ${IMAGE} && echo 'Container started.'"

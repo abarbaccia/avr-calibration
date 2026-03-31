@@ -3596,3 +3596,58 @@ def test_signal_path_test_mid_tone_levels_fail(client, tmp_path, monkeypatch):
     assert body["passed"] is False
     steps = {s["name"]: s for s in body["steps"]}
     assert "Cannot read mid-tone levels" in steps["DSP Input"]["detail"]
+
+
+# ── GET /api/equipment/minidsp/state ──────────────────────────────────────────
+
+def test_equipment_minidsp_state_happy_path(client, cfg_path, monkeypatch):
+    """Returns product_name, serial, master when minidspd responds."""
+    import respx, httpx
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+    devices = [{"product_name": "miniDSP 2x4 HD", "version": {"serial": "12345"}}]
+    master = {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False}
+    status = {"master": master, "input_levels": [], "output_levels": []}
+
+    with respx.mock:
+        respx.get("http://localhost:5380/devices").mock(return_value=httpx.Response(200, json=devices))
+        respx.get("http://localhost:5380/devices/0").mock(return_value=httpx.Response(200, json=status))
+        r = client.get("/api/equipment/minidsp/state")
+
+    assert r.status_code == 200
+    d = r.json()
+    assert d["connected"] is True
+    assert d["product_name"] == "miniDSP 2x4 HD"
+    assert d["serial"] == "12345"
+    assert d["master"]["preset"] == 0
+
+
+def test_equipment_minidsp_state_empty_devices(client, cfg_path, monkeypatch):
+    """Empty device list → falls back to default product name."""
+    import respx, httpx
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+    status = {"master": {"preset": 0, "source": "Analog"}, "input_levels": [], "output_levels": []}
+
+    with respx.mock:
+        respx.get("http://localhost:5380/devices").mock(return_value=httpx.Response(200, json=[]))
+        respx.get("http://localhost:5380/devices/0").mock(return_value=httpx.Response(200, json=status))
+        r = client.get("/api/equipment/minidsp/state")
+
+    assert r.status_code == 200
+    d = r.json()
+    assert d["connected"] is True
+    assert d["product_name"] == "miniDSP 2x4 HD"
+
+
+def test_equipment_minidsp_state_error(client, cfg_path, monkeypatch):
+    """minidspd unreachable → connected=False with error."""
+    import respx, httpx
+    monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_path)
+
+    with respx.mock:
+        respx.get("http://localhost:5380/devices").mock(return_value=httpx.Response(503))
+        r = client.get("/api/equipment/minidsp/state")
+
+    assert r.status_code == 200
+    d = r.json()
+    assert d["connected"] is False
+    assert "error" in d
