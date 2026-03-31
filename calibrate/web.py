@@ -1379,10 +1379,6 @@ _HTML = """<!DOCTYPE html>
         _chainDenonHost = (d.denon || {}).host || null;
         _chainDenonConfirmedInput = (d.denon || {}).sweep_input || null;
         _chainDevices = [];
-        if (_chainDenonHost) _chainDevices.push('denon');
-        const slots = (_chainState.minidsp || {}).output_slots || [];
-        const hasLabels = Object.values((_chainState.minidsp || {}).input_labels || {}).some(v => !!v);
-        if (slots.some(s => s.label || s.preset) || hasLabels) _chainDevices.push('minidsp');
       }
     } catch (_) {}
     renderChain();
@@ -3087,17 +3083,47 @@ async def equipment_denon_state() -> dict:
 
 @app.post("/api/equipment/denon/discover")
 async def equipment_denon_discover() -> dict:
-    """SSDP discovery — finds Denon AVR on local network."""
+    """Find Denon AVR: checks saved config host and SSDP in parallel, returns first success."""
     import denonavr
-    try:
-        devices = await asyncio.wait_for(denonavr.async_discover(), timeout=10.0)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=408, detail="SSDP discovery timed out (10s)")
-    if not devices:
-        raise HTTPException(status_code=404, detail="No Denon AVR found on network")
-    host = devices[0].get("host")
+
+    async def _check_configured_host() -> Optional[str]:
+        """Return saved host if reachable, else None."""
+        cfg = _load_config()
+        host = cfg.denon.get("host")
+        if not host:
+            return None
+        try:
+            receiver = denonavr.DenonAVR(host)
+            await asyncio.wait_for(receiver.async_setup(), timeout=4.0)
+            return host
+        except Exception:
+            return None
+
+    async def _ssdp_discover() -> Optional[str]:
+        """Return first SSDP host found, else None."""
+        try:
+            devices = await asyncio.wait_for(denonavr.async_discover(), timeout=8.0)
+            return (devices[0].get("host") if devices else None)
+        except Exception:
+            return None
+
+    # Race: whichever method finds the host first wins.
+    configured_task = asyncio.create_task(_check_configured_host())
+    ssdp_task = asyncio.create_task(_ssdp_discover())
+
+    host: Optional[str] = None
+    for coro in asyncio.as_completed([configured_task, ssdp_task]):
+        result = await coro
+        if result:
+            host = result
+            break
+
+    # Cancel the loser task
+    configured_task.cancel()
+    ssdp_task.cancel()
+
     if not host:
-        raise HTTPException(status_code=502, detail="Device found but no IP address returned")
+        raise HTTPException(status_code=404, detail="No Denon AVR found on network")
     return {"host": host}
 
 
