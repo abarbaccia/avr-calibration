@@ -188,6 +188,28 @@ sudo systemctl restart avr-calibration
 
 ## Troubleshooting
 
+**miniDSP always returns 500 / "DSP Input unreachable" from the signal path test:**
+
+This happens when a standalone `minidsp.service` is running on the Pi host at the
+same time as the Docker container. Both processes try to own the USB device; the
+host service wins, leaving the container's internal minidspd without USB access.
+
+Check for the conflict:
+```bash
+ps aux | grep minidsp
+```
+
+If you see two `minidspd` processes (one from `/usr/bin/minidspd` and one from
+the container), disable the host service — minidspd runs **inside** the Docker
+container and the host service is redundant:
+
+```bash
+sudo systemctl stop minidsp.service
+sudo systemctl disable minidsp.service
+```
+
+The container's minidspd will then get exclusive USB access. No restart needed.
+
 **miniDSP goes offline after ~20 minutes (DeviceNotReady / 502 errors):**
 
 This is a kernel-level bug in the `dwc_otg` USB OTG driver used by the Pi Zero 2 W.
