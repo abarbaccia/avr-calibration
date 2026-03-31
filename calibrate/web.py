@@ -1752,7 +1752,6 @@ _HTML = """<!DOCTYPE html>
   showPhase(_currentPhase);
 
   loadMics();
-  loadSignalPathConfig();
   loadHistory().then(() => {
     const urlParams = new URLSearchParams(window.location.search);
     const urlSession = urlParams.get('session');
