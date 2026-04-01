@@ -1,269 +1,335 @@
-<!-- /autoplan restore point: /home/andrew/.gstack/projects/abarbaccia-avr-calibration/feat-equipment-driver-abstraction-autoplan-restore-20260401-022023.md -->
+<!-- /autoplan restore point: /home/andrew/.gstack/projects/abarbaccia-avr-calibration/feat-pi5-headless-readiness-autoplan-restore-20260401-210330.md -->
 
-# Plan: Equipment Driver Abstraction
+# Plan: Pi 5 Headless Readiness
 
-**Branch:** `feat/equipment-driver-abstraction`
-**Base:** `feat/mcp-server`
-**Feature Brief:** `~/.gstack/projects/abarbaccia-avr-calibration/andrew-feat-equipment-driver-abstraction-feature-20260401-0218.md`
+**Branch:** feat/pi5-headless-readiness
+**Base:** main
+**Date:** 2026-04-01
 
-## Problem
+## Feature Brief
 
-`calibrate/mcp_server.py` (635 lines) has `denonavr` imports and Denon-specific logic hardcoded in tool implementations. The miniDSP adapter (`calibrate/adapters/minidsp.py`) is a good model — it's a dedicated module — but the Denon equivalent doesn't exist. A user with a Yamaha AVR would need to modify `mcp_server.py` directly. Recipes that call `set_denon_volume` would break on any non-Denon setup.
+**One-liner:** The Docker image builds for arm64, the UMIK-1 is auto-detected on Pi 5, and a measurement sweep can be triggered headlessly via CLI or MCP tool without a browser.
 
-## Goal
+**Why now:** Pi 5 arrives this week. It has 4 USB ports meaning miniDSP and UMIK-1 can coexist for the first time. This unlocks the autonomous calibration loop the Zero 2 W could never run.
 
-A driver protocol layer so:
-1. MCP tools call `avr_driver.set_volume()` / `dsp_driver.apply_eq()` — no brand references in `mcp_server.py`
-2. The right driver loads at startup based on `config.yaml` (`avr_driver: denon`, `dsp_driver: minidsp`)
-3. Adding a new driver requires: create a class implementing the protocol + register one config key
+**In scope:**
+- arm64 Docker CI build target (GitHub Actions — add `linux/arm64` to platforms)
+- UMIK-1 auto-detection on Pi 5 (sounddevice device enumeration, select UMIK by name)
+- `/api/measure` headless endpoint (Pi-side record via UMIK, not browser getUserMedia)
+- `calibrate measure` CLI works headlessly on Pi 5 (already uses `MeasurementEngine.measure()`)
+- `trigger_measurement` MCP tool returns real result on Pi 5, not degraded mode
 
-## Architecture
+**Out of scope:**
+- Full autonomous loop (sweep → analyze → apply EQ → re-measure) — next feature
+- Pi Zero 2 W changes — arm/v7 path stays as-is (browser audio remains)
+- UMIK calibration file (.cal) application — already wired; just needs UMIK detected
 
-### New file structure
+## Problem Decomposition
 
+### What exists today
+
+| Sub-problem | File | Status |
+|-------------|------|--------|
+| CI arm/v7 + amd64 build | `.github/workflows/docker.yml` | Working — platforms: `linux/arm/v7,linux/amd64` |
+| PyTTa included for amd64 | `Dockerfile` else-branch | Working — `--extra measurement` |
+| PyTTa excluded for arm/v7 | `Dockerfile` arm-branch | Correct — browser captures audio on Pi Zero |
+| `calibrate measure` CLI | `calibrate/cli.py:83` + `MeasurementEngine.measure()` | Works on amd64; uses PyTTa PlayRecMeasure |
+| `MeasurementEngine.measure()` | `calibrate/measurement.py:313` | Exists; uses `pytta.PlayRecMeasure`; no UMIK device selection |
+| UMIK detection | `calibrate/mcp_server.py:196-203` | Inline in `_tool_trigger_measurement`; not reusable |
+| MCP `trigger_measurement` | `calibrate/mcp_server.py:189-227` | Detects UMIK, then POSTs to `/api/measure` |
+| `/api/measure` endpoint | `calibrate/web.py` | DOES NOT EXIST — only `/api/measure/start` + `/api/measure/record` |
+
+### The critical gap
+
+The MCP tool (`trigger_measurement`) calls `POST /api/measure` which returns 404 today. The whole headless path is blocked on this missing endpoint.
+
+`/api/measure/start` and `/api/measure/record` are the browser-split path. We need a unified headless endpoint that calls `MeasurementEngine.measure()` directly on the Pi.
+
+### Arm64 Docker gap
+
+The Dockerfile's conditional is:
+```bash
+if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]
 ```
-calibrate/
-  drivers/
-    __init__.py
-    avr_driver.py       # AVRDriver ABC: setup, get_state, list_inputs, set_input, set_volume
-    dsp_driver.py       # DSPDriver ABC: get_state, read_eq, apply_eq, set_preset, set_routing, current_preset
-    denon.py            # DenonDriver(AVRDriver) — wraps denonavr
-    minidsp.py          # MinidspDriver(DSPDriver) — wraps MinidspClient from adapters/
-    registry.py         # load_avr_driver(config) + load_dsp_driver(config) factories
-  mcp_server.py         # (modified) — calls driver methods, zero denonavr/MinidspClient references
-  config.py             # (modified) — add avr_driver/dsp_driver keys + defaults
-```
-
-### Driver protocols
-
-Narrowed to only what MCP tools currently call (CEO review: no speculative interface).
-
-```python
-# avr_driver.py
-class AVRDriver(ABC):
-    async def get_state(self) -> dict: ...            # get_device_state tool
-    async def set_volume(self, level_db: float) -> None: ...  # avr_set_volume tool
-    async def close(self) -> None: ...               # teardown on server shutdown
-    # Non-abstract (override in subclass when available):
-    async def discover(self) -> list[str]: return []  # SSDP/mDNS discovery
-
-# dsp_driver.py
-class DSPDriver(ABC):
-    async def get_state(self) -> dict: ...           # get_device_state tool
-    async def current_preset(self) -> int: ...       # used internally by read_eq/apply_eq
-    async def read_eq(self, preset: int) -> list[dict]: ...   # read_eq tool
-    async def apply_eq(self, preset: int, filters: list[dict]) -> None: ...  # apply_eq tool
-    async def set_preset(self, preset: int) -> None: ...      # signal path
-    async def set_routing(self, routing: dict) -> None: ...   # signal path
-    async def close(self) -> None: ...               # teardown on server shutdown
-```
-
-Error boundary: each driver method raises `DriverError(message)`. MCP tool functions catch `DriverError` and return `_err(str(exc))`. No raw exceptions escape to MCP protocol layer.
-
-### MCP tool renames
-
-| Old name | New name | Reason |
-|---|---|---|
-| `set_denon_volume` | `avr_set_volume` | Brand-agnostic |
-| `get_device_state` | `get_device_state` | Keep — already generic |
-| `read_eq` | `read_eq` | Keep — recipe references this |
-| `apply_eq` | `apply_eq` | Keep — recipe references this |
-
-**Backward-compat alias:** `set_denon_volume` remains as a deprecated alias → calls `avr_set_volume`. Prevents breaking any existing Claude Code sessions that have cached the old tool name. Alias marked deprecated in description. Remove after one release cycle.
-
-### Config additions
-
-```yaml
-avr_driver: denon    # which AVRDriver implementation to load (default: denon)
-dsp_driver: minidsp  # which DSPDriver implementation to load (default: minidsp)
-```
-
-### Driver registry
-
-```python
-# registry.py
-_AVR_DRIVERS = {"denon": DenonDriver}
-_DSP_DRIVERS = {"minidsp": MinidspDriver}
-
-def load_avr_driver(config: Config) -> AVRDriver: ...
-def load_dsp_driver(config: Config) -> DSPDriver: ...
-```
-
-### In-memory EQ state
-
-Currently lives as `_eq_state: dict[int, list[dict]]` at module level in `mcp_server.py`. Moves into `MinidspDriver` as an instance variable. `_get_eq_state` / `_set_eq_state` become `driver.read_eq_state()` / `driver.write_eq_state()`.
-
-### MCP server startup
-
-```python
-# mcp_server.py — module level, loaded once
-_cfg = Config.load()
-_avr: AVRDriver = load_avr_driver(_cfg)
-_dsp: DSPDriver = load_dsp_driver(_cfg)
-```
+Pi 5 has `TARGETARCH=arm64`, `TARGETVARIANT=` (empty). This falls to the else-branch which already runs `uv sync --extra measurement` — PyTTa IS included for arm64. The Dockerfile already handles arm64 correctly. Only CI platforms needs adding.
 
 ## Implementation Steps
 
-1. `calibrate/drivers/__init__.py` — empty, marks package
-2. `calibrate/drivers/avr_driver.py` — `AVRDriver` ABC
-3. `calibrate/drivers/dsp_driver.py` — `DSPDriver` ABC
-4. `calibrate/drivers/denon.py` — `DenonDriver(AVRDriver)` (move Denon logic from mcp_server.py)
-5. `calibrate/drivers/minidsp.py` — `MinidspDriver(DSPDriver)` (wrap `adapters.minidsp.MinidspClient`; owns `_eq_state`)
-6. `calibrate/drivers/registry.py` — `load_avr_driver()` + `load_dsp_driver()`
-7. `calibrate/config.py` — add `avr_driver` / `dsp_driver` to `DEFAULT_CONFIG`; add `Config.avr_driver_name` and `Config.dsp_driver_name` typed properties; bundle TODO-SP1 (atomic YAML write: `os.replace` in `update_config()`)
-8. `calibrate/mcp_server.py` — replace all inline Denon/miniDSP logic with driver calls; rename `set_denon_volume` → `avr_set_volume`; add backward-compat `set_denon_volume` alias; add asyncio lock around `_eq_state` writes (now inside MinidspDriver); fix config-per-call (load once at startup); add `DriverError` handling in each tool function
-9. `tests/test_mcp_server.py` — mock drivers at the driver level (not `denonavr` / `MinidspClient`)
-10. `tests/test_drivers.py` — new: unit tests for `DenonDriver` + `MinidspDriver` + registry
+### Step 1: CI — Add arm64 platform
+**File:** `.github/workflows/docker.yml`
+**Change:** `platforms: linux/arm/v7,linux/amd64` → `platforms: linux/arm/v7,linux/arm64,linux/amd64`
+**QEMU:** `docker/setup-qemu-action@v3` with `platforms: arm` needs to add `arm64` (or `all`)
+**Build time concern (CEO Finding 5):** aarch64 manylinux wheels exist on PyPI for numpy and scipy. sounddevice C extension needs PortAudio; builder stage already has `portaudio19-dev`. PyTTa is pure Python. Build time for arm64 should be similar to arm/v7 (~30-60 min in QEMU). Consider making arm64 a separate non-blocking workflow job if it proves flaky during initial bringup.
 
-## Out of Scope
+### Step 2.5: Gate — Validate PyTTa device selection (BLOCKING, CEO Finding 2)
+**Before writing Step 3 or Step 4 code, verify this:**
+```python
+import sounddevice as sd
+import pytta
+sd.default.device = (UMIK_INDEX, sd.default.device[1])
+# Does pytta.PlayRecMeasure respect this? Check by logging which device index is opened.
+```
+If PyTTa ignores `sd.default.device`, use sounddevice directly for recording:
+```python
+# Alternative: play via sd.play(), record via sd.rec() with device=UMIK_INDEX
+recording = sd.rec(frames, samplerate=sr, channels=1, device=UMIK_INDEX)
+sd.play(sweep, samplerate=sr, device=output_idx)
+sd.wait()
+```
+This is the sounddevice fallback. Implement this path if PyTTa doesn't expose device selection.
 
-- Implementing any second driver (Yamaha, other DSP)
-- Auto-discovery of hardware type
-- MCP config tools (get_config / set_config)
-- Updating recipes — `apply_eq` keeps its name; `harman-bass.md` unchanged
+### Step 2: Add UMIK device detection utility
+**File:** `calibrate/measurement.py`
+**Change:** Add `_find_umik_device(devices) -> int | None` function that searches sounddevice device list for UMIK by name substring.
+
+### Step 3: Wire UMIK device into MeasurementEngine.measure()
+**File:** `calibrate/measurement.py`
+**Change:** Add `input_device_name: str | None = None` parameter to `measure()`. Before creating `pytta.PlayRecMeasure`, if `input_device_name` is set, use sounddevice to find the device index and call `sd.default.device = (input_idx, output_idx)`. PyTTa respects sounddevice defaults.
+
+### Step 4: Add /api/measure headless endpoint
+**File:** `calibrate/web.py`
+**New endpoint:** `POST /api/measure`
+```python
+class HeadlessMeasureRequest(BaseModel):
+    label: str | None = None
+
+@app.post("/api/measure")
+async def measure_headless(body: HeadlessMeasureRequest) -> dict:
+    """Headless measurement for Pi 5. Requires UMIK-1 connected and PyTTa installed."""
+    try:
+        import sounddevice as sd
+        devices = sd.query_devices()
+        umik_devices = [(i, d) for i, d in enumerate(devices)
+                        if "UMIK" in str(d.get("name", "")) and d.get("max_input_channels", 0) > 0]
+        if not umik_devices:
+            raise HTTPException(status_code=503, detail="No UMIK microphone found")
+    except ImportError:
+        raise HTTPException(status_code=503, detail="sounddevice not available on this platform")
+
+    cfg = Config.load()
+    engine = MeasurementEngine(cfg)
+    device_name = umik_devices[0][1]["name"]
+    try:
+        fr = await asyncio.to_thread(engine.measure, input_device_name=device_name)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    store = SessionStore(cfg.db_path)
+    session_id = store.save_measurement(fr, label=body.label or "headless")
+    return {"session_id": session_id, "status": "ok"}
+```
+
+### Step 5: Update MCP trigger_measurement
+**File:** `calibrate/mcp_server.py`
+**Changes (CEO Finding 3 — all 4 locations):**
+- Line 191: docstring "Requires Pi 4" → "Requires Pi 5"
+- Line 201-203: "trigger_measurement requires Pi 4 — no UMIK" → "trigger_measurement requires Pi 5"
+- Line 206-209: "trigger_measurement requires Pi 4 — audio device" → "trigger_measurement requires Pi 5"
+- `_TOOLS` tool description line 388-390: "Requires Pi 4 4GB" → "Requires Pi 5 (4 USB ports)"
+- Pass `{"label": "mcp-triggered"}` — already correct
+- No structural changes needed (already POSTs to `/api/measure`)
+
+### Step 6: Tests
+- `tests/test_measurement_headless.py`: test `/api/measure` endpoint
+  - UMIK detected: returns session_id
+  - No UMIK: 503
+  - sounddevice unavailable: 503
+  - sounddevice device detection mocked
+- `tests/test_measurement.py`: test `MeasurementEngine.measure(input_device_name=...)` sets sd.default.device
+- CI arm64 build: validated by GitHub Actions (no unit test)
+
+## Risk Assessment
+
+### R1: PyTTa/sounddevice arm64 build — MEDIUM
+PyTTa requires sounddevice which requires PortAudio. PortAudio (`portaudio19-dev`) is already in the builder stage. sounddevice on arm64 should build from source via PyPI (manylinux wheels exist for aarch64). PyTTa itself is a pure-Python wrapper around sounddevice + numpy. Verdict: likely works, but untested. If it fails, fallback is to skip PyTTa `PlayRecMeasure` and implement play+record via sounddevice directly.
+
+### R2: pytta.PlayRecMeasure ignores sd.default.device — HIGH (must verify)
+If PyTTa opens its own PortAudio stream without respecting `sd.default.device`, UMIK selection won't work. Mitigation: test on amd64 first; if PyTTa ignores defaults, implement UMIK recording via `sounddevice.rec()` directly (bypass PyTTa for the record step; still use PyTTa for sweep generation).
+
+### R3: /api/measure called from browser accidentally — LOW
+New endpoint should only be called from MCP or CLI. No browser JS calls it. Already isolated by endpoint name.
+
+### R4: Pi 5 USB enumeration order — LOW
+On Pi 5, USB devices enumerate in plug-in order. UMIK device index could be 0, 1, or 2 depending on what else is plugged in. The name-based search (`_find_umik_device`) handles this correctly regardless of index.
+
+## Eng Review Additions
+
+### P0: Measurement lock required (F1 + F2)
+`sd.default.device` is a global shared across threads. Two concurrent `/api/measure` calls will race on PortAudio. Fix: add module-level `asyncio.Lock` in web.py, held for the full duration of `measure()`. Return HTTP 409 if lock is already held.
+
+```python
+_measurement_lock = asyncio.Lock()
+
+@app.post("/api/measure")
+async def measure_headless(body: HeadlessMeasureRequest) -> dict:
+    if _measurement_lock.locked():
+        raise HTTPException(status_code=409, detail="measurement already in progress")
+    async with _measurement_lock:
+        ...
+```
+
+The lock also prevents the `sd.default.device` race (F1) since no two calls can set the device concurrently.
+
+### P1: Dockerfile — arm64 gets wrong minidsp binary (F6)
+Current: `if [ "$ARCH" = "amd64" ]; then DEB_ARCH="amd64"; else DEB_ARCH="armhf"; fi`
+For TARGETARCH=arm64, ARCH="arm64" → falls to else → DEB_ARCH="armhf" → 32-bit binary on 64-bit kernel → Exec format error.
+
+Fix:
+```bash
+if [ "$ARCH" = "amd64" ]; then DEB_ARCH="amd64"; \
+elif [ "$ARCH" = "arm64" ]; then DEB_ARCH="arm64"; \
+else DEB_ARCH="armhf"; fi
+```
+(Verify `minidsp_0.1.12-1_arm64.deb` exists in mrene/minidsp-rs releases.)
+
+### P1: QEMU needs arm64 (F7)
+Fix: `platforms: arm,arm64` (or `platforms: all`) in `docker/setup-qemu-action@v3`.
+
+### P1: measure() missing input_device_name param (F4)
+Must implement BEFORE Step 4 endpoint. Current signature has no params. Add:
+```python
+def measure(self, input_device_name: str | None = None) -> FrequencyResponse:
+    ...
+    if input_device_name:
+        import sounddevice as sd
+        devs = sd.query_devices()
+        for i, d in enumerate(devs):
+            if input_device_name in str(d.get("name", "")) and d.get("max_input_channels", 0) > 0:
+                sd.default.device = (i, sd.default.device[1] if isinstance(sd.default.device, tuple) else sd.default.device)
+                break
+```
+
+### P1: SessionStore() call pattern (F5)
+All existing calls use `SessionStore()` with no args. Plan draft incorrectly used `SessionStore(cfg.db_path)`. Fix: use `store = SessionStore()`.
+
+### P1: UMIK disconnect / PortAudioError not caught (F3 + F11)
+`measure()` calls `_compute_fr()` directly (not `compute_fr()`), bypassing quality checks. Two fixes:
+1. Wrap `meas.run()` in try/except for all exceptions, re-raise as RuntimeError
+2. Call `validate_recording()` inside `measure()` before deconvolution
+3. In the endpoint, catch both `RuntimeError` and `sounddevice.PortAudioError` → 503
+
+### P2: Add mic_device_name config key (F9)
+UMIK may present as "C-Media USB Audio Device" on Linux. Add to config defaults:
+```yaml
+measurement:
+  mic_device_name: "UMIK"   # substring match for input device name
+```
+`_find_umik_device()` uses this config key instead of hardcoded "UMIK".
+
+### P2: MCP timeout too short (F10)
+`httpx.AsyncClient(timeout=30.0)` in `_tool_trigger_measurement()` — a 3s sweep + Pi 5 startup can exceed 30s under load. Increase to `timeout=60.0`. Document expected latency in tool description.
+
+### P2: sounddevice aarch64 wheel validation (F8)
+Before declaring arm64 ready: verify PyPI `sounddevice` has `manylinux_2_17_aarch64` wheel. If falls back to source build, builder stage has `portaudio19-dev` — will succeed but be slower.
+
+### P3: measure() headless path skips quality gate (F12)
+Add `validate_recording()` call inside `measure()` before `_compute_fr()`. Already in plan (F3 fix — same change).
 
 ## Done Criteria
+- `docker build --platform linux/arm64` succeeds in CI and image pushes to ghcr.io
+- On Pi 5: `calibrate measure` completes, saves a measurement file with real data (UMIK used as input)
+- On Pi 5: MCP `trigger_measurement` call returns `{"status": "ok", "session_id": N}` not `{"error": "..."}`
+- All existing tests pass (arm/v7 + amd64 paths unchanged)
 
-- All test BEHAVIORS preserved (test file updated to mock at driver level; `sys.modules["denonavr"]` hack replaced with `patch("calibrate.mcp_server._avr", mock_driver)`)
-- `mcp_server.py` contains zero direct references to `denonavr` or `MinidspClient`
-- `avr_set_volume` is the primary tool; `set_denon_volume` exists as deprecated alias
-- Adding a new AVR brand requires only: subclass `AVRDriver` + add one entry to `_AVR_DRIVERS`
-- 100% test coverage maintained (new `tests/test_drivers.py` + updated `tests/test_mcp_server.py`)
+## Eng Review — Test Plan
+Test plan artifact: `~/.gstack/projects/abarbaccia-avr-calibration/andrew-feat-pi5-headless-readiness-test-plan-20260401-211515.md`
 
-## Eng Review Additions (autoplan 2026-04-01)
+New test files:
+- `tests/test_measurement_headless.py` — 9 new tests for `measure()` device param + `_find_umik_device()`
+- `tests/test_api_measure_headless.py` — 5 new integration tests for `POST /api/measure`
+- Update `tests/test_mcp_server.py` — update "Pi 4" → "Pi 5" assertions, verify 60s timeout
 
-### P0: Partial write rollback required in MinidspDriver.apply_eq
+## Eng Review — NOT In Scope (confirmed deferred)
+- CamillaDSP or other DSP driver (zero relevance to Pi 5)
+- sounddevice aarch64 wheel caching in CI (optimization, not correctness)
+- Full PyTTa device selection rewrite (try `sd.default.device` first; fallback only if broken)
+- arm64 native runner (too expensive for hobby project; QEMU acceptable)
 
-`_tool_apply_eq` writes PEQ slots one at a time across outputs 0 and 1. A `MinidspApiError` mid-loop leaves hardware partially configured. `_eq_state` must only update after ALL writes succeed. `MinidspDriver.apply_eq` must: acquire the asyncio lock → write all slots → on any exception, do NOT update `_eq_state` → re-raise as `DriverError`. The SafetyValidator diffs against `_eq_state`; if state diverges from hardware, safety limits can be silently violated.
+## Eng Review — What Already Exists
+| Sub-problem | Existing code |
+|---|---|
+| Headless sweep measurement | `measurement.py:313` `measure()` — exists; needs device param + quality gate |
+| UMIK detection (inline) | `mcp_server.py:196-203` — extract into utility |
+| Session persistence | `web.py SessionStore()` pattern — established; use no-arg form |
+| Measurement quality validation | `measurement.py validate_recording()` — exists; wire into `measure()` |
+| PortAudio runtime | `libportaudio2` in Dockerfile runtime stage — already installed |
+| PyTTa deps for arm64 | Dockerfile else-branch — already includes `--extra measurement` |
 
-### P0: Path traversal — add symlink resolution check
+## Not In Scope (confirmed deferred)
+- Full autonomous loop (analyze → apply EQ → re-measure)
+- MicDriver abstraction (TODO-DA1) — design doc exists; implement after headless path is validated
+- Multi-channel sweep (TODO-6) — Pi 5 HDMI audio driver opens that door, but deferred
+- Pi Zero 2 W: zero changes to arm/v7 Dockerfile path
 
-`fetch_recipe` currently checks for `".."` in the name but does not block symlinks inside `recipes/` that point outside it. Add after constructing `recipe_path`:
-```python
-if not recipe_path.resolve().is_relative_to(RECIPES_DIR.resolve()):
-    return _err(f"invalid recipe name: {name!r}")
+## CEO Review — NOT In Scope (deferred)
+- PyTTa measurement quality validation vs. REW (TODO-MQ1 — prerequisite before autonomous loop feature)
+- Making arm64 a non-blocking CI job — do if arm64 build proves flaky
+- MicDriver abstraction (TODO-DA1) — implement after this feature validates the Pi 5 path
+
+## CEO Review — What Already Exists
+- `calibrate measure` CLI uses `MeasurementEngine.measure()` — headless path already validated on amd64
+- UMIK detection logic in `mcp_server.py:196-203` — inline, extract into utility
+- Dockerfile else-branch already handles arm64 with PyTTa included
+- CI QEMU setup already configured; just needs `arm64` added
+
+## CEO Review — Failure Modes Registry
+
+| Mode | Trigger | Impact | Mitigation |
+|------|---------|--------|------------|
+| PyTTa ignores sd.default.device | PyTTa opens own PortAudio stream | Wrong device records; garbage FR | Step 2.5 gate; sounddevice fallback |
+| sounddevice C extension fails arm64 | Missing PortAudio headers | PyTTa import fails; CLI 503 | portaudio19-dev already in builder stage |
+| UMIK not found by name | Device shows as "C-Media USB" not "UMIK" | 503 on all measurements | Add `mic_device_name` config key for substring |
+| /api/measure called during browser session | Concurrent measurement | Double-sweep, race condition | Add `_measurement_lock: asyncio.Lock()` in web.py |
+| arm64 CI QEMU timeout | Large C extension builds | CI failure | Separate non-blocking arm64 job |
+
+## CEO Review — Dream State Delta
 ```
-Test: `recipes/evil -> /etc/passwd` symlink → returns `_err`.
+CURRENT STATE (today, Pi Zero 2 W):
+  miniDSP connected via USB OTG (single port)
+  UMIK-1 on laptop → browser getUserMedia → Float32 sent to Pi
+  Manual: human opens browser, clicks measure, reads results
 
-### P1: Config loading — keep per-call (hot-reload is a feature)
+THIS PLAN (Pi 5, this branch):
+  miniDSP + UMIK-1 both connected (4 ports)
+  MCP trigger_measurement → /api/measure → MeasurementEngine → FR saved
+  calibrate measure CLI also works on Pi 5
+  Browser path unchanged (still works for manual use)
 
-Do NOT change `_config()` to a startup singleton. Config.load() is a fast local file read (~1ms). Removing it would silently kill hot-reload (user edits `config.yaml` while server runs). The original plan step 8 said "fix config-per-call" — **REVERTED**. Keep `_config()` as-is.
-
-### P1: asyncio lock in MinidspDriver.apply_eq — full sequence
-
-The lock must wrap: `read _eq_state` → `SafetyValidator` → `write hardware` → `update _eq_state`. If lock only wraps the state update, two concurrent `apply_eq` calls can both pass SafetyValidator with the same baseline before either writes. The lock is an instance-level `asyncio.Lock()` on `MinidspDriver`.
-
-### P1: Starlette lifespan handler — required for close()
-
-Add to `create_app()`:
-```python
-from contextlib import asynccontextmanager
-@asynccontextmanager
-async def lifespan(app):
-    await _avr.setup()   # async_setup with 5s timeout
-    await _dsp.setup()
-    yield
-    await _avr.close()
-    await _dsp.close()
-Starlette(lifespan=lifespan, routes=[...])
+12-MONTH IDEAL:
+  Claude agent calls trigger_measurement → gets FR → calls apply_eq → calls trigger_measurement again
+  Closed loop runs until FR matches Harman target within tolerance
+  Human reviews at end; each iteration takes <60s
 ```
-`DenonDriver.__init__` must be sync (no network). `setup()` is called in lifespan, not constructor — prevents blocking cold start when AVR is off.
 
-### P1: DriverError exception hierarchy
-
-Define `DriverError(RuntimeError)` in `calibrate/drivers/base.py`. All driver methods raise `DriverError` (wrapping `MinidspApiError`, `denonavr` exceptions, `asyncio.TimeoutError`). All MCP tool functions catch `DriverError` and return `_err(str(exc))`. No raw hardware exceptions escape to the MCP protocol layer.
-
-### P2: Deprecated alias must appear in list_tools()
-
-Keep `Tool(name="set_denon_volume", description="Deprecated: use avr_set_volume. ...")` in `_TOOLS` so Claude Code sessions that cached the old name still see it in the tool list. Remove in the next release cycle.
-
-### P2: update_config() atomic write — REQUIRED (not optional)
-
-This is mandatory, not a deferred TODO. Four-line fix in step 7. Write to `path.with_suffix('.tmp')`, then `os.replace(tmp, path)`.
-
-### P2: eq://current resource is 3rd MinidspClient call site
-
-`_read_resource("eq://current")` at line 565 calls `_minidsp_client()` directly. After the refactor, this must call `_dsp.current_preset()` instead. Add CI grep check: `grep -n "MinidspClient" calibrate/mcp_server.py` must return 0 lines.
-
-### P3: reset_eq_state fixture breaks post-refactor
-
-`tests/test_mcp_server.py:66` clears `_eq_state` directly. After `_eq_state` moves into `MinidspDriver`, this fixture silently stops working. Replace with: mock the driver's EQ state as part of the mock driver fixture.
-
-## Known Risks (updated)
-
-- 605-line test file uses 4 brittle patterns (sys.modules injection, _eq_state direct access, _config patch, private function imports) — all must be replaced in step 9
-- `_minidsp_client()` has 3 call sites in mcp_server.py (lines 198, 228, 565) — all 3 must be replaced; add CI grep check
-- Test for concurrent `apply_eq` requires `asyncio.gather` — must be a real async test, not a mock
-
-
-<!-- AUTONOMOUS DECISION LOG -->
 ## Decision Audit Trail
 
 | # | Phase | Decision | Classification | Principle | Rationale | Rejected |
 |---|-------|----------|----------------|-----------|-----------|----------|
-| 1 | CEO | Narrow ABC interface to only what MCP tools currently call; remove list_inputs, set_input | Mechanical | P5 explicit | Speculative interface for non-existent use cases; add when needed | Keep full API |
-| 2 | CEO | Add backward-compat alias set_denon_volume → avr_set_volume | Mechanical | P1 completeness | Breaks cached Claude Code sessions otherwise | Remove immediately |
-| 3 | CEO | Fix done criteria: "tests unchanged" impossible; "behaviors preserved, tests updated" | Mechanical | P1 completeness | test_mcp_server.py imports _tool_set_denon_volume which will be removed | Keep old criteria |
-| 4 | CEO | Bundle TODO-SP1 (atomic YAML write) into step 7 | Mechanical | P2 boil lakes | config.py is in blast radius; 4-line fix; prevents config corruption on Pi power loss | Defer to separate PR |
-| 5 | CEO | Add Config.avr_driver_name / Config.dsp_driver_name typed properties | Mechanical | P1 completeness | Registry must not access Config._data directly | Use _data.get() |
-| 6 | CEO | Add close() and discover() to AVRDriver ABC | Mechanical | P1 completeness | Lifecycle and discovery are part of the driver contract | Driver-specific only |
-| 7 | CEO | DEFER: MCP get_config/set_config tools | Taste | P3 pragmatic | Separate feature; not in this brief | Include now |
-| 8 | CEO | DEFER: discover_avr MCP tool | Taste | P3 pragmatic | Separate feature; separate PR | Include now |
-| 9 | CEO/Taste | Proceed with abstraction now (no second user yet) | Taste | User decision | User explicitly chose architectural investment before recipes lock in brand names | Defer |
-| 10 | CEO/Taste | 6-month regret: automated measurement loop deferred | Taste | User decision | User chose driver abstraction as higher priority | Switch to measurement loop |
-| 11 | Eng | P0: MinidspDriver.apply_eq must rollback on partial failure | Mechanical | P1 completeness | Partial write leaves hardware/state diverged; SafetyValidator diffs against wrong baseline | Accept divergence |
-| 12 | Eng | P0: Add resolve().is_relative_to() for path traversal | Mechanical | Security | String check alone doesn't block symlinks | String check only |
-| 13 | Eng | P1: REVERT config singleton change; keep _config() per-call | Mechanical | P3 pragmatic | Hot-reload is a feature; Config.load() is 1ms on local file | Singleton |
-| 14 | Eng | P1: asyncio lock must wrap full read-validate-write-state sequence | Mechanical | P1 completeness | Narrow lock still allows SafetyValidator race between two concurrent calls | Lock only state write |
-| 15 | Eng | P1: Add Starlette lifespan handler for setup()/close() | Mechanical | P1 completeness | DenonDriver.close() never called without it; aiohttp session leaks | Skip teardown |
-| 16 | Eng | P1: Define DriverError in drivers/base.py | Mechanical | P5 explicit | Referenced in plan without existing; MinidspApiError must wrap into it | Reuse MinidspApiError |
-| 17 | Eng | P2: Deprecated alias in _TOOLS (not just dispatch) | Mechanical | P1 completeness | Claude Code checks list_tools(); alias at dispatch only is invisible | Dispatch-only alias |
-| 18 | Eng | P2: update_config() atomic write REQUIRED | Mechanical | P1 completeness | Non-atomic write + Pi power loss = zero-byte config; 4-line fix | Optional/deferred |
-| 19 | Eng | P2: eq://current resource = 3rd call site; add CI grep check | Mechanical | P1 completeness | Easy to miss; grep check enforces the abstraction | Trust visual review |
-| 20 | Eng | P3: DenonDriver constructor must be sync; setup() in lifespan | Mechanical | P5 explicit | Async setup at module import blocks cold start when AVR is off | Sync setup in constructor |
-| 21 | Eng | P3: reset_eq_state fixture must reset via driver mock | Mechanical | P1 completeness | Direct _eq_state.clear() silently stops working after refactor | Keep existing fixture |
+| 1 | CEO | Add Step 2.5 gate — validate PyTTa device selection before endpoint ships | Mechanical | P1 completeness | R2 is Critical; endpoint with wrong device records garbage FR | Ship without validation |
+| 2 | CEO | Fix all 4 "Pi 4" references in mcp_server.py (docstring + 2 errors + tool desc) | Mechanical | P1 completeness | All 4 are wrong; plan Step 5 originally missed docstring | Fix only error messages |
+| 3 | CEO | Reject SSH-to-CLI alternative (Finding 4) | Mechanical | P3 pragmatic | MCP server is the designed integration point; SSH is a workaround | Replace MCP with SSH |
+| 4 | CEO | Note arm64 CI build time concern; check aarch64 wheels | Mechanical | P1 completeness | QEMU arm64 could be slow; document the risk | Ignore |
+| 5 | CEO | Add measurement quality validation to TODOS.md | Mechanical | P2 boil lakes | Valid concern; prerequisite for autonomous loop; zero code in this PR | Include in this PR |
+| 6 | CEO | TASTE: Ship infra-only vs. include loop iteration | TASTE | User chose scope | User explicitly picked "headless trigger + infra" scope in /feature | See gate |
+| 7 | CEO | TASTE: PyTTa quality validation as prerequisite for next feature | TASTE | P3 pragmatic | Important long-term concern; zero relevance to arm64 infra work | See gate |
+| 8 | Eng | P0: Add _measurement_lock asyncio.Lock to prevent concurrent sweep + sd.default.device race | Mechanical | P1 completeness | Two concurrent calls race on PortAudio global state | Accept race |
+| 9 | Eng | P1: Fix Dockerfile arm64 minidsp binary selection (armhf → arm64) | Mechanical | P1 completeness | armhf binary on arm64 kernel = Exec format error; minidspd never starts | Leave armhf |
+| 10 | Eng | P1: Fix QEMU platforms to include arm64 | Mechanical | P1 completeness | Without aarch64 QEMU, arm64 build fails at first RUN | Leave arm only |
+| 11 | Eng | P1: Implement measure(input_device_name) before Step 4 | Mechanical | P5 explicit | Plan's endpoint calls this param; current signature has none → TypeError | Hardcode device |
+| 12 | Eng | P1: Use SessionStore() not SessionStore(cfg.db_path) | Mechanical | P3 pragmatic | All existing calls use no-arg pattern; inconsistency causes TypeError | Use db_path |
+| 13 | Eng | P1: Catch PortAudioError + add validate_recording in measure() | Mechanical | P1 completeness | Disconnect mid-measure returns garbage FR silently saved to DB | Accept garbage |
+| 14 | Eng | P2: Add mic_device_name config key for Linux device name mismatch | Mechanical | P1 completeness | UMIK presents as "C-Media USB" on Linux; hardcoded "UMIK" fails | Hardcode "UMIK" |
+| 15 | Eng | P2: Increase MCP trigger_measurement timeout to 60s | Mechanical | P1 completeness | 30s too short for 3s sweep + deconvolution on Pi 5 under load | Leave 30s |
+| 16 | Eng | P3: validate_recording in measure() headless path | Mechanical | P1 completeness | Same fix as decision 13; no separate work | Separate task |
 
-
-## Failure Modes Registry
-
-| Mode | Trigger | Impact | Mitigation |
-|------|---------|--------|------------|
-| Partial EQ write | MinidspApiError mid-loop in apply_eq | Hardware/state diverge; safety checks against wrong baseline | Rollback: only update _eq_state after all writes succeed |
-| DenonDriver cold start fail | AVR off when server starts | lifespan startup exception | Lazy setup: setup() retry on each call; don't fail startup |
-| Unknown driver config | avr_driver: yamaha (unregistered) | Server fails to start | ValueError with list of valid options |
-| Concurrent apply_eq | Two MCP clients calling simultaneously | Potential double-apply | asyncio.Lock covers full read-validate-write-state |
-| In-memory EQ state lost | MCP server restart | _eq_state is [] after restart | Document: server restart clears EQ memory; re-run recipe |
-| config.yaml corruption | Power loss during write | All config lost, defaults loaded | Atomic write via os.replace (TODO-SP1, now required) |
-| Symlink traversal | Crafted recipe name points outside recipes/ | File system read | resolve().is_relative_to() check + test |
-
-## What Already Exists (Eng)
-
-| Sub-problem | Existing code | Status |
-|---|---|---|
-| miniDSP HTTP client | calibrate/adapters/minidsp.py | Complete, well-tested; MinidspDriver wraps it |
-| Denon HTTP client | denonavr library | External dep; DenonDriver wraps it |
-| SafetyValidator | calibrate/safety.py | Unchanged; stays in mcp_server.py |
-| Biquad conversion | calibrate/dsp.py | Unchanged; stays in mcp_server.py |
-| Measurement storage | calibrate/storage.py | Unchanged |
-| In-memory EQ state | mcp_server.py _eq_state dict | Moves to MinidspDriver._eq_state |
-
-## NOT In Scope (confirmed deferred)
-
-- Yamaha, Marantz, or any other AVR driver implementation
-- CamillaDSP or other DSP driver implementation
-- Auto-discovery of hardware type (SSDP MCP tool)
-- MCP get_config / set_config tools
-- Automated measurement loop / trigger_measurement on Pi Zero
-- Recipe updates (apply_eq keeps its name)
-
-## ## GSTACK REVIEW REPORT
+## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
-| CEO Review | `/autoplan` | Scope & strategy | 1 | issues_open | 8 findings; 2 taste decisions surfaced at gate; user confirmed proceed; done criteria fixed; ABC narrowed; backward-compat alias added |
-| CEO Voices | `/autoplan` | Dual independent review | 1 | subagent-only | Codex unavailable; Claude subagent: 7 findings (1 critical, 3 high, 3 medium); critical finding surfaced at gate |
+| CEO Review | `/autoplan` | Scope & strategy | 1 | issues_open | 7 findings; 2 taste decisions at gate; 5 auto-decided; QEMU + PyTTa gate + "Pi 4" coverage added |
+| CEO Voices | `/autoplan` | Dual independent review | 1 | subagent-only | Codex unavailable; Claude subagent: 6 findings (1 critical, 2 high, 3 medium/low) |
 | Design Review | skipped | No UI scope | 0 | — | — |
-| Eng Review | `/autoplan` | Architecture & tests | 1 | issues_open | 11 findings (2 P0, 4 P1, 3 P2, 2 P3); all auto-decided and incorporated into plan |
-| Eng Voices | `/autoplan` | Dual independent review | 1 | subagent-only | Codex unavailable; Claude subagent: 2 P0, 4 P1, 3 P2, 2 P3 |
+| Eng Review | `/autoplan` | Architecture & tests | 1 | issues_open | 13 findings (2 P0, 5 P1, 4 P2, 2 P3); all auto-decided; test plan written |
+| Eng Voices | `/autoplan` | Dual independent review | 1 | subagent-only | Codex unavailable; Claude subagent: 13 findings |
 
-**VERDICT:** REVIEWED [subagent-only, Codex unavailable]. Two P0s must be implemented: (1) MinidspDriver.apply_eq partial-write rollback — SafetyValidator correctness depends on this. (2) Path traversal symlink check — security hardening. All other findings auto-decided and incorporated into the plan. Plan is implementation-ready.
+**VERDICT:** REVIEWED [subagent-only, Codex unavailable]. Critical bugs caught: armhf minidsp binary on arm64 (P1), QEMU missing arm64 (P1), no measurement lock (P0). Plan is implementation-ready.

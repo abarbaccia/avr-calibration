@@ -1,5 +1,21 @@
 # TODOS
 
+## Deferred from /autoplan (2026-04-01) — Pi 5 Headless Readiness
+
+### TODO-P5-1: PyTTa measurement quality validation vs. REW
+**What:** Run a measurement quality comparison: same room, same mic (UMIK-1), REW vs. PyTTa. Compare frequency response curves in 20-200 Hz band.
+**Why:** Before building the autonomous calibration loop (next feature), confirm PyTTa is within 1-2 dB of REW in the target band. If materially worse, the autonomous loop will converge on a bad result.
+**How:** Run REW with UMIK-1 (laptop), run `calibrate measure` on Pi 5, export both to CSV, compare. Look for systematic bias or high variance in PyTTa measurements.
+**Effort:** S — measurement comparison, no code.
+**Priority:** P1 — prerequisite for autonomous loop feature. Do before starting that feature.
+
+### TODO-P5-2: arm64 sounddevice wheel validation
+**What:** Verify `sounddevice` on arm64 resolves to manylinux wheel (fast) vs. source build (slow).
+**Why:** If sounddevice falls back to source compilation on arm64, CI arm64 build time increases significantly.
+**How:** Inspect arm64 CI build logs after first push; look for "Building sounddevice from source" vs. wheel install.
+**Effort:** S — observation task.
+**Priority:** P2 — validate during first arm64 CI run.
+
 ## Deferred from /autoplan (2026-03-31) — Signal Path Builder
 
 ### TODO-SP1: Atomic YAML write in update_config()
