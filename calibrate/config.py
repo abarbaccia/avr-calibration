@@ -1,11 +1,15 @@
 """Configuration loading for avr-calibration."""
 
+import os
 from pathlib import Path
+
 import yaml
 
 CONFIG_PATH = Path.home() / ".avr-calibration" / "config.yaml"
 
 DEFAULT_CONFIG: dict = {
+    "avr_driver": "denon",
+    "dsp_driver": "minidsp",
     "denon": {
         "host": None,
     },
@@ -92,6 +96,14 @@ class Config:
         self._data = data
 
     @property
+    def avr_driver_name(self) -> str:
+        return str(self._data.get("avr_driver", "denon"))
+
+    @property
+    def dsp_driver_name(self) -> str:
+        return str(self._data.get("dsp_driver", "minidsp"))
+
+    @property
     def denon(self) -> dict:
         return self._data.get("denon", {})
 
@@ -153,5 +165,7 @@ def update_config(updates: dict, path: Path = CONFIG_PATH) -> None:
         else:
             data[key] = val
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
         yaml.safe_dump(data, f, default_flow_style=False, allow_unicode=True)
+    os.replace(tmp, path)

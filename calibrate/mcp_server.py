@@ -1,17 +1,22 @@
 """MCP server — HTTP/SSE interface exposing Pi hardware control to Claude.
 
-Exposes the miniDSP 2x4 HD + Denon X3800H as MCP tools and resources so that
-Claude Code can drive the full calibration loop without a browser.
+Exposes the DSP + AVR as MCP tools and resources so Claude Code can drive
+the full calibration loop without a browser.
+
+All hardware-specific logic lives in the driver layer (calibrate/drivers/).
+This file contains zero direct references to denonavr or MinidspClient —
+those are encapsulated in DenonDriver and MinidspDriver respectively.
 
 Transport: HTTP/SSE on port 8765 (configurable via MCP_PORT env var)
 Framework: mcp Python SDK (official Anthropic MCP library)
 
 Tools:
-  get_device_state       — current Denon + miniDSP status
+  get_device_state       — current AVR + DSP hardware status
   get_measurement_history — last N measurements from SessionStore
   read_eq                — current EQ state (in-memory, updated by apply_eq)
-  apply_eq               — SafetyValidator → biquad conversion → miniDSP write
-  set_denon_volume       — denonavr volume control
+  apply_eq               — SafetyValidator → biquad conversion → DSP write
+  avr_set_volume         — generic AVR volume control
+  set_denon_volume       — DEPRECATED: alias for avr_set_volume
   trigger_measurement    — Pi 4 only; returns degraded-mode error on Pi Zero
   fetch_recipe           — serve recipe markdown from recipes/ directory
 
@@ -32,6 +37,7 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -51,15 +57,11 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Mount, Route
 
-from .adapters.minidsp import (
-    ALIGNMENT_PEQ_SLOTS,
-    APF_RESERVED_SLOTS,
-    MinidspApiError,
-    MinidspClient,
-)
 from .config import Config
-from .dsp import freq_gain_q_to_biquad, mandatory_hpf_biquads
-from .safety import FilterSpec, SafetyValidator
+from .drivers.avr_driver import AVRDriver
+from .drivers.base import DriverError
+from .drivers.dsp_driver import DSPDriver
+from .drivers.registry import load_avr_driver, load_dsp_driver
 
 log = logging.getLogger(__name__)
 
@@ -70,22 +72,10 @@ MCP_HOST: str = os.environ.get("MCP_HOST", "0.0.0.0")
 
 RECIPES_DIR: Path = Path(__file__).parent.parent / "recipes"
 
-# ── In-memory EQ state ─────────────────────────────────────────────────────────
-# minidspd has no GET endpoint for PEQ state — we track it here.
-# Initialised to all-bypass (flat response) on startup; updated by apply_eq().
-# Keyed by preset index (int) → list of FilterSpec dicts (serialisable form).
+# ── Driver singletons — set in lifespan, patched in tests ─────────────────────
 
-_eq_state: dict[int, list[dict]] = {}
-
-
-def _get_eq_state(preset: int) -> list[dict]:
-    """Return current EQ state for *preset*, defaulting to empty (flat)."""
-    return _eq_state.get(preset, [])
-
-
-def _set_eq_state(preset: int, filters: list[dict]) -> None:
-    """Persist EQ state for *preset* in-memory."""
-    _eq_state[preset] = filters
+_avr: AVRDriver | None = None
+_dsp: DSPDriver | None = None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -99,76 +89,31 @@ def _err(message: str) -> dict:
 
 
 def _config() -> Config:
+    """Load config per-call to support hot-reload without server restart."""
     return Config.load()
-
-
-async def _minidsp_client() -> tuple[MinidspClient, int]:
-    """Return (MinidspClient, current_preset)."""
-    cfg = _config()
-    host = cfg.minidsp.get("host", "localhost")
-    port = cfg.minidsp.get("port", 5380)
-    client = MinidspClient(host=host, port=port)
-    try:
-        status = await client.get_device_status()
-        preset = status.get("master", {}).get("preset", 0)
-    except Exception:
-        preset = 0
-    return client, preset
 
 
 # ── Tool implementations ───────────────────────────────────────────────────────
 
 async def _tool_get_device_state() -> dict:
-    """Return current Denon AVR + miniDSP hardware state."""
-    cfg = _config()
-
-    # miniDSP state
-    minidsp_result: dict = {"connected": False}
-    host = cfg.minidsp.get("host", "localhost")
-    port = cfg.minidsp.get("port", 5380)
+    """Return current AVR + DSP hardware state."""
+    avr_result: dict = {"connected": False}
     try:
-        client = MinidspClient(host=host, port=port)
-        status = await asyncio.wait_for(client.get_device_status(), timeout=5.0)
-        master = status.get("master", {})
-        minidsp_result = {
-            "connected": True,
-            "host": host,
-            "preset": master.get("preset"),
-            "source": master.get("source"),
-            "volume": master.get("volume"),
-            "mute": master.get("mute"),
-        }
-    except asyncio.TimeoutError:
-        minidsp_result = {"connected": False, "host": host, "error": "timeout"}
-    except MinidspApiError as exc:
-        minidsp_result = {"connected": False, "host": host, "error": str(exc)}
+        avr_result = await _avr.get_state()  # type: ignore[union-attr]
+    except DriverError as exc:
+        avr_result = {"connected": False, "error": str(exc)}
     except Exception as exc:
-        minidsp_result = {"connected": False, "host": host, "error": str(exc)}
+        avr_result = {"connected": False, "error": str(exc)}
 
-    # Denon state
-    denon_result: dict = {"connected": False}
-    denon_host = cfg.denon.get("host")
-    if denon_host:
-        try:
-            import denonavr
-            receiver = denonavr.DenonAVR(denon_host)
-            await asyncio.wait_for(receiver.async_setup(), timeout=5.0)
-            await receiver.async_update()
-            denon_result = {
-                "connected": True,
-                "host": denon_host,
-                "volume": receiver.volume,
-                "input": receiver.input_func,
-                "mute": receiver.muted,
-            }
-        except asyncio.TimeoutError:
-            denon_result = {"connected": False, "host": denon_host, "error": "timeout"}
-        except Exception as exc:
-            denon_result = {"connected": False, "host": denon_host, "error": str(exc)}
-    else:
-        denon_result = {"connected": False, "error": "no host configured"}
+    dsp_result: dict = {"connected": False}
+    try:
+        dsp_result = await _dsp.get_state()  # type: ignore[union-attr]
+    except DriverError as exc:
+        dsp_result = {"connected": False, "error": str(exc)}
+    except Exception as exc:
+        dsp_result = {"connected": False, "error": str(exc)}
 
-    return _ok(denon=denon_result, minidsp=minidsp_result)
+    return _ok(avr=avr_result, dsp=dsp_result)
 
 
 async def _tool_get_measurement_history(limit: int = 10) -> dict:
@@ -195,118 +140,36 @@ async def _tool_get_measurement_history(limit: int = 10) -> dict:
 async def _tool_read_eq() -> dict:
     """Return current EQ filter state (in-memory, updated by apply_eq)."""
     try:
-        _, preset = await _minidsp_client()
-        filters = _get_eq_state(preset)
+        preset = await _dsp.current_preset()  # type: ignore[union-attr]
+        filters = await _dsp.read_eq(preset)  # type: ignore[union-attr]
         return _ok(preset=preset, filters=filters)
-    except Exception as exc:
+    except DriverError as exc:
         return _err(f"read_eq error: {exc}")
 
 
 async def _tool_apply_eq(filters: list[dict]) -> dict:
-    """Validate and apply EQ filters to miniDSP.
+    """Validate and apply EQ filters to the DSP.
 
-    *filters* is a list of dicts with keys: freq, gain_db, q, type.
-    Runs through SafetyValidator before any hardware write.
-    Returns {ok: True} or {ok: False, error: "SafetyValidator: ..."}.
+    Delegates validation (SafetyValidator), biquad conversion, hardware write,
+    and state tracking to MinidspDriver.apply_eq — all under an asyncio lock.
+
+    Returns {ok: True} or {ok: False, error: "SafetyValidator: ..."} on rejection.
     """
-    # Parse filter specs
     try:
-        filter_specs = [
-            FilterSpec(
-                freq=float(f["freq"]),
-                gain_db=float(f["gain_db"]),
-                q=float(f.get("q", 0.707)),
-                type=f["type"],
-            )
-            for f in filters
-        ]
-    except (KeyError, ValueError, TypeError) as exc:
-        return _err(f"invalid filter spec: {exc}")
+        preset = await _dsp.current_preset()  # type: ignore[union-attr]
+        await _dsp.apply_eq(preset, filters)  # type: ignore[union-attr]
+        return _ok(filters_applied=len(filters), preset=preset)
+    except DriverError as exc:
+        return _err(str(exc))
 
-    # SafetyValidator
-    validator = SafetyValidator()
-    client, preset = await _minidsp_client()
-    prev_raw = _get_eq_state(preset)
-    prev_specs = [
-        FilterSpec(
-            freq=float(f["freq"]),
-            gain_db=float(f["gain_db"]),
-            q=float(f.get("q", 0.707)),
-            type=f["type"],
-        )
-        for f in prev_raw
-    ] if prev_raw else None
 
-    result = validator.validate(filter_specs, prev_specs)
-    if not result.ok:
-        return {"ok": False, "error": result.error}
-
-    # Convert to biquad and write to miniDSP
-    # Slots: APF reserved slots 0-1; use ALIGNMENT_PEQ_SLOTS (2-9) for EQ.
-    available_slots = list(ALIGNMENT_PEQ_SLOTS)
-    if len(filter_specs) > len(available_slots):
-        return _err(
-            f"too many filters: {len(filter_specs)} requested, "
-            f"{len(available_slots)} PEQ slots available (slots 2-9)"
-        )
-
+async def _tool_avr_set_volume(level_db: float) -> dict:
+    """Set AVR volume to *level_db* dB."""
     try:
-        # Write each filter to an output slot
-        # miniDSP 2x4 HD: outputs 0 and 1 are the sub outputs
-        for output in [0, 1]:
-            for slot_offset, fspec in enumerate(filter_specs):
-                slot = available_slots[slot_offset]
-                biquad = freq_gain_q_to_biquad(
-                    freq=fspec.freq,
-                    gain_db=fspec.gain_db,
-                    q=fspec.q,
-                    filter_type=fspec.type,
-                )
-                await client.set_output_peq(output=output, slot=slot, biquad=biquad)
-
-            # Bypass any unused slots
-            for slot in available_slots[len(filter_specs):]:
-                bypass_biquad = {"b0": 1.0, "b1": 0.0, "b2": 0.0, "a1": 0.0, "a2": 0.0}
-                await client.set_output_peq(
-                    output=output, slot=slot, biquad={**bypass_biquad, "bypass": True}
-                )
-
-        # Update in-memory state
-        _set_eq_state(preset, [
-            {"freq": f.freq, "gain_db": f.gain_db, "q": f.q, "type": f.type}
-            for f in filter_specs
-        ])
-        return _ok(filters_applied=len(filter_specs), preset=preset)
-
-    except MinidspApiError as exc:
-        return _err(f"minidsp write failed: {exc}")
-    except Exception as exc:
-        return _err(f"apply_eq error: {exc}")
-
-
-async def _tool_set_denon_volume(level_db: float) -> dict:
-    """Set Denon AVR volume to *level_db* dB."""
-    cfg = _config()
-    host = cfg.denon.get("host")
-    if not host:
-        return _err("denonavr unreachable: no host configured")
-    try:
-        import denonavr
-        receiver = denonavr.DenonAVR(host)
-        await asyncio.wait_for(receiver.async_setup(), timeout=5.0)
-        await receiver.async_update()
-        # denonavr async_set_volume_level takes 0.0–1.0; Denon X3800H range: -80 to +18 dB
-        _DENON_MIN_DB = -80.0
-        _DENON_MAX_DB = 18.0
-        level_db_clamped = max(_DENON_MIN_DB, min(_DENON_MAX_DB, level_db))
-        volume_level = (level_db_clamped - _DENON_MIN_DB) / (_DENON_MAX_DB - _DENON_MIN_DB)
-        await receiver.async_set_volume_level(volume_level)
-        await receiver.async_update()
-        return _ok(level_db=receiver.volume)
-    except asyncio.TimeoutError:
-        return _err(f"denonavr unreachable: timeout connecting to {host}")
-    except Exception as exc:
-        return _err(f"denonavr unreachable: {exc}")
+        confirmed_db = await _avr.set_volume(level_db)  # type: ignore[union-attr]
+        return _ok(level_db=confirmed_db)
+    except DriverError as exc:
+        return _err(f"avr unreachable: {exc}")
 
 
 async def _tool_trigger_measurement() -> dict:
@@ -315,7 +178,6 @@ async def _tool_trigger_measurement() -> dict:
     Requires Pi 4 with UMIK-1 connected. On Pi Zero 2 W, returns a structured
     degraded-mode error directing the user to the browser.
     """
-    # Check if UMIK-1 is accessible (Pi 4 only — Pi Zero has 1 USB port taken by miniDSP)
     try:
         import sounddevice as sd
         devices = sd.query_devices()
@@ -333,7 +195,6 @@ async def _tool_trigger_measurement() -> dict:
             "to retrieve it."
         )
 
-    # Pi 4 path: trigger measurement via the Flask API (runs in same container)
     try:
         import httpx
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -358,12 +219,17 @@ async def _tool_fetch_recipe(name: str) -> dict:
     Recipes live in the recipes/ directory of this repo.  The name is a
     relative path within that directory, without the .md extension.
     """
-    # Sanitise: prevent path traversal
+    # Sanitise: prevent path traversal via ".." or symlinks
     safe_name = name.strip().lstrip("/")
     if ".." in safe_name:
         return _err(f"invalid recipe name: {name!r}")
 
     recipe_path = RECIPES_DIR / f"{safe_name}.md"
+
+    # P0: resolve symlinks before checking containment
+    if not recipe_path.resolve().is_relative_to(RECIPES_DIR.resolve()):
+        return _err(f"invalid recipe name: {name!r}")
+
     if not recipe_path.exists():
         return _err(f"recipe not found: {name}")
 
@@ -382,8 +248,8 @@ _TOOLS: list[Tool] = [
     Tool(
         name="get_device_state",
         description=(
-            "Return current Denon AVR and miniDSP 2x4 HD hardware state. "
-            "Includes Denon volume, input, mute status, and miniDSP preset, "
+            "Return current AVR and DSP hardware state. "
+            "Includes AVR volume, input, mute status, and DSP preset, "
             "source, and connection status."
         ),
         inputSchema={
@@ -412,7 +278,7 @@ _TOOLS: list[Tool] = [
     Tool(
         name="read_eq",
         description=(
-            "Return the current miniDSP EQ filter state. Tracked in-memory — "
+            "Return the current DSP EQ filter state. Tracked in-memory — "
             "reflects filters applied via apply_eq() since the MCP server started. "
             "Returns preset index and list of active filters with freq, gain_db, q, type."
         ),
@@ -424,7 +290,7 @@ _TOOLS: list[Tool] = [
     Tool(
         name="apply_eq",
         description=(
-            "Apply EQ filters to the miniDSP 2x4 HD subwoofer outputs. "
+            "Apply EQ filters to the DSP subwoofer outputs. "
             "Filters are validated by SafetyValidator before any hardware write — "
             "unsafe filters return {ok: false, error: 'SafetyValidator: ...'} rather than "
             "throwing. Each filter: {freq: Hz, gain_db: dB, q: float, type: 'peaking'|"
@@ -455,12 +321,30 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="avr_set_volume",
+        description=(
+            "Set the AVR volume to a specific level in dB. "
+            "Range: approximately -80 to +18 dB for the Denon X3800H. "
+            "Returns {ok: true, level_db: N} on success, "
+            "{ok: false, error: 'avr unreachable: ...'} on failure."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "level_db": {
+                    "type": "number",
+                    "description": "Target volume in dB (e.g. -30.0 for -30 dB)",
+                }
+            },
+            "required": ["level_db"],
+        },
+    ),
+    Tool(
         name="set_denon_volume",
         description=(
-            "Set the Denon AVR volume to a specific level in dB. "
-            "Range: approximately -80 to +18 dB for the X3800H. "
-            "Returns {ok: true, level_db: N} on success, "
-            "{ok: false, error: 'denonavr unreachable: ...'} on failure."
+            "Deprecated: use avr_set_volume instead. "
+            "Set the AVR volume to a specific level in dB. "
+            "This alias is preserved for backwards compatibility with cached Claude Code sessions."
         ),
         inputSchema={
             "type": "object",
@@ -526,8 +410,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_read_eq()
     elif name == "apply_eq":
         result = await _tool_apply_eq(arguments.get("filters", []))
-    elif name == "set_denon_volume":
-        result = await _tool_set_denon_volume(float(arguments["level_db"]))
+    elif name in ("avr_set_volume", "set_denon_volume"):
+        result = await _tool_avr_set_volume(float(arguments["level_db"]))
     elif name == "trigger_measurement":
         result = await _tool_trigger_measurement()
     elif name == "fetch_recipe":
@@ -562,8 +446,8 @@ async def _read_resource(uri: str) -> str:
 
     elif uri == "eq://current":
         try:
-            _, preset = await _minidsp_client()
-            filters = _get_eq_state(preset)
+            preset = await _dsp.current_preset()  # type: ignore[union-attr]
+            filters = await _dsp.read_eq(preset)  # type: ignore[union-attr]
             return json.dumps({"preset": preset, "filters": filters})
         except Exception as exc:
             return json.dumps({"error": str(exc)})
@@ -583,7 +467,7 @@ async def list_resources() -> list[Resource]:
         Resource(
             uri="eq://current",
             name="Current EQ",
-            description="Current miniDSP EQ filter state (in-memory)",
+            description="Current DSP EQ filter state (in-memory)",
             mimeType="application/json",
         ),
     ]
@@ -595,6 +479,25 @@ async def read_resource(uri: str) -> str:
 
 
 # ── Starlette ASGI app ─────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: Starlette):
+    """Load drivers on startup; tear them down on shutdown."""
+    global _avr, _dsp
+    cfg = _config()
+    _avr = load_avr_driver(cfg)
+    _dsp = load_dsp_driver(cfg)
+    await _avr.setup()
+    await _dsp.setup()
+    log.info(
+        "Drivers loaded: avr=%s dsp=%s",
+        cfg.avr_driver_name,
+        cfg.dsp_driver_name,
+    )
+    yield
+    await _avr.close()
+    await _dsp.close()
+
 
 def create_app() -> Starlette:
     """Build the ASGI application wrapping the MCP server via SSE transport."""
@@ -614,10 +517,11 @@ def create_app() -> Starlette:
         return Response()
 
     return Starlette(
+        lifespan=lifespan,
         routes=[
             Route("/sse", endpoint=handle_sse),
             Mount("/messages/", app=sse.handle_post_message),
-        ]
+        ],
     )
 
 
