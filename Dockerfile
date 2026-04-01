@@ -94,8 +94,10 @@ EXPOSE 8000
 # /data holds config.yaml, TLS cert, and the SQLite measurement DB — mount as a volume
 VOLUME ["/data"]
 
+COPY recipes/ /app/recipes/
 COPY deploy/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY deploy/entrypoint-with-mcp.sh /entrypoint-with-mcp.sh
+RUN chmod +x /entrypoint.sh /entrypoint-with-mcp.sh
 
 # Generates a self-signed TLS cert on first boot (stored in /data volume),
 # then starts uvicorn over HTTPS — required for browser getUserMedia access.
