@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0.0] - 2026-04-01
+
+### Added
+- **Driver abstraction layer (`calibrate/drivers/`):** `AVRDriver` and `DSPDriver` abstract base classes decouple MCP tools from specific hardware brands. Adding a new AVR or DSP requires only a new subclass + one registry entry.
+- **`DenonDriver`:** Wraps the `denonavr` library behind the `AVRDriver` protocol. Lazy setup (no network calls in constructor), asyncio.TimeoutError wrapped as `DriverError`.
+- **`MinidspDriver`:** Wraps `MinidspClient` behind the `DSPDriver` protocol. Owns in-memory EQ state with an `asyncio.Lock` covering the full read→SafetyValidator→write→update sequence.
+- **`avr_set_volume` MCP tool:** Brand-agnostic replacement for `set_denon_volume`. The old name is kept as a deprecated alias for backward compatibility with cached Claude Code sessions.
+- **`DriverError` exception hierarchy:** All driver methods raise `DriverError`; MCP tools catch it and return `{ok: false}`. No raw hardware exceptions escape to the MCP protocol layer.
+- **Starlette lifespan handler:** `setup()` and `close()` called on server start/stop for proper resource lifecycle.
+- **`tests/test_drivers.py`:** 28 new unit tests covering `DenonDriver`, `MinidspDriver`, and the driver registry.
+
+### Changed
+- **`calibrate/mcp_server.py`:** Zero direct references to `denonavr` or `MinidspClient` — all hardware logic moved to driver layer. `_eq_state` dict moved from module-level into `MinidspDriver` instance.
+- **`calibrate/config.py`:** Added `avr_driver` and `dsp_driver` config keys (defaults: `denon`, `minidsp`). Added `avr_driver_name` and `dsp_driver_name` typed properties. Atomic config write via `os.replace()` (prevents zero-byte config on Pi power loss).
+- **`tests/test_mcp_server.py`:** Refactored to mock at driver level (`patch("calibrate.mcp_server._avr", ...)`) instead of patching `sys.modules["denonavr"]` and `_eq_state` directly.
+- **`get_device_state` response:** Keys renamed from `denon`/`minidsp` to `avr`/`dsp` for brand-agnostic output.
+
+### Fixed
+- **P0: Partial EQ write rollback:** `MinidspDriver.apply_eq` only updates `_eq_state` after ALL hardware writes succeed. Previously a mid-loop `MinidspApiError` left state diverged from hardware, causing SafetyValidator to diff against a wrong baseline.
+- **P0: Path traversal via symlinks:** `fetch_recipe` now calls `recipe_path.resolve().is_relative_to(RECIPES_DIR.resolve())` after the `".."` check, blocking symlinks inside `recipes/` that point outside it.
+
 ## [0.4.1.0] - 2026-03-31
 
 ### Added

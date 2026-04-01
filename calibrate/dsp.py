@@ -1,0 +1,205 @@
+"""DSP utilities — human-readable filter spec to miniDSP biquad coefficients.
+
+miniDSP 2x4 HD accepts raw biquad coefficients (b0, b1, b2, a1, a2) in the
+minidspd HTTP API.  This module converts human-readable filter specifications
+(frequency, gain, Q, type) to the biquad form miniDSP expects.
+
+Supported filter types:
+  - ``peaking``    — parametric EQ peak/notch
+  - ``low_shelf``  — low-frequency shelving filter
+  - ``high_shelf`` — high-frequency shelving filter
+  - ``hpf``        — high-pass filter (Butterworth, variable order)
+
+Usage::
+
+    from calibrate.dsp import freq_gain_q_to_biquad
+
+    biquad = freq_gain_q_to_biquad(freq=80.0, gain_db=-3.0, q=0.7, filter_type="peaking")
+    # → {"b0": ..., "b1": ..., "b2": ..., "a1": ..., "a2": ...}
+
+All functions operate at the sample rate of the miniDSP 2x4 HD (96 000 Hz).
+The biquad coefficients are in the minidspd normalised form where a0 = 1.
+
+References:
+  Audio EQ Cookbook — Robert Bristow-Johnson
+  scipy.signal.iirfilter / sosfilt for multi-order HPF
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Literal
+
+import numpy as np
+from scipy import signal as _signal
+
+# ── Types ──────────────────────────────────────────────────────────────────────
+
+FilterType = Literal["peaking", "low_shelf", "high_shelf", "hpf"]
+
+BiquadCoeffs = dict[str, float]
+"""Biquad coefficients in minidspd form: {b0, b1, b2, a1, a2}."""
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+
+SAMPLE_RATE_HZ: int = 96_000
+"""miniDSP 2x4 HD internal sample rate."""
+
+DEFAULT_HPF_ORDER: int = 4
+"""Default Butterworth HPF order (matches CLAUDE.md mandatory infrasonic HPF)."""
+
+
+# ── Public API ─────────────────────────────────────────────────────────────────
+
+def freq_gain_q_to_biquad(
+    freq: float,
+    gain_db: float,
+    q: float,
+    filter_type: FilterType,
+    sample_rate: int = SAMPLE_RATE_HZ,
+    hpf_order: int = DEFAULT_HPF_ORDER,
+) -> BiquadCoeffs:
+    """Convert a human-readable filter spec to miniDSP biquad coefficients.
+
+    Args:
+        freq:        Centre / corner frequency in Hz.
+        gain_db:     Gain in dB.  Ignored for HPF/LPF.
+        q:           Quality factor.  Ignored for HPF/LPF.
+        filter_type: One of 'peaking', 'low_shelf', 'high_shelf', 'hpf'.
+        sample_rate: Sample rate in Hz (default: 96 000 Hz for miniDSP 2x4 HD).
+        hpf_order:   Butterworth order for HPF (default: 4).
+
+    Returns:
+        Dict with keys b0, b1, b2, a1, a2 (normalised: a0 = 1).
+
+    Raises:
+        ValueError: if filter_type is not supported.
+    """
+    if filter_type == "peaking":
+        return _peaking(freq, gain_db, q, sample_rate)
+    elif filter_type == "low_shelf":
+        return _low_shelf(freq, gain_db, q, sample_rate)
+    elif filter_type == "high_shelf":
+        return _high_shelf(freq, gain_db, q, sample_rate)
+    elif filter_type == "hpf":
+        return _hpf(freq, sample_rate, order=hpf_order)
+    else:
+        raise ValueError(
+            f"Unsupported filter type: {filter_type!r}. "
+            f"Must be one of: peaking, low_shelf, high_shelf, hpf"
+        )
+
+
+def mandatory_hpf_biquads(
+    freq: float = 18.0,
+    order: int = DEFAULT_HPF_ORDER,
+    sample_rate: int = SAMPLE_RATE_HZ,
+) -> list[BiquadCoeffs]:
+    """Return the mandatory infrasonic HPF as a list of biquad sections.
+
+    A 4th-order Butterworth HPF is two cascaded 2nd-order sections.  miniDSP
+    PEQ slots each hold one biquad, so a 4th-order HPF occupies 2 slots.
+
+    Returns a list of BiquadCoeffs dicts, one per biquad section.
+    """
+    # Design as second-order sections (sos) then convert each section
+    sos = _signal.butter(order, freq, btype="high", fs=sample_rate, output="sos")
+    result = []
+    for section in sos:
+        b0, b1, b2 = float(section[0]), float(section[1]), float(section[2])
+        a0, a1, a2 = float(section[3]), float(section[4]), float(section[5])
+        # Normalise by a0 (should be 1.0 from scipy but be explicit)
+        result.append({
+            "b0": b0 / a0,
+            "b1": b1 / a0,
+            "b2": b2 / a0,
+            "a1": a1 / a0,
+            "a2": a2 / a0,
+        })
+    return result
+
+
+# ── Private implementations ────────────────────────────────────────────────────
+
+def _omega_and_alpha(freq: float, q: float, sample_rate: int) -> tuple[float, float]:
+    """Pre-compute the omega and alpha values shared by peaking and shelf filters."""
+    w0 = 2.0 * math.pi * freq / sample_rate
+    alpha = math.sin(w0) / (2.0 * q)
+    return w0, alpha
+
+
+def _normalise(b0: float, b1: float, b2: float,
+               a0: float, a1: float, a2: float) -> BiquadCoeffs:
+    """Return coefficients normalised by a0."""
+    return {
+        "b0": b0 / a0,
+        "b1": b1 / a0,
+        "b2": b2 / a0,
+        "a1": a1 / a0,
+        "a2": a2 / a0,
+    }
+
+
+def _peaking(freq: float, gain_db: float, q: float, sample_rate: int) -> BiquadCoeffs:
+    """Peaking EQ — Audio EQ Cookbook peakingEQ."""
+    w0, alpha = _omega_and_alpha(freq, q, sample_rate)
+    A = 10.0 ** (gain_db / 40.0)
+    cos_w0 = math.cos(w0)
+
+    b0 = 1.0 + alpha * A
+    b1 = -2.0 * cos_w0
+    b2 = 1.0 - alpha * A
+    a0 = 1.0 + alpha / A
+    a1 = -2.0 * cos_w0
+    a2 = 1.0 - alpha / A
+    return _normalise(b0, b1, b2, a0, a1, a2)
+
+
+def _low_shelf(freq: float, gain_db: float, q: float, sample_rate: int) -> BiquadCoeffs:
+    """Low-shelf filter — Audio EQ Cookbook lowShelf."""
+    w0 = 2.0 * math.pi * freq / sample_rate
+    A = 10.0 ** (gain_db / 40.0)
+    cos_w0 = math.cos(w0)
+    sin_w0 = math.sin(w0)
+    alpha = sin_w0 / (2.0 * q)
+    sqrt_A = math.sqrt(A)
+
+    b0 = A * ((A + 1.0) - (A - 1.0) * cos_w0 + 2.0 * sqrt_A * alpha)
+    b1 = 2.0 * A * ((A - 1.0) - (A + 1.0) * cos_w0)
+    b2 = A * ((A + 1.0) - (A - 1.0) * cos_w0 - 2.0 * sqrt_A * alpha)
+    a0 = (A + 1.0) + (A - 1.0) * cos_w0 + 2.0 * sqrt_A * alpha
+    a1 = -2.0 * ((A - 1.0) + (A + 1.0) * cos_w0)
+    a2 = (A + 1.0) + (A - 1.0) * cos_w0 - 2.0 * sqrt_A * alpha
+    return _normalise(b0, b1, b2, a0, a1, a2)
+
+
+def _high_shelf(freq: float, gain_db: float, q: float, sample_rate: int) -> BiquadCoeffs:
+    """High-shelf filter — Audio EQ Cookbook highShelf."""
+    w0 = 2.0 * math.pi * freq / sample_rate
+    A = 10.0 ** (gain_db / 40.0)
+    cos_w0 = math.cos(w0)
+    sin_w0 = math.sin(w0)
+    alpha = sin_w0 / (2.0 * q)
+    sqrt_A = math.sqrt(A)
+
+    b0 = A * ((A + 1.0) + (A - 1.0) * cos_w0 + 2.0 * sqrt_A * alpha)
+    b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cos_w0)
+    b2 = A * ((A + 1.0) + (A - 1.0) * cos_w0 - 2.0 * sqrt_A * alpha)
+    a0 = (A + 1.0) - (A - 1.0) * cos_w0 + 2.0 * sqrt_A * alpha
+    a1 = 2.0 * ((A - 1.0) - (A + 1.0) * cos_w0)
+    a2 = (A + 1.0) - (A - 1.0) * cos_w0 - 2.0 * sqrt_A * alpha
+    return _normalise(b0, b1, b2, a0, a1, a2)
+
+
+def _hpf(freq: float, sample_rate: int, order: int = DEFAULT_HPF_ORDER) -> BiquadCoeffs:
+    """High-pass Butterworth filter — returns the first biquad section.
+
+    For a single-section HPF (order=2), returns the complete filter.
+    For higher-order filters, use mandatory_hpf_biquads() which returns
+    all cascaded sections.
+
+    This function returns only the first section — suitable for single-slot
+    writes.  Use mandatory_hpf_biquads() for the full 4th-order HPF.
+    """
+    sections = mandatory_hpf_biquads(freq=freq, order=order, sample_rate=sample_rate)
+    return sections[0]

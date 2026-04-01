@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "avr-calibration": {
+      "url": "http://avr-calibration.local:8765/sse"
+    }
+  }
+}

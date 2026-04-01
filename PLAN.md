@@ -1,327 +1,269 @@
-<!-- /autoplan restore point: /home/andrew/.gstack/projects/abarbaccia-avr-calibration/main-autoplan-restore-20260331-004220.md -->
+<!-- /autoplan restore point: /home/andrew/.gstack/projects/abarbaccia-avr-calibration/feat-equipment-driver-abstraction-autoplan-restore-20260401-022023.md -->
 
-## GSTACK REVIEW REPORT
+# Plan: Equipment Driver Abstraction
 
-| Review | Trigger | Why | Runs | Status | Findings |
-|--------|---------|-----|------|--------|----------|
-| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | issues_open | 7 findings; data model changed from graph to flat config (APPROVED by user); premise gate passed |
-| Design Review | `/plan-design-review` | UI/UX gaps | 1 | issues_open | 12 findings; all auto-decided and added to plan; empty state, picker, save model, load state all specified |
-| Eng Review | `/plan-eng-review` | Architecture & tests | 1 | issues_open | 9 findings; 1 CRITICAL (sub_outputs sync); all auto-decided; test plan written to disk |
-| Codex Review | `/codex review` | Independent 2nd opinion | 0 | UNAVAILABLE | Codex returned unavailable for all 3 phases |
+**Branch:** `feat/equipment-driver-abstraction`
+**Base:** `feat/mcp-server`
+**Feature Brief:** `~/.gstack/projects/abarbaccia-avr-calibration/andrew-feat-equipment-driver-abstraction-feature-20260401-0218.md`
 
-**VERDICT:** REVIEWED [subagent-only, Codex unavailable]. Critical fix required in implementation: `POST /api/signal-chain` MUST write `measurement.sub_outputs` from non-empty output slots or the calibration loop is disconnected from the new UI. All other issues are auto-decided and documented. Plan is implementation-ready.
+## Problem
 
-# Plan: Signal Path Builder
+`calibrate/mcp_server.py` (635 lines) has `denonavr` imports and Denon-specific logic hardcoded in tool implementations. The miniDSP adapter (`calibrate/adapters/minidsp.py`) is a good model — it's a dedicated module — but the Denon equivalent doesn't exist. A user with a Yamaha AVR would need to modify `mcp_server.py` directly. Recipes that call `set_denon_volume` would break on any non-Denon setup.
 
-**Branch:** feat/signal-path-builder
-**Base:** feat/equipment-setup
-**Feature Brief:** ~/.gstack/projects/abarbaccia-avr-calibration/andrew-feat-signal-path-builder-feature-20260331-0039.md
+## Goal
 
-## What We're Building
+A driver protocol layer so:
+1. MCP tools call `avr_driver.set_volume()` / `dsp_driver.apply_eq()` — no brand references in `mcp_server.py`
+2. The right driver loads at startup based on `config.yaml` (`avr_driver: denon`, `dsp_driver: minidsp`)
+3. Adding a new driver requires: create a class implementing the protocol + register one config key
 
-Replace the three-card flat equipment setup UI (Denon / miniDSP / Speakers as independent CRUD forms) with a **vertical signal-chain builder** that traces the audio path from the Pi outward, node by node.
+## Architecture
 
-**Pi root node:** Displayed as a small muted non-card header above the chain (not a full card). Labeled "Calibration Host" with a tooltip explaining measurement-only role. Connectivity status shown as a small green/red dot only.
-
-The user sees:
+### New file structure
 
 ```
-  ┌──────────────────────────────────┐
-  │  Calibration Host (Pi)  ● Online │   ← small header, not a full card
-  └──────────────────┬───────────────┘
-                     │ HDMI out
-┌────────────────────▼─────────────────┐
-│  Denon X3800H                  [OK]  │   ← full card, always expanded
-│  Host: 192.168.1.100  [Discover]     │
-│  Pi input:  [HDMI 1 ▾]  [Test]       │
-│  Sub output: [Sub Out ▾]             │
-│                          [Save]      │
-└────────────────────┬─────────────────┘
-                     │ Sub Out
-┌────────────────────▼─────────────────┐
-│  miniDSP 2x4 HD                [OK]  │   ← full card, always expanded
-│  In 1: [LFE L      ]  In 2: [LFE R] │
-│  Out 1 → [Sub L  front-left   ✕]    │
-│  Out 2 → [Sub R  front-right  ✕]    │
-│  Out 3 → [+ Add speaker]            │
-│  Out 4 → [+ Add speaker]            │
-│                    [Save Changes]    │
-└──────────────────────────────────────┘
-
-[Save Chain]   ← teal CTA at bottom
+calibrate/
+  drivers/
+    __init__.py
+    avr_driver.py       # AVRDriver ABC: setup, get_state, list_inputs, set_input, set_volume
+    dsp_driver.py       # DSPDriver ABC: get_state, read_eq, apply_eq, set_preset, set_routing, current_preset
+    denon.py            # DenonDriver(AVRDriver) — wraps denonavr
+    minidsp.py          # MinidspDriver(DSPDriver) — wraps MinidspClient from adapters/
+    registry.py         # load_avr_driver(config) + load_dsp_driver(config) factories
+  mcp_server.py         # (modified) — calls driver methods, zero denonavr/MinidspClient references
+  config.py             # (modified) — add avr_driver/dsp_driver keys + defaults
 ```
 
-**EMPTY STATE (new user, no config):**
-```
-  ┌──────────────────────────────────┐
-  │  Calibration Host (Pi)  ● Online │
-  └──────────────────┬───────────────┘
-                     │
-┌────────────────────▼─────────────────┐
-│  Denon X3800H                  [ — ] │
-│  ┌─────────────────────────────────┐ │
-│  │  Click Discover to find your    │ │
-│  │  Denon AVR on the network       │ │
-│  └─────────────────────────────────┘ │
-│  [Discover]  or enter IP manually:   │
-│  [________________]  [Save]          │
-└──────────────────────────────────────┘
-[+ Add DSP]   ← greyed out until Denon is saved
-```
+### Driver protocols
 
-**PARTIAL STATE (Denon saved, DSP not yet configured):**
-```
-┌─────────────────────────────────────────┐
-│  Denon X3800H                    [OK]   │
-│  ...configured...                        │
-└─────────────────────────┬───────────────┘
-                          │ Sub Out
-┌─────────────────────────▼───────────────┐
-│  miniDSP 2x4 HD                  [ — ] │
-│  ┌──────────────────────────────────┐   │
-│  │  No DSP configured yet.          │   │
-│  │  Host defaults to localhost:5380 │   │
-│  └──────────────────────────────────┘   │
-│  [Configure DSP]                         │
-└─────────────────────────────────────────┘
+Narrowed to only what MCP tools currently call (CEO review: no speculative interface).
+
+```python
+# avr_driver.py
+class AVRDriver(ABC):
+    async def get_state(self) -> dict: ...            # get_device_state tool
+    async def set_volume(self, level_db: float) -> None: ...  # avr_set_volume tool
+    async def close(self) -> None: ...               # teardown on server shutdown
+    # Non-abstract (override in subclass when available):
+    async def discover(self) -> list[str]: return []  # SSDP/mDNS discovery
+
+# dsp_driver.py
+class DSPDriver(ABC):
+    async def get_state(self) -> dict: ...           # get_device_state tool
+    async def current_preset(self) -> int: ...       # used internally by read_eq/apply_eq
+    async def read_eq(self, preset: int) -> list[dict]: ...   # read_eq tool
+    async def apply_eq(self, preset: int, filters: list[dict]) -> None: ...  # apply_eq tool
+    async def set_preset(self, preset: int) -> None: ...      # signal path
+    async def set_routing(self, routing: dict) -> None: ...   # signal path
+    async def close(self) -> None: ...               # teardown on server shutdown
 ```
 
-**OFFLINE STATE (Denon unreachable):**
-```
-│  Denon X3800H                  [FAIL]  │
-│  Host: 192.168.1.100 ← amber highlight │
-│  ⚠ Cannot reach Denon (timeout 5s)     │
-│  [Retry]  [Change host]                 │
-```
+Error boundary: each driver method raises `DriverError(message)`. MCP tool functions catch `DriverError` and return `_err(str(exc))`. No raw exceptions escape to MCP protocol layer.
 
-**LOADING STATE:** Skeleton cards with `.pending` badge animation during `initChainBuilder()`. Each node card renders immediately in skeleton state (grey placeholders for text, `.running` badge) while the fetch is in progress.
+### MCP tool renames
 
-**SAVE MODEL:** Explicit "Save Chain" button at bottom of the page. No auto-save. Per-section save buttons kept inside Denon and miniDSP cards for individual changes (consistent with existing pattern). "Save Chain" saves the full topology.
+| Old name | New name | Reason |
+|---|---|---|
+| `set_denon_volume` | `avr_set_volume` | Brand-agnostic |
+| `get_device_state` | `get_device_state` | Keep — already generic |
+| `read_eq` | `read_eq` | Keep — recipe references this |
+| `apply_eq` | `apply_eq` | Keep — recipe references this |
 
-**SETUP GATE:** Step 2 ("Baseline") unlocks when: Denon host is saved AND at least one output slot has a speaker configured. Gate checked on each save.
+**Backward-compat alias:** `set_denon_volume` remains as a deprecated alias → calls `avr_set_volume`. Prevents breaking any existing Claude Code sessions that have cached the old tool name. Alias marked deprecated in description. Remove after one release cycle.
 
-**"+ Add speaker" INLINE PICKER:** Clicking "+ Add speaker" on an output slot expands that row inline:
-```
-Out 3 → ┌──────────────────────────────────┐
-         │ Label:    [________________]    │
-         │ Location: [front-left      ▾]   │
-         │ Preset:   [SVS PB12-NSD    ▾]   │
-         │           [Save]  [Cancel]      │
-         └──────────────────────────────────┘
-```
-Cancel collapses without saving. Save adds the speaker and shows slot row.
+### Config additions
 
-**NODE EXPAND/COLLAPSE:** Always expanded in v1. No accordion. Explicitly out of scope.
-
-**LOCATION SOURCE OF TRUTH:** `output_slots[].location` in config.yaml is authoritative. Speaker `equipment.data` blob does NOT store `room_location`. The measurement loop looks up location via `minidsp.output_slots[i].location`. Speaker records in SQLite are identified by their slot index.
-
-The user sees:
-
-```
-┌─────────────────────┐
-│  Pi (AVR Calibration)│   (root — always present)
-└──────────┬──────────┘
-           │ HDMI
-┌──────────▼──────────┐
-│  Denon X3800H  [OK] │   ← host, input selection, sub out picker
-│  Input: HDMI 1      │
-│  Sub Out →          │
-└──────────┬──────────┘
-           │
-┌──────────▼──────────┐
-│  miniDSP 2x4 HD [OK]│   ← input labels, 4 output slots
-│  In: LFE L / LFE R  │
-│  Out 1 → [Speaker]  │
-│  Out 2 → [Speaker]  │
-│  Out 3 → [+ Add]    │
-│  Out 4 → [+ Add]    │
-└─────────────────────┘
-```
-
-Each node shows a live connectivity badge. Each output slot has a "+ Add" affordance: add a speaker (with preset selector and room location) or another device.
-
-## Data Model (Approach C — Extended Flat Config)
-
-*CEO review decision: graph model over-engineered for fixed linear topology. Use extended flat config.*
-
-### config.yaml additions
 ```yaml
-minidsp:
-  host: "localhost"
-  port: 5380
-  input_labels:            # existing field, renamed from connections.minidsp.inputs
-    "0": "LFE L"
-    "1": "LFE R"
-  output_slots:            # NEW: replaces output labels, adds location + preset
-    - index: 0
-      label: "Sub L"
-      location: "front-left"
-      preset: "pb12-nsd"
-    - index: 1
-      label: "Sub R"
-      location: "front-right"
-      preset: "pb12-nsd"
-    - index: 2
-      label: ""
-      location: ""
-      preset: ""
-    - index: 3
-      label: ""
-      location: ""
-      preset: ""
+avr_driver: denon    # which AVRDriver implementation to load (default: denon)
+dsp_driver: minidsp  # which DSPDriver implementation to load (default: minidsp)
 ```
 
-Speaker `room_location` added to `equipment.data` JSON blob (no DB migration — already an open blob).
+### Driver registry
 
-### Speaker presets (v1)
-- `pb12-nsd`: SVS PB-12 NSD, 12" ported, ~22Hz tuning
-- Room locations: `front-left`, `front-right`, `rear-left`, `rear-right`, `center`, `other`
+```python
+# registry.py
+_AVR_DRIVERS = {"denon": DenonDriver}
+_DSP_DRIVERS = {"minidsp": MinidspDriver}
 
-## Backend Changes
+def load_avr_driver(config: Config) -> AVRDriver: ...
+def load_dsp_driver(config: Config) -> DSPDriver: ...
+```
 
-### New endpoints
-- `GET /api/signal-chain` — synthesize chain from flat config + speakers (computed, not stored)
-- `POST /api/signal-chain` — write to `denon.*`, `minidsp.input_labels`, `minidsp.output_slots`, speakers table
+### In-memory EQ state
 
-### Existing endpoints (kept, not changed)
-- `/api/equipment/denon/*` — unchanged
-- `/api/equipment/minidsp/save-labels` — keep for backward compat, deprecated in UI
-- `/api/equipment/speakers` — keep as-is
+Currently lives as `_eq_state: dict[int, list[dict]]` at module level in `mcp_server.py`. Moves into `MinidspDriver` as an instance variable. `_get_eq_state` / `_set_eq_state` become `driver.read_eq_state()` / `driver.write_eq_state()`.
 
-### config.py changes
-- Add `output_slots` to minidsp section defaults
-- `Config.minidsp` now includes `output_slots` list
+### MCP server startup
 
-## Frontend Changes
+```python
+# mcp_server.py — module level, loaded once
+_cfg = Config.load()
+_avr: AVRDriver = load_avr_driver(_cfg)
+_dsp: DSPDriver = load_dsp_driver(_cfg)
+```
 
-### Replace Phase 1 (Equipment Setup) HTML
-- Remove the 3-card layout (Denon card, miniDSP card, Speakers card)
-- Replace with chain builder: vertical list of node cards, each card renders based on node type
-- Dynamic: "Pi" root is always first. Each node's outputs render as slots. Clicking "+ Add" on a slot opens an inline picker (device type or speaker).
-- Connectivity badges: each device card has a status indicator that polls `/api/preflight/denon` or `/api/preflight/minidsp-combined` on load
+## Implementation Steps
 
-### JavaScript
+1. `calibrate/drivers/__init__.py` — empty, marks package
+2. `calibrate/drivers/avr_driver.py` — `AVRDriver` ABC
+3. `calibrate/drivers/dsp_driver.py` — `DSPDriver` ABC
+4. `calibrate/drivers/denon.py` — `DenonDriver(AVRDriver)` (move Denon logic from mcp_server.py)
+5. `calibrate/drivers/minidsp.py` — `MinidspDriver(DSPDriver)` (wrap `adapters.minidsp.MinidspClient`; owns `_eq_state`)
+6. `calibrate/drivers/registry.py` — `load_avr_driver()` + `load_dsp_driver()`
+7. `calibrate/config.py` — add `avr_driver` / `dsp_driver` to `DEFAULT_CONFIG`; add `Config.avr_driver_name` and `Config.dsp_driver_name` typed properties; bundle TODO-SP1 (atomic YAML write: `os.replace` in `update_config()`)
+8. `calibrate/mcp_server.py` — replace all inline Denon/miniDSP logic with driver calls; rename `set_denon_volume` → `avr_set_volume`; add backward-compat `set_denon_volume` alias; add asyncio lock around `_eq_state` writes (now inside MinidspDriver); fix config-per-call (load once at startup); add `DriverError` handling in each tool function
+9. `tests/test_mcp_server.py` — mock drivers at the driver level (not `denonavr` / `MinidspClient`)
+10. `tests/test_drivers.py` — new: unit tests for `DenonDriver` + `MinidspDriver` + registry
 
-In-memory chain state (`_chainState` object) is the single JS source of truth. All saves (per-card and "Save Chain") read from and write back to `_chainState`.
+## Out of Scope
 
-- `initChainBuilder()` — GET `/api/signal-chain`, populate `_chainState`, render all nodes, trigger badge poll
-- `renderChain()` — render all nodes from `_chainState` (pure render, no fetch)
-- `saveChain()` — POST `_chainState` to `/api/signal-chain` (single write, no race with per-card saves)
-- `saveDenonSection()` — updates `_chainState.denon` in memory AND calls `saveChain()`. No separate Denon-only endpoint.
-- `saveDspSection()` — updates `_chainState.minidsp` in memory AND calls `saveChain()`
-- `addSpeakerToSlot(slotIndex, label, location, preset)` — updates `_chainState.output_slots[slotIndex]`, calls `saveChain()`
-- `removeSpeakerFromSlot(slotIndex)` — clears slot in `_chainState`, calls `saveChain()`
-- `pollBadges()` — called on load and on manual "Refresh" click; fetches `/api/equipment/denon/state` with 5s abort signal; updates badge only (does not re-render whole chain)
+- Implementing any second driver (Yamaha, other DSP)
+- Auto-discovery of hardware type
+- MCP config tools (get_config / set_config)
+- Updating recipes — `apply_eq` keeps its name; `harman-bass.md` unchanged
 
-**No separate "Save Chain" button needed:** every section save writes the full `_chainState`. The "Save Chain" CTA at the bottom is an alias for `saveChain()` that provides a clear "I'm done" affordance. Per-card saves and the CTA are equivalent — last write wins, but since they all write the full state, there's no race.
+## Done Criteria
 
-## Test Plan
+- All test BEHAVIORS preserved (test file updated to mock at driver level; `sys.modules["denonavr"]` hack replaced with `patch("calibrate.mcp_server._avr", mock_driver)`)
+- `mcp_server.py` contains zero direct references to `denonavr` or `MinidspClient`
+- `avr_set_volume` is the primary tool; `set_denon_volume` exists as deprecated alias
+- Adding a new AVR brand requires only: subclass `AVRDriver` + add one entry to `_AVR_DRIVERS`
+- 100% test coverage maintained (new `tests/test_drivers.py` + updated `tests/test_mcp_server.py`)
 
-### New tests needed (complete list after all reviews)
+## Eng Review Additions (autoplan 2026-04-01)
 
-**Core chain CRUD:**
-- `test_signal_chain_get_empty` — GET returns Pi-only chain when no config
-- `test_signal_chain_get_populated` — GET returns full chain from config
-- `test_signal_chain_get_partial_slots` — config has 2 of 4 slots filled → 2 slots + 2 empty returned
-- `test_signal_chain_post` — POST writes denon + minidsp + speakers, round-trips
-- `test_signal_chain_post_derives_sub_outputs` — POST with 2 non-empty slots → measurement.sub_outputs=[0,1] written
-- `test_signal_chain_post_empty_slots` — POST with all empty slots → measurement.sub_outputs=[]
-- `test_signal_chain_post_partial_failure` — YAML write throws → 500, SQLite unchanged
-- `test_signal_chain_cascade_delete` — remove DSP config → speaker slots cleared + measurement.sub_outputs=[]
-- `test_signal_chain_speaker_preset` — slot with preset="pb12-nsd" and location="front-left"
-- `test_signal_chain_yaml_error` — GET when config.yaml is malformed → 500 with message
+### P0: Partial write rollback required in MinidspDriver.apply_eq
 
-**Config:**
-- `test_config_output_slots_default` — DEFAULT_CONFIG has minidsp.output_slots with 4 empty entries
-- `test_config_output_slots_roundtrip` — Config.load() reads output_slots correctly
+`_tool_apply_eq` writes PEQ slots one at a time across outputs 0 and 1. A `MinidspApiError` mid-loop leaves hardware partially configured. `_eq_state` must only update after ALL writes succeed. `MinidspDriver.apply_eq` must: acquire the asyncio lock → write all slots → on any exception, do NOT update `_eq_state` → re-raise as `DriverError`. The SafetyValidator diffs against `_eq_state`; if state diverges from hardware, safety limits can be silently violated.
 
-**Connectivity badges:**
-- `test_signal_chain_badge_timeout` — Denon unreachable → badge=FAIL within 5s, no hang
-- `test_signal_chain_badge_state_denon_no_host` — no host configured → "unconfigured" state not "offline"
+### P0: Path traversal — add symlink resolution check
 
-**Migration:**
-- `test_signal_chain_migration_reads_denon_host` — existing denon.host → Denon node populated
-- `test_signal_chain_migration_tombstone` — old connections.minidsp.outputs migrated to output_slots labels
-- `test_signal_chain_migration_speakers_no_slot_index` — existing speakers stay in DB, not auto-mapped to slots
+`fetch_recipe` currently checks for `".."` in the name but does not block symlinks inside `recipes/` that point outside it. Add after constructing `recipe_path`:
+```python
+if not recipe_path.resolve().is_relative_to(RECIPES_DIR.resolve()):
+    return _err(f"invalid recipe name: {name!r}")
+```
+Test: `recipes/evil -> /etc/passwd` symlink → returns `_err`.
 
-**Setup gate:**
-- `test_signal_chain_gate_unlocks_step2` — Denon saved + ≥1 slot with speaker → gate condition true
+### P1: Config loading — keep per-call (hot-reload is a feature)
 
-## Migration
+Do NOT change `_config()` to a startup singleton. Config.load() is a fast local file read (~1ms). Removing it would silently kill hot-reload (user edits `config.yaml` while server runs). The original plan step 8 said "fix config-per-call" — **REVERTED**. Keep `_config()` as-is.
 
-Users on `feat/equipment-setup` have Denon/miniDSP data in config.yaml and speakers in SQLite.
-`GET /api/signal-chain` auto-populates chain from existing config on first load.
+### P1: asyncio lock in MinidspDriver.apply_eq — full sequence
 
-**Migration logic:**
-- Read from `denon.host` (NOT `connections.minidsp`) → add Denon node if present
-- Read from `connections.minidsp.outputs` → tombstone: copy labels to `minidsp.output_slots[].label`, then clear old key
-- Read from `measurement.sub_outputs` → infer which output slot indices were active subs
-- SQLite speaker records with no `slot_index` in data blob → **NOT auto-mapped**. Speaker records stay in DB but do not appear in output slots. User must re-add speakers via the new UI. Document clearly in empty slot UI. (No data lost — records available in SQLite.)
+The lock must wrap: `read _eq_state` → `SafetyValidator` → `write hardware` → `update _eq_state`. If lock only wraps the state update, two concurrent `apply_eq` calls can both pass SafetyValidator with the same baseline before either writes. The lock is an instance-level `asyncio.Lock()` on `MinidspDriver`.
 
-**Important:** `POST /api/signal-chain` MUST derive and write `measurement.sub_outputs` from non-empty output slots to keep the measurement pipeline in sync. This is the critical coupling between the new UI and the calibration loop.
+### P1: Starlette lifespan handler — required for close()
 
-## Open Questions (resolved by CEO review)
+Add to `create_app()`:
+```python
+from contextlib import asynccontextmanager
+@asynccontextmanager
+async def lifespan(app):
+    await _avr.setup()   # async_setup with 5s timeout
+    await _dsp.setup()
+    yield
+    await _avr.close()
+    await _dsp.close()
+Starlette(lifespan=lifespan, routes=[...])
+```
+`DenonDriver.__init__` must be sync (no network). `setup()` is called in lifespan, not constructor — prevents blocking cold start when AVR is off.
 
-1. Delete mid-chain node → cascade delete children. No orphans.
-2. Multi-chain → no, single chain only (v1).
-3. Badge polling → on node expand + manual refresh button. Not continuous (reduces Denon queries).
+### P1: DriverError exception hierarchy
 
-## CEO Review Findings (autoplan 2026-03-31)
+Define `DriverError(RuntimeError)` in `calibrate/drivers/base.py`. All driver methods raise `DriverError` (wrapping `MinidspApiError`, `denonavr` exceptions, `asyncio.TimeoutError`). All MCP tool functions catch `DriverError` and return `_err(str(exc))`. No raw hardware exceptions escape to the MCP protocol layer.
 
-### Architecture Decision: Approach C (Extended Flat Config) over Approach A (Graph)
-Subagent challenge: the topology is linear and fixed (Pi → Denon → miniDSP → 1-4 subs). A full graph model adds referential integrity complexity not justified for this use case. The visual chain builder UI is correct; the debate is the data model.
+### P2: Deprecated alias must appear in list_tools()
 
-**Revised data model (Approach C):**
-- Extend `minidsp` config section with `output_slots: [{index, label, location, preset}]`
-- `output_slots[].location` is the single source of truth for room location (NOT equipment.data blob)
-- `GET /api/signal-chain`: synthesize chain from flat config + speakers (computed read)
-- `POST /api/signal-chain`: writes to `denon.*`, `minidsp.output_slots`, and speakers table
-- Single source of truth: flat config. No dual-write.
+Keep `Tool(name="set_denon_volume", description="Deprecated: use avr_set_volume. ...")` in `_TOOLS` so Claude Code sessions that cached the old name still see it in the tool list. Remove in the next release cycle.
 
-### Migration Fix
-Read from `denon.host` + `measurement.sub_outputs`, NOT `connections.minidsp` (old plan had wrong source).
+### P2: update_config() atomic write — REQUIRED (not optional)
 
-### Error Gaps Found
-- `equipment_denon_state()` has no timeout → add `asyncio.wait_for(..., timeout=5.0)` for badge
-- YAML parse error on GET → explicit try/except needed
-- Cascade delete: delete miniDSP config → also clear speaker records
-- Pi root node: label "Calibration Host" with tooltip (Pi is not in listening signal path)
+This is mandatory, not a deferred TODO. Four-line fix in step 7. Write to `path.with_suffix('.tmp')`, then `os.replace(tmp, path)`.
 
-### Additional Tests Needed
-- `test_signal_chain_migration_reads_denon_host` (not connections.minidsp)
-- `test_signal_chain_badge_timeout` (5s timeout → offline badge, no hang)
-- `test_signal_chain_cascade_delete` (delete DSP → speakers cleared)
-- `test_signal_chain_partial_config` (only Denon configured, no DSP yet)
+### P2: eq://current resource is 3rd MinidspClient call site
+
+`_read_resource("eq://current")` at line 565 calls `_minidsp_client()` directly. After the refactor, this must call `_dsp.current_preset()` instead. Add CI grep check: `grep -n "MinidspClient" calibrate/mcp_server.py` must return 0 lines.
+
+### P3: reset_eq_state fixture breaks post-refactor
+
+`tests/test_mcp_server.py:66` clears `_eq_state` directly. After `_eq_state` moves into `MinidspDriver`, this fixture silently stops working. Replace with: mock the driver's EQ state as part of the mock driver fixture.
+
+## Known Risks (updated)
+
+- 605-line test file uses 4 brittle patterns (sys.modules injection, _eq_state direct access, _config patch, private function imports) — all must be replaced in step 9
+- `_minidsp_client()` has 3 call sites in mcp_server.py (lines 198, 228, 565) — all 3 must be replaced; add CI grep check
+- Test for concurrent `apply_eq` requires `asyncio.gather` — must be a real async test, not a mock
+
 
 <!-- AUTONOMOUS DECISION LOG -->
 ## Decision Audit Trail
 
 | # | Phase | Decision | Classification | Principle | Rationale | Rejected |
 |---|-------|----------|----------------|-----------|-----------|----------|
-| 1 | CEO | Choose Approach C (extended flat config) over Approach A (graph model) | Taste | P5 explicit over clever | Fixed linear topology doesn't need graph; flat config is readable, queryable, no dual-write | Approach A (graph), Approach B (UI-only) |
-| 2 | CEO | Cascade delete children on node removal | Mechanical | P1 completeness | Orphaned speakers are a UX bug | Orphan-on-delete |
-| 3 | CEO | Badge poll on node expand + manual refresh, not continuous | Mechanical | P3 pragmatic | Reduces Denon query load, avoids race on slow networks | Continuous polling |
-| 4 | CEO | Label Pi root as "Calibration Host" | Mechanical | P5 explicit | Pi is not in listening signal path; label avoids user confusion | "Pi (AVR Calibration)" |
-| 5 | CEO | Include in-place speaker location editing in v1 | Mechanical | P1 completeness | Trivial JS change; prevents delete-and-re-add for location changes | Defer to v2 |
-| 6 | CEO | DEFER: SQLite graph table | Taste | P3 pragmatic | Over-engineered for single user; YAML flat config sufficient | Add to this plan |
-| 7 | CEO | DEFER: auto-detect topology | Taste | P3 pragmatic | Nice-to-have, not blocking core feature | Add to this plan |
-| 8 | Design | Empty state: Denon card appears immediately with Discover CTA | Mechanical | P1 completeness | No spec = implementer guesses = bad first-run UX | Blank page |
-| 9 | Design | "+ Add" picker: inline expand (label, location, preset + Save/Cancel) | Mechanical | P5 explicit | Unspecified picker = modal or dropdown, both worse | Modal picker |
-| 10 | Design | location source of truth: output_slots[].location only, not equipment.data | Mechanical | P5 explicit | Two locations in sync is dual-write we explicitly rejected | equipment.data blob |
-| 11 | Design | Setup gate: Denon saved AND ≥1 slot has speaker → Step 2 unlocks | Mechanical | P1 completeness | No gate = workflow nav is decorative | Always unlock |
-| 12 | Design | Save model: explicit "Save Chain" button at bottom + per-card saves | Mechanical | P5 explicit | Auto-save needs dirty state + debounce = scope creep | Auto-save |
-| 13 | Design | Loading: skeleton cards with .pending badge animation | Mechanical | P1 completeness | No loading state = layout flash on every load | No loading state |
-| 14 | Design | Offline recovery: fail badge + inline Retry link + amber host highlight | Mechanical | P1 completeness | Red badge with no action = user stuck | Badge only |
-| 15 | Design | Pi root: small non-card header above chain, not full card node | Mechanical | P5 explicit | Full card node misrepresents Pi as audio device | Full card |
-| 16 | Design | Node expand/collapse: always expanded in v1, no accordion | Mechanical | P5 explicit | Accordion adds state machine, no benefit for 4-5 nodes | Accordion |
-| 17 | Design | DEFER: keyboard navigation | Taste | P3 pragmatic | Codebase has zero keyboard nav; fixing globally is scope expansion | Fix now |
-| 18 | Design | Partial state: miniDSP ghost node appears unconditionally below Denon | Mechanical | P1 completeness | No ghost node = no guidance on next step | Only show configured nodes |
-| 19 | Eng | POST /api/signal-chain MUST write measurement.sub_outputs from non-empty slots | Mechanical | P1 completeness | Measurement pipeline reads sub_outputs not output_slots — without this fix, new UI is silently disconnected from calibration | Defer |
-| 20 | Eng | Migration: existing SQLite speakers not auto-mapped to slots (no slot_index) | Mechanical | P5 explicit | No slot_index column; auto-mapping impossible; document clearly; user re-adds via new UI | Auto-map |
-| 21 | Eng | In-memory _chainState as single JS source of truth; all saves write full state | Mechanical | P5 explicit | Eliminates per-card vs Save Chain race condition | Per-card saves only |
-| 22 | Eng | Denon badge poll: use fetch AbortController with 5s timeout | Mechanical | P1 completeness | No timeout = page freezes when Denon offline | No timeout |
-| 23 | Eng | DEFAULT_CONFIG must include minidsp.output_slots with 4 empty entries | Mechanical | P1 completeness | Without default, cfg.minidsp.get("output_slots") returns None for all new users | No default |
-| 24 | Eng | Migration tombstone: connections.minidsp.outputs → minidsp.output_slots labels | Mechanical | P1 completeness | Old save-labels writes different YAML key; must migrate on first POST | Perpetual dual-write |
-| 25 | Eng | DEFER: atomic YAML write (os.replace) | Taste | P3 pragmatic | Known limitation predates this feature; file in TODOS.md | Fix now |
-| 26 | Eng | DEFER: f-string SQL in update_equipment | Taste | P3 pragmatic | Not injectable today (fixed key names); log to TODOS.md for future safety | Fix now |
+| 1 | CEO | Narrow ABC interface to only what MCP tools currently call; remove list_inputs, set_input | Mechanical | P5 explicit | Speculative interface for non-existent use cases; add when needed | Keep full API |
+| 2 | CEO | Add backward-compat alias set_denon_volume → avr_set_volume | Mechanical | P1 completeness | Breaks cached Claude Code sessions otherwise | Remove immediately |
+| 3 | CEO | Fix done criteria: "tests unchanged" impossible; "behaviors preserved, tests updated" | Mechanical | P1 completeness | test_mcp_server.py imports _tool_set_denon_volume which will be removed | Keep old criteria |
+| 4 | CEO | Bundle TODO-SP1 (atomic YAML write) into step 7 | Mechanical | P2 boil lakes | config.py is in blast radius; 4-line fix; prevents config corruption on Pi power loss | Defer to separate PR |
+| 5 | CEO | Add Config.avr_driver_name / Config.dsp_driver_name typed properties | Mechanical | P1 completeness | Registry must not access Config._data directly | Use _data.get() |
+| 6 | CEO | Add close() and discover() to AVRDriver ABC | Mechanical | P1 completeness | Lifecycle and discovery are part of the driver contract | Driver-specific only |
+| 7 | CEO | DEFER: MCP get_config/set_config tools | Taste | P3 pragmatic | Separate feature; not in this brief | Include now |
+| 8 | CEO | DEFER: discover_avr MCP tool | Taste | P3 pragmatic | Separate feature; separate PR | Include now |
+| 9 | CEO/Taste | Proceed with abstraction now (no second user yet) | Taste | User decision | User explicitly chose architectural investment before recipes lock in brand names | Defer |
+| 10 | CEO/Taste | 6-month regret: automated measurement loop deferred | Taste | User decision | User chose driver abstraction as higher priority | Switch to measurement loop |
+| 11 | Eng | P0: MinidspDriver.apply_eq must rollback on partial failure | Mechanical | P1 completeness | Partial write leaves hardware/state diverged; SafetyValidator diffs against wrong baseline | Accept divergence |
+| 12 | Eng | P0: Add resolve().is_relative_to() for path traversal | Mechanical | Security | String check alone doesn't block symlinks | String check only |
+| 13 | Eng | P1: REVERT config singleton change; keep _config() per-call | Mechanical | P3 pragmatic | Hot-reload is a feature; Config.load() is 1ms on local file | Singleton |
+| 14 | Eng | P1: asyncio lock must wrap full read-validate-write-state sequence | Mechanical | P1 completeness | Narrow lock still allows SafetyValidator race between two concurrent calls | Lock only state write |
+| 15 | Eng | P1: Add Starlette lifespan handler for setup()/close() | Mechanical | P1 completeness | DenonDriver.close() never called without it; aiohttp session leaks | Skip teardown |
+| 16 | Eng | P1: Define DriverError in drivers/base.py | Mechanical | P5 explicit | Referenced in plan without existing; MinidspApiError must wrap into it | Reuse MinidspApiError |
+| 17 | Eng | P2: Deprecated alias in _TOOLS (not just dispatch) | Mechanical | P1 completeness | Claude Code checks list_tools(); alias at dispatch only is invisible | Dispatch-only alias |
+| 18 | Eng | P2: update_config() atomic write REQUIRED | Mechanical | P1 completeness | Non-atomic write + Pi power loss = zero-byte config; 4-line fix | Optional/deferred |
+| 19 | Eng | P2: eq://current resource = 3rd call site; add CI grep check | Mechanical | P1 completeness | Easy to miss; grep check enforces the abstraction | Trust visual review |
+| 20 | Eng | P3: DenonDriver constructor must be sync; setup() in lifespan | Mechanical | P5 explicit | Async setup at module import blocks cold start when AVR is off | Sync setup in constructor |
+| 21 | Eng | P3: reset_eq_state fixture must reset via driver mock | Mechanical | P1 completeness | Direct _eq_state.clear() silently stops working after refactor | Keep existing fixture |
 
+
+## Failure Modes Registry
+
+| Mode | Trigger | Impact | Mitigation |
+|------|---------|--------|------------|
+| Partial EQ write | MinidspApiError mid-loop in apply_eq | Hardware/state diverge; safety checks against wrong baseline | Rollback: only update _eq_state after all writes succeed |
+| DenonDriver cold start fail | AVR off when server starts | lifespan startup exception | Lazy setup: setup() retry on each call; don't fail startup |
+| Unknown driver config | avr_driver: yamaha (unregistered) | Server fails to start | ValueError with list of valid options |
+| Concurrent apply_eq | Two MCP clients calling simultaneously | Potential double-apply | asyncio.Lock covers full read-validate-write-state |
+| In-memory EQ state lost | MCP server restart | _eq_state is [] after restart | Document: server restart clears EQ memory; re-run recipe |
+| config.yaml corruption | Power loss during write | All config lost, defaults loaded | Atomic write via os.replace (TODO-SP1, now required) |
+| Symlink traversal | Crafted recipe name points outside recipes/ | File system read | resolve().is_relative_to() check + test |
+
+## What Already Exists (Eng)
+
+| Sub-problem | Existing code | Status |
+|---|---|---|
+| miniDSP HTTP client | calibrate/adapters/minidsp.py | Complete, well-tested; MinidspDriver wraps it |
+| Denon HTTP client | denonavr library | External dep; DenonDriver wraps it |
+| SafetyValidator | calibrate/safety.py | Unchanged; stays in mcp_server.py |
+| Biquad conversion | calibrate/dsp.py | Unchanged; stays in mcp_server.py |
+| Measurement storage | calibrate/storage.py | Unchanged |
+| In-memory EQ state | mcp_server.py _eq_state dict | Moves to MinidspDriver._eq_state |
+
+## NOT In Scope (confirmed deferred)
+
+- Yamaha, Marantz, or any other AVR driver implementation
+- CamillaDSP or other DSP driver implementation
+- Auto-discovery of hardware type (SSDP MCP tool)
+- MCP get_config / set_config tools
+- Automated measurement loop / trigger_measurement on Pi Zero
+- Recipe updates (apply_eq keeps its name)
+
+## ## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/autoplan` | Scope & strategy | 1 | issues_open | 8 findings; 2 taste decisions surfaced at gate; user confirmed proceed; done criteria fixed; ABC narrowed; backward-compat alias added |
+| CEO Voices | `/autoplan` | Dual independent review | 1 | subagent-only | Codex unavailable; Claude subagent: 7 findings (1 critical, 3 high, 3 medium); critical finding surfaced at gate |
+| Design Review | skipped | No UI scope | 0 | — | — |
+| Eng Review | `/autoplan` | Architecture & tests | 1 | issues_open | 11 findings (2 P0, 4 P1, 3 P2, 2 P3); all auto-decided and incorporated into plan |
+| Eng Voices | `/autoplan` | Dual independent review | 1 | subagent-only | Codex unavailable; Claude subagent: 2 P0, 4 P1, 3 P2, 2 P3 |
+
+**VERDICT:** REVIEWED [subagent-only, Codex unavailable]. Two P0s must be implemented: (1) MinidspDriver.apply_eq partial-write rollback — SafetyValidator correctness depends on this. (2) Path traversal symlink check — security hardening. All other findings auto-decided and incorporated into the plan. Plan is implementation-ready.

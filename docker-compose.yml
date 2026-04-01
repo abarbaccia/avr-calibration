@@ -1,0 +1,50 @@
+# AVR Calibration — Docker Compose
+#
+# Two services sharing one container image:
+#   api  — FastAPI web app + minidspd daemon (existing deployment)
+#   mcp  — MCP server for Claude Code integration (new)
+#
+# Usage (development):
+#   docker compose up --build
+#
+# Pi deployment: hotfix.sh + systemd remain the primary workflow.
+# This Compose file is for local development and documentation.
+# On the Pi, use the single-container entrypoint (entrypoint.sh)
+# or the combined entrypoint (entrypoint-with-mcp.sh) directly.
+#
+# Note: both services MUST share network_mode so the MCP server can reach
+# minidspd on localhost:5380 (minidspd binds to 127.0.0.1 in the api container).
+# The combined entrypoint-with-mcp.sh runs all three processes in one container.
+
+services:
+  avr-calibration:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/abarbaccia/avr-calibration:local
+    command: ["/entrypoint-with-mcp.sh"]
+    ports:
+      - "8000:8000"   # FastAPI (HTTPS — browser UI)
+      - "8765:8765"   # MCP server (HTTP/SSE — Claude Code)
+      - "5380:5380"   # minidspd REST API (internal, expose for debugging)
+    volumes:
+      - avr_data:/data
+      - ./recipes:/app/recipes:ro    # recipe files served by fetch_recipe()
+    environment:
+      - MCP_PORT=8765
+      - MCP_HOST=0.0.0.0
+      - PYTHONUNBUFFERED=1
+    # Pass-through USB device access for miniDSP HID and UMIK-1
+    # On the Pi: docker run --privileged or --device=/dev/hidraw0
+    privileged: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/api/version', verify=False)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  avr_data:
+    driver: local

@@ -278,3 +278,25 @@ measurement:
 **Why:** The long-term value of this tool is the accumulated room model. Without visibility, you can't tell if the system is improving over time or debug why a session diverged.
 **Context:** Read-only queries against the same SQLite store the pipeline writes to. Output as a formatted table or JSON. Also `calibrate show <id>` for detail view with --csv and --json export.
 **Completed:** v0.1.2 (2026-03-20)
+
+## Deferred from /autoplan (2026-04-01) — Equipment Driver Abstraction
+
+### TODO-DA1: MicDriver abstraction
+**What:** A `MicDriver` ABC in `calibrate/drivers/mic_driver.py` for measurement microphone abstraction. Follows the same pattern as `AVRDriver`/`DSPDriver`. `UMIKDriver(MicDriver)` handles: device discovery by name substring, UMIK .cal file loading and correction, audio sweep recording.
+**Config:** `mic_driver: umik` with `UMIKDriver` registered in registry.py.
+**Why:** The mic is hardware with variation (UMIK-1, UMIK-2, Dayton iMM-6, miniDSP EARS). Cal file format differs per model. Abstracting enables other mic types without touching measurement.py.
+**Deferred because:** `trigger_measurement` is a Pi Zero degraded stub (USB port occupied by miniDSP). Abstracting a mic that can't be triggered from MCP yet is premature. Revisit when measurement loop is unblocked (see TODO-R1).
+**Effort:** M — `measurement.py` is the hottest file in repo; requires careful blast radius management.
+**Priority:** P2 — natural follow-on after AVR+DSP drivers; block by TODO-R1.
+
+### TODO-DA2: discover_avr MCP tool
+**What:** `discover_avr()` MCP tool that calls `_avr.discover()` (SSDP scan). Returns list of found AVR hosts on the network. Claude calls this during setup conversation to auto-populate Denon IP.
+**Why:** Core of the "AI-first configuration" conversation — user says "set up my system" and Claude discovers the AVR automatically.
+**Effort:** S — `DenonDriver.discover()` base returns []; `DenonDriver.discover()` implementation uses denonavr SSDP; expose as MCP tool.
+**Priority:** P2 — enables conversational setup flow.
+
+### TODO-DA3: MCP get_config / set_config tools
+**What:** Two new MCP tools: `get_config()` returns current `config.yaml` as dict, `set_config(updates)` deep-merges updates and writes back. Enables Claude to configure hardware via conversation.
+**Why:** The "AI-first configuration" design goal requires Claude to be able to read/write config without SSH or YAML editing.
+**Effort:** S — thin wrappers over `Config.load()` and `update_config()` already in config.py.
+**Priority:** P2 — completes the AI-first config vision.
