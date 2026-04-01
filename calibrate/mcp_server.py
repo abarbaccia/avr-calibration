@@ -20,6 +20,20 @@ Tools:
   trigger_measurement    — Pi 4 only; returns degraded-mode error on Pi Zero
   fetch_recipe           — serve recipe markdown from recipes/ directory
 
+HARD RULE — Signal Path Writes Require Human Confirmation:
+  Tools that change DSP routing, input source, or preset selection MUST NOT be
+  called autonomously by an AI agent. The miniDSP hardware flash is the source of
+  truth; overwriting it without user approval can destroy a working configuration.
+
+  If you (as an AI) want to change routing, source, or preset, you MUST:
+    1. Describe exactly what you intend to change and why.
+    2. Ask the user to confirm before calling any tool that writes to hardware.
+    3. Do not proceed until the user explicitly approves.
+
+  EQ (apply_eq) is exempt — that is the calibration output and is always
+  intentional. Volume (avr_set_volume) is exempt — it is transient and safe.
+  Everything else that touches DSP configuration requires explicit approval.
+
 Resources:
   measurements://latest  — most recent measurement session
   eq://current           — current EQ filter state
@@ -241,6 +255,16 @@ async def _tool_fetch_recipe(name: str) -> dict:
 
 
 # ── MCP Server ─────────────────────────────────────────────────────────────────
+
+# Text appended to any tool description that writes signal-path state (routing,
+# source selection, preset switching). Forces human-in-the-loop before the AI
+# proceeds. EQ and volume are intentionally excluded — they are calibration
+# outputs, not hardware configuration.
+_SIGNAL_PATH_WRITE_WARNING = (
+    " REQUIRES HUMAN APPROVAL: before calling this tool, describe exactly what "
+    "you intend to change and why, then wait for the user to explicitly confirm. "
+    "Do not call this tool autonomously."
+)
 
 server = Server("avr-calibration")
 
