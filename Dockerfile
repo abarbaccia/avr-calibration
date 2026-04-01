@@ -33,9 +33,11 @@ RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \
         pip install --no-cache-dir uv && \
         uv venv /opt/venv && \
         NUMPY_VER=$(grep -A1 '^name = "numpy"$' uv.lock | grep version | grep -o '[0-9][0-9.]*') && \
+        SCIPY_VER=$(grep -A1 '^name = "scipy"$' uv.lock | grep version | grep -o '[0-9][0-9.]*') && \
         VIRTUAL_ENV=/opt/venv uv pip install \
             --extra-index-url https://www.piwheels.org/simple \
-            "numpy==${NUMPY_VER}" && \
+            "numpy==${NUMPY_VER}" \
+            "scipy==${SCIPY_VER}" && \
         UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --no-dev --no-install-project; \
     else \
         echo "amd64: full deps including pytta (measurement extra)" && \
