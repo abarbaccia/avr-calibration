@@ -1682,6 +1682,53 @@ class TestApplySignalPath:
             0, {0: True, 1: True, 2: True, 3: True}
         )
 
+    def test_applies_routing_from_input_routing_fallback(self, client, tmp_path, monkeypatch):
+        """Routing saved by signal-chain UI (input_routing) is applied when signal_path.routing absent."""
+        import yaml
+        from unittest.mock import AsyncMock
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({
+            "minidsp": {
+                "host": "localhost", "port": 5380,
+                "input_routing": [{"input": 0, "outputs": [0, 2]}],
+            },
+        }))
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_file)
+
+        mock_client = AsyncMock()
+        with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+            r = client.post("/api/signal-path/apply", json={})
+
+        assert r.status_code == 200
+        assert r.json()["routing_applied"] is True
+        mock_client.set_input_routing.assert_called_once_with(
+            0, {0: True, 1: False, 2: True, 3: False}
+        )
+
+    def test_signal_path_routing_takes_priority_over_input_routing(self, client, tmp_path, monkeypatch):
+        """signal_path.routing takes priority over input_routing when both present."""
+        import yaml
+        from unittest.mock import AsyncMock
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({
+            "minidsp": {
+                "host": "localhost", "port": 5380,
+                "signal_path": {"routing": [{"input": 1, "outputs": [1, 3]}]},
+                "input_routing": [{"input": 0, "outputs": [0, 2]}],
+            },
+        }))
+        monkeypatch.setattr("calibrate.web.CONFIG_PATH", cfg_file)
+
+        mock_client = AsyncMock()
+        with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+            r = client.post("/api/signal-path/apply", json={})
+
+        assert r.status_code == 200
+        assert r.json()["routing_applied"] is True
+        mock_client.set_input_routing.assert_called_once_with(
+            1, {0: False, 1: True, 2: False, 3: True}
+        )
+
     def test_minidsp_api_error_returns_502(self, client, tmp_path, monkeypatch):
         import yaml
         from unittest.mock import AsyncMock

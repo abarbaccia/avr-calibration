@@ -1826,21 +1826,25 @@ _HTML = """<!DOCTYPE html>
     _syncDspLabelsToState();
     const statusEl = document.getElementById('chainDspStatus');
     await chainSaveWithStatus(statusEl);
-    // Switch device to selected preset if one is chosen
+    // Apply routing (and preset if selected) to the physical device
     const activePreset = (_chainState.minidsp || {}).active_preset;
-    if (activePreset !== null && activePreset !== undefined) {
-      try {
-        const r = await fetch('/api/signal-path/apply', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ preset: activePreset }),
-        });
-        if (r.ok && statusEl) {
-          statusEl.textContent = `Saved \u2014 device switched to Preset ${activePreset + 1}`;
-          statusEl.style.color = '#4ade80';
-        }
-      } catch (_) {}
-    }
+    const applyBody = {};
+    if (activePreset !== null && activePreset !== undefined) applyBody.preset = activePreset;
+    try {
+      const r = await fetch('/api/signal-path/apply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(applyBody),
+      });
+      if (r.ok && statusEl) {
+        const d = await r.json();
+        const parts = ['Saved'];
+        if (d.routing_applied) parts.push('routing applied to device');
+        if (activePreset !== null && activePreset !== undefined) parts.push(`Preset ${activePreset + 1} active`);
+        statusEl.textContent = parts.join(' \u2014 ');
+        statusEl.style.color = '#4ade80';
+      }
+    } catch (_) {}
   }
 
   async function chainDenonDiscover() {
@@ -3404,7 +3408,7 @@ async def apply_signal_path(body: SignalPathApplyRequest) -> dict:
 
         routing_applied = False
         sp = cfg.minidsp.get("signal_path") or {}
-        routing = sp.get("routing") or []
+        routing = sp.get("routing") or cfg.minidsp.get("input_routing") or []
         for entry in routing:
             input_idx = entry.get("input", 0)
             enabled_outputs = set(entry.get("outputs", []))
