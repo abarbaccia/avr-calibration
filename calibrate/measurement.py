@@ -78,6 +78,22 @@ class FrequencyResponse:
         return self.frequencies[self.spl.index(peak)]
 
 
+def _find_umik_device(devices, name_substring: str = "UMIK") -> int | None:
+    """Return the index of the first input device whose name contains name_substring.
+
+    Args:
+        devices: sequence of device dicts as returned by sounddevice.query_devices()
+        name_substring: substring to match against device name (case-sensitive)
+
+    Returns:
+        Device index (int) or None if no matching input device is found.
+    """
+    for i, d in enumerate(devices):
+        if name_substring in str(d.get("name", "")) and d.get("max_input_channels", 0) > 0:
+            return i
+    return None
+
+
 class MeasurementEngine:
     """
     Runs a log-sweep measurement via PyTTa and returns a FrequencyResponse.
@@ -310,8 +326,13 @@ class MeasurementEngine:
 
     # ── Legacy full-cycle API (used by CLI measure command) ────────────────
 
-    def measure(self) -> FrequencyResponse:
-        """Run a full sweep measurement. Raises RuntimeError if dependencies unavailable."""
+    def measure(self, input_device_name: str | None = None) -> FrequencyResponse:
+        """Run a full sweep measurement. Raises RuntimeError if dependencies unavailable.
+
+        Args:
+            input_device_name: optional substring to select the recording device by name
+                (e.g. "UMIK"). If None, uses the sounddevice default input device.
+        """
         try:
             import pytta
         except ImportError as exc:
@@ -334,6 +355,18 @@ class MeasurementEngine:
         in_channel: int = cfg.get("input_channel", 1)
         out_channel: int = cfg.get("output_channel", 1)
 
+        if input_device_name is not None:
+            try:
+                import sounddevice as sd
+                devices = sd.query_devices()
+                idx = _find_umik_device(devices, name_substring=input_device_name)
+                if idx is not None:
+                    current = sd.default.device
+                    out_idx = current[1] if isinstance(current, (list, tuple)) else current
+                    sd.default.device = (idx, out_idx)
+            except ImportError:
+                pass  # sounddevice unavailable; let PyTTa use its own default
+
         sweep = pytta.generate.sweep(
             freq_min=freq_min,
             freq_max=freq_max,
@@ -350,7 +383,20 @@ class MeasurementEngine:
             inChannels=[in_channel],
             outChannels=[out_channel],
         )
-        recording = meas.run()
+        try:
+            recording = meas.run()
+        except Exception as exc:
+            # Catch sounddevice.PortAudioError (imported lazily to avoid hard dep)
+            if "PortAudioError" in type(exc).__name__ or "PortAudio" in str(exc):
+                raise RuntimeError(f"Audio device error during measurement: {exc}") from exc
+            raise
+
+        self.validate_recording(
+            np,
+            sweep.timeSignal[:, 0],
+            recording.timeSignal[:, 0],
+            sample_rate,
+        )
 
         frequencies, spl, ir_samples = self._compute_fr(
             np, sweep, recording, freq_min, freq_max, sample_rate
