@@ -55,7 +55,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .config import Config, CONFIG_PATH, update_config
-from .measurement import MeasurementEngine, FrequencyResponse, MeasurementQualityError
+from .measurement import MeasurementEngine, FrequencyResponse, MeasurementQualityError, _find_umik_device
 from .preflight import PreflightChecker
 from .storage import SessionStore
 
@@ -64,6 +64,10 @@ app = FastAPI(title="avr-calibration")
 # token → {sweep_samples, sample_rate, freq_min, freq_max, sweep_duration, label}
 _pending_sweeps: dict[str, dict] = {}
 _pending_lock = threading.Lock()
+
+# Headless measurement lock — prevents concurrent /api/measure calls from racing
+# on sd.default.device (a global PortAudio setting).
+_measurement_lock = asyncio.Lock()
 
 # token → AlignmentSession
 _pending_alignments: dict[str, "_AlignmentSession"] = {}
@@ -2497,6 +2501,52 @@ async def api_upgrade() -> dict:
         raise HTTPException(status_code=503, detail=f"Upgrade unavailable: {exc}")
 
     return {"status": "upgrade_triggered"}
+
+
+class HeadlessMeasureRequest(BaseModel):
+    label: str | None = None
+
+
+@app.post("/api/measure")
+async def measure_headless(body: HeadlessMeasureRequest) -> dict:
+    """Headless measurement for Pi 5: Pi records via UMIK-1 using PyTTa.
+
+    Requires UMIK-1 connected and the 'measurement' extra installed (arm64/amd64 images).
+    On Pi Zero 2 W (arm/v7), use the browser-based /api/measure/start + /api/measure/record flow.
+    """
+    if _measurement_lock.locked():
+        raise HTTPException(status_code=409, detail="measurement already in progress")
+
+    try:
+        import sounddevice as sd
+        devices = sd.query_devices()
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail="sounddevice not available on this platform — use browser-based measurement",
+        )
+
+    cfg = _load_config()
+    mic_name: str = cfg.mic.get("name", "UMIK")
+    umik_idx = _find_umik_device(devices, name_substring=mic_name)
+    if umik_idx is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"No microphone matching '{mic_name}' found — check USB connection",
+        )
+
+    device_name: str = str(devices[umik_idx].get("name", mic_name))
+
+    async with _measurement_lock:
+        engine = MeasurementEngine(cfg)
+        try:
+            fr = await asyncio.to_thread(engine.measure, device_name)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+
+    store = SessionStore()
+    session_id = store.save_measurement(fr, label=body.label or "headless")
+    return {"session_id": session_id, "status": "ok"}
 
 
 @app.post("/api/measure/start")
