@@ -17,7 +17,7 @@ Tools:
   apply_eq               — SafetyValidator → biquad conversion → DSP write
   avr_set_volume         — generic AVR volume control
   set_denon_volume       — DEPRECATED: alias for avr_set_volume
-  trigger_measurement    — Pi 4 only; returns degraded-mode error on Pi Zero
+  trigger_measurement    — Pi 5 only; returns degraded-mode error on Pi Zero
   fetch_recipe           — serve recipe markdown from recipes/ directory
 
 HARD RULE — Signal Path Writes Require Human Confirmation:
@@ -189,7 +189,7 @@ async def _tool_avr_set_volume(level_db: float) -> dict:
 async def _tool_trigger_measurement() -> dict:
     """Trigger a measurement via UMIK-1 + PyTTa.
 
-    Requires Pi 4 with UMIK-1 connected. On Pi Zero 2 W, returns a structured
+    Requires Pi 5 with UMIK-1 connected. On Pi Zero 2 W, returns a structured
     degraded-mode error directing the user to the browser.
     """
     try:
@@ -198,20 +198,20 @@ async def _tool_trigger_measurement() -> dict:
         umik_devices = [d for d in devices if "UMIK" in str(d.get("name", ""))]
         if not umik_devices:
             return _err(
-                "trigger_measurement requires Pi 4 — no UMIK microphone found. "
+                "trigger_measurement requires Pi 5 — no UMIK microphone found. "
                 "Take a measurement in the browser and use get_measurement_history() "
                 "to retrieve it."
             )
     except Exception:
         return _err(
-            "trigger_measurement requires Pi 4 — audio device enumeration failed. "
+            "trigger_measurement requires Pi 5 — audio device enumeration failed. "
             "Take a measurement in the browser and use get_measurement_history() "
             "to retrieve it."
         )
 
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 "http://localhost:8000/api/measure",
                 json={"label": "mcp-triggered"},
@@ -385,7 +385,7 @@ _TOOLS: list[Tool] = [
         name="trigger_measurement",
         description=(
             "Trigger a frequency response measurement using the UMIK-1 microphone. "
-            "Requires Pi 4 4GB (4 USB ports: miniDSP + UMIK-1). "
+            "Requires Pi 5 (4 USB ports: miniDSP + UMIK-1). "
             "On Pi Zero 2 W, returns a structured error directing you to use the browser "
             "and then call get_measurement_history() to retrieve results."
         ),
