@@ -142,6 +142,11 @@ class TestMeasure:
         mock_pytta.reset_mock()  # clear call history from previous tests
         mock_pytta.generate.sweep.return_value = mock_sweep
         mock_pytta.PlayRecMeasure.return_value.run.return_value = mock_recording
+        mock_pytta.PlayRecMeasure.return_value.run.side_effect = None
+
+        # validate_recording is now called inside measure(); mock it so random
+        # test signals don't trigger quality-gate errors.
+        engine.validate_recording = MagicMock(return_value=[])
 
         return engine, mock_pytta, mock_sweep, mock_recording
 

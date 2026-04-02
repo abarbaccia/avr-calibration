@@ -12,6 +12,8 @@ Covers:
   - avr_set_volume: success and failure cases
   - set_denon_volume: deprecated alias → same behaviour as avr_set_volume
   - trigger_measurement: Pi Zero degraded-mode error (no UMIK found)
+  - trigger_measurement: Pi 5 success path (UMIK found, 200 from /api/measure)
+  - trigger_measurement: httpx timeout is 60s (not 30s)
   - fetch_recipe: found → returns content; not found → {ok: false}
   - fetch_recipe: path traversal via ".." → rejected
   - fetch_recipe: path traversal via symlink → rejected
@@ -351,13 +353,13 @@ async def test_trigger_measurement_pi_zero_no_umik() -> None:
         ]
     result = await _tool_trigger_measurement()
     assert not result["ok"]
-    assert "Pi 4" in result["error"] or "UMIK" in result["error"]
+    assert "Pi 5" in result["error"] or "UMIK" in result["error"]
     assert "browser" in result["error"].lower() or "get_measurement_history" in result["error"]
 
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_trigger_measurement_pi4_success() -> None:
+async def test_trigger_measurement_pi5_success() -> None:
     mock_sd = MagicMock()
     mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
     respx.post(MEASURE_URL).mock(return_value=httpx.Response(
@@ -371,7 +373,7 @@ async def test_trigger_measurement_pi4_success() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_trigger_measurement_pi4_api_error() -> None:
+async def test_trigger_measurement_pi5_api_error() -> None:
     mock_sd = MagicMock()
     mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
     respx.post(MEASURE_URL).mock(return_value=httpx.Response(500))
@@ -383,7 +385,7 @@ async def test_trigger_measurement_pi4_api_error() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_trigger_measurement_pi4_network_failure() -> None:
+async def test_trigger_measurement_pi5_network_failure() -> None:
     mock_sd = MagicMock()
     mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
     respx.post(MEASURE_URL).mock(side_effect=httpx.ConnectError("refused"))
@@ -391,6 +393,36 @@ async def test_trigger_measurement_pi4_network_failure() -> None:
         result = await _tool_trigger_measurement()
     assert not result["ok"]
     assert "measurement failed" in result["error"]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_trigger_measurement_uses_60s_timeout() -> None:
+    """Pi 5: httpx client timeout should be 60s to allow 3s sweep + processing."""
+    import httpx as _httpx
+    mock_sd = MagicMock()
+    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
+    respx.post(MEASURE_URL).mock(return_value=_httpx.Response(200, json={"session_id": 1}))
+
+    captured_timeout: list[float] = []
+
+    original_client = _httpx.AsyncClient
+
+    class CapturingClient(original_client):
+        def __init__(self, *args, **kwargs):
+            captured_timeout.append(kwargs.get("timeout", -1))
+            super().__init__(*args, **kwargs)
+
+    # httpx is imported inside _tool_trigger_measurement, so we patch it in the
+    # httpx module directly (that's what the local `import httpx` resolves to).
+    with (
+        patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        patch.object(_httpx, "AsyncClient", CapturingClient),
+    ):
+        await _tool_trigger_measurement()
+
+    assert captured_timeout, "httpx.AsyncClient was not instantiated"
+    assert captured_timeout[0] == 60.0, f"Expected timeout=60.0, got {captured_timeout[0]}"
 
 
 # ── fetch_recipe ───────────────────────────────────────────────────────────────
