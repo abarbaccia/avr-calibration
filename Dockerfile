@@ -5,7 +5,8 @@
 #   old distutils spawn(dry_run=) API removed in setuptools 60+ → build fails.
 #   Fix: uv sync without --extra measurement (pytta not needed; web UI uses browser audio).
 #
-# amd64: full deps including pytta via uv sync (dev use; CLI measure command).
+# arm64 (Pi 5) + amd64: full deps including pytta via uv sync.
+#   Pi 5 has 4 USB ports — miniDSP + UMIK-1 coexist, enabling headless measurement.
 #
 FROM python:3.11-slim-bookworm AS builder
 
@@ -66,7 +67,9 @@ ARG TARGETVARIANT
 ARG MINIDSP_VERSION=0.1.12
 RUN set -e; \
     ARCH="${TARGETARCH}${TARGETVARIANT}"; \
-    if [ "$ARCH" = "amd64" ]; then DEB_ARCH="amd64"; else DEB_ARCH="armhf"; fi; \
+    if [ "$ARCH" = "amd64" ]; then DEB_ARCH="amd64"; \
+    elif [ "$ARCH" = "arm64" ]; then DEB_ARCH="arm64"; \
+    else DEB_ARCH="armhf"; fi; \
     DEB_ARCH_EXPORT="$DEB_ARCH" MINIDSP_VERSION_EXPORT="$MINIDSP_VERSION" python3 -c "import urllib.request, subprocess, os; ver=os.environ['MINIDSP_VERSION_EXPORT']; arch=os.environ['DEB_ARCH_EXPORT']; url=f'https://github.com/mrene/minidsp-rs/releases/download/v{ver}/minidsp_{ver}-1_{arch}.deb'; urllib.request.urlretrieve(url, '/tmp/minidsp.deb'); subprocess.run(['dpkg','-x','/tmp/minidsp.deb','/tmp/minidsp-pkg'],check=True); os.rename('/tmp/minidsp-pkg/usr/bin/minidsp','/usr/local/bin/minidsp'); os.rename('/tmp/minidsp-pkg/usr/bin/minidspd','/usr/local/bin/minidspd'); os.chmod('/usr/local/bin/minidsp',0o755); os.chmod('/usr/local/bin/minidspd',0o755); os.remove('/tmp/minidsp.deb')"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
