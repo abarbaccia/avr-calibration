@@ -83,13 +83,13 @@ def _find_umik_device(devices, name_substring: str = "UMIK") -> int | None:
 
     Args:
         devices: sequence of device dicts as returned by sounddevice.query_devices()
-        name_substring: substring to match against device name (case-sensitive)
+        name_substring: substring to match against device name (case-insensitive)
 
     Returns:
         Device index (int) or None if no matching input device is found.
     """
     for i, d in enumerate(devices):
-        if name_substring in str(d.get("name", "")) and d.get("max_input_channels", 0) > 0:
+        if name_substring.lower() in str(d.get("name", "")).lower() and d.get("max_input_channels", 0) > 0:
             return i
     return None
 

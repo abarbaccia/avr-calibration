@@ -564,3 +564,172 @@ async def test_resource_measurements_latest_storage_exception() -> None:
     data = json.loads(result)
     assert "error" in data
     assert "disk error" in data["error"]
+
+
+# ── Missing error paths ────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_device_state_avr_generic_exception(mock_avr, mock_dsp) -> None:
+    """Generic (non-DriverError) exception from avr.get_state → error in avr sub-dict."""
+    mock_avr.get_state.side_effect = RuntimeError("unexpected avr failure")
+    result = await _tool_get_device_state()
+    assert result["ok"]
+    assert not result["avr"]["connected"]
+    assert "unexpected avr failure" in result["avr"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_get_device_state_dsp_generic_exception(mock_avr, mock_dsp) -> None:
+    """Generic (non-DriverError) exception from dsp.get_state → error in dsp sub-dict."""
+    mock_dsp.get_state.side_effect = RuntimeError("unexpected dsp failure")
+    result = await _tool_get_device_state()
+    assert result["ok"]
+    assert not result["dsp"]["connected"]
+    assert "unexpected dsp failure" in result["dsp"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_read_eq_driver_error(mock_dsp) -> None:
+    """DriverError from dsp.current_preset → {ok: false}."""
+    mock_dsp.current_preset.side_effect = DriverError("dsp unreachable")
+    result = await _tool_read_eq()
+    assert not result["ok"]
+    assert "dsp unreachable" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_trigger_measurement_sounddevice_exception() -> None:
+    """sounddevice raises an unexpected exception → degraded-mode error."""
+    with patch.dict(sys.modules, {"sounddevice": None}):
+        result = await _tool_trigger_measurement()
+    assert not result["ok"]
+    assert "Pi 5" in result["error"]
+    assert "get_measurement_history" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_resource_eq_current_driver_error(mock_dsp) -> None:
+    """DriverError from dsp in eq://current resource → JSON error."""
+    mock_dsp.current_preset.side_effect = DriverError("preset unavailable")
+    result = await _read_resource("eq://current")
+    data = json.loads(result)
+    assert "error" in data
+    assert "preset unavailable" in data["error"]
+
+
+# ── MCP handler dispatch (call_tool for all branches) ─────────────────────────
+
+@pytest.mark.asyncio
+async def test_call_tool_get_device_state(mock_avr, mock_dsp) -> None:
+    from calibrate.mcp_server import call_tool
+    texts = await call_tool("get_device_state", {})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "avr" in data
+    assert "dsp" in data
+
+
+@pytest.mark.asyncio
+async def test_call_tool_get_measurement_history() -> None:
+    from calibrate.mcp_server import call_tool
+    with patch("calibrate.storage.SessionStore") as mock_cls:
+        mock_store = MagicMock()
+        mock_store.list_sessions.return_value = []
+        mock_cls.return_value = mock_store
+        texts = await call_tool("get_measurement_history", {"limit": 3})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert data["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_call_tool_read_eq(mock_dsp) -> None:
+    from calibrate.mcp_server import call_tool
+    texts = await call_tool("read_eq", {})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "filters" in data
+
+
+@pytest.mark.asyncio
+async def test_call_tool_apply_eq(mock_dsp, valid_filters) -> None:
+    from calibrate.mcp_server import call_tool
+    texts = await call_tool("apply_eq", {"filters": valid_filters})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert data["filters_applied"] == len(valid_filters)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_trigger_measurement_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+    with patch.dict(sys.modules, {"sounddevice": None}):
+        texts = await call_tool("trigger_measurement", {})
+    data = json.loads(texts[0].text)
+    assert not data["ok"]  # no UMIK on CI → degraded mode
+
+
+@pytest.mark.asyncio
+async def test_call_tool_fetch_recipe_dispatch(tmp_path) -> None:
+    from calibrate.mcp_server import call_tool
+    recipe = tmp_path / "core" / "test.md"
+    recipe.parent.mkdir()
+    recipe.write_text("# test recipe")
+    with patch.object(sut, "RECIPES_DIR", tmp_path):
+        texts = await call_tool("fetch_recipe", {"name": "core/test"})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "test recipe" in data["content"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_unknown_dispatches_error() -> None:
+    from calibrate.mcp_server import call_tool
+    texts = await call_tool("no_such_tool", {})
+    data = json.loads(texts[0].text)
+    assert not data["ok"]
+    assert "unknown tool" in data["error"]
+
+
+# ── MCP list_tools / list_resources / read_resource handlers ──────────────────
+
+@pytest.mark.asyncio
+async def test_list_tools_returns_all_tools() -> None:
+    from calibrate.mcp_server import list_tools
+    tools = await list_tools()
+    names = {t.name for t in tools}
+    assert "get_device_state" in names
+    assert "apply_eq" in names
+    assert "trigger_measurement" in names
+    assert "fetch_recipe" in names
+
+
+@pytest.mark.asyncio
+async def test_list_resources_returns_known_resources() -> None:
+    from calibrate.mcp_server import list_resources
+    resources = await list_resources()
+    uris = {str(r.uri) for r in resources}
+    assert "measurements://latest" in uris
+    assert "eq://current" in uris
+
+
+@pytest.mark.asyncio
+async def test_read_resource_handler_delegates(mock_dsp) -> None:
+    """read_resource() MCP handler delegates to _read_resource()."""
+    from calibrate.mcp_server import read_resource
+    result = await read_resource("eq://current")
+    data = json.loads(result)
+    assert "preset" in data
+    assert "filters" in data
+
+
+# ── create_app ────────────────────────────────────────────────────────────────
+
+def test_create_app_returns_starlette_app() -> None:
+    """create_app() constructs a Starlette ASGI app with SSE and messages routes."""
+    from starlette.applications import Starlette
+    from calibrate.mcp_server import create_app
+    app = create_app()
+    assert isinstance(app, Starlette)
+    route_paths = [r.path for r in app.routes]
+    assert "/sse" in route_paths

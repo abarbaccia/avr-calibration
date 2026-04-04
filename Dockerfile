@@ -49,8 +49,13 @@ RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \
 
 # Step 2: copy source and install the project itself.
 # This layer re-runs on every calibrate/ change but is fast (no third-party downloads).
+# Must repeat --extra measurement for arm64/amd64 — uv sync without extras removes them.
 COPY calibrate/ ./calibrate/
-RUN UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --no-dev --no-editable
+RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \
+        UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --no-dev --no-editable; \
+    else \
+        UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --no-dev --no-editable --extra measurement; \
+    fi
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM python:3.11-slim-bookworm AS runtime
