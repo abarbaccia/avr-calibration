@@ -146,6 +146,10 @@ _HTML = """<!DOCTYPE html>
     /* Status grid */
     .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
     .status-item { background: #131720; border-radius: 8px; padding: .75rem 1rem; }
+    .status-item .status-row { display: flex; align-items: center; gap: .5rem; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .status-dot.ok { background: #4ade80; box-shadow: 0 0 4px #4ade80; }
+    .status-dot.err { background: #f87171; box-shadow: 0 0 4px #f87171; }
     /* Harman delta colors */
     .harman-good { color: #4ade80; }
     .harman-ok   { color: #fbbf24; }
@@ -159,7 +163,7 @@ _HTML = """<!DOCTYPE html>
 </head>
 <body>
   <div id="versionChip" title="Running version">&#8230;</div>
-  <h1>AVR Calibration</h1>
+  <h1><a href="/" style="color:inherit;text-decoration:none">AVR Calibration</a></h1>
 
   <!-- System Status -->
   <div class="card" id="statusCard">
@@ -169,6 +173,7 @@ _HTML = """<!DOCTYPE html>
 
   <!-- FR Plot -->
   <div class="card" id="plotCard" style="display:none">
+    <div style="margin-bottom:.5rem"><a href="/" style="color:#3b82f6;font-size:.82rem;text-decoration:none">&larr; Back to overview</a></div>
     <div class="curve-row">
       <label for="curveSelect">Target curve:</label>
       <select id="curveSelect" onchange="onCurveChange()">
@@ -215,7 +220,7 @@ _HTML = """<!DOCTYPE html>
   <!-- Measurement History -->
   <div class="card">
     <div class="hist-header">
-      <h2>History</h2>
+      <h2>Sweep History</h2>
       <button id="avgBtn" onclick="averageSelected()">Average Selected</button>
     </div>
     <table id="histTable">
@@ -338,6 +343,23 @@ _HTML = """<!DOCTYPE html>
         pointRadius: 0,
         tension: 0.3,
         fill: false,
+      });
+    }
+
+    // Port tune vertical marker
+    if (portTuneHz && freqs[0] <= portTuneHz && portTuneHz <= freqs[freqs.length-1]) {
+      const allSpl = [...spl, ...(endSpl||[]), ...targetLine].filter(v => v != null && isFinite(v));
+      const yMin = Math.min(...allSpl) - 3;
+      const yMax = Math.max(...allSpl) + 3;
+      datasets.push({
+        label: `Port tune (${portTuneHz} Hz)`,
+        data: [{x: portTuneHz, y: yMin}, {x: portTuneHz, y: yMax}],
+        borderColor: '#f59e0b',
+        borderDash: [4, 4],
+        borderWidth: 1.5,
+        pointRadius: 0,
+        fill: false,
+        parsing: false,
       });
     }
 
@@ -499,28 +521,34 @@ _HTML = """<!DOCTYPE html>
   }
 
   // ── System status ─────────────────────────────────────────────────────────
+  let portTuneHz = null;
+
   async function loadStatus() {
     try {
       const r = await fetch('/api/status');
       if (!r.ok) return;
       const data = await r.json();
+      portTuneHz = data.port_tune_hz || null;
       const grid = document.getElementById('statusGrid');
       grid.innerHTML = data.devices.map(d => {
-        const cls = d.connected ? 'badge-optimal' : 'badge-danger';
-        const label = d.connected ? 'Connected' : 'Disconnected';
+        const dotCls = d.connected ? 'ok' : 'err';
         return `<div class="status-item">
-          <span class="badge ${cls}">${label}</span>
-          <strong>${d.name}</strong>
-          <div style="font-size:.78rem;color:#94a3b8;">${d.detail || ''}</div>
+          <div class="status-row">
+            <span class="status-dot ${dotCls}"></span>
+            <strong>${d.name}</strong>
+          </div>
+          <div style="font-size:.78rem;color:#94a3b8;margin-top:.25rem;padding-left:1rem;">${d.detail || ''}</div>
         </div>`;
       }).join('');
       if (data.last_run) {
         const lr = data.last_run;
-        const status = lr.converged ? '\u2713 Converged' : '\u2717 Not converged';
+        const dotCls = lr.converged ? 'ok' : 'err';
         grid.innerHTML += `<div class="status-item">
-          <span class="badge ${lr.converged ? 'badge-optimal' : 'badge-warn'}">${status}</span>
-          <strong>Last Run</strong>
-          <div style="font-size:.78rem;color:#94a3b8;">${lr.recipe_name} \u2014 ${lr.final_rms?.toFixed(1) || '?'} dB RMS</div>
+          <div class="status-row">
+            <span class="status-dot ${dotCls}"></span>
+            <strong>Last Run</strong>
+          </div>
+          <div style="font-size:.78rem;color:#94a3b8;margin-top:.25rem;padding-left:1rem;">${lr.recipe_name} \u2014 ${lr.final_rms?.toFixed(1) || '?'} dB RMS</div>
         </div>`;
       }
     } catch(e) { console.warn('status load failed:', e); }
@@ -619,14 +647,19 @@ _HTML = """<!DOCTYPE html>
   });
 
   // ── Version footer ────────────────────────────────────────────────────────
-
-  const versionFooter = document.getElementById('versionFooter');
-  const versionBadge = document.getElementById('versionBadge');
-  const versionStatus = document.getElementById('versionStatus');
-  const upgradeBtn = document.getElementById('upgradeBtn');
-  const upgradeConfirm = document.getElementById('upgradeConfirm');
-  const versionChip = document.getElementById('versionChip');
+  // Version elements are in the DOM below; defer lookup until DOMContentLoaded.
+  let versionFooter, versionBadge, versionStatus, upgradeBtn, upgradeConfirm, versionChip;
   let _upgradePolling = false;
+
+  document.addEventListener('DOMContentLoaded', () => {
+    versionFooter = document.getElementById('versionFooter');
+    versionBadge = document.getElementById('versionBadge');
+    versionStatus = document.getElementById('versionStatus');
+    upgradeBtn = document.getElementById('upgradeBtn');
+    upgradeConfirm = document.getElementById('upgradeConfirm');
+    versionChip = document.getElementById('versionChip');
+    loadVersion();
+  });
 
   function _setChip(text, cls, title) {
     if (!versionChip) return;
@@ -751,7 +784,6 @@ _HTML = """<!DOCTYPE html>
     setTimeout(poll, 5000);
   }
 
-  loadVersion();
   </script>
 
   <div id="versionFooter">
@@ -773,6 +805,13 @@ _HTML = """<!DOCTYPE html>
       </button>
     </div>
   </div>
+
+  <footer style="width:100%;max-width:760px;margin-top:.5rem;text-align:center;padding:.75rem 0;">
+    <a href="https://github.com/abarbaccia/avr-calibration" target="_blank" rel="noopener"
+       style="color:#64748b;font-size:.75rem;text-decoration:none;">
+      github.com/abarbaccia/avr-calibration
+    </a>
+  </footer>
 </body>
 </html>
 """
@@ -1200,7 +1239,7 @@ async def system_status() -> dict:
             await asyncio.wait_for(receiver.async_setup(), timeout=5.0)
             await receiver.async_update()
             devices.append({
-                "name": f"Denon {receiver.model_name or 'AVR'}",
+                "name": receiver.model_name or "Denon AVR",
                 "connected": True,
                 "detail": f"Input: {receiver.input_func}, Volume: {receiver.volume} dB",
             })
@@ -1212,13 +1251,14 @@ async def system_status() -> dict:
     minidsp_port = cfg.minidsp.get("port", 5380)
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
-            r = await client.get(f"http://{minidsp_host}:{minidsp_port}/devices/0/config")
+            r = await client.get(f"http://{minidsp_host}:{minidsp_port}/devices/0")
             if r.status_code == 200:
                 data = r.json()
+                master = data.get("master", {})
                 devices.append({
                     "name": "miniDSP 2x4 HD",
                     "connected": True,
-                    "detail": f"Preset: {data.get('preset', '?')}, Source: {data.get('source', '?')}",
+                    "detail": f"Preset: {master.get('preset', '?')}, Source: {master.get('source', '?')}",
                 })
             else:
                 devices.append({"name": "miniDSP 2x4 HD", "connected": False, "detail": "HTTP error"})
@@ -1245,7 +1285,8 @@ async def system_status() -> dict:
     runs = store.get_runs(limit=1)
     last_run = runs[0] if runs else None
 
-    return {"devices": devices, "last_run": last_run}
+    port_tune_hz = cfg.sub.get("port_tune_hz")
+    return {"devices": devices, "last_run": last_run, "port_tune_hz": port_tune_hz}
 
 
 # ── Config helper ─────────────────────────────────────────────────────────────
