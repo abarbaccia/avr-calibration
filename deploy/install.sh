@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# avr-calibration Pi Zero W bootstrap (Docker-based)
+# avr-calibration Raspberry Pi bootstrap (Docker-based)
 # Run as the pi user (not root): bash install.sh
-# Tested on Raspberry Pi OS Bookworm Lite (32-bit)
+# Tested on Raspberry Pi OS Bookworm 64-bit (Pi 5)
 set -euo pipefail
 
 IMAGE="ghcr.io/abarbaccia/avr-calibration:latest"
@@ -9,7 +9,7 @@ SERVICE_NAME="avr-calibration"
 DATA_DIR="$HOME/.avr-calibration"
 
 echo ""
-echo "=== avr-calibration Pi Zero W setup ==="
+echo "=== avr-calibration Raspberry Pi setup ==="
 echo ""
 
 ARCH=$(uname -m)
@@ -40,68 +40,7 @@ else
     echo "Docker already installed: $(docker --version)"
 fi
 
-# ── 3. udev rules for miniDSP HID ─────────────────────────────────────────
-#
-# Two rules are needed:
-#   a) Bind usbhid to the HID interface (interface 4, class 0x03) on hotplug.
-#      Without this the hidraw device is not created after a replug.
-#   b) Grant group-readable permissions to /dev/hidraw* for the miniDSP.
-#
-# The Docker container gets access via --device=/dev/hidraw0.
-# We do NOT pass --device=/dev/bus/usb — that steals exclusive USB HID access
-# from the kernel and breaks hidraw for everyone else.
-
-echo ""
-echo "--- Setting up udev rules for miniDSP HID ---"
-UDEV_FILE="/etc/udev/rules.d/99-minidsp.rules"
-sudo tee "$UDEV_FILE" > /dev/null << 'EOF'
-# miniDSP 2x4HD — bind usbhid to HID interface on hotplug so hidraw is created
-ACTION=="add", SUBSYSTEM=="usb_interface", \
-    ATTRS{idVendor}=="2752", ATTRS{idProduct}=="0011", \
-    ATTR{bInterfaceClass}=="03", \
-    RUN+="/bin/sh -c 'echo -n %k > /sys/bus/usb/drivers/usbhid/bind'"
-
-# Immediately unbind snd-usb-audio from miniDSP audio interfaces.
-# We don't use the USB audio output (playback is via HDMI). The audio driver's
-# repeated failed probes generate -71 errors that stress the DWC2 controller
-# and accelerate device resets on Pi Zero W.
-ACTION=="bind", SUBSYSTEM=="usb_interface", \
-    ATTRS{idVendor}=="2752", ATTRS{idProduct}=="0011", \
-    ATTR{bInterfaceClass}=="01", \
-    ENV{DRIVER}=="snd-usb-audio", \
-    RUN+="/bin/sh -c 'echo -n %k > /sys/bus/usb/drivers/snd-usb-audio/unbind 2>/dev/null || true'"
-
-# Grant container-accessible permissions to the hidraw device
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2752", ATTRS{idProduct}=="0011", \
-    MODE="0666", GROUP="plugdev"
-
-# Restart the avr-calibration service when miniDSP hidraw reappears
-# (handles device resets — container needs to be restarted to pick up new /dev/hidraw0)
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2752", ATTRS{idProduct}=="0011", \
-    ACTION=="add", \
-    RUN+="/bin/systemctl restart avr-calibration"
-EOF
-sudo udevadm control --reload-rules
-echo "udev rules installed — replug miniDSP USB if already connected"
-
-# ── 4. USB power boost ─────────────────────────────────────────────────────
-#
-# miniDSP 2x4HD draws ~500mA. The Pi Zero W USB OTG port is current-limited
-# by default. max_usb_current=1 enables a GPIO switch that raises the USB
-# current limit to 1.2A, preventing device resets under sustained load.
-
-echo ""
-echo "--- Enabling USB current boost (max_usb_current=1) ---"
-CONFIG_FILE="/boot/firmware/config.txt"
-[ -f "$CONFIG_FILE" ] || CONFIG_FILE="/boot/config.txt"
-if ! grep -q "max_usb_current" "$CONFIG_FILE"; then
-    sudo sed -i '/^\[all\]/a max_usb_current=1' "$CONFIG_FILE"
-    echo "Added max_usb_current=1 to $CONFIG_FILE (takes effect after reboot)"
-else
-    echo "max_usb_current already set in $CONFIG_FILE"
-fi
-
-# ── 5. Config ─────────────────────────────────────────────────────────────
+# ── 3. Config ─────────────────────────────────────────────────────────────
 
 echo ""
 echo "--- Generating config ---"
@@ -146,7 +85,7 @@ else
     echo "Config already exists at $DATA_DIR/config.yaml"
 fi
 
-# ── 6. Pull Docker image ───────────────────────────────────────────────────
+# ── 4. Pull Docker image ───────────────────────────────────────────────────
 
 echo ""
 echo "--- Pulling Docker image ---"
@@ -154,7 +93,7 @@ echo "--- Pulling Docker image ---"
 sudo docker pull "$IMAGE"
 echo "Image pulled: $IMAGE"
 
-# ── 7. avr-calibration Docker systemd service ─────────────────────────────
+# ── 5. avr-calibration Docker systemd service ─────────────────────────────
 #
 # minidspd runs INSIDE the container (not on the Pi host).
 # We use --privileged to give the container full device access, which avoids
@@ -184,7 +123,7 @@ User=$USER
 ExecStartPre=-/usr/bin/docker rm -f ${SERVICE_NAME}
 ExecStart=/usr/bin/docker run --rm \\
     --name ${SERVICE_NAME} \\
-    -p 8000:8000 \\
+    --network=host \\
     --privileged \\
     -v ${DATA_DIR}:/data/.avr-calibration \\
     ${IMAGE}
@@ -201,7 +140,7 @@ sudo systemctl enable "$SERVICE_NAME"
 sudo systemctl start "$SERVICE_NAME"
 echo "Service enabled and started"
 
-# ── 8. Auto-update timer ──────────────────────────────────────────────────
+# ── 6. Auto-update timer ──────────────────────────────────────────────────
 #
 # Registers avr-calibration-update.service (one-shot updater) and
 # avr-calibration-update.timer (fires daily at 3am) on the host.
@@ -214,7 +153,7 @@ echo "--- Installing auto-update service and timer ---"
 UPDATE_SERVICE="/etc/systemd/system/avr-calibration-update.service"
 UPDATE_TIMER="/etc/systemd/system/avr-calibration-update.timer"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 if [ -f "$SCRIPT_DIR/avr-calibration-update.service" ]; then
     sudo cp "$SCRIPT_DIR/avr-calibration-update.service" "$UPDATE_SERVICE"
@@ -238,14 +177,14 @@ if [ -f "$UPDATE_TIMER" ]; then
     echo "  Next run: $(systemctl show avr-calibration-update.timer --property=NextElapseUSecRealtime --value 2>/dev/null || echo 'unknown')"
 fi
 
-# ── 9. Done ───────────────────────────────────────────────────────────────
+# ── 7. Done ───────────────────────────────────────────────────────────────
 
 echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "Next steps:"
 echo "  1. Edit $DATA_DIR/config.yaml (set denon.host)"
-echo "  2. Plug in miniDSP via USB — hidraw0 will be created automatically"
+echo "  2. Plug in miniDSP and UMIK-1 via USB"
 echo "  3. Run: docker exec ${SERVICE_NAME} calibrate check"
 echo "  4. Service URL: https://$(hostname -I | awk '{print $1}'):8000"
 echo "     (self-signed cert — click Advanced → Proceed in your browser)"
