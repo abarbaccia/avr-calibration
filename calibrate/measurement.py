@@ -363,8 +363,8 @@ class MeasurementEngine:
                 devices = sd.query_devices()
                 idx = _find_umik_device(devices, name_substring=input_device_name)
                 if idx is not None:
-                    current = sd.default.device
-                    out_idx = current[1] if isinstance(current, (list, tuple)) else current
+                    # sd.default.device is _InputOutputPair([in, out]) — index directly
+                    out_idx = int(sd.default.device[1])
                     sd.default.device = (idx, out_idx)
             except ImportError:
                 pass  # sounddevice unavailable; let PyTTa use its own default
