@@ -1,7 +1,7 @@
 #!/bin/sh
 # Entrypoint for the avr-calibration Docker container.
-# Starts minidspd (DSP control daemon), then uvicorn (web dashboard).
-# Plain HTTP — browser is a read-only dashboard, no mic access needed.
+# Starts minidspd (DSP control), MCP server (Claude control plane),
+# and uvicorn (web dashboard).
 
 mkdir -p /data/.avr-calibration
 
@@ -32,6 +32,21 @@ if kill -0 "$MINIDSPD_PID" 2>/dev/null; then
 else
     echo "WARNING: minidspd exited — DSP control unavailable. Check /tmp/minidspd.log"
     cat /tmp/minidspd.log >&2
+fi
+
+# ── MCP server ────────────────────────────────────────────────────────────────
+# Claude Code connects to this via SSE on port 8765.
+# Runs in background so uvicorn (foreground) is the main process.
+MCP_PORT="${MCP_PORT:-8765}"
+echo "Starting MCP server on 0.0.0.0:${MCP_PORT}..."
+python -m calibrate.mcp_server >/tmp/mcp-server.log 2>&1 &
+MCP_PID=$!
+sleep 1
+if kill -0 "$MCP_PID" 2>/dev/null; then
+    echo "MCP server started (pid $MCP_PID)"
+else
+    echo "WARNING: MCP server exited — Claude control unavailable. Check /tmp/mcp-server.log"
+    cat /tmp/mcp-server.log >&2
 fi
 
 exec python -m uvicorn calibrate.web:app \
