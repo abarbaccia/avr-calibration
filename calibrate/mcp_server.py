@@ -85,7 +85,11 @@ log = logging.getLogger(__name__)
 MCP_PORT: int = int(os.environ.get("MCP_PORT", "8765"))
 MCP_HOST: str = os.environ.get("MCP_HOST", "0.0.0.0")
 
-RECIPES_DIR: Path = Path(__file__).parent.parent / "recipes"
+# recipes/ is a sibling of calibrate/ in the repo, but when pip-installed
+# it ends up at /app/recipes/ (Docker WORKDIR) not next to site-packages/.
+_REPO_RECIPES = Path(__file__).parent.parent / "recipes"
+_APP_RECIPES = Path("/app/recipes")
+RECIPES_DIR: Path = _REPO_RECIPES if _REPO_RECIPES.is_dir() else _APP_RECIPES
 
 # ── Driver singletons — set in lifespan, patched in tests ─────────────────────
 
