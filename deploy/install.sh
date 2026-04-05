@@ -153,7 +153,7 @@ echo "--- Installing auto-update service and timer ---"
 UPDATE_SERVICE="/etc/systemd/system/avr-calibration-update.service"
 UPDATE_TIMER="/etc/systemd/system/avr-calibration-update.timer"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 if [ -f "$SCRIPT_DIR/avr-calibration-update.service" ]; then
     sudo cp "$SCRIPT_DIR/avr-calibration-update.service" "$UPDATE_SERVICE"
