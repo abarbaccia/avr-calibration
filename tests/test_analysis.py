@@ -1,0 +1,233 @@
+"""Tests for analysis module — target curves, convergence, mock corrections."""
+
+import math
+
+import numpy as np
+import pytest
+
+from calibrate.analysis import (
+    HarmanTarget,
+    make_flat_target,
+    per_band_deviation,
+    rms_deviation,
+    _propose_mock,
+)
+from calibrate.measurement import FrequencyResponse
+from calibrate.recipe import Recipe, ConvergenceCriteria, MeasurementConfig
+from calibrate.safety import FilterSpec, SafetyValidator, _third_octave_for_freq
+
+
+def _make_fr(
+    freq_range: tuple[float, float] = (20.0, 200.0),
+    n_points: int = 100,
+    spl_value: float = 75.0,
+    spl_offsets: dict[float, float] | None = None,
+) -> FrequencyResponse:
+    """Create a synthetic FrequencyResponse for testing."""
+    freqs = np.logspace(
+        np.log10(freq_range[0]),
+        np.log10(freq_range[1]),
+        n_points,
+    ).tolist()
+
+    spl = [spl_value] * n_points
+
+    if spl_offsets:
+        for target_freq, offset in spl_offsets.items():
+            # Find closest bin and apply offset
+            idx = int(np.argmin(np.abs(np.array(freqs) - target_freq)))
+            spl[idx] = spl_value + offset
+
+    return FrequencyResponse(
+        frequencies=freqs,
+        spl=spl,
+        sample_rate=96000,
+        sweep_duration=3.0,
+        timestamp="2026-04-05T00:00:00Z",
+    )
+
+
+def _make_recipe(analysis: str = "mock") -> Recipe:
+    return Recipe(
+        name="test",
+        target="harman",
+        band=(20.0, 200.0),
+        convergence=ConvergenceCriteria(threshold_db=2.0, max_iterations=5),
+        analysis=analysis,
+        measurement=MeasurementConfig(),
+    )
+
+
+# ── Harman target shape ──────────────────────────────────────────────────────
+
+def test_harman_target_shape() -> None:
+    """Harman target has +slope below 80 Hz, flat above."""
+    target = HarmanTarget(reference_spl=75.0)
+
+    # Below 80 Hz: should be above reference
+    assert target.target_at(25.0) > target.target_at(80.0)
+    assert target.target_at(40.0) > target.target_at(80.0)
+    assert target.target_at(63.0) > target.target_at(80.0)
+
+    # At 80 Hz: should be at reference
+    assert target.target_at(80.0) == 75.0
+
+    # Above 80 Hz: flat or slightly below
+    assert target.target_at(100.0) == 75.0
+    assert target.target_at(200.0) < 75.0
+
+    # Monotonic decrease from 20 Hz to 200 Hz
+    spl_20 = target.target_at(20.0)
+    spl_80 = target.target_at(80.0)
+    spl_200 = target.target_at(200.0)
+    assert spl_20 > spl_80 > spl_200
+
+
+def test_harman_target_at_20hz() -> None:
+    target = HarmanTarget(reference_spl=75.0)
+    assert target.target_at(20.0) == pytest.approx(81.0, abs=0.1)
+
+
+def test_harman_target_array() -> None:
+    target = HarmanTarget(reference_spl=75.0)
+    freqs = [20.0, 80.0, 200.0]
+    arr = target.target_array(freqs)
+    assert len(arr) == 3
+    assert arr[0] > arr[1] > arr[2]
+
+
+# ── Flat target ───────────────────────────────────────────────────────────────
+
+def test_flat_target() -> None:
+    target = make_flat_target(reference_spl=75.0)
+    assert target.target_at(20.0) == 75.0
+    assert target.target_at(80.0) == 75.0
+    assert target.target_at(200.0) == 75.0
+
+
+# ── RMS deviation ─────────────────────────────────────────────────────────────
+
+def test_rms_deviation_perfect() -> None:
+    """Measurement matching target -> 0.0 deviation."""
+    target = HarmanTarget(reference_spl=75.0)
+    # Create FR that exactly matches Harman target
+    freqs = [20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0, 160.0, 200.0]
+    spl = [target.target_at(f) for f in freqs]
+    fr = FrequencyResponse(
+        frequencies=freqs,
+        spl=spl,
+        sample_rate=96000,
+        sweep_duration=3.0,
+        timestamp="2026-04-05T00:00:00Z",
+    )
+    rms = rms_deviation(fr, target, (20.0, 200.0))
+    assert rms == pytest.approx(0.0, abs=0.01)
+
+
+def test_rms_deviation_flat() -> None:
+    """Flat measurement vs Harman target -> known non-zero deviation."""
+    target = HarmanTarget(reference_spl=75.0)
+    fr = _make_fr(spl_value=75.0)  # flat at 75 dB
+    rms = rms_deviation(fr, target, (20.0, 200.0))
+    # Harman has ~6 dB range (from +6 at 20 Hz to -2 at 200 Hz)
+    # RMS of a slope should be > 0
+    assert rms > 1.0
+    assert rms < 10.0  # sanity check
+
+
+def test_rms_deviation_empty_band() -> None:
+    """Band outside measurement range -> 0.0."""
+    target = HarmanTarget(reference_spl=75.0)
+    fr = _make_fr(freq_range=(20.0, 200.0))
+    rms = rms_deviation(fr, target, (500.0, 1000.0))
+    assert rms == 0.0
+
+
+# ── Convergence reference pinned to baseline ──────────────────────────────────
+
+def test_convergence_reference_pinned_to_baseline() -> None:
+    """Reference SPL stays constant regardless of measurement changes."""
+    baseline_spl = 75.0
+    target = HarmanTarget(reference_spl=baseline_spl)
+
+    # Iteration 1: measurement at 75 dB
+    fr1 = _make_fr(spl_value=75.0)
+    rms1 = rms_deviation(fr1, target, (20.0, 200.0))
+
+    # Iteration 2: measurement at 80 dB (louder)
+    fr2 = _make_fr(spl_value=80.0)
+    rms2 = rms_deviation(fr2, target, (20.0, 200.0))
+
+    # Both use the same target (reference_spl=75), so the 80 dB measurement
+    # should have a different (higher) RMS because it's offset from target
+    assert rms2 > rms1
+
+
+# ── Mock backend proposals ────────────────────────────────────────────────────
+
+def test_deterministic_proposes_cuts_for_peaks() -> None:
+    """A +6 dB peak at 80 Hz -> negative gain filter."""
+    fr = _make_fr(spl_value=75.0, spl_offsets={80.0: 6.0})
+    target = HarmanTarget(reference_spl=75.0)
+    recipe = _make_recipe()
+    hw = {"available_peq_slots": 8}
+
+    filters = _propose_mock(fr, target, [], hw, recipe)
+    # Should have at least one cut near 80 Hz
+    cuts = [f for f in filters if f.gain_db < 0]
+    assert len(cuts) >= 1
+    # The biggest cut should be near 80 Hz
+    biggest_cut = min(filters, key=lambda f: f.gain_db)
+    assert biggest_cut.gain_db < 0
+
+
+def test_deterministic_proposes_boosts_for_dips() -> None:
+    """A -6 dB dip at 50 Hz -> positive gain filter (capped by safety)."""
+    fr = _make_fr(spl_value=75.0, spl_offsets={50.0: -6.0})
+    target = HarmanTarget(reference_spl=75.0)
+    recipe = _make_recipe()
+    hw = {"available_peq_slots": 8}
+
+    filters = _propose_mock(fr, target, [], hw, recipe)
+    boosts = [f for f in filters if f.gain_db > 0]
+    # Should have at least one boost
+    assert len(boosts) >= 1
+    # All boosts should be within safety limits
+    for f in boosts:
+        assert f.gain_db <= 6.0
+        assert f.gain_db <= 3.0  # per-iteration limit for mock
+
+
+def test_deterministic_respects_slot_limit() -> None:
+    """More peaks than PEQ slots -> limited to available slots."""
+    # Create FR with deviations at every 1/3-octave centre
+    offsets = {f: 4.0 for f in [25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0, 160.0, 200.0]}
+    fr = _make_fr(spl_value=75.0, spl_offsets=offsets)
+    target = HarmanTarget(reference_spl=75.0)
+    recipe = _make_recipe()
+    hw = {"available_peq_slots": 3}  # only 3 slots
+
+    filters = _propose_mock(fr, target, [], hw, recipe)
+    assert len(filters) <= 3
+
+
+# ── Frequency drift safety check ─────────────────────────────────────────────
+
+def test_frequency_drift_caught_by_validator() -> None:
+    """49.9 Hz and 50.0 Hz should be treated as the same 1/3-octave band."""
+    # Both should map to 50 Hz 1/3-octave centre
+    assert _third_octave_for_freq(49.9) == _third_octave_for_freq(50.0)
+    assert _third_octave_for_freq(50.0) == 50.0
+
+    # SafetyValidator should catch the drift
+    validator = SafetyValidator()
+    hpf = FilterSpec(freq=18.0, gain_db=0.0, q=0.707, type="hpf")
+
+    prev = [hpf, FilterSpec(freq=50.0, gain_db=1.0, q=1.0, type="peaking")]
+    # New filter at 49.9 Hz with +5.0 dB -> delta is 4.0 dB (> 3.0 limit)
+    # Under per-band ceiling (+6 dB) so it hits the per-iteration check
+    new = [hpf, FilterSpec(freq=49.9, gain_db=5.0, q=1.0, type="peaking")]
+
+    result = validator.validate(new, prev)
+    assert not result.ok
+    assert "change per iteration" in result.error.lower()

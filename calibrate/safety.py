@@ -227,18 +227,31 @@ class SafetyValidator:
         filters: list[FilterSpec],
         previous_filters: list[FilterSpec],
     ) -> ValidationResult:
-        """Reject if any band increases by more than MAX_CHANGE_PER_ITER_DB vs previous."""
-        # Build a lookup: previous gain by nearest frequency
-        prev_by_freq: dict[float, float] = {f.freq: f.gain_db for f in previous_filters}
+        """Reject if any band increases by more than MAX_CHANGE_PER_ITER_DB vs previous.
+
+        Matches filters by nearest 1/3-octave band (not exact frequency) to
+        prevent drift-based bypasses where a correction algorithm shifts a
+        filter from 50.0 Hz to 49.9 Hz to dodge the delta check.
+        """
+        # Build a lookup: previous gain by 1/3-octave centre
+        prev_by_band: dict[float, float] = {}
+        for f in previous_filters:
+            if f.type == "hpf":
+                continue
+            centre = _third_octave_for_freq(f.freq)
+            # If multiple filters in the same band, use the max gain
+            prev_by_band[centre] = max(prev_by_band.get(centre, f.gain_db), f.gain_db)
 
         for f in filters:
             if f.type == "hpf":
                 continue
-            prev_gain = prev_by_freq.get(f.freq, 0.0)
+            centre = _third_octave_for_freq(f.freq)
+            prev_gain = prev_by_band.get(centre, 0.0)
             delta = f.gain_db - prev_gain
             if delta > MAX_CHANGE_PER_ITER_DB:
                 return ValidationResult.failed(
-                    f"band at {f.freq:.1f} Hz increases by +{delta:.1f} dB "
+                    f"band at {f.freq:.1f} Hz (1/3-octave: {centre:.0f} Hz) "
+                    f"increases by +{delta:.1f} dB "
                     f"(max change per iteration is +{MAX_CHANGE_PER_ITER_DB:.0f} dB)"
                 )
         return ValidationResult.passed()

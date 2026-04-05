@@ -89,6 +89,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libatlas3-base \
     libopenblas0 \
     libatomic1 \
+    libusb-1.0-0 \
     alsa-utils \
     openssl \
     && rm -rf /var/lib/apt/lists/*
