@@ -9,12 +9,16 @@ Covers:
   - read_eq: returns in-memory state (flat on startup, updated after apply_eq)
   - apply_eq: valid filters → driver.apply_eq called
   - apply_eq: DriverError propagated as {ok: false}
-  - avr_set_volume: success and failure cases
-  - set_denon_volume: deprecated alias → same behaviour as avr_set_volume
-  - trigger_measurement: no UMIK found → error
-  - trigger_measurement: success (direct engine call, session saved)
-  - trigger_measurement: engine error propagated
-  - trigger_measurement: DenonSweepContext wraps engine when HDMI configured
+  - set_volume: success and failure cases
+  - set_volume: legacy aliases (avr_set_volume, set_denon_volume) still dispatch
+  - measure: no UMIK found → error
+  - measure: success (direct engine call, session saved)
+  - measure: engine error propagated
+  - measure: DenonSweepContext wraps engine when HDMI configured
+  - mute_output / unmute_output: mute/unmute DSP outputs
+  - set_delay: set output delay
+  - set_polarity: set output polarity
+  - check_system: pre-flight hardware checks
   - fetch_recipe: found → returns content; not found → {ok: false}
   - fetch_recipe: path traversal via ".." → rejected
   - fetch_recipe: path traversal via symlink → rejected
@@ -37,11 +41,16 @@ from calibrate.mcp_server import (
     _read_resource,
     _tool_apply_eq,
     _tool_avr_set_volume,
+    _tool_check_system,
     _tool_fetch_recipe,
     _tool_get_device_state,
     _tool_get_measurement_history,
+    _tool_mute_output,
     _tool_read_eq,
+    _tool_set_delay,
+    _tool_set_polarity,
     _tool_trigger_measurement,
+    _tool_unmute_output,
 )
 from calibrate.drivers.base import DriverError
 
@@ -328,10 +337,20 @@ async def test_avr_set_volume_connection_error(mock_avr) -> None:
 
 
 @pytest.mark.asyncio
-async def test_set_denon_volume_alias_dispatches(mock_avr) -> None:
-    """set_denon_volume deprecated alias calls avr_set_volume behaviour."""
+async def test_set_volume_legacy_alias_avr_set_volume(mock_avr) -> None:
+    """Legacy avr_set_volume alias still dispatches to set_volume."""
     mock_avr.set_volume.return_value = -25.0
-    # Call via the MCP dispatch to verify the alias is wired up
+    from calibrate.mcp_server import call_tool
+    texts = await call_tool("avr_set_volume", {"level_db": -25.0})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert data["level_db"] == -25.0
+
+
+@pytest.mark.asyncio
+async def test_set_volume_legacy_alias_set_denon_volume(mock_avr) -> None:
+    """Legacy set_denon_volume alias still dispatches to set_volume."""
+    mock_avr.set_volume.return_value = -25.0
     from calibrate.mcp_server import call_tool
     texts = await call_tool("set_denon_volume", {"level_db": -25.0})
     data = json.loads(texts[0].text)
@@ -669,12 +688,22 @@ async def test_call_tool_apply_eq(mock_dsp, valid_filters) -> None:
 
 
 @pytest.mark.asyncio
-async def test_call_tool_trigger_measurement_dispatch() -> None:
+async def test_call_tool_measure_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+    with patch.dict(sys.modules, {"sounddevice": None}):
+        texts = await call_tool("measure", {})
+    data = json.loads(texts[0].text)
+    assert not data["ok"]  # no UMIK on CI → degraded mode
+
+
+@pytest.mark.asyncio
+async def test_call_tool_trigger_measurement_legacy_alias() -> None:
+    """Legacy trigger_measurement name still dispatches."""
     from calibrate.mcp_server import call_tool
     with patch.dict(sys.modules, {"sounddevice": None}):
         texts = await call_tool("trigger_measurement", {})
     data = json.loads(texts[0].text)
-    assert not data["ok"]  # no UMIK on CI → degraded mode
+    assert not data["ok"]
 
 
 @pytest.mark.asyncio
@@ -708,8 +737,19 @@ async def test_list_tools_returns_all_tools() -> None:
     names = {t.name for t in tools}
     assert "get_device_state" in names
     assert "apply_eq" in names
-    assert "trigger_measurement" in names
+    assert "measure" in names
+    assert "set_volume" in names
+    assert "mute_output" in names
+    assert "unmute_output" in names
+    assert "set_delay" in names
+    assert "set_polarity" in names
+    assert "check_system" in names
     assert "fetch_recipe" in names
+    # Deprecated names should NOT be in tool list
+    assert "trigger_measurement" not in names
+    assert "set_denon_volume" not in names
+    assert "avr_set_volume" not in names
+    assert "mute_sub_outputs" not in names
 
 
 @pytest.mark.asyncio
@@ -836,5 +876,196 @@ async def test_get_calibration_runs_no_crash() -> None:
     assert result["runs"] == []
 
 
-# ── run_calibration_loop ────────────────────────────────────────────────────
+# ── mute_output / unmute_output ─────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_mute_output_success(mock_dsp) -> None:
+    result = await _tool_mute_output([0, 1])
+    assert result["ok"]
+    assert result["muted"] == [0, 1]
+    mock_dsp.mute_outputs.assert_called_once_with([0, 1])
+
+
+@pytest.mark.asyncio
+async def test_mute_output_error(mock_dsp) -> None:
+    mock_dsp.mute_outputs.side_effect = Exception("hw error")
+    result = await _tool_mute_output([0])
+    assert not result["ok"]
+    assert "mute failed" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_unmute_output_success(mock_dsp) -> None:
+    result = await _tool_unmute_output([0, 1])
+    assert result["ok"]
+    assert result["unmuted"] == [0, 1]
+    mock_dsp.unmute_outputs.assert_called_once_with([0, 1])
+
+
+@pytest.mark.asyncio
+async def test_unmute_output_error(mock_dsp) -> None:
+    mock_dsp.unmute_outputs.side_effect = Exception("hw error")
+    result = await _tool_unmute_output([0])
+    assert not result["ok"]
+    assert "unmute failed" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_mute_output_dispatch(mock_dsp) -> None:
+    from calibrate.mcp_server import call_tool
+    texts = await call_tool("mute_output", {"output_indices": [1]})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert data["muted"] == [1]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_unmute_output_dispatch(mock_dsp) -> None:
+    from calibrate.mcp_server import call_tool
+    texts = await call_tool("unmute_output", {"output_indices": [0, 1]})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert data["unmuted"] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_mute_sub_outputs_legacy(mock_dsp) -> None:
+    """Legacy mute_sub_outputs name still works via dispatch."""
+    from calibrate.mcp_server import call_tool
+    texts = await call_tool("mute_sub_outputs", {"mute": [1], "unmute": [0]})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+
+
+# ── set_delay ───────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_set_delay_success(mock_dsp) -> None:
+    result = await _tool_set_delay(output_index=0, delay_ms=2.5)
+    assert result["ok"]
+    assert result["output_index"] == 0
+    assert result["delay_ms"] == 2.5
+    mock_dsp.set_output_delay.assert_called_once_with(0, 2.5)
+
+
+@pytest.mark.asyncio
+async def test_set_delay_driver_error(mock_dsp) -> None:
+    mock_dsp.set_output_delay.side_effect = DriverError("invalid output")
+    result = await _tool_set_delay(output_index=5, delay_ms=1.0)
+    assert not result["ok"]
+    assert "invalid output" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_set_delay_dispatch(mock_dsp) -> None:
+    from calibrate.mcp_server import call_tool
+    texts = await call_tool("set_delay", {"output_index": 1, "delay_ms": 3.0})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert data["delay_ms"] == 3.0
+
+
+# ── set_polarity ────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_set_polarity_success(mock_dsp) -> None:
+    result = await _tool_set_polarity(output_index=1, inverted=True)
+    assert result["ok"]
+    assert result["output_index"] == 1
+    assert result["inverted"] is True
+    mock_dsp.set_output_polarity.assert_called_once_with(1, True)
+
+
+@pytest.mark.asyncio
+async def test_set_polarity_driver_error(mock_dsp) -> None:
+    mock_dsp.set_output_polarity.side_effect = DriverError("hw failure")
+    result = await _tool_set_polarity(output_index=0, inverted=False)
+    assert not result["ok"]
+    assert "hw failure" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_set_polarity_dispatch(mock_dsp) -> None:
+    from calibrate.mcp_server import call_tool
+    texts = await call_tool("set_polarity", {"output_index": 0, "inverted": True})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert data["inverted"] is True
+
+
+# ── check_system ────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_check_system_all_pass() -> None:
+    from calibrate.preflight import CheckResult
+    mock_results = [
+        CheckResult(name="Config", passed=True, detail="ok"),
+        CheckResult(name="miniDSP", passed=True, detail="connected"),
+        CheckResult(name="Denon AVR", passed=True, detail="online"),
+        CheckResult(name="Signal Path", passed=True, detail="matches"),
+    ]
+    with patch("calibrate.preflight.PreflightChecker") as MockChecker:
+        instance = AsyncMock()
+        instance.run_all.return_value = mock_results
+        MockChecker.return_value = instance
+        result = await _tool_check_system()
+    assert result["ok"]
+    assert result["all_passed"] is True
+    assert len(result["checks"]) == 4
+
+
+@pytest.mark.asyncio
+async def test_check_system_some_fail() -> None:
+    from calibrate.preflight import CheckResult
+    mock_results = [
+        CheckResult(name="Config", passed=True, detail="ok"),
+        CheckResult(name="miniDSP", passed=False, detail="not found", error="USB disconnected"),
+    ]
+    with patch("calibrate.preflight.PreflightChecker") as MockChecker:
+        instance = AsyncMock()
+        instance.run_all.return_value = mock_results
+        MockChecker.return_value = instance
+        result = await _tool_check_system()
+    assert result["ok"]
+    assert result["all_passed"] is False
+    failed = [c for c in result["checks"] if not c["passed"]]
+    assert len(failed) == 1
+    assert failed[0]["name"] == "miniDSP"
+
+
+@pytest.mark.asyncio
+async def test_check_system_error() -> None:
+    with patch("calibrate.mcp_server._config", side_effect=Exception("boom")):
+        result = await _tool_check_system()
+    assert not result["ok"]
+    assert "check_system error" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_check_system_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+    from calibrate.preflight import CheckResult
+    mock_results = [
+        CheckResult(name="Config", passed=True, detail="ok"),
+    ]
+    with patch("calibrate.preflight.PreflightChecker") as MockChecker:
+        instance = AsyncMock()
+        instance.run_all.return_value = mock_results
+        MockChecker.return_value = instance
+        texts = await call_tool("check_system", {})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert data["all_passed"] is True
+
+
+# ── set_volume dispatch ─────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_call_tool_set_volume_dispatch(mock_avr) -> None:
+    from calibrate.mcp_server import call_tool
+    mock_avr.set_volume.return_value = -30.0
+    texts = await call_tool("set_volume", {"level_db": -30.0})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert data["level_db"] == -30.0
 

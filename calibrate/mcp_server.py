@@ -15,9 +15,13 @@ Tools:
   get_measurement_history — last N measurements from SessionStore
   read_eq                — current EQ state (in-memory, updated by apply_eq)
   apply_eq               — SafetyValidator → biquad conversion → DSP write
-  avr_set_volume         — generic AVR volume control
-  set_denon_volume       — DEPRECATED: alias for avr_set_volume
-  trigger_measurement    — Pi 5 only; returns degraded-mode error on Pi Zero
+  set_volume             — AVR volume control
+  measure                — trigger sweep measurement via UMIK + PyTTa
+  mute_output            — mute DSP outputs (gain → -127 dB)
+  unmute_output          — unmute DSP outputs (gain → 0 dB)
+  set_delay              — set output delay in ms
+  set_polarity           — set output polarity (normal/inverted)
+  check_system           — pre-flight hardware checks
   fetch_recipe           — serve recipe markdown from recipes/ directory
 
 HARD RULE — Signal Path Writes Require Human Confirmation:
@@ -308,20 +312,66 @@ async def _tool_discover_avr() -> dict:
         return _err(f"discovery error: {exc}")
 
 
-async def _tool_mute_sub_outputs(
-    mute: list[int] | None, unmute: list[int] | None
-) -> dict:
-    """Mute/unmute individual miniDSP outputs for per-sub measurement."""
+async def _tool_mute_output(output_indices: list[int]) -> dict:
+    """Mute individual miniDSP outputs (gain → -127 dB)."""
     try:
-        if mute:
-            await _dsp.mute_outputs(mute)
-        if unmute:
-            await _dsp.unmute_outputs(unmute)
-        muted_str = str(mute) if mute else "none"
-        unmuted_str = str(unmute) if unmute else "none"
-        return _ok(message=f"muted={muted_str}, unmuted={unmuted_str}")
+        await _dsp.mute_outputs(output_indices)  # type: ignore[union-attr]
+        return _ok(muted=output_indices)
     except Exception as exc:
-        return _err(f"mute/unmute failed: {exc}")
+        return _err(f"mute failed: {exc}")
+
+
+async def _tool_unmute_output(output_indices: list[int]) -> dict:
+    """Unmute individual miniDSP outputs (gain → 0 dB)."""
+    try:
+        await _dsp.unmute_outputs(output_indices)  # type: ignore[union-attr]
+        return _ok(unmuted=output_indices)
+    except Exception as exc:
+        return _err(f"unmute failed: {exc}")
+
+
+async def _tool_set_delay(output_index: int, delay_ms: float) -> dict:
+    """Set delay for a single DSP output in milliseconds."""
+    try:
+        await _dsp.set_output_delay(output_index, delay_ms)  # type: ignore[union-attr]
+        return _ok(output_index=output_index, delay_ms=delay_ms)
+    except DriverError as exc:
+        return _err(str(exc))
+    except Exception as exc:
+        return _err(f"set_delay error: {exc}")
+
+
+async def _tool_set_polarity(output_index: int, inverted: bool) -> dict:
+    """Set polarity for a single DSP output (inverted=True flips phase)."""
+    try:
+        await _dsp.set_output_polarity(output_index, inverted)  # type: ignore[union-attr]
+        return _ok(output_index=output_index, inverted=inverted)
+    except DriverError as exc:
+        return _err(str(exc))
+    except Exception as exc:
+        return _err(f"set_polarity error: {exc}")
+
+
+async def _tool_check_system() -> dict:
+    """Run all pre-flight hardware checks and return results."""
+    from .preflight import PreflightChecker
+    try:
+        cfg = _config()
+        checker = PreflightChecker(cfg)
+        results = await checker.run_all()
+        checks = [
+            {
+                "name": r.name,
+                "passed": r.passed,
+                "detail": r.detail,
+                "error": r.error,
+            }
+            for r in results
+        ]
+        all_passed = all(r.passed for r in results)
+        return _ok(all_passed=all_passed, checks=checks)
+    except Exception as exc:
+        return _err(f"check_system error: {exc}")
 
 
 # ── MCP Server ─────────────────────────────────────────────────────────────────
@@ -415,10 +465,10 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
-        name="avr_set_volume",
+        name="set_volume",
         description=(
             "Set the AVR volume to a specific level in dB. "
-            "Range: approximately -80 to +18 dB for the Denon X3800H. "
+            "Range: approximately -80 to +18 dB. "
             "Returns {ok: true, level_db: N} on success, "
             "{ok: false, error: 'avr unreachable: ...'} on failure."
         ),
@@ -434,30 +484,11 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
-        name="set_denon_volume",
+        name="measure",
         description=(
-            "Deprecated: use avr_set_volume instead. "
-            "Set the AVR volume to a specific level in dB. "
-            "This alias is preserved for backwards compatibility with cached Claude Code sessions."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "level_db": {
-                    "type": "number",
-                    "description": "Target volume in dB (e.g. -30.0 for -30 dB)",
-                }
-            },
-            "required": ["level_db"],
-        },
-    ),
-    Tool(
-        name="trigger_measurement",
-        description=(
-            "Trigger a frequency response measurement using the UMIK-1 microphone. "
-            "Requires Pi 5 (4 USB ports: miniDSP + UMIK-1). "
-            "On Pi Zero 2 W, returns a structured error directing you to use the browser "
-            "and then call get_measurement_history() to retrieve results."
+            "Trigger a frequency response measurement using the UMIK microphone. "
+            "Takes a sweep measurement via PyTTa, saves to the session store, "
+            "and returns the session ID. Use get_measurement_history() to retrieve FR data."
         ),
         inputSchema={
             "type": "object",
@@ -549,27 +580,99 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
-        name="mute_sub_outputs",
+        name="mute_output",
         description=(
-            "Mute or unmute individual miniDSP sub outputs for per-sub measurement. "
-            "Pass output indices to mute and/or unmute. Use this to isolate individual "
-            "subs during calibration (e.g. mute output 1 to measure sub on output 0 only). "
-            "Always unmute all outputs when done."
+            "Mute DSP outputs by setting gain to -127 dB. "
+            "Use this to isolate individual subs during calibration "
+            "(e.g. mute output 1 to measure sub on output 0 only)."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "mute": {
+                "output_indices": {
                     "type": "array",
                     "items": {"type": "integer"},
-                    "description": "Output indices to mute (gain → -127 dB)",
-                },
-                "unmute": {
-                    "type": "array",
-                    "items": {"type": "integer"},
-                    "description": "Output indices to unmute (gain → 0 dB)",
+                    "description": "Output indices to mute",
                 },
             },
+            "required": ["output_indices"],
+        },
+    ),
+    Tool(
+        name="unmute_output",
+        description=(
+            "Unmute DSP outputs by restoring gain to 0 dB. "
+            "Always unmute all outputs when calibration is done."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "output_indices": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Output indices to unmute",
+                },
+            },
+            "required": ["output_indices"],
+        },
+    ),
+    Tool(
+        name="set_delay",
+        description=(
+            "Set delay for a single DSP output in milliseconds. "
+            "Used during sub alignment to time-align multiple subs. "
+            "Range: 0-10 ms typical for sub alignment."
+            + _SIGNAL_PATH_WRITE_WARNING
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "output_index": {
+                    "type": "integer",
+                    "description": "DSP output index (0-3)",
+                },
+                "delay_ms": {
+                    "type": "number",
+                    "description": "Delay in milliseconds",
+                },
+            },
+            "required": ["output_index", "delay_ms"],
+        },
+    ),
+    Tool(
+        name="set_polarity",
+        description=(
+            "Set polarity for a single DSP output. "
+            "inverted=true flips the phase 180°. Used during sub alignment "
+            "when one sub is out of phase with others (dip where others peak)."
+            + _SIGNAL_PATH_WRITE_WARNING
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "output_index": {
+                    "type": "integer",
+                    "description": "DSP output index (0-3)",
+                },
+                "inverted": {
+                    "type": "boolean",
+                    "description": "true = inverted (180° flip), false = normal",
+                },
+            },
+            "required": ["output_index", "inverted"],
+        },
+    ),
+    Tool(
+        name="check_system",
+        description=(
+            "Run pre-flight hardware checks: config, miniDSP (USB + daemon), "
+            "Denon AVR (with auto-discovery), and signal path sync. "
+            "Returns {all_passed: bool, checks: [{name, passed, detail, error}]}. "
+            "Call this before starting any calibration."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {},
         },
     ),
 ]
@@ -593,9 +696,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_read_eq()
     elif name == "apply_eq":
         result = await _tool_apply_eq(arguments.get("filters", []))
-    elif name in ("avr_set_volume", "set_denon_volume"):
+    elif name in ("set_volume", "avr_set_volume", "set_denon_volume"):
         result = await _tool_avr_set_volume(float(arguments["level_db"]))
-    elif name == "trigger_measurement":
+    elif name in ("measure", "trigger_measurement"):
         result = await _tool_trigger_measurement()
     elif name == "fetch_recipe":
         result = await _tool_fetch_recipe(arguments["name"])
@@ -610,11 +713,33 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_set_config(arguments["updates"])
     elif name == "discover_avr":
         result = await _tool_discover_avr()
-    elif name == "mute_sub_outputs":
-        result = await _tool_mute_sub_outputs(
-            mute=arguments.get("mute"),
-            unmute=arguments.get("unmute"),
+    elif name == "mute_output":
+        result = await _tool_mute_output(arguments["output_indices"])
+    elif name == "unmute_output":
+        result = await _tool_unmute_output(arguments["output_indices"])
+    elif name == "set_delay":
+        result = await _tool_set_delay(
+            output_index=int(arguments["output_index"]),
+            delay_ms=float(arguments["delay_ms"]),
         )
+    elif name == "set_polarity":
+        result = await _tool_set_polarity(
+            output_index=int(arguments["output_index"]),
+            inverted=arguments["inverted"] is True,
+        )
+    elif name == "check_system":
+        result = await _tool_check_system()
+    # Legacy aliases for backwards compatibility with cached sessions
+    elif name == "mute_sub_outputs":
+        mute = arguments.get("mute")
+        unmute = arguments.get("unmute")
+        results_list = []
+        if mute:
+            results_list.append(await _tool_mute_output(mute))
+        if unmute:
+            results_list.append(await _tool_unmute_output(unmute))
+        failed = [r for r in results_list if not r.get("ok")]
+        result = failed[0] if failed else _ok(message="mute/unmute complete")
     else:
         result = _err(f"unknown tool: {name}")
 
