@@ -1,151 +1,138 @@
 # MCP Server Setup
 
-Connect Claude Code to your Pi's hardware so you can calibrate without the browser.
+Connect Claude Code to your Pi's hardware so you can calibrate without touching the browser.
 
 ## What this gives you
 
 Once connected, you can ask Claude Code things like:
+- "Measure the room and apply Harman bass corrections"
 - "What's my current EQ?"
-- "Apply Harman bass corrections from my last measurement"
 - "What does my sub response look like at 80 Hz?"
+- "Compare my last two measurements and show what changed"
 
-Claude calls the tools directly — no browser clicks required.
+Claude calls the MCP tools directly — sweep, read EQ, apply corrections, re-sweep.
 
 ## Prerequisites
 
-- Pi Zero 2 W or Pi 4 with the AVR calibration container running
-- Claude Code installed on your laptop (`npm install -g @anthropic-ai/claude-code`)
-- Pi reachable on your local network (test: `ping avr-calibration.local`)
+- Pi 5 (recommended) or Pi Zero 2 W with the avr-calibration container running
+- UMIK-1 or UMIK-2 connected to the Pi via USB
+- Claude Code installed on your laptop
+- Pi reachable on your local network
 
-## Step 1 — Deploy the updated container
+## Step 1 — Deploy the container
 
-The MCP server is included in the container image starting from this release.
+The MCP server is included in the `:latest` image.
 
-**Option A — hotfix (fastest, for Pi deployments already running):**
 ```bash
-./deploy/hotfix.sh calibrate/mcp_server.py calibrate/safety.py calibrate/dsp.py
-```
-
-**Option B — pull the latest branch image:**
-```bash
-# On the Pi:
-sudo docker pull ghcr.io/abarbaccia/avr-calibration:feat-mcp-server
+# On the Pi — pull latest and restart:
+sudo docker pull ghcr.io/abarbaccia/avr-calibration:latest
 sudo systemctl restart avr-calibration
 ```
 
-**Option C — docker compose (development machine):**
+If you haven't deployed yet, run the one-line installer:
 ```bash
-docker compose up --build
+bash <(curl -sL https://raw.githubusercontent.com/abarbaccia/avr-calibration/main/deploy/install.sh)
 ```
 
-## Step 2 — Verify the MCP server is running
+## Step 2 — Configure your Pi
 
-From your laptop:
-```bash
-curl http://avr-calibration.local:8765/sse
-# Should respond (SSE connection opens, may hang — that's correct)
+Edit `/home/pi/.avr-calibration/config.yaml`:
+
+```yaml
+denon:
+  host: "192.168.1.209"          # your Denon IP
+minidsp:
+  host: "localhost"
+  port: 5380
+mic:
+  name: "UMIK"
+measurement:
+  denon_sweep_input: "Videocore" # exact input name from your Denon — see tip below
+  denon_sweep_volume: -25.0      # master volume during sweep (restored after)
 ```
 
-Or check the container logs:
+> **Finding your exact Denon input name:** Input names depend on your AVR model and any renaming you've done in the Denon setup menu. The endpoint will return HTTP 503 with the available list if the configured name is wrong:
+> ```bash
+> curl -sk https://<pi-ip>:8000/api/equipment/denon | python3 -m json.tool | grep -A20 inputs
+> ```
+
+## Step 3 — Verify the MCP server is running
+
 ```bash
-# On the Pi:
+# From your laptop:
+curl http://<pi-ip>:8765/sse
+# SSE connection opens and hangs — that's correct
+
+# Or check container logs on the Pi:
 sudo docker logs avr-calibration | grep -i mcp
 # Should show: "MCP server starting on 0.0.0.0:8765"
 ```
 
-## Step 3 — Configure Claude Code
+## Step 4 — Configure Claude Code
 
-The `.claude/mcp.json` file in this repo already has the configuration:
+The `.claude/mcp.json` file in this repo has the config. Update the URL with your Pi's IP:
 
 ```json
 {
   "mcpServers": {
     "avr-calibration": {
-      "url": "http://avr-calibration.local:8765/sse"
+      "type": "sse",
+      "url": "http://<pi-ip>:8765/sse"
     }
   }
 }
 ```
 
-If your Pi has a different hostname or IP, edit this file:
-```bash
-# Replace with your Pi's hostname or IP:
-# "url": "http://192.168.1.50:8765/sse"
-```
+Claude Code picks this up automatically when run from the repo directory. For global access, add it to `~/.claude/mcp.json` instead.
 
-Claude Code picks up `.claude/mcp.json` automatically when you run it from
-this repo directory.
+## Step 5 — Test the connection
 
-## Step 4 — Test the connection
-
-In a Claude Code session (run `claude` from this repo):
+Run `claude` from this repo and try:
 
 ```
 What's my current EQ?
 ```
 
-Claude should call `read_eq()` and describe the filter state. If it doesn't
-use the tools, check that you ran `claude` from the repo directory (where
-`.claude/mcp.json` lives).
+Claude should call `get_current_eq` and describe the filter state. If it doesn't use the tools, check that you're running from the repo directory and that the MCP URL is reachable.
 
 ## Available tools
 
-| Tool | What it does |
+| Tool | Description |
 |------|-------------|
+| `trigger_measurement` | Run a headless sweep via UMIK, returns session ID |
+| `get_frequency_response` | Fetch FR data for a session |
+| `get_current_eq` | Read current miniDSP EQ settings |
+| `apply_eq_corrections` | Write EQ band changes (SafetyValidator enforced) |
+| `get_sessions` | List measurement history |
+| `check_hardware` | Verify Denon, miniDSP, and mic are reachable |
 | `get_device_state` | Current Denon + miniDSP status |
-| `get_measurement_history(limit)` | Last N measurements from the Pi's database |
-| `read_eq` | Current EQ filter state |
-| `apply_eq(filters)` | Apply EQ filters (SafetyValidator enforced) |
-| `set_denon_volume(level_db)` | Set Denon AVR volume |
-| `trigger_measurement` | Take a measurement (Pi 4 + UMIK-1 required) |
-| `fetch_recipe(name)` | Get a calibration recipe (e.g. `core/harman-bass`) |
-
-## Resources
-
-| URI | Contents |
-|-----|---------|
-| `measurements://latest` | Most recent measurement session |
-| `eq://current` | Current EQ state |
-
-## Pi Zero 2 W — trigger_measurement
-
-The Pi Zero 2 W has one USB port, taken by the miniDSP. `trigger_measurement`
-returns a structured error on Pi Zero:
-
-```
-trigger_measurement requires Pi 4 — take a measurement in the browser
-and use get_measurement_history() to retrieve it.
-```
-
-All other tools (read_eq, apply_eq, get_measurement_history, fetch_recipe, etc.)
-work on Pi Zero.
+| `set_denon_volume` | Set Denon AVR master volume |
 
 ## Security note
 
-The MCP server has no authentication — same LAN trust model as the FastAPI server.
-Do not expose port 8765 to the internet. If you need remote access, use a VPN or
-SSH tunnel:
+The MCP server has no authentication — same LAN trust model as the web UI. Don't expose port 8765 to the internet. For remote access, use SSH tunneling:
 
 ```bash
-ssh -L 8765:localhost:8765 pi@avr-calibration.local
+ssh -L 8765:localhost:8765 pi@<pi-ip>
 # Then set the MCP URL to: http://localhost:8765/sse
 ```
 
 ## Troubleshooting
 
 **Claude doesn't use the MCP tools:**
-- Make sure you're running `claude` from the repo directory (`.claude/mcp.json` must be present)
-- Check `claude --version` — MCP support requires a recent version
+- Make sure you're running `claude` from the repo directory
+- Check that `.claude/mcp.json` exists and has the correct Pi IP
 
 **Connection refused on port 8765:**
-- Check the container is running the new image (with MCP server included)
-- On Pi: `sudo docker logs avr-calibration | tail -50`
+- Verify the container is running: `sudo docker ps | grep avr`
+- Check logs: `sudo docker logs avr-calibration | tail -50`
+
+**HTTP 503 on sweep — "Input not found":**
+- The configured `denon_sweep_input` doesn't match your Denon's input list
+- Check available inputs: `curl -sk https://<pi-ip>:8000/api/equipment/denon`
+- Update `config.yaml` with the exact name shown
 
 **SafetyValidator errors when applying EQ:**
-- The error message tells you exactly which limit was violated
-- Reduce the boost amount or move the frequency above 25 Hz
+- The error message specifies which limit was violated
+- Reduce boost amount or move the frequency above 25 Hz
 - Claude will adjust automatically if you ask it to retry
-
-**EQ state lost after restart:**
-- `read_eq` tracks state in-memory — it resets when the container restarts
-- Re-apply your filters, or check the measurement history for previously applied filter sets

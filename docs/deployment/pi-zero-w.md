@@ -1,8 +1,8 @@
-# Deploying on Raspberry Pi Zero W
+# Deploying on Raspberry Pi
 
-The Pi Zero W lives permanently in your rack. miniDSP is always connected. When
-calibrating, you plug the UMIK into your laptop and open a browser — no software
-install on the laptop required.
+> **Pi 5 is the recommended target.** It has enough USB ports for both the miniDSP and UMIK-1, enabling fully headless measurement via `POST /api/measure` or Claude Code MCP. The Pi Zero 2 W works for EQ control and web UI but requires a USB hub for simultaneous miniDSP + UMIK, or use the browser-based measurement flow instead.
+
+The Pi lives permanently in your rack. miniDSP is always connected. The UMIK connects directly to the Pi (Pi 5) or via a USB hub (Pi Zero 2 W).
 
 ## Hardware
 

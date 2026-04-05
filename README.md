@@ -1,87 +1,161 @@
 # avr-calibration
 
-AI-first home theater calibration — closed-loop bass optimization.
+AI-first home theater calibration — closed-loop bass optimization via Claude Code + MCP.
 
-Tired of endless manual loops with REW, miniDSP, UMIK-1, etc? This tool closes the loop: measure → AI analyzes (measurements + how it sounds) → apply changes → re-measure → repeat until converged on a target curve.
+Tired of endless manual loops with REW, miniDSP, UMIK-1? This closes the loop: **measure → AI analyzes → apply EQ changes → re-measure → converge**.
 
-## What it does
+The primary interface is Claude Code talking directly to your hardware through an MCP server. No browser clicks required for calibration.
 
-- **Automated measurement** via log sweep + numpy deconvolution (UMIK-1/2 captures via browser Web Audio API)
-- **Multi-sub alignment** — MSO-inspired IR phase alignment: travel-time delays, polarity correction, level matching
-- **AI analysis** with Claude — reads both frequency response graphs and subjective feedback ("the Fury Road chase scene sounded muddy")
-- **Hardware control** via miniDSP 2x4 HD (through minidsp-rs) and Denon X3800H (through denonavr)
-- **Safety rails** — hard limits on boost depth and frequency floor protect your drivers
-- **Convergence** against the Harman target curve (or your own)
+## How it works
+
+```
+Claude Code (your laptop)
+    │
+    │  MCP tools (trigger sweep, read EQ, apply corrections)
+    ▼
+Pi 5 — avr-calibration service (Docker)
+    ├── UMIK-1 (USB) — headless log sweep via sounddevice + PyTTa
+    ├── Denon X3800H — auto power on/off, input switch, volume control
+    ├── miniDSP 2x4 HD — EQ reads and writes via minidspd HTTP
+    └── SQLite — measurement history
+```
+
+Claude reads your frequency response, compares against the Harman target curve, proposes EQ corrections within safety limits, applies them, and re-measures. You stay in the loop — writes require your confirmation.
 
 ## Hardware
 
-- Denon X3800H (or other Denon/Marantz AVR)
-- miniDSP 2x4 HD
-- UMIK-1 or UMIK-2 measurement microphone
+- **Pi 5** (recommended) or Pi Zero 2 W — runs the service permanently in your rack
+- **Denon X3800H** (or other Denon/Marantz AVR with denonavr support)
+- **miniDSP 2x4 HD** — subwoofer EQ and routing
+- **UMIK-1 or UMIK-2** — connected to the Pi via USB
 - Subwoofer(s) — initially tuned for SVS PB12-NSD
 
-## Quick start (local dev)
+## Quick start
+
+### 1. Deploy to Pi
 
 ```bash
-# Set up environment
+# One command: installs Docker, pulls image, starts service
+bash <(curl -sL https://raw.githubusercontent.com/abarbaccia/avr-calibration/main/deploy/install.sh)
+```
+
+Edit `/home/pi/.avr-calibration/config.yaml` with your hardware details:
+
+```yaml
+denon:
+  host: "192.168.1.209"
+minidsp:
+  host: "localhost"
+  port: 5380
+mic:
+  name: "UMIK"
+measurement:
+  denon_sweep_input: "Videocore"   # must match Denon's exact name — see tip below
+  denon_sweep_volume: -25.0
+```
+
+> **Finding your Denon input name:** Input names vary by AVR and user renaming. Check what yours are called:
+> ```bash
+> curl -sk https://<pi-ip>:8000/api/equipment/denon | python3 -m json.tool | grep -A20 inputs
+> ```
+
+### 2. Connect Claude Code via MCP
+
+Add to your MCP config (`.claude/mcp.json` in this repo, or `~/.claude/mcp.json` globally):
+
+```json
+{
+  "mcpServers": {
+    "avr-calibration": {
+      "type": "sse",
+      "url": "http://<pi-ip>:8765/sse"
+    }
+  }
+}
+```
+
+Then just talk to Claude Code:
+
+```
+measure the room and apply Harman bass corrections
+```
+
+Claude will sweep, analyze, propose EQ changes, and apply them — asking before any write.
+
+See [docs/mcp-setup.md](docs/mcp-setup.md) for the full MCP setup guide.
+
+## MCP tools
+
+| Tool | Description |
+|------|-------------|
+| `trigger_measurement` | Run a headless sweep via UMIK, returns session ID |
+| `get_frequency_response` | Fetch FR data for a session |
+| `get_current_eq` | Read current miniDSP EQ settings |
+| `apply_eq_corrections` | Write EQ band changes (SafetyValidator enforced) |
+| `get_sessions` | List measurement history |
+| `check_hardware` | Verify Denon, miniDSP, and mic are reachable |
+
+## Headless measurement API
+
+```bash
+# Trigger a sweep from anywhere on the network
+curl -sk -X POST https://<pi-ip>:8000/api/measure \
+  -H 'Content-Type: application/json' \
+  -d '{"label": "post-eq"}'
+# → {"session_id": 4, "status": "ok"}
+```
+
+The endpoint automatically: validates your configured Denon input against the live input list, powers on the Denon if off, switches input and volume, records the sweep, then restores original state.
+
+## Safety limits (SVS PB12-NSD)
+
+All EQ writes go through `SafetyValidator` before reaching the miniDSP:
+
+| Limit | Value |
+|-------|-------|
+| Minimum boost frequency | 25 Hz |
+| Max boost per band | +6 dB |
+| Max cumulative boost (1/3 oct) | +9 dB |
+| Max change per iteration | +3 dB/band |
+| Infrasonic HPF | 18 Hz, 4th-order Butterworth (always on) |
+
+Cuts have no floor — they're always safe.
+
+## Web UI
+
+Available at `https://<pi-ip>:8000` — history viewer, frequency response charts, Harman target overlay, before/after EQ comparison, PNG export.
+
+## Development
+
+```bash
 uv venv .venv && source .venv/bin/activate
 uv sync --extra dev
 
-# Configure
-calibrate check           # creates ~/.avr-calibration/config.yaml if missing
-# edit the config with your Denon IP, then:
-calibrate check           # verify all hardware is reachable
+# Run tests (100% coverage is the goal)
+uv run python -m pytest tests/ -v
 
-# Inspect results
-calibrate history         # list all past sessions
-calibrate show 1          # detail view: ASCII plot, peak SPL, band
-calibrate show 1 --csv    # export frequency response as CSV
-calibrate show 1 --json   # export as JSON
+# CLI
+calibrate --help
+calibrate check        # verify all hardware is reachable
 ```
 
 ## Deployment
 
-Designed to run on a **Raspberry Pi Zero 2 W** permanently installed in your rack as a
-Docker container. The image is pre-built for `linux/arm/v7` and `linux/amd64` — no
-source compilation on the Pi.
+Docker image built by GitHub Actions on every push:
+- Branch push → `ghcr.io/abarbaccia/avr-calibration:<branch-name>`
+- Main push → also tagged `:latest`
+- Targets: `linux/arm64` (Pi 5), `linux/arm/v7` (Pi Zero 2 W), `linux/amd64`
 
+**Hotfix deploy** (seconds, no rebuild):
 ```bash
-# On the Pi Zero 2 W — one command installs Docker, pulls image, and starts the service:
-bash <(curl -sL https://raw.githubusercontent.com/abarbaccia/avr-calibration/main/deploy/install.sh)
-# Web UI: https://<pi-ip>:8000  (self-signed cert — click Advanced → Proceed)
+./deploy/hotfix.sh                    # auto-detects modified calibrate/ files
+./deploy/hotfix.sh calibrate/web.py   # specific file
 ```
 
-See [docs/deployment/pi-zero-w.md](docs/deployment/pi-zero-w.md) for the full guide.
+**Pull new image after CI:**
+```bash
+sudo docker pull ghcr.io/abarbaccia/avr-calibration:latest
+sudo systemctl restart avr-calibration
+```
 
-## Requirements
-
-- Python 3.11+
-- [minidsp-rs](https://github.com/mrene/minidsp-rs) daemon running (`minidspd`)
-- Denon AVR on your local network
-- UMIK-1/2 connected via USB (to the measurement client, not the Pi)
-
-## Status
-
-Early development. Currently implemented:
-
-- `calibrate check` — hardware pre-flight verification (UMIK mic, miniDSP, Denon AVR)
-- `calibrate measure` — log-sweep frequency response measurement via PyTTa + SQLite session history
-- `calibrate history` — list past sessions with timestamp, label, peak SPL, and point count
-- `calibrate show <id>` — session detail with ASCII frequency response plot; `--csv` and `--json` export
-- `calibrate web` — start web server (Pi serves UI; browser captures UMIK audio)
-  - **History viewer:** click any session row to display its frequency response curve alongside the Harman subwoofer target. Before/after EQ overlay when both measurements exist.
-  - **URL deep linking:** `?session={id}` restores the selected session on load; browser back/forward navigates history.
-  - **PNG export:** export the active FR chart as a PNG.
-- **Sub-alignment:** `POST /api/align-subs/start|record|cancel` — sweep each sub independently, extract IR, apply delays + polarity + level matching via miniDSP
-- **Extended target curves:** HT-Aggressive (+4 dB/octave below 100 Hz for movies) and Musicality (Gaussian peak at 30 Hz) join Harman and Flat in the curve selector
-- **Sub Trim Advisor:** enter your Audyssey sub trim reading and get a color-coded badge (green/amber/red/blue) with actionable guidance
-- **Seat-to-seat variance:** average multiple measurement sessions and see a ±1σ variance band on the chart
-- **Phase/Time Alignment:** IR-based cross-correlation estimates sub/mains time offset in milliseconds and feet with a plain-language delay recommendation
-- **Dynamic EQ Advisor:** dismissable reminder card to disable Audyssey Dynamic EQ before calibrating
-- **Cardioid sub helper:** `POST /api/signal-path/cardioid` — inverts polarity and applies computed delay to miniDSP output 1 for cardioid array mode
-- `Dockerfile` + `.github/workflows/docker.yml` — multi-platform Docker image (arm/v7 + amd64), built and pushed to GHCR via GitHub Actions
-- `deploy/install.sh` — Pi Zero 2 W bootstrap: installs Docker, pulls GHCR image, starts systemd service
-
-Next: AI analysis, closed-loop EQ optimization.
-
-See [TODOS.md](TODOS.md) for the roadmap.
+See [docs/deployment/pi-zero-w.md](docs/deployment/pi-zero-w.md) for the full setup guide.
