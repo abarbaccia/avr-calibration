@@ -24,6 +24,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import asyncio
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -733,3 +734,96 @@ def test_create_app_returns_starlette_app() -> None:
     assert isinstance(app, Starlette)
     route_paths = [r.path for r in app.routes]
     assert "/sse" in route_paths
+
+
+# ── get_config ───────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_config() -> None:
+    from calibrate.mcp_server import _tool_get_config
+    fake_data = {"denon": {"host": "192.168.1.100"}, "minidsp": {"port": 5380}}
+    mock_cfg = MagicMock()
+    mock_cfg._data = fake_data
+    with patch("calibrate.mcp_server._config", return_value=mock_cfg):
+        result = await _tool_get_config()
+    assert result["ok"]
+    assert result["config"]["denon"]["host"] == "192.168.1.100"
+
+
+@pytest.mark.asyncio
+async def test_get_config_error() -> None:
+    from calibrate.mcp_server import _tool_get_config
+    with patch("calibrate.mcp_server._config", side_effect=FileNotFoundError("missing")):
+        result = await _tool_get_config()
+    assert not result["ok"]
+    assert "config error" in result["error"]
+
+
+# ── set_config ───────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_set_config() -> None:
+    from calibrate.mcp_server import _tool_set_config
+    updated_data = {"denon": {"host": "10.0.0.1"}, "minidsp": {"port": 5380}}
+    mock_cfg = MagicMock()
+    mock_cfg._data = updated_data
+    with (
+        patch("calibrate.mcp_server.update_config") as mock_update,
+        patch("calibrate.mcp_server._config", return_value=mock_cfg),
+    ):
+        result = await _tool_set_config({"denon": {"host": "10.0.0.1"}})
+    assert result["ok"]
+    assert result["config"]["denon"]["host"] == "10.0.0.1"
+    mock_update.assert_called_once_with({"denon": {"host": "10.0.0.1"}})
+
+
+@pytest.mark.asyncio
+async def test_set_config_error() -> None:
+    from calibrate.mcp_server import _tool_set_config
+    with patch("calibrate.mcp_server.update_config", side_effect=OSError("read-only fs")):
+        result = await _tool_set_config({"denon": {"host": "x"}})
+    assert not result["ok"]
+    assert "config write error" in result["error"]
+
+
+# ── discover_avr ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_discover_avr_found(mock_avr) -> None:
+    from calibrate.mcp_server import _tool_discover_avr
+    mock_avr.discover.return_value = ["192.168.1.209", "192.168.1.210"]
+    result = await _tool_discover_avr()
+    assert result["ok"]
+    assert result["receivers"] == ["192.168.1.209", "192.168.1.210"]
+
+
+@pytest.mark.asyncio
+async def test_discover_avr_empty(mock_avr) -> None:
+    from calibrate.mcp_server import _tool_discover_avr
+    mock_avr.discover.return_value = []
+    result = await _tool_discover_avr()
+    assert result["ok"]
+    assert result["receivers"] == []
+
+
+@pytest.mark.asyncio
+async def test_discover_avr_error(mock_avr) -> None:
+    from calibrate.mcp_server import _tool_discover_avr
+    mock_avr.discover.side_effect = asyncio.TimeoutError("scan timed out")
+    result = await _tool_discover_avr()
+    assert not result["ok"]
+    assert "discovery error" in result["error"]
+
+
+# ── get_calibration_runs bug fix ─────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_calibration_runs_no_crash() -> None:
+    """Verify the _load_config() -> _config() bug is fixed (no NameError)."""
+    from calibrate.mcp_server import _tool_get_calibration_runs
+    mock_store = MagicMock()
+    mock_store.get_runs.return_value = []
+    with patch("calibrate.storage.SessionStore", return_value=mock_store):
+        result = await _tool_get_calibration_runs()
+    assert result["ok"]
+    assert result["runs"] == []

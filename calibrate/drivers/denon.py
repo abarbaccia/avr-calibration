@@ -65,3 +65,14 @@ class DenonDriver(AVRDriver):
             raise DriverError(f"timeout connecting to {self._host}")
         except Exception as exc:
             raise DriverError(str(exc))
+
+    async def discover(self) -> list[str]:
+        """SSDP scan for Denon/Marantz AVRs on the local network."""
+        try:
+            import denonavr
+            found = await asyncio.wait_for(denonavr.async_discover(), timeout=10.0)
+            return [d["host"] for d in found if "host" in d]
+        except asyncio.TimeoutError:
+            return []
+        except Exception:
+            return []

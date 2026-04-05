@@ -71,7 +71,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Mount, Route
 
-from .config import Config
+from .config import Config, update_config
 from .drivers.avr_driver import AVRDriver
 from .drivers.base import DriverError
 from .drivers.dsp_driver import DSPDriver
@@ -258,7 +258,6 @@ async def _tool_get_calibration_runs(limit: int = 10, run_id: int | None = None)
     """Return calibration run history, or detail for a single run."""
     from .storage import SessionStore
 
-    cfg = _load_config()
     store = SessionStore()
 
     if run_id is not None:
@@ -269,6 +268,34 @@ async def _tool_get_calibration_runs(limit: int = 10, run_id: int | None = None)
 
     runs = store.get_runs(limit=limit)
     return _ok(runs=runs)
+
+
+async def _tool_get_config() -> dict:
+    """Return the current config.yaml as a dict."""
+    try:
+        cfg = _config()
+        return _ok(config=cfg._data)
+    except Exception as exc:
+        return _err(f"config error: {exc}")
+
+
+async def _tool_set_config(updates: dict) -> dict:
+    """Deep-merge updates into config.yaml and return the result."""
+    try:
+        update_config(updates)
+        cfg = _config()
+        return _ok(config=cfg._data)
+    except Exception as exc:
+        return _err(f"config write error: {exc}")
+
+
+async def _tool_discover_avr() -> dict:
+    """Run SSDP scan for Denon/Marantz AVRs on the local network."""
+    try:
+        hosts = await _avr.discover()  # type: ignore[union-attr]
+        return _ok(receivers=hosts)
+    except Exception as exc:
+        return _err(f"discovery error: {exc}")
 
 
 # ── MCP Server ─────────────────────────────────────────────────────────────────
@@ -452,6 +479,49 @@ _TOOLS: list[Tool] = [
             },
         },
     ),
+    Tool(
+        name="get_config",
+        description=(
+            "Return the current config.yaml as a dict. Includes all sections: "
+            "denon, minidsp, mic, sub, measurement, connections."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {},
+        },
+    ),
+    Tool(
+        name="set_config",
+        description=(
+            "Deep-merge updates into config.yaml. Pass a dict of sections to update. "
+            "Example: {\"denon\": {\"host\": \"192.168.1.100\"}} sets the Denon IP. "
+            "Existing keys not mentioned in updates are preserved."
+            + _SIGNAL_PATH_WRITE_WARNING
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "updates": {
+                    "type": "object",
+                    "description": "Dict of config sections to deep-merge. Keys: denon, minidsp, mic, sub, measurement.",
+                }
+            },
+            "required": ["updates"],
+        },
+    ),
+    Tool(
+        name="discover_avr",
+        description=(
+            "Run an SSDP scan to find Denon/Marantz AVRs on the local network. "
+            "Returns a list of IP addresses. Timeout: 10 seconds. "
+            "Use this during setup to auto-detect the AVR before calling "
+            "set_config to save the host."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {},
+        },
+    ),
 ]
 
 
@@ -484,6 +554,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             limit=int(arguments.get("limit", 10)),
             run_id=arguments.get("run_id"),
         )
+    elif name == "get_config":
+        result = await _tool_get_config()
+    elif name == "set_config":
+        result = await _tool_set_config(arguments["updates"])
+    elif name == "discover_avr":
+        result = await _tool_discover_avr()
     else:
         result = _err(f"unknown tool: {name}")
 
