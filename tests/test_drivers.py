@@ -128,8 +128,37 @@ async def test_denon_setup_and_close_are_noop() -> None:
 
 @pytest.mark.asyncio
 async def test_denon_discover_returns_empty() -> None:
-    driver = DenonDriver(host=None)
-    assert await driver.discover() == []
+    """discover() returns [] when SSDP finds no devices."""
+    denonavr_mock = MagicMock()
+    denonavr_mock.async_discover = AsyncMock(return_value=[])
+    with patch.dict(sys.modules, {"denonavr": denonavr_mock}):
+        driver = DenonDriver(host=None)
+        assert await driver.discover() == []
+
+
+@pytest.mark.asyncio
+async def test_denon_discover_found() -> None:
+    """discover() returns host list from SSDP scan."""
+    denonavr_mock = MagicMock()
+    denonavr_mock.async_discover = AsyncMock(return_value=[
+        {"host": "192.168.1.209"},
+        {"host": "192.168.1.210"},
+    ])
+    with patch.dict(sys.modules, {"denonavr": denonavr_mock}):
+        driver = DenonDriver(host=None)
+        result = await driver.discover()
+    assert result == ["192.168.1.209", "192.168.1.210"]
+
+
+@pytest.mark.asyncio
+async def test_denon_discover_timeout() -> None:
+    """discover() returns [] on timeout."""
+    import asyncio
+    denonavr_mock = MagicMock()
+    denonavr_mock.async_discover = AsyncMock(side_effect=asyncio.TimeoutError())
+    with patch.dict(sys.modules, {"denonavr": denonavr_mock}):
+        driver = DenonDriver(host=None)
+        assert await driver.discover() == []
 
 
 # ── MinidspDriver ──────────────────────────────────────────────────────────────

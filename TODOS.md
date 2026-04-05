@@ -281,10 +281,27 @@ measurement:
 
 ---
 
+## Architecture Convergence (added 2026-04-05)
+
+### TODO-ARCH1: Extract Denon lifecycle from measurement.py
+**Completed:** v0.1.9.1 (2026-04-05) — `DenonSweepContext` async context manager in `drivers/denon.py`. `measurement.py` has zero denonavr imports. All callers (CLI, web, MCP) use the same pattern: `DenonSweepContext.from_config(cfg)` returns context or None, caller wraps `engine.measure()` accordingly.
+
+### TODO-ARCH2: Extract HDMI int16 conversion from measurement.py
+**Completed:** v0.1.9.1 (2026-04-05) — `PlaybackStrategy` protocol in `calibrate/drivers/playback.py` with `USBPlayback` (PyTTa duplex) and `HDMIPlayback` (split sd.rec+sd.play, int16 output). `measurement.py` calls `playback_for_route(route).play_and_record()`. Zero format-specific logic in the engine.
+
+### TODO-ARCH3: MCP trigger_measurement should call engine directly
+**Completed:** v0.1.9.1 (2026-04-05) — `_tool_trigger_measurement()` now creates `MeasurementEngine`, calls `engine.measure()` directly, saves to `SessionStore`. No httpx, no HTTP hop. Uses `DenonSweepContext` wrapper for HDMI route.
+
+### TODO-ARCH4: Consolidate Denon access through DenonDriver
+**Completed:** v0.1.9.1 (2026-04-05) — Zero raw denonavr imports outside `drivers/denon.py`. `measurement.py`, `web.py`, `mcp_server.py`, and `preflight.py` all go through `DenonDriver` or `DenonSweepContext`. `preflight.check_denon()` uses `DenonDriver.get_state()` and `DenonDriver.discover()` for SSDP.
+
+---
+
 ## Completed
 
 ### TODO-4: Sweep playback routing — miniDSP USB vs. Denon HDMI
-**Completed:** v0.1.6.0 (2026-03-22) — implemented `_play_via_usb()` + `_play_via_hdmi()` with `playback_route: usb | hdmi` config dispatch. Two-stage calibration model (Stage 1 USB for sub alignment, Stage 2 HDMI for full-chain integration). `calibrate check` reports playback route status.
+**Completed:** v0.1.6.0 (2026-03-22) — original: `_play_via_usb()` + `_play_via_hdmi()` split API.
+**Updated:** v0.1.9.1 (2026-04-05) — dead code deleted. `measure()` is the single entry point with route-aware playback (USB=PyTTa duplex, HDMI=split sd.rec+sd.play with int16 conversion). Denon lifecycle extracted to `DenonSweepContext` in `drivers/denon.py` (ARCH1). All callers use the same context manager pattern.
 
 ### TODO-5: Measurement quality validation
 **Completed:** v0.1.6.0 (2026-03-22) — implemented `validate_recording()` with three checks (floor noise gate → warn, cross-correlation sweep capture → raise, SNR → raise). HTTP 422 response with structured `{error, check, detail, suggestion}` body. `FrequencyResponse.warnings` field for non-fatal warnings.

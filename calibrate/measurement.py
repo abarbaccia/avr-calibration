@@ -1,22 +1,23 @@
-"""PyTTa-based acoustic measurement engine.
+"""PyTTa-based acoustic measurement engine. Hardware-agnostic.
 
-Measurement flow:
-    generate log sweep → play+record (PyTTa) → deconvolve (numpy FFT) → FR
+Single entry point: MeasurementEngine.measure()
+
+    generate log sweep (PyTTa) → play+record → deconvolve (numpy FFT) → FR
+
+Playback is delegated to PlaybackStrategy (calibrate.drivers.playback):
+    USBPlayback  → PyTTa PlayRecMeasure (float32 duplex)
+    HDMIPlayback → split sd.rec() + sd.play() (HDMI requires int16 output)
+
+This module has ZERO knowledge of AVR hardware or output format quirks.
+Callers that need AVR input/volume switching should use DenonSweepContext
+from calibrate.drivers.denon before/after calling measure().
 
 PyTTa and numpy are imported lazily so the module loads in CI/test
 environments without PortAudio.
-
-The web API uses the split methods:
-    generate_sweep() → play_signal() + compute_fr()
-
-play_signal() dispatches based on config.measurement.playback_route:
-    "usb"  → _play_via_usb()   (Pi → miniDSP direct, Stage 1 sub alignment)
-    "hdmi" → _play_via_hdmi()  (Pi → Denon → full chain, Stage 2 integration)
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import math
@@ -97,154 +98,14 @@ def _find_umik_device(devices, name_substring: str = "UMIK") -> int | None:
 
 
 class MeasurementEngine:
-    """
-    Runs a log-sweep measurement via PyTTa and returns a FrequencyResponse.
+    """Run a log-sweep measurement via PyTTa and return a FrequencyResponse.
 
-         generate log sweep  (pytta.generate.sweep)
-                │
-         play + record       (pytta.PlayRecMeasure)
-                │
-         deconvolve          H(f) = FFT(recording) / FFT(sweep)
-                │
-         trim to [freq_min, freq_max]
-                │
-         FrequencyResponse
-
-    For the web API, the sweep can be split across requests:
-        sweep_samples, sr, dur = engine.generate_sweep()
-        engine.play_signal(sweep_samples, sr)    # non-blocking — 1s delay
-        fr = engine.compute_fr(sweep_samples, recording_samples, sr=sr)
-
-    play_signal() dispatches based on playback_route config:
-
-        play_signal()
-              │
-              ├─[route=usb]──→ _play_via_usb()
-              │                  └→ sounddevice.play(device="miniDSP")
-              │
-              └─[route=hdmi]─→ _play_via_hdmi()
-                                 ├→ denonavr: switch to AUX1
-                                 ├→ denonavr: set volume -25.0 dB
-                                 ├→ sounddevice.play(device=HDMI)
-                                 └→ denonavr: restore input + volume (always)
+    Single entry point: measure(). Route-aware for USB (PyTTa duplex)
+    and HDMI (split play+record with int16 output conversion).
     """
 
     def __init__(self, config: Config) -> None:
         self.config = config
-
-    # ── Public split API (used by web server) ─────────────────────────────
-
-    def generate_sweep(
-        self,
-        freq_min: int | None = None,
-        freq_max: int | None = None,
-        duration: float | None = None,
-        sample_rate: int | None = None,
-    ) -> tuple[list[float], int, float]:
-        """
-        Generate a log-sweep signal using numpy (no pytta dependency).
-
-        Returns (samples, sample_rate, duration) where samples is a flat list
-        of float32 values suitable for playback or JSON serialisation.
-
-        Raises RuntimeError if numpy is unavailable.
-        """
-        try:
-            import numpy as np
-        except ImportError as exc:
-            raise RuntimeError("numpy is required — pip install numpy") from exc
-
-        cfg = self.config.measurement
-        f_min = freq_min if freq_min is not None else cfg.get("freq_min", 20)
-        f_max = freq_max if freq_max is not None else cfg.get("freq_max", 200)
-        dur = duration if duration is not None else cfg.get("sweep_duration", 3.0)
-        sr = sample_rate if sample_rate is not None else cfg.get("sample_rate", 48000)
-
-        # Logarithmic (exponential) sine sweep: y(t) = sin(2π·f_min·k·(e^(t/k) - 1))
-        # where k = dur / ln(f_max / f_min)
-        n = int(sr * dur)
-        t = np.linspace(0.0, dur, n, endpoint=False)
-        k = dur / np.log(f_max / f_min)
-        phase = 2.0 * np.pi * f_min * k * (np.exp(t / k) - 1.0)
-        samples: list[float] = np.sin(phase).astype(np.float32).tolist()
-        return samples, sr, dur
-
-    def play_signal(
-        self,
-        samples: list[float],
-        sample_rate: int,
-        out_channel: int | None = None,
-    ) -> None:
-        """
-        Play samples through the configured output route (blocking).
-
-        Dispatches to _play_via_usb() or _play_via_hdmi() based on
-        config.measurement.playback_route (default: "usb").
-
-        Call this from a background thread to leave the web server responsive.
-        """
-        route = self.config.measurement.get("playback_route", "usb")
-        if route == "hdmi":
-            loop = asyncio.new_event_loop()
-            try:
-                loop.run_until_complete(self._play_via_hdmi(samples, sample_rate))
-            finally:
-                loop.close()
-        else:
-            self._play_via_usb(samples, sample_rate, out_channel)
-
-    def compute_fr(
-        self,
-        sweep_samples: list[float],
-        recording_samples: list[float],
-        freq_min: int | None = None,
-        freq_max: int | None = None,
-        sample_rate: int = 48000,
-    ) -> FrequencyResponse:
-        """
-        Validate recording quality, then deconvolve sweep + browser recording
-        into a FrequencyResponse.
-
-        Raises MeasurementQualityError if the recording fails quality checks
-        (sweep not captured, SNR too low). Returns warnings for non-fatal
-        issues (noisy room).
-
-        sweep_samples    — the sweep generated by generate_sweep()
-        recording_samples — Float32 PCM captured by the browser
-        sample_rate      — must match both arrays (browser records at this rate)
-        """
-        try:
-            import numpy as np
-        except ImportError as exc:
-            raise RuntimeError("numpy is required — pip install numpy") from exc
-
-        cfg = self.config.measurement
-        f_min = freq_min if freq_min is not None else cfg.get("freq_min", 20)
-        f_max = freq_max if freq_max is not None else cfg.get("freq_max", 200)
-        dur = len(sweep_samples) / sample_rate
-
-        sweep_array = np.array(sweep_samples, dtype=np.float64)
-        rec_array = np.array(recording_samples, dtype=np.float64)
-
-        warnings = self.validate_recording(np, sweep_array, rec_array, sample_rate)
-
-        frequencies, spl, ir_samples = self._compute_fr_arrays(
-            np,
-            sweep_array,
-            rec_array,
-            f_min,
-            f_max,
-            sample_rate,
-        )
-        return FrequencyResponse(
-            frequencies=frequencies,
-            spl=spl,
-            sample_rate=sample_rate,
-            sweep_duration=dur,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            warnings=warnings,
-            impulse_response=ir_samples,
-        )
 
     def validate_recording(
         self,
@@ -326,14 +187,25 @@ class MeasurementEngine:
 
         return warnings_out
 
-    # ── Legacy full-cycle API (used by CLI measure command) ────────────────
+    async def measure(
+        self,
+        input_device_name: str | None = None,
+    ) -> FrequencyResponse:
+        """Run a full sweep measurement. Hardware-agnostic.
 
-    def measure(self, input_device_name: str | None = None) -> FrequencyResponse:
-        """Run a full sweep measurement. Raises RuntimeError if dependencies unavailable.
+        Generates a log sweep via PyTTa, plays+records based on the configured
+        playback route, validates the recording, and deconvolves to FR.
+
+        Route-aware playback:
+          "usb"  — PyTTa PlayRecMeasure (float32 duplex, both devices support it)
+          "hdmi" — split sd.rec() + sd.play() (HDMI only supports int16 output)
+
+        The caller is responsible for any AVR lifecycle management (input switching,
+        volume, power) before/after calling measure(). Use DenonSweepContext for that.
 
         Args:
             input_device_name: optional substring to select the recording device by name
-                (e.g. "UMIK"). If None, uses the sounddevice default input device.
+                (e.g. "UMIK"). If None, uses config.mic.name (default "UMIK").
         """
         try:
             import pytta
@@ -356,18 +228,35 @@ class MeasurementEngine:
         sample_rate: int = cfg.get("sample_rate", 48000)
         in_channel: int = cfg.get("input_channel", 1)
         out_channel: int = cfg.get("output_channel", 1)
+        route = cfg.get("playback_route", "usb")
 
-        if input_device_name is not None:
+        # Always select UMIK for recording input
+        mic_name = input_device_name or self.config._data.get("mic", {}).get("name", "UMIK")
+        try:
+            import sounddevice as sd
+            devices = sd.query_devices()
+            umik_idx = _find_umik_device(devices, name_substring=mic_name)
+            if umik_idx is not None:
+                out_idx = int(sd.default.device[1])
+                sd.default.device = (umik_idx, out_idx)
+                log.info("Input device: %s (index %d)", devices[umik_idx]["name"], umik_idx)
+        except ImportError:
+            pass
+
+        # Select output device based on route
+        if route == "hdmi":
             try:
                 import sounddevice as sd
                 devices = sd.query_devices()
-                idx = _find_umik_device(devices, name_substring=input_device_name)
-                if idx is not None:
-                    # sd.default.device is _InputOutputPair([in, out]) — index directly
-                    out_idx = int(sd.default.device[1])
-                    sd.default.device = (idx, out_idx)
+                hdmi_name = cfg.get("hdmi_playback_device") or "hdmi"
+                for idx, dev in enumerate(devices):
+                    if dev["max_output_channels"] > 0 and hdmi_name.lower() in dev["name"].lower():
+                        in_idx = int(sd.default.device[0])
+                        sd.default.device = (in_idx, idx)
+                        log.info("Output device (HDMI): %s (index %d)", dev["name"], idx)
+                        break
             except ImportError:
-                pass  # sounddevice unavailable; let PyTTa use its own default
+                pass
 
         # pytta 0.1.1 uses camelCase params and fftDegree instead of duration.
         # Also patches traceback.walk_stack to handle shallow stacks (Python 3.11 bug).
@@ -384,7 +273,6 @@ class MeasurementEngine:
             sweep = pytta.generate.sweep(
                 freqMin=freq_min,
                 freqMax=freq_max,
-                # fftDegree: total signal = 2^N samples; account for ~1s default margins
                 fftDegree=math.ceil(math.log2((duration + 1.0) * sample_rate)),
                 samplingRate=sample_rate,
                 method="logarithmic",
@@ -392,29 +280,15 @@ class MeasurementEngine:
         finally:
             _traceback.walk_stack = _orig_walk_stack
 
-        # pytta 0.1.1: samplingRate is inferred from excitation; numInChannels removed
-        meas = pytta.PlayRecMeasure(
-            excitation=sweep,
-            inChannels=[in_channel],
-            outChannels=[out_channel],
-        )
-        try:
-            recording = meas.run()
-        except Exception as exc:
-            # Catch sounddevice.PortAudioError (imported lazily to avoid hard dep)
-            if "PortAudioError" in type(exc).__name__ or "PortAudio" in str(exc):
-                raise RuntimeError(f"Audio device error during measurement: {exc}") from exc
-            raise
+        from .drivers.playback import playback_for_route
 
-        self.validate_recording(
-            np,
-            sweep.timeSignal[:, 0],
-            recording.timeSignal[:, 0],
-            sample_rate,
-        )
+        strategy = playback_for_route(route)
+        sweep_1d, rec_1d = strategy.play_and_record(sweep, sample_rate, in_channel, out_channel)
 
-        frequencies, spl, ir_samples = self._compute_fr(
-            np, sweep, recording, freq_min, freq_max, sample_rate
+        self.validate_recording(np, sweep_1d, rec_1d, sample_rate)
+
+        frequencies, spl, ir_samples = self._compute_fr_arrays(
+            np, sweep_1d, rec_1d, freq_min, freq_max, sample_rate
         )
 
         return FrequencyResponse(
@@ -425,117 +299,6 @@ class MeasurementEngine:
             timestamp=datetime.now(timezone.utc).isoformat(),
             impulse_response=ir_samples,
         )
-
-    # ── Playback routes ────────────────────────────────────────────────────
-
-    def _play_via_usb(
-        self,
-        samples: list[float],
-        sample_rate: int,
-        out_channel: int | None = None,
-    ) -> None:
-        """Play via USB → miniDSP direct (Stage 1: sub alignment).
-
-        Finds the output device by substring match on config.measurement.playback_device.
-        Falls back to PortAudio default device if no name is configured or matched.
-        """
-        try:
-            import numpy as np
-            import sounddevice as sd
-        except ImportError as exc:
-            raise RuntimeError("sounddevice/numpy required for playback") from exc
-
-        cfg = self.config.measurement
-        device_name = cfg.get("playback_device", None)
-        device = None
-        if device_name:
-            devices = sd.query_devices()
-            for idx, dev in enumerate(devices):
-                if (
-                    dev["max_output_channels"] > 0
-                    and device_name.lower() in dev["name"].lower()
-                ):
-                    device = idx
-                    break
-
-        arr = np.array(samples, dtype=np.float32).reshape(-1, 1)
-        sd.play(arr, samplerate=sample_rate, device=device)
-        sd.wait()
-
-    async def _play_via_hdmi(
-        self,
-        samples: list[float],
-        sample_rate: int,
-    ) -> None:
-        """Play via Pi HDMI → Denon → full signal chain (Stage 2: system integration).
-
-        Sequence:
-          1. Connect to Denon, capture current input + volume
-          2. Switch to denon_sweep_input, set denon_sweep_volume
-          3. Wait denon_settle_ms for input switch to settle
-          4. Play sweep via HDMI sounddevice
-          5. Always restore input + volume in finally block
-
-        Volume safety: denon_sweep_volume must be ≤ -25.0 dB.
-        Raises ValueError if misconfigured to prevent accidental loud sweeps.
-        """
-        try:
-            import numpy as np
-            import sounddevice as sd
-            import denonavr
-        except ImportError as exc:
-            raise RuntimeError(
-                "denonavr/sounddevice/numpy required for HDMI playback — pip install denonavr sounddevice"
-            ) from exc
-
-        cfg = self.config.measurement
-        host = self.config.denon.get("host")
-        if not host:
-            raise RuntimeError("denon.host not configured — edit config.yaml")
-
-        sweep_vol = float(cfg.get("denon_sweep_volume", -25.0))
-        if sweep_vol > -25.0:
-            raise ValueError(
-                f"denon_sweep_volume must be ≤ -25.0 dB to prevent accidental loud sweeps, "
-                f"got {sweep_vol}"
-            )
-
-        sweep_input = cfg.get("denon_sweep_input") or None
-        if not sweep_input:
-            raise ValueError(
-                "denon_sweep_input is not set in config. "
-                "Find your input name: python -c \"import asyncio, denonavr; "
-                "r=denonavr.DenonAVR('YOUR_IP'); asyncio.run(r.async_setup()); "
-                "asyncio.run(r.async_update()); print(r.input_func_list)\""
-            )
-        settle_ms = cfg.get("denon_settle_ms", 800)
-        hdmi_device = cfg.get("hdmi_playback_device", None)
-
-        saved_input = None
-        saved_volume = None
-
-        receiver = denonavr.DenonAVR(host)
-        await receiver.async_setup()
-        await receiver.async_update()
-
-        try:
-            saved_input = receiver.input_func
-            saved_volume = receiver.volume
-
-            await receiver.async_set_input_func(sweep_input)
-            await receiver.async_set_volume(sweep_vol)
-            await asyncio.sleep(settle_ms / 1000.0)
-
-            # vc4-hdmi (Pi HDMI) only supports integer formats — convert float32 → int16
-            arr = (np.clip(np.array(samples, dtype=np.float32), -1.0, 1.0) * 32767).astype(np.int16).reshape(-1, 1)
-            sd.play(arr, samplerate=sample_rate, device=hdmi_device)
-            sd.wait()
-
-        finally:
-            if saved_input is not None:
-                await receiver.async_set_input_func(saved_input)
-            if saved_volume is not None:
-                await receiver.async_set_volume(saved_volume)
 
     # ── Internals ─────────────────────────────────────────────────────────
 

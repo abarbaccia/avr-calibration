@@ -23,10 +23,13 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from .config import Config, CONFIG_PATH
+from .drivers.denon import DenonDriver, DenonSweepContext
 from .measurement import MeasurementEngine, FrequencyResponse, _find_umik_device
 from .storage import SessionStore
 
 app = FastAPI(title="avr-calibration")
+
+
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -1003,11 +1006,11 @@ async def api_upgrade() -> dict:
 async def measure_headless(body: HeadlessMeasureRequest) -> dict:
     """Headless measurement for Pi 5: Pi records via UMIK-1 using PyTTa.
 
-    Automatically powers on the Denon, switches to the configured sweep input,
-    sets sweep volume, runs the measurement, then restores previous input/volume.
+    MeasurementEngine.measure() handles UMIK selection and route-aware playback.
+    Denon lifecycle (input/volume switching) is managed here via DenonSweepContext
+    when the HDMI route is configured.
 
     Requires UMIK-1 connected and the 'measurement' extra installed (arm64/amd64 images).
-    On Pi Zero 2 W (arm/v7), use the browser-based /api/measure/start + /api/measure/record flow.
     """
     if _measurement_lock.locked():
         raise HTTPException(status_code=409, detail="measurement already in progress")
@@ -1030,70 +1033,17 @@ async def measure_headless(body: HeadlessMeasureRequest) -> dict:
             detail=f"No microphone matching '{mic_name}' found — check USB connection",
         )
 
-    device_name: str = str(devices[umik_idx].get("name", mic_name))
-
-    # ── Denon: power on, switch input, set sweep volume ────────────────────
-    denon_host = cfg.denon.get("host")
-    sweep_input = cfg.measurement.get("denon_sweep_input")
-    sweep_volume: float = float(cfg.measurement.get("denon_sweep_volume", -25.0))
-    receiver = None
-    prev_input: str | None = None
-    prev_volume: float | None = None
-    was_off: bool = False
-
-    if denon_host and sweep_input:
+    async with _measurement_lock:
+        engine = MeasurementEngine(cfg)
         try:
-            import denonavr as _denonavr
-            receiver = _denonavr.DenonAVR(denon_host)
-            await asyncio.wait_for(receiver.async_setup(), timeout=5.0)
-            await receiver.async_update()
-
-            was_off = (receiver.power or "").upper() == "OFF"
-            if was_off:
-                await receiver.async_power_on()
-                await asyncio.sleep(3.0)  # Denon boot takes ~2-3s
-                await receiver.async_update()
-
-            available = receiver.input_func_list or []
-            if sweep_input not in available:
-                raise ValueError(
-                    f"Input '{sweep_input}' not found on Denon. "
-                    f"Available: {sorted(available)}"
-                )
-
-            prev_input = receiver.input_func
-            prev_volume = receiver.volume
-
-            await receiver.async_set_input_func(sweep_input)
-            await asyncio.sleep(0.5)
-            await receiver.async_set_volume(sweep_volume)
-            await asyncio.sleep(0.5)
-        except Exception as exc:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Denon setup failed ({denon_host}): {exc}",
-            )
-
-    # ── Run measurement ─────────────────────────────────────────────────────
-    try:
-        async with _measurement_lock:
-            engine = MeasurementEngine(cfg)
-            try:
-                fr = await asyncio.to_thread(engine.measure, device_name)
-            except RuntimeError as exc:
-                raise HTTPException(status_code=503, detail=str(exc))
-    finally:
-        # ── Restore Denon state ─────────────────────────────────────────────
-        if receiver is not None:
-            try:
-                if prev_volume is not None:
-                    await receiver.async_set_volume(prev_volume)
-                if prev_input is not None:
-                    await receiver.async_set_input_func(prev_input)
-                if was_off:
-                    await receiver.async_power_off()
-            except Exception:
-                pass  # best-effort restore; don't mask measurement errors
+            denon_ctx = DenonSweepContext.from_config(cfg)
+            if denon_ctx:
+                async with denon_ctx:
+                    fr = await engine.measure()
+            else:
+                fr = await engine.measure()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
 
     store = SessionStore()
     session_id = store.save_measurement(fr, label=body.label or "headless")
@@ -1230,19 +1180,20 @@ async def system_status() -> dict:
     devices = []
     cfg = _load_config()
 
-    # Denon
+    # Denon (via DenonDriver abstraction)
     denon_host = cfg.denon.get("host")
     if denon_host:
         try:
-            import denonavr
-            receiver = denonavr.DenonAVR(denon_host)
-            await asyncio.wait_for(receiver.async_setup(), timeout=5.0)
-            await receiver.async_update()
-            devices.append({
-                "name": receiver.model_name or "Denon AVR",
-                "connected": True,
-                "detail": f"Input: {receiver.input_func}, Volume: {receiver.volume} dB",
-            })
+            driver = DenonDriver(denon_host)
+            state = await driver.get_state()
+            if state.get("connected"):
+                devices.append({
+                    "name": "Denon AVR",
+                    "connected": True,
+                    "detail": f"Input: {state.get('input')}, Volume: {state.get('volume')} dB",
+                })
+            else:
+                devices.append({"name": "Denon AVR", "connected": False, "detail": denon_host})
         except Exception:
             devices.append({"name": "Denon AVR", "connected": False, "detail": denon_host})
 

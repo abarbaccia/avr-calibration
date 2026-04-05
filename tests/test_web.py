@@ -262,11 +262,12 @@ class TestMeasure:
         return denonavr
 
     def test_measure_happy_path(self, tmp_path: Path, client: TestClient) -> None:
+        from unittest.mock import AsyncMock
         sd_mock = self._mock_sounddevice()
         denonavr_mock = self._mock_denonavr()
         fr = _make_fr()
         engine_mock = MagicMock()
-        engine_mock.measure.return_value = fr
+        engine_mock.measure = AsyncMock(return_value=fr)
         store = SessionStore(db_path=tmp_path / "test.db")
 
         with (
@@ -332,10 +333,11 @@ class TestMeasure:
 
     def test_measure_runtime_error(self, tmp_path: Path, client: TestClient) -> None:
         """MeasurementEngine.measure raising RuntimeError returns 503."""
+        from unittest.mock import AsyncMock
         sd_mock = self._mock_sounddevice()
         denonavr_mock = self._mock_denonavr()
         engine_mock = MagicMock()
-        engine_mock.measure.side_effect = RuntimeError("sweep failed")
+        engine_mock.measure = AsyncMock(side_effect=RuntimeError("sweep failed"))
 
         with (
             patch.dict(sys.modules, {"sounddevice": sd_mock, "denonavr": denonavr_mock}),
@@ -349,11 +351,12 @@ class TestMeasure:
 
     def test_measure_default_label(self, tmp_path: Path, client: TestClient) -> None:
         """When no label is provided, defaults to 'headless'."""
+        from unittest.mock import AsyncMock
         sd_mock = self._mock_sounddevice()
         denonavr_mock = self._mock_denonavr()
         fr = _make_fr()
         engine_mock = MagicMock()
-        engine_mock.measure.return_value = fr
+        engine_mock.measure = AsyncMock(return_value=fr)
         store = SessionStore(db_path=tmp_path / "test.db")
 
         with (

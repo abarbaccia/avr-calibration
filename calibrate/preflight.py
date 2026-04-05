@@ -191,18 +191,21 @@ class PreflightChecker:
     async def check_denon(self) -> CheckResult:
         """Check that the Denon AVR is online.
 
-        If denon.host is not configured, performs SSDP discovery (2 s timeout)
+        If denon.host is not configured, performs SSDP discovery (10s timeout)
         to find a Denon AVR on the local network automatically.
+
+        Uses DenonDriver for all hardware access (no raw denonavr imports).
         """
-        import denonavr
+        from .drivers.denon import DenonDriver
+        from .drivers.base import DriverError
 
         host = self.config.denon.get("host")
         auto_discovered = False
 
         if not host:
             try:
-                devices = await asyncio.wait_for(denonavr.async_discover(), timeout=10.0)
-                if not devices:
+                discovered = await DenonDriver(None).discover()
+                if not discovered:
                     return CheckResult(
                         name="Denon AVR",
                         passed=False,
@@ -213,25 +216,8 @@ class PreflightChecker:
                             "or set denon.host in ~/.avr-calibration/config.yaml."
                         ),
                     )
-                host = devices[0].get("host")
-                if not host:
-                    return CheckResult(
-                        name="Denon AVR",
-                        passed=False,
-                        detail="SSDP found a device but could not determine its IP address",
-                        error="Discovered device has no host address. Set denon.host in config manually.",
-                    )
+                host = discovered[0]
                 auto_discovered = True
-            except asyncio.TimeoutError:
-                return CheckResult(
-                    name="Denon AVR",
-                    passed=False,
-                    detail="SSDP discovery timed out after 10s",
-                    error=(
-                        "SSDP scan timed out. "
-                        "Set denon.host in ~/.avr-calibration/config.yaml to skip auto-discovery."
-                    ),
-                )
             except Exception as exc:
                 return CheckResult(
                     name="Denon AVR",
@@ -241,16 +227,16 @@ class PreflightChecker:
                 )
 
         try:
-            receiver = denonavr.DenonAVR(host)
-            await receiver.async_setup()
-            model = receiver.model_name or "Denon AVR"
+            driver = DenonDriver(host)
+            state = await driver.get_state()
+            model = state.get("model", "Denon AVR")
             suffix = " (auto-discovered)" if auto_discovered else ""
             return CheckResult(
                 name="Denon AVR",
                 passed=True,
                 detail=f"{model} online at {host}{suffix}",
             )
-        except Exception as exc:
+        except DriverError as exc:
             return CheckResult(
                 name="Denon AVR",
                 passed=False,
