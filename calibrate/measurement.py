@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import traceback as _traceback
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Optional
@@ -367,13 +369,28 @@ class MeasurementEngine:
             except ImportError:
                 pass  # sounddevice unavailable; let PyTTa use its own default
 
-        sweep = pytta.generate.sweep(
-            freq_min=freq_min,
-            freq_max=freq_max,
-            duration=duration,
-            Fs=sample_rate,
-            method="log",
-        )
+        # pytta 0.1.1 uses camelCase params and fftDegree instead of duration.
+        # Also patches traceback.walk_stack to handle shallow stacks (Python 3.11 bug).
+        _orig_walk_stack = _traceback.walk_stack
+
+        def _safe_walk_stack(f):
+            try:
+                yield from _orig_walk_stack(f)
+            except AttributeError:
+                return
+
+        _traceback.walk_stack = _safe_walk_stack
+        try:
+            sweep = pytta.generate.sweep(
+                freqMin=freq_min,
+                freqMax=freq_max,
+                # fftDegree: total signal = 2^N samples; account for ~1s default margins
+                fftDegree=math.ceil(math.log2((duration + 1.0) * sample_rate)),
+                samplingRate=sample_rate,
+                method="logarithmic",
+            )
+        finally:
+            _traceback.walk_stack = _orig_walk_stack
 
         meas = pytta.PlayRecMeasure(
             excitation=sweep,
