@@ -23,7 +23,9 @@ import yaml
 
 log = logging.getLogger(__name__)
 
-_RECIPES_DIR = Path(__file__).parent.parent / "recipes"
+_RECIPES_DIR_DEFAULT = Path(__file__).parent.parent / "recipes"
+_RECIPES_DIR_APP = Path("/app/recipes")
+_RECIPES_DIR = _RECIPES_DIR_DEFAULT if _RECIPES_DIR_DEFAULT.is_dir() else _RECIPES_DIR_APP
 
 VALID_TARGETS = {"harman", "flat"}
 VALID_METRICS = {"rms_deviation"}

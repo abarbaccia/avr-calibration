@@ -83,10 +83,10 @@ echo "Starting hotfixed container..."
 # shellcheck disable=SC2029  # MOUNT_ARGS intentionally expands on local side
 $SSH "sudo docker run -d \
     --name ${CONTAINER} \
-    -p 8000:8000 \
-    --device=/dev/bus/usb \
-    --device=/dev/snd \
+    -p 8000:8000 -p 8765:8765 \
+    --privileged \
     -v \$HOME/.avr-calibration:/data/.avr-calibration \
+    -v \$HOME/.avr-calibration/entrypoint.sh:/entrypoint.sh:ro \
     ${MOUNT_ARGS} \
     ${IMAGE} && echo 'Container started.'"
 

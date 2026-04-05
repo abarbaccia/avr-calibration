@@ -249,12 +249,19 @@ class MeasurementEngine:
                 import sounddevice as sd
                 devices = sd.query_devices()
                 hdmi_name = cfg.get("hdmi_playback_device") or "hdmi"
-                for idx, dev in enumerate(devices):
-                    if dev["max_output_channels"] > 0 and hdmi_name.lower() in dev["name"].lower():
-                        in_idx = int(sd.default.device[0])
-                        sd.default.device = (in_idx, idx)
-                        log.info("Output device (HDMI): %s (index %d)", dev["name"], idx)
-                        break
+                # Prefer ALSA plugin devices (e.g. "hdmi") over hardware devices
+                # (e.g. "vc4-hdmi-0: MAI PCM ...") — plugins handle resampling.
+                candidates = [
+                    (idx, dev) for idx, dev in enumerate(devices)
+                    if dev["max_output_channels"] > 0 and hdmi_name.lower() in dev["name"].lower()
+                ]
+                # Sort: exact name match first, then shorter names (plugins) before hardware
+                candidates.sort(key=lambda x: (x[1]["name"].lower() != hdmi_name.lower(), len(x[1]["name"])))
+                if candidates:
+                    idx, dev = candidates[0]
+                    in_idx = int(sd.default.device[0])
+                    sd.default.device = (in_idx, idx)
+                    log.info("Output device (HDMI): %s (index %d)", dev["name"], idx)
             except ImportError:
                 pass
 

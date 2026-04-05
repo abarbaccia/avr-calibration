@@ -281,6 +281,17 @@ measurement:
 
 ---
 
+## Room Optimization
+
+### TODO-11: Sub crawl — guided placement optimization
+**What:** A guided workflow where the user places the UMIK mic at the listening position and moves the sub (or places the sub at the listening position and walks the mic around the room — "reverse sub crawl"). At each candidate position, the system takes a measurement and logs the FR. After all positions are measured, the system recommends the best placement based on smoothest bass response, fewest nulls, and best extension.
+**Why:** Sub placement is the single highest-impact variable in bass calibration. No amount of EQ can fix a sub in a null. The classic "sub crawl" technique works but is tedious and imprecise without measurement data at each position. An AI-guided version with real FR data at each spot turns a 45-minute guessing game into a 15-minute measured decision.
+**How:** TBD. Core pieces: (1) take N measurements at labeled positions, (2) store all FRs, (3) score/rank by some metric (flatness, extension, null depth), (4) recommend best position. Could be MCP-driven ("measure position A... now move to B... measuring...") or web-driven with a room map UI.
+**Effort:** M-L — measurement infra exists, scoring algorithm and UX are the new work.
+**Priority:** P2 — high user value, but requires the measurement loop to be solid first.
+
+---
+
 ## Architecture Convergence (added 2026-04-05)
 
 ### TODO-ARCH1: Extract Denon lifecycle from measurement.py
