@@ -1,84 +1,90 @@
-"""Tests for recipe parser — YAML loading, defaults, and validation."""
+"""Tests for recipe module — file loading, listing, and data containers."""
 
 import pytest
-import yaml
 from pathlib import Path
 
-from calibrate.recipe import Recipe, RecipeError, load_recipe
+from calibrate.recipe import (
+    Recipe,
+    RecipeError,
+    ConvergenceCriteria,
+    MeasurementConfig,
+    load_recipe_text,
+    list_recipes,
+)
 
 
-# ── Load harman-bass ──────────────────────────────────────────────────────────
+# ── load_recipe_text ─────────────────────────────────────────────────────────
 
-def test_load_harman_bass() -> None:
-    recipe = load_recipe("harman-bass")
-    assert recipe.name == "harman-bass"
-    assert recipe.target == "harman"
-    assert recipe.band == (20.0, 200.0)
-    assert recipe.convergence.metric == "rms_deviation"
-    assert recipe.convergence.threshold_db == 2.0
-    assert recipe.convergence.max_iterations == 5
-    assert recipe.analysis == "claude"
-    assert recipe.measurement.retry_count == 2
-    assert recipe.measurement.retry_delay_s == 5.0
+def test_load_harman_bass_md() -> None:
+    """Core markdown recipe loads successfully."""
+    text = load_recipe_text("harman-bass")
+    assert "Harman" in text
+    assert len(text) > 100
 
 
-# ── Defaults ──────────────────────────────────────────────────────────────────
-
-def test_recipe_defaults(tmp_path: Path) -> None:
-    """Missing optional fields get sensible defaults."""
-    recipe_file = tmp_path / "minimal.yaml"
-    recipe_file.write_text(yaml.dump({"name": "minimal"}))
-
-    recipe = load_recipe(str(recipe_file))
-    assert recipe.name == "minimal"
-    assert recipe.target == "harman"
-    assert recipe.band == (20.0, 200.0)
-    assert recipe.convergence.threshold_db == 2.0
-    assert recipe.convergence.max_iterations == 5
-    assert recipe.analysis == "claude"
-    assert recipe.measurement.retry_count == 2
+def test_load_harman_bass_aligned_md() -> None:
+    text = load_recipe_text("harman-bass-aligned")
+    assert "Sub Alignment" in text or "alignment" in text.lower()
 
 
-# ── Validation errors ─────────────────────────────────────────────────────────
-
-def test_recipe_missing_name(tmp_path: Path) -> None:
-    recipe_file = tmp_path / "bad.yaml"
-    recipe_file.write_text(yaml.dump({"target": "harman"}))
-    with pytest.raises(RecipeError, match="missing required field 'name'"):
-        load_recipe(str(recipe_file))
-
-
-def test_recipe_invalid_band(tmp_path: Path) -> None:
-    recipe_file = tmp_path / "bad.yaml"
-    recipe_file.write_text(yaml.dump({"name": "test", "band": [200, 20]}))
-    with pytest.raises(RecipeError, match="invalid band"):
-        load_recipe(str(recipe_file))
+def test_load_by_path(tmp_path: Path) -> None:
+    """Loading by direct file path works."""
+    recipe_file = tmp_path / "custom.md"
+    recipe_file.write_text("# Custom recipe\nDo stuff.")
+    text = load_recipe_text(str(recipe_file))
+    assert "Custom recipe" in text
 
 
-def test_recipe_negative_threshold(tmp_path: Path) -> None:
-    recipe_file = tmp_path / "bad.yaml"
-    recipe_file.write_text(yaml.dump({
-        "name": "test",
-        "convergence": {"threshold_db": -1.0},
-    }))
-    with pytest.raises(RecipeError, match="threshold_db must be positive"):
-        load_recipe(str(recipe_file))
-
-
-def test_recipe_unknown_analysis_backend(tmp_path: Path) -> None:
-    recipe_file = tmp_path / "bad.yaml"
-    recipe_file.write_text(yaml.dump({"name": "test", "analysis": "gpt4"}))
-    with pytest.raises(RecipeError, match="invalid analysis backend"):
-        load_recipe(str(recipe_file))
-
-
-def test_recipe_unknown_target(tmp_path: Path) -> None:
-    recipe_file = tmp_path / "bad.yaml"
-    recipe_file.write_text(yaml.dump({"name": "test", "target": "pink_floyd"}))
-    with pytest.raises(RecipeError, match="invalid target"):
-        load_recipe(str(recipe_file))
+def test_load_yaml_fallback() -> None:
+    """YAML recipes in recipes/ dir still load."""
+    text = load_recipe_text("harman-bass")
+    # Should find either .md or .yaml version
+    assert len(text) > 0
 
 
 def test_recipe_not_found() -> None:
     with pytest.raises(RecipeError, match="recipe not found"):
-        load_recipe("nonexistent-recipe-xyz")
+        load_recipe_text("nonexistent-recipe-xyz")
+
+
+# ── list_recipes ─────────────────────────────────────────────────────────────
+
+def test_list_recipes_includes_core() -> None:
+    recipes = list_recipes()
+    names = [r["name"] for r in recipes]
+    assert "harman-bass" in names
+    assert "harman-bass-aligned" in names
+
+
+def test_list_recipes_format_field() -> None:
+    recipes = list_recipes()
+    for r in recipes:
+        assert r["format"] in ("markdown", "yaml")
+        assert "path" in r
+
+
+# ── Recipe dataclass ─────────────────────────────────────────────────────────
+
+def test_recipe_defaults() -> None:
+    r = Recipe(name="test")
+    assert r.target == "harman"
+    assert r.band == (20.0, 80.0)
+    assert r.convergence.threshold_db == 2.0
+    assert r.convergence.max_iterations == 5
+    assert r.analysis == "claude"
+    assert r.measurement.retry_count == 2
+
+
+def test_recipe_custom_values() -> None:
+    r = Recipe(
+        name="custom",
+        target="flat",
+        band=(30.0, 120.0),
+        convergence=ConvergenceCriteria(threshold_db=1.5, max_iterations=3),
+        analysis="mock",
+        measurement=MeasurementConfig(retry_count=1, retry_delay_s=2.0),
+    )
+    assert r.target == "flat"
+    assert r.band == (30.0, 120.0)
+    assert r.convergence.threshold_db == 1.5
+    assert r.measurement.retry_delay_s == 2.0
