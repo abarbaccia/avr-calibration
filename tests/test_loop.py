@@ -293,3 +293,56 @@ def test_median_spl_empty() -> None:
         timestamp="2026-04-05T00:00:00Z",
     )
     assert median_spl(fr) == 0.0
+
+
+# ── Persistence tests ────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_loop_persists_run_and_iterations(tmp_path) -> None:
+    """When a SessionStore is provided, the loop persists run + iterations."""
+    from calibrate.storage import SessionStore
+
+    store = SessionStore(db_path=tmp_path / "test.db")
+    driver = _make_mock_driver(eq_state=_make_initial_eq())
+    recipe = _make_recipe(max_iterations=3)
+
+    call_count = 0
+
+    async def measure_fn():
+        nonlocal call_count
+        call_count += 1
+        return _make_fr(spl_value=75.0)
+
+    orch = LoopOrchestrator(minidsp=driver, store=store)
+    result = await orch.run(recipe, preset=0, measure_fn=measure_fn)
+
+    # Should have run some iterations
+    assert result.iterations_run > 0
+
+    # Check persistence
+    runs = store.get_runs()
+    assert len(runs) == 1
+    assert runs[0]["recipe_name"] == "test-recipe"
+    assert runs[0]["target"] == "harman"
+
+    detail = store.get_run_detail(runs[0]["id"])
+    assert detail is not None
+    assert len(detail["iterations"]) == result.iterations_run
+    # Each iteration has filter data
+    for it in detail["iterations"]:
+        assert isinstance(it["filters_proposed"], list)
+        assert isinstance(it["filters_applied"], list)
+
+
+@pytest.mark.asyncio
+async def test_loop_persists_without_store() -> None:
+    """Loop works fine without a store (backward compatibility)."""
+    driver = _make_mock_driver(eq_state=_make_initial_eq())
+    recipe = _make_recipe(max_iterations=1)
+
+    async def measure_fn():
+        return _make_fr()
+
+    orch = LoopOrchestrator(minidsp=driver)  # no store
+    result = await orch.run(recipe, preset=0, measure_fn=measure_fn)
+    assert result.iterations_run >= 0  # just didn't crash

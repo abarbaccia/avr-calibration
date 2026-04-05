@@ -91,7 +91,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libatomic1 \
     libusb-1.0-0 \
     alsa-utils \
-    openssl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
@@ -118,6 +117,5 @@ COPY deploy/entrypoint.sh /entrypoint.sh
 COPY deploy/entrypoint-with-mcp.sh /entrypoint-with-mcp.sh
 RUN chmod +x /entrypoint.sh /entrypoint-with-mcp.sh
 
-# Generates a self-signed TLS cert on first boot (stored in /data volume),
-# then starts uvicorn over HTTPS — required for browser getUserMedia access.
+# Starts minidspd + uvicorn over plain HTTP (browser is read-only dashboard).
 CMD ["/entrypoint.sh"]

@@ -67,6 +67,30 @@ CREATE TABLE IF NOT EXISTS equipment (
     created_at TEXT    NOT NULL,
     updated_at TEXT    NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS calibration_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp       TEXT    NOT NULL,
+    recipe_name     TEXT    NOT NULL,
+    target          TEXT    NOT NULL,
+    converged       INTEGER NOT NULL DEFAULT 0,
+    iterations_run  INTEGER NOT NULL DEFAULT 0,
+    baseline_rms    REAL,
+    final_rms       REAL,
+    error           TEXT
+);
+
+CREATE TABLE IF NOT EXISTS calibration_iterations (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           INTEGER NOT NULL REFERENCES calibration_runs(id),
+    iteration        INTEGER NOT NULL,
+    rms_before       REAL    NOT NULL,
+    rms_after        REAL    NOT NULL,
+    filters_proposed TEXT,
+    filters_applied  TEXT,
+    safety_ok        INTEGER NOT NULL DEFAULT 1,
+    safety_error     TEXT
+);
 """
 
 
@@ -312,6 +336,108 @@ class SessionStore:
         else:
             d["data"] = {}
         return d
+
+    # ── Calibration runs ────────────────────────────────────────────────────
+
+    def save_run(self, recipe_name: str, target: str) -> int:
+        """Create a new calibration run record. Returns the run id."""
+        ts = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO calibration_runs (timestamp, recipe_name, target)"
+                " VALUES (?, ?, ?)",
+                (ts, recipe_name, target),
+            )
+            return cur.lastrowid
+
+    def update_run(
+        self,
+        run_id: int,
+        converged: bool,
+        iterations_run: int,
+        baseline_rms: float | None = None,
+        final_rms: float | None = None,
+        error: str = "",
+    ) -> None:
+        """Update a calibration run with final results."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE calibration_runs"
+                " SET converged=?, iterations_run=?, baseline_rms=?, final_rms=?, error=?"
+                " WHERE id=?",
+                (int(converged), iterations_run, baseline_rms, final_rms, error or None, run_id),
+            )
+
+    def save_iteration(
+        self,
+        run_id: int,
+        iteration: int,
+        rms_before: float,
+        rms_after: float,
+        filters_proposed: list[dict],
+        filters_applied: list[dict],
+        safety_ok: bool,
+        safety_error: str = "",
+    ) -> int:
+        """Save one iteration of a calibration run. Returns the iteration row id."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO calibration_iterations"
+                " (run_id, iteration, rms_before, rms_after,"
+                "  filters_proposed, filters_applied, safety_ok, safety_error)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    iteration,
+                    rms_before,
+                    rms_after,
+                    json.dumps(filters_proposed),
+                    json.dumps(filters_applied),
+                    int(safety_ok),
+                    safety_error or None,
+                ),
+            )
+            return cur.lastrowid
+
+    def get_runs(self, limit: int = 20) -> list[dict]:
+        """Return recent calibration runs, most recent first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM calibration_runs ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_run_detail(self, run_id: int) -> dict | None:
+        """Return a calibration run with all its iterations, or None if not found."""
+        with self._connect() as conn:
+            run_row = conn.execute(
+                "SELECT * FROM calibration_runs WHERE id=?", (run_id,)
+            ).fetchone()
+            if run_row is None:
+                return None
+
+            iter_rows = conn.execute(
+                "SELECT * FROM calibration_iterations WHERE run_id=? ORDER BY iteration",
+                (run_id,),
+            ).fetchall()
+
+        run = dict(run_row)
+        iterations = []
+        for r in iter_rows:
+            d = dict(r)
+            for key in ("filters_proposed", "filters_applied"):
+                if d.get(key):
+                    try:
+                        d[key] = json.loads(d[key])
+                    except (json.JSONDecodeError, TypeError):
+                        d[key] = []
+                else:
+                    d[key] = []
+            iterations.append(d)
+
+        run["iterations"] = iterations
+        return run
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 

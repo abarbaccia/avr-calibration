@@ -231,3 +231,34 @@ def test_frequency_drift_caught_by_validator() -> None:
     result = validator.validate(new, prev)
     assert not result.ok
     assert "change per iteration" in result.error.lower()
+
+
+# ── harman_rms helper ────────────────────────────────────────────────────────
+
+def test_harman_rms_returns_positive_float():
+    """harman_rms() computes a single RMS deviation number from Harman target."""
+    from calibrate.analysis import harman_rms
+
+    # Flat measurement at 75 dB — Harman has bass rise, so deviation > 0
+    fr = _make_fr(spl_value=75.0)
+    result = harman_rms(fr)
+    assert isinstance(result, float)
+    assert result > 0  # flat measurement != Harman target
+
+
+def test_harman_rms_near_zero_for_matching_shape():
+    """Measurement shaped like Harman target -> low deviation."""
+    from calibrate.analysis import harman_rms, HarmanTarget
+
+    # Create a measurement with Harman-like shape
+    ref = 75.0
+    target = HarmanTarget(reference_spl=ref)
+    # Use offsets to match Harman curve shape
+    offsets = {
+        20.0: +6.0, 25.0: +5.0, 31.5: +4.0, 40.0: +3.0,
+        50.0: +2.0, 63.0: +1.0, 80.0: 0.0, 100.0: 0.0,
+        125.0: 0.0, 160.0: -1.0, 200.0: -2.0,
+    }
+    fr = _make_fr(spl_value=ref, spl_offsets=offsets)
+    result = harman_rms(fr)
+    assert result < 3.0  # close to Harman shape (interpolation causes some deviation)

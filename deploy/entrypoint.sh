@@ -1,31 +1,9 @@
 #!/bin/sh
-# Generate a self-signed TLS cert on first boot so the browser treats this
-# origin as secure — required for getUserMedia (microphone access).
-# Stored in the mounted data volume so it persists across container restarts.
+# Entrypoint for the avr-calibration Docker container.
+# Starts minidspd (DSP control daemon), then uvicorn (web dashboard).
+# Plain HTTP — browser is a read-only dashboard, no mic access needed.
 
-# Hard-coded to match the Docker volume mount (-v host_data:/data/.avr-calibration)
-# and ENV HOME=/data in the Dockerfile. Do not rely on $HOME to avoid silent breakage.
-CERT_DIR=/data/.avr-calibration
-CERT="${CERT_DIR}/cert.pem"
-KEY="${CERT_DIR}/key.pem"
-
-mkdir -p "$CERT_DIR"
-
-if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
-    # Detect the container's IP for the SAN so Chrome shows it correctly
-    HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-    SAN="DNS:avr-cal.local,DNS:localhost"
-    [ -n "$HOST_IP" ] && SAN="${SAN},IP:${HOST_IP}"
-
-    echo "Generating self-signed TLS certificate (SAN: ${SAN})..."
-    openssl req -x509 -newkey rsa:2048 \
-        -keyout "$KEY" -out "$CERT" \
-        -days 3650 -nodes \
-        -subj '/CN=avr-calibration' \
-        -addext "subjectAltName=${SAN}" \
-        2>&1 || { echo "ERROR: TLS cert generation failed — check openssl output above" >&2; exit 1; }
-    echo "Certificate generated at ${CERT}"
-fi
+mkdir -p /data/.avr-calibration
 
 # ── minidspd ──────────────────────────────────────────────────────────────────
 # Start the minidspd HTTP REST daemon so the web server can control the
@@ -57,6 +35,4 @@ else
 fi
 
 exec python -m uvicorn calibrate.web:app \
-    --host 0.0.0.0 --port 8000 \
-    --ssl-keyfile "$KEY" \
-    --ssl-certfile "$CERT"
+    --host 0.0.0.0 --port 8000
