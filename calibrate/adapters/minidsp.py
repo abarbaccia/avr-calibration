@@ -173,12 +173,23 @@ class MinidspClient:
             )
         await self._patch_master({"source": source})
 
+    MUTE_GAIN_DB: float = -127.0
+
     async def set_output_gain(self, output: int, gain_db: float) -> None:
         """Set output *output* gain to *gain_db* dB.
 
         Typical use: mute with MUTE_GAIN_DB (-127) or restore to 0.0.
         """
         await self._post_config({"outputs": [{"index": output, "gain": gain_db}]})
+
+    async def mute_outputs(self, output_indices: list[int]) -> None:
+        """Mute multiple outputs in parallel by setting gain to -127 dB."""
+        tasks = [self.set_output_gain(idx, self.MUTE_GAIN_DB) for idx in output_indices]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def unmute_outputs(self, output_indices: list[int]) -> None:
+        """Unmute multiple outputs in parallel by restoring gain to 0 dB."""
+        await self.restore_all_gains(output_indices)
 
     async def set_output_delay(self, output: int, delay_ms: float) -> None:
         """Set output *output* delay to *delay_ms* milliseconds.
