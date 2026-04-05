@@ -164,12 +164,13 @@ class TestMeasure:
         cfg = make_config(freq_min=30, freq_max=150, sweep_duration=5.0, sample_rate=44100)
         engine, mock_pytta, _, _ = self._make_engine_with_mocks(cfg)
         engine.measure()
+        import math
         mock_pytta.generate.sweep.assert_called_once_with(
-            freq_min=30,
-            freq_max=150,
-            duration=5.0,
-            Fs=44100,
-            method="log",
+            freqMin=30,
+            freqMax=150,
+            fftDegree=math.ceil(math.log2((5.0 + 1.0) * 44100)),
+            samplingRate=44100,
+            method="logarithmic",
         )
 
     def test_playrecmeasure_called_with_channel_config(self):
