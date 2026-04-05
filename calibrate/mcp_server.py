@@ -254,6 +254,23 @@ async def _tool_fetch_recipe(name: str) -> dict:
         return _err(f"failed to read recipe: {exc}")
 
 
+async def _tool_get_calibration_runs(limit: int = 10, run_id: int | None = None) -> dict:
+    """Return calibration run history, or detail for a single run."""
+    from .storage import SessionStore
+
+    cfg = _load_config()
+    store = SessionStore()
+
+    if run_id is not None:
+        detail = store.get_run_detail(run_id)
+        if detail is None:
+            return _err(f"run #{run_id} not found")
+        return _ok(**detail)
+
+    runs = store.get_runs(limit=limit)
+    return _ok(runs=runs)
+
+
 # ── MCP Server ─────────────────────────────────────────────────────────────────
 
 # Text appended to any tool description that writes signal-path state (routing,
@@ -413,6 +430,28 @@ _TOOLS: list[Tool] = [
             "required": ["name"],
         },
     ),
+    Tool(
+        name="get_calibration_runs",
+        description=(
+            "Return calibration run history. Each run shows recipe, target curve, "
+            "convergence status, iterations, and RMS deviation from target. "
+            "Pass run_id to get full detail including per-iteration filter data."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Number of runs to return (default: 10)",
+                    "default": 10,
+                },
+                "run_id": {
+                    "type": "integer",
+                    "description": "If provided, return full detail for this run only",
+                },
+            },
+        },
+    ),
 ]
 
 
@@ -440,6 +479,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_trigger_measurement()
     elif name == "fetch_recipe":
         result = await _tool_fetch_recipe(arguments["name"])
+    elif name == "get_calibration_runs":
+        result = await _tool_get_calibration_runs(
+            limit=int(arguments.get("limit", 10)),
+            run_id=arguments.get("run_id"),
+        )
     else:
         result = _err(f"unknown tool: {name}")
 

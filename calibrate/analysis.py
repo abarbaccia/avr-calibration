@@ -157,6 +157,23 @@ def per_band_deviation(
     return result
 
 
+def harman_rms(
+    fr: FrequencyResponse,
+    band: tuple[float, float] = (20.0, 200.0),
+) -> float:
+    """Compute RMS deviation from Harman target for a measurement.
+
+    Standalone helper — creates a HarmanTarget anchored to the FR's median SPL
+    and returns the RMS deviation within *band*. Useful for computing a single
+    "how close to Harman" number for any stored measurement.
+    """
+    from .loop import median_spl
+
+    ref = median_spl(fr)
+    target = HarmanTarget(reference_spl=ref, band=band)
+    return rms_deviation(fr, target, band)
+
+
 # ── Correction proposals ──────────────────────────────────────────────────────
 
 async def propose_corrections(

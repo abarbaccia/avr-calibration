@@ -33,6 +33,7 @@ from .safety import (
     SafetyValidator,
     _third_octave_for_freq,
 )
+from .storage import SessionStore
 
 log = logging.getLogger(__name__)
 
@@ -83,11 +84,13 @@ class LoopOrchestrator:
         minidsp: MinidspDriver,
         measurement_engine: MeasurementEngine | None = None,
         hardware_profile: dict[str, Any] | None = None,
+        store: SessionStore | None = None,
     ) -> None:
         self._minidsp = minidsp
         self._measurement = measurement_engine
         self._hardware_profile = hardware_profile or _default_hardware_profile()
         self._validator = SafetyValidator()
+        self._store = store
         self._lock = asyncio.Lock()
         self._running = False
 
@@ -143,6 +146,9 @@ class LoopOrchestrator:
 
         log.info("Loop starting: recipe=%s, preset=%d, fresh=%s", recipe.name, preset, fresh)
 
+        # Persist run start
+        run_id = self._persist_run_start(recipe)
+
         # Step 2: Baseline measurement
         baseline = await self._measure_with_retry(recipe, measure_fn)
         reference_spl = float(median_spl(baseline))
@@ -162,6 +168,7 @@ class LoopOrchestrator:
         # Check if already converged
         if baseline_rms <= recipe.convergence.threshold_db:
             log.info("Already converged at baseline, no corrections needed")
+            self._persist_run_end(run_id, True, 0, baseline_rms, baseline_rms)
             return LoopResult(
                 converged=True,
                 iterations_run=0,
@@ -201,7 +208,8 @@ class LoopOrchestrator:
                 log.error("Correction proposal failed: %s", exc)
                 return await self._rollback_and_return(
                     preset, snapshot, iteration, current_rms, baseline_rms,
-                    iteration_results, f"proposal failed: {exc}"
+                    iteration_results, f"proposal failed: {exc}",
+                    run_id=run_id,
                 )
 
             # Inject mandatory HPF (defense in depth)
@@ -211,7 +219,7 @@ class LoopOrchestrator:
             result = self._validator.validate(filters_with_hpf, current_eq or None)
             if not result.ok:
                 log.warning("SafetyValidator rejected iteration %d: %s", iteration, result.error)
-                iteration_results.append(IterationResult(
+                iter_result = IterationResult(
                     iteration=iteration,
                     rms_before=rms_before,
                     rms_after=rms_before,
@@ -219,7 +227,9 @@ class LoopOrchestrator:
                     filters_applied=[],
                     safety_ok=False,
                     safety_error=result.error,
-                ))
+                )
+                iteration_results.append(iter_result)
+                self._persist_iteration(run_id, iter_result)
                 # Don't rollback on safety rejection — just skip this iteration
                 # and try again with the same measurement
                 continue
@@ -235,7 +245,8 @@ class LoopOrchestrator:
                 log.error("apply_eq failed: %s", exc)
                 return await self._rollback_and_return(
                     preset, snapshot, iteration, current_rms, baseline_rms,
-                    iteration_results, f"apply_eq failed: {exc}"
+                    iteration_results, f"apply_eq failed: {exc}",
+                    run_id=run_id,
                 )
 
             current_eq = filters_with_hpf
@@ -246,25 +257,29 @@ class LoopOrchestrator:
             except LoopError:
                 return await self._rollback_and_return(
                     preset, snapshot, iteration, current_rms, baseline_rms,
-                    iteration_results, "measurement failed after retries"
+                    iteration_results, "measurement failed after retries",
+                    run_id=run_id,
                 )
 
             rms_after = rms_deviation(post_measure, target, recipe.band)
             current_rms = rms_after
 
-            iteration_results.append(IterationResult(
+            iter_result = IterationResult(
                 iteration=iteration,
                 rms_before=rms_before,
                 rms_after=rms_after,
                 filters_proposed=proposed,
                 filters_applied=filters_with_hpf,
                 safety_ok=True,
-            ))
+            )
+            iteration_results.append(iter_result)
+            self._persist_iteration(run_id, iter_result)
 
             log.info("Iteration %d: RMS %.1f -> %.1f dB", iteration, rms_before, rms_after)
 
             if rms_after <= recipe.convergence.threshold_db:
                 log.info("Converged after %d iterations (RMS: %.1f dB)", iteration, rms_after)
+                self._persist_run_end(run_id, True, iteration, baseline_rms, rms_after)
                 return LoopResult(
                     converged=True,
                     iterations_run=iteration,
@@ -276,6 +291,10 @@ class LoopOrchestrator:
 
         # Max iterations reached
         log.info("Max iterations reached. Final RMS: %.1f dB", current_rms)
+        self._persist_run_end(
+            run_id, False, recipe.convergence.max_iterations,
+            baseline_rms, current_rms,
+        )
         return LoopResult(
             converged=False,
             iterations_run=recipe.convergence.max_iterations,
@@ -324,6 +343,7 @@ class LoopOrchestrator:
         baseline_rms: float,
         iteration_results: list[IterationResult],
         error: str,
+        run_id: int | None = None,
     ) -> LoopResult:
         """Rollback to snapshot and return error result."""
         if snapshot:
@@ -333,6 +353,7 @@ class LoopOrchestrator:
             except Exception as rollback_exc:
                 log.error("Rollback failed: %s", rollback_exc)
                 error += f" (rollback also failed: {rollback_exc})"
+        self._persist_run_end(run_id, False, iteration, baseline_rms, current_rms, error)
         return LoopResult(
             converged=False,
             iterations_run=iteration,
@@ -342,6 +363,62 @@ class LoopOrchestrator:
             rollback_snapshot=snapshot,
             error=error,
         )
+
+    # ── Persistence helpers (non-critical, never abort calibration) ──────────
+
+    def _persist_run_start(self, recipe: Recipe) -> int | None:
+        """Save a new calibration run to the store. Returns run_id or None."""
+        if self._store is None:
+            return None
+        try:
+            return self._store.save_run(recipe.name, recipe.target)
+        except Exception as exc:
+            log.warning("Failed to persist run start: %s", exc)
+            return None
+
+    def _persist_run_end(
+        self,
+        run_id: int | None,
+        converged: bool,
+        iterations_run: int,
+        baseline_rms: float,
+        final_rms: float,
+        error: str = "",
+    ) -> None:
+        """Update a calibration run with final results."""
+        if self._store is None or run_id is None:
+            return
+        try:
+            self._store.update_run(
+                run_id, converged=converged, iterations_run=iterations_run,
+                baseline_rms=baseline_rms, final_rms=final_rms, error=error,
+            )
+        except Exception as exc:
+            log.warning("Failed to persist run end: %s", exc)
+
+    def _persist_iteration(self, run_id: int | None, ir: IterationResult) -> None:
+        """Save one iteration result to the store."""
+        if self._store is None or run_id is None:
+            return
+        try:
+            self._store.save_iteration(
+                run_id=run_id,
+                iteration=ir.iteration,
+                rms_before=ir.rms_before,
+                rms_after=ir.rms_after,
+                filters_proposed=[
+                    {"freq": f.freq, "gain_db": f.gain_db, "q": f.q, "type": f.type}
+                    for f in ir.filters_proposed
+                ],
+                filters_applied=[
+                    {"freq": f.freq, "gain_db": f.gain_db, "q": f.q, "type": f.type}
+                    for f in ir.filters_applied
+                ],
+                safety_ok=ir.safety_ok,
+                safety_error=ir.safety_error,
+            )
+        except Exception as exc:
+            log.warning("Failed to persist iteration %d: %s", ir.iteration, exc)
 
     async def rollback(self, preset: int, snapshot: list[dict]) -> None:
         """Manually rollback to a saved EQ snapshot."""

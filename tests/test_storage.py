@@ -480,6 +480,111 @@ class TestEquipmentCrud:
         assert rows[0]["data"] == {}
 
 
+# ── Calibration runs ─────────────────────────────────────────────────────────
+
+class TestCalibrationRuns:
+
+    def test_save_run_returns_id(self, store):
+        run_id = store.save_run("harman-bass", "harman")
+        assert run_id == 1
+
+    def test_save_run_ids_auto_increment(self, store):
+        r1 = store.save_run("harman-bass", "harman")
+        r2 = store.save_run("flat-bass", "flat")
+        assert r2 == r1 + 1
+
+    def test_update_run_stores_fields(self, store):
+        run_id = store.save_run("harman-bass", "harman")
+        store.update_run(run_id, converged=True, iterations_run=3,
+                         baseline_rms=8.3, final_rms=1.8)
+        runs = store.get_runs()
+        assert len(runs) == 1
+        assert runs[0]["converged"] == 1
+        assert runs[0]["iterations_run"] == 3
+        assert runs[0]["baseline_rms"] == 8.3
+        assert runs[0]["final_rms"] == 1.8
+        assert runs[0]["error"] is None
+
+    def test_update_run_with_error(self, store):
+        run_id = store.save_run("harman-bass", "harman")
+        store.update_run(run_id, converged=False, iterations_run=1,
+                         baseline_rms=8.3, final_rms=7.5,
+                         error="measurement failed after 3 attempts")
+        runs = store.get_runs()
+        assert runs[0]["error"] == "measurement failed after 3 attempts"
+
+    def test_save_iteration(self, store):
+        run_id = store.save_run("harman-bass", "harman")
+        proposed = [{"freq": 50.0, "gain_db": -3.0, "q": 1.0, "type": "peaking"}]
+        applied = [{"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"}] + proposed
+        iter_id = store.save_iteration(
+            run_id, iteration=1, rms_before=8.3, rms_after=6.1,
+            filters_proposed=proposed, filters_applied=applied,
+            safety_ok=True,
+        )
+        assert iter_id >= 1
+
+    def test_save_iteration_safety_rejected(self, store):
+        run_id = store.save_run("harman-bass", "harman")
+        store.save_iteration(
+            run_id, iteration=1, rms_before=8.3, rms_after=8.3,
+            filters_proposed=[{"freq": 25.0, "gain_db": 10.0, "q": 1.0, "type": "peaking"}],
+            filters_applied=[],
+            safety_ok=False,
+            safety_error="max boost per band exceeded: 10.0 dB > 6.0 dB",
+        )
+        detail = store.get_run_detail(run_id)
+        assert detail is not None
+        iters = detail["iterations"]
+        assert len(iters) == 1
+        assert iters[0]["safety_ok"] == 0
+        assert "max boost" in iters[0]["safety_error"]
+
+    def test_get_runs_most_recent_first(self, store):
+        r1 = store.save_run("first", "harman")
+        r2 = store.save_run("second", "flat")
+        runs = store.get_runs()
+        assert runs[0]["id"] == r2
+        assert runs[1]["id"] == r1
+
+    def test_get_runs_respects_limit(self, store):
+        for i in range(5):
+            store.save_run(f"run-{i}", "harman")
+        runs = store.get_runs(limit=3)
+        assert len(runs) == 3
+
+    def test_get_run_detail_with_iterations(self, store):
+        run_id = store.save_run("harman-bass", "harman")
+        store.update_run(run_id, converged=True, iterations_run=2,
+                         baseline_rms=8.3, final_rms=1.8)
+        for i in range(1, 3):
+            store.save_iteration(
+                run_id, iteration=i, rms_before=8.3 - i, rms_after=8.3 - i - 1,
+                filters_proposed=[{"freq": 50.0, "gain_db": -2.0, "q": 1.0, "type": "peaking"}],
+                filters_applied=[{"freq": 50.0, "gain_db": -2.0, "q": 1.0, "type": "peaking"}],
+                safety_ok=True,
+            )
+        detail = store.get_run_detail(run_id)
+        assert detail["recipe_name"] == "harman-bass"
+        assert detail["converged"] == 1
+        assert len(detail["iterations"]) == 2
+        assert detail["iterations"][0]["iteration"] == 1
+        assert detail["iterations"][1]["iteration"] == 2
+        # Filters are deserialized from JSON
+        assert isinstance(detail["iterations"][0]["filters_applied"], list)
+        assert detail["iterations"][0]["filters_applied"][0]["freq"] == 50.0
+
+    def test_get_run_detail_unknown_id_returns_none(self, store):
+        assert store.get_run_detail(999) is None
+
+    def test_coexists_with_existing_sessions(self, store):
+        """New calibration tables don't break existing session data."""
+        sid = store.save_measurement(make_fr())
+        run_id = store.save_run("harman-bass", "harman")
+        assert store.get_session(sid) is not None
+        assert store.get_run_detail(run_id) is not None
+
+
 # ── _row_to_session — corrupt end_fr / filters_applied / impulse_response ────
 
 class TestRowToSessionCorruption:
