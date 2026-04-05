@@ -308,80 +308,20 @@ async def _tool_discover_avr() -> dict:
         return _err(f"discovery error: {exc}")
 
 
-async def _tool_run_calibration_loop(
-    recipe_name: str = "harman-bass",
-    preset: int = 0,
-    fresh: bool = True,
+async def _tool_mute_sub_outputs(
+    mute: list[int] | None, unmute: list[int] | None
 ) -> dict:
-    """Run the full calibration loop: measure → analyze → apply EQ → re-measure → converge.
-
-    Returns per-iteration results with RMS deviation tracking.
-    """
-    from .loop import LoopOrchestrator, LoopError
-    from .measurement import MeasurementEngine
-    from .recipe import load_recipe, RecipeError
-    from .storage import SessionStore
-
+    """Mute/unmute individual miniDSP outputs for per-sub measurement."""
     try:
-        recipe = load_recipe(recipe_name)
-    except RecipeError as exc:
-        return _err(f"recipe error: {exc}")
-
-    cfg = _config()
-
-    try:
-        engine = MeasurementEngine(cfg)
+        if mute:
+            await _dsp.mute_outputs(mute)
+        if unmute:
+            await _dsp.unmute_outputs(unmute)
+        muted_str = str(mute) if mute else "none"
+        unmuted_str = str(unmute) if unmute else "none"
+        return _ok(message=f"muted={muted_str}, unmuted={unmuted_str}")
     except Exception as exc:
-        return _err(f"measurement engine init failed: {exc}")
-
-    try:
-        store = SessionStore()
-    except Exception:
-        store = None  # non-critical, loop runs without persistence
-
-    # Wrap measurement with DenonSweepContext if HDMI route configured
-    denon_ctx = DenonSweepContext.from_config(cfg)
-
-    async def _measure_with_denon() -> "FrequencyResponse":
-        from .measurement import FrequencyResponse as _FR
-        if denon_ctx:
-            async with denon_ctx:
-                return await engine.measure()
-        return await engine.measure()
-
-    orchestrator = LoopOrchestrator(
-        minidsp=_dsp,  # type: ignore[arg-type]
-        measurement_engine=None,  # use measure_fn instead
-        store=store,
-    )
-
-    try:
-        result = await orchestrator.run(recipe, preset=preset, fresh=fresh, measure_fn=_measure_with_denon)
-    except LoopError as exc:
-        return _err(f"loop error: {exc}")
-    except Exception as exc:
-        return _err(f"unexpected error: {exc}")
-
-    iterations = []
-    for ir in result.iteration_results:
-        iterations.append({
-            "iteration": ir.iteration,
-            "rms_before": round(ir.rms_before, 2),
-            "rms_after": round(ir.rms_after, 2),
-            "filters_proposed": len(ir.filters_proposed),
-            "filters_applied": len(ir.filters_applied),
-            "safety_ok": ir.safety_ok,
-            "safety_error": ir.safety_error or None,
-        })
-
-    return _ok(
-        converged=result.converged,
-        iterations_run=result.iterations_run,
-        baseline_rms=round(result.baseline_rms, 2),
-        final_rms=round(result.final_rms, 2),
-        iterations=iterations,
-        error=result.error or None,
-    )
+        return _err(f"mute/unmute failed: {exc}")
 
 
 # ── MCP Server ─────────────────────────────────────────────────────────────────
@@ -609,32 +549,25 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
-        name="run_calibration_loop",
+        name="mute_sub_outputs",
         description=(
-            "Run the full closed-loop calibration: measure room response, "
-            "analyze vs Harman target, propose EQ corrections, apply to miniDSP, "
-            "re-measure, and iterate until converged (RMS deviation ≤ threshold). "
-            "SafetyValidator guards every write. Rolls back on fatal error. "
-            "Returns per-iteration RMS tracking and convergence status. "
-            "This is a long-running operation (minutes, not seconds)."
+            "Mute or unmute individual miniDSP sub outputs for per-sub measurement. "
+            "Pass output indices to mute and/or unmute. Use this to isolate individual "
+            "subs during calibration (e.g. mute output 1 to measure sub on output 0 only). "
+            "Always unmute all outputs when done."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "recipe_name": {
-                    "type": "string",
-                    "description": "Recipe name to load (default: 'harman-bass'). Defines target curve, convergence threshold, max iterations.",
-                    "default": "harman-bass",
+                "mute": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Output indices to mute (gain → -127 dB)",
                 },
-                "preset": {
-                    "type": "integer",
-                    "description": "miniDSP preset index to operate on (default: 0)",
-                    "default": 0,
-                },
-                "fresh": {
-                    "type": "boolean",
-                    "description": "If true, start from empty EQ state. If false, require existing EQ snapshot for rollback (default: true).",
-                    "default": True,
+                "unmute": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Output indices to unmute (gain → 0 dB)",
                 },
             },
         },
@@ -677,11 +610,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_set_config(arguments["updates"])
     elif name == "discover_avr":
         result = await _tool_discover_avr()
-    elif name == "run_calibration_loop":
-        result = await _tool_run_calibration_loop(
-            recipe_name=arguments.get("recipe_name", "harman-bass"),
-            preset=int(arguments.get("preset", 0)),
-            fresh=bool(arguments.get("fresh", True)),
+    elif name == "mute_sub_outputs":
+        result = await _tool_mute_sub_outputs(
+            mute=arguments.get("mute"),
+            unmute=arguments.get("unmute"),
         )
     else:
         result = _err(f"unknown tool: {name}")
