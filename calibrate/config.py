@@ -28,6 +28,9 @@ DEFAULT_CONFIG: dict = {
     "mic": {
         "name": "UMIK",
     },
+    "sub": {
+        "port_tune_hz": None,
+    },
     "measurement": {
         "freq_min": 20,
         "freq_max": 200,
@@ -67,6 +70,9 @@ minidsp:
         outputs: [0, 1, 2, 3]   # output indices this input routes to (unmuted)
       - input: 1
         outputs: [0, 1, 2, 3]
+
+sub:
+  port_tune_hz: 22       # Hz — ported sub tuning frequency (shown on FR chart)
 
 mic:
   name: "UMIK"           # substring matched against audio device names
@@ -114,6 +120,10 @@ class Config:
     @property
     def mic(self) -> dict:
         return self._data.get("mic", {})
+
+    @property
+    def sub(self) -> dict:
+        return self._data.get("sub", {})
 
     @property
     def measurement(self) -> dict:

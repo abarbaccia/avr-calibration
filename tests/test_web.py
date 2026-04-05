@@ -631,7 +631,7 @@ class TestSystemStatus:
         # httpx mock for miniDSP
         mock_response = MagicMock()
         mock_response.status_code = 200
-        mock_response.json.return_value = {"preset": 0, "source": "USB"}
+        mock_response.json.return_value = {"master": {"preset": 0, "source": "USB"}}
 
         with (
             patch.dict(sys.modules, {"denonavr": denonavr_mock, "sounddevice": sd_mock}),
@@ -655,7 +655,7 @@ class TestSystemStatus:
 
         # Should have Denon, miniDSP, and UMIK devices
         names = [d["name"] for d in data["devices"]]
-        assert any("Denon" in n for n in names)
+        assert any("X3800H" in n or "Denon" in n for n in names)
         assert any("miniDSP" in n for n in names)
         assert any("UMIK" in n for n in names)
 
