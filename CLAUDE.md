@@ -5,23 +5,21 @@ AI-first home theater calibration — closed-loop bass optimization for Denon X3
 ## Architecture
 
 ```
-[ Browser (laptop) ]
-  UMIK-1 → Web Audio API → measurement upload
+[ Claude Code (MCP) ]  ←── control plane
          |
          ▼
-[ Pi Zero 2 W — web server (Docker) ]
-  [ PyTTa analysis ]  [ Subjective feedback log ]
-         |                         |
-         └──────── AI Analysis (Claude API) ──────
-                          |
-                   SafetyValidator
-                   (hard limits, never bypassed)
-                          |
-              ┌───────────┴──────────┐
-       miniDSP adapter          Denon adapter
-       (→ minidspd HTTP)        (→ denonavr)
-              |
-       re-measure → delta vs. Harman target → loop or stop
+[ Pi 5 @ 192.168.1.117 — Docker (arm64) ]
+  ├── MCP server     ← Claude drives calibration
+  ├── Web UI         ← browser dashboard (read-only)
+  ├── MeasurementEngine (PyTTa)
+  │     └── PlaybackStrategy (USB | HDMI)
+  ├── DenonDriver    ← AVR control (denonavr)
+  │     └── DenonSweepContext (input/volume lifecycle)
+  ├── MinidspDriver  ← DSP control (minidsp-rs HTTP)
+  │     └── SafetyValidator (hard limits, never bypassed)
+  └── SessionStore   ← SQLite history
+         |
+  measure → AI analysis → propose EQ → validate → apply → re-measure → converge
 ```
 
 ## Hardware
@@ -77,27 +75,25 @@ Never commit code that makes existing tests fail.
 - Docker image built by GitHub Actions on every branch push
 - Branch push → `ghcr.io/abarbaccia/avr-calibration:<branch-name>`
 - Main push → also tagged `:latest`
-- arm/v7 cross-compiled in CI (~30-60 min); no compilation on the Pi
+- arm64 cross-compiled in CI; no compilation on the Pi
 - Source installed at `/opt/venv/lib/python3.11/site-packages/calibrate/` inside container
-- Full guide: `docs/deployment/pi-zero-w.md`
+- Pi 5 at `192.168.1.117` (user `pi`)
 
 **Primary workflow:** hotfix first, pipeline second.
 
 ```
-SSH hotfix → validate → git push → CI build → pull branch image → validate → merge
+SSH hotfix → validate → git push → CI build → pull latest image → validate → merge
 ```
 
 **SSH hotfix (seconds, no rebuild):**
 ```bash
 ./deploy/hotfix.sh                    # auto-detects modified calibrate/ files
 ./deploy/hotfix.sh calibrate/web.py   # specific file
-PI_HOST=192.168.1.50 ./deploy/hotfix.sh
 ```
 
-**Pull branch image after CI:**
+**Pull latest image after CI build completes:**
 ```bash
-sudo docker pull ghcr.io/abarbaccia/avr-calibration:<branch>
-sudo systemctl restart avr-calibration
+ssh pi@192.168.1.117 "sudo docker pull ghcr.io/abarbaccia/avr-calibration:latest && sudo systemctl restart avr-calibration"
 ```
 
 ## Key design decisions
