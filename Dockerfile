@@ -57,6 +57,13 @@ RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \
         UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --no-dev --no-editable --extra measurement; \
     fi
 
+# Step 3: patch pytta 0.1.1 for scipy>=1.12 compat (ss.hanning removed in 1.12)
+RUN if [ "$TARGETARCH" != "arm" ] || [ "$TARGETVARIANT" != "v7" ]; then \
+        PYTTA_GEN=/opt/venv/lib/python3.11/site-packages/pytta/generate.py && \
+        sed -i 's/ss\.hanning(/ss.windows.hann(/g' "$PYTTA_GEN" && \
+        echo "pytta patched: ss.hanning -> ss.windows.hann"; \
+    fi
+
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM python:3.11-slim-bookworm AS runtime
 
