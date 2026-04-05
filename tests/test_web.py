@@ -3430,6 +3430,7 @@ def test_signal_path_test_minidsp_unreachable_after_retries(client, tmp_path, mo
     import respx, httpx
     monkeypatch.setattr("calibrate.web.CONFIG_PATH", _signal_path_cfg(tmp_path))
     receiver = AsyncMock()
+    receiver.input_func_list = ["HDMI 1"]
 
     with patch("denonavr.DenonAVR", return_value=receiver):
         with patch("asyncio.sleep", new=AsyncMock()):  # skip retry delays
@@ -3453,6 +3454,7 @@ def test_signal_path_test_minidsp_recovers_on_retry(client, tmp_path, monkeypatc
     import respx, httpx
     monkeypatch.setattr("calibrate.web.CONFIG_PATH", _signal_path_cfg(tmp_path))
     receiver = AsyncMock()
+    receiver.input_func_list = ["HDMI 1"]
 
     call_count = {"n": 0}
 
@@ -3489,6 +3491,7 @@ def test_signal_path_test_tone_failure(client, tmp_path, monkeypatch):
     import respx, httpx
     monkeypatch.setattr("calibrate.web.CONFIG_PATH", _signal_path_cfg(tmp_path))
     receiver = AsyncMock()
+    receiver.input_func_list = ["HDMI 1"]
     device_payload = {
         "master": {"preset": 0, "source": "Analog"},
         "input_levels": [-128.0, -128.0],
@@ -3528,6 +3531,7 @@ def test_signal_path_test_switches_to_analog_by_default(client, tmp_path, monkey
     }))
     monkeypatch.setattr("calibrate.web.CONFIG_PATH", p)
     receiver = AsyncMock()
+    receiver.input_func_list = ["HDMI 1"]
     device_payload = {
         "master": {"preset": 0, "source": "Usb"},  # starts on USB
         "input_levels": [-70.0, -70.0],
@@ -3571,6 +3575,7 @@ def test_signal_path_test_uses_configured_source(client, tmp_path, monkeypatch):
     }))
     monkeypatch.setattr("calibrate.web.CONFIG_PATH", p)
     receiver = AsyncMock()
+    receiver.input_func_list = ["HDMI 1"]
     device_payload = {
         "master": {"preset": 0, "source": "Analog"},
         "input_levels": [-70.0, -70.0],
@@ -3607,6 +3612,7 @@ def test_signal_path_test_no_input_signal(client, tmp_path, monkeypatch):
     import respx, httpx
     monkeypatch.setattr("calibrate.web.CONFIG_PATH", _signal_path_cfg(tmp_path))
     receiver = AsyncMock()
+    receiver.input_func_list = ["HDMI 1"]
     device_payload = {
         "master": {"preset": 0, "source": "Analog"},
         "input_levels": [-128.0, -128.0],
@@ -3639,6 +3645,7 @@ def test_signal_path_test_no_output_signal(client, tmp_path, monkeypatch):
     import respx, httpx
     monkeypatch.setattr("calibrate.web.CONFIG_PATH", _signal_path_cfg(tmp_path))
     receiver = AsyncMock()
+    receiver.input_func_list = ["HDMI 1"]
     device_payload = {
         "master": {"preset": 0, "source": "Analog"},
         "input_levels": [-80.0, -80.0],   # signal present
@@ -3672,6 +3679,7 @@ def test_signal_path_test_full_pass(client, tmp_path, monkeypatch):
     import respx, httpx
     monkeypatch.setattr("calibrate.web.CONFIG_PATH", _signal_path_cfg(tmp_path))
     receiver = AsyncMock()
+    receiver.input_func_list = ["HDMI 1"]
     device_payload = {
         "master": {"preset": 0, "source": "Analog"},
         "input_levels": [-70.0, -72.0],
@@ -3705,6 +3713,7 @@ def test_signal_path_test_tone_exception(client, tmp_path, monkeypatch):
     import respx, httpx
     monkeypatch.setattr("calibrate.web.CONFIG_PATH", _signal_path_cfg(tmp_path))
     receiver = AsyncMock()
+    receiver.input_func_list = ["HDMI 1"]
     device_payload = {
         "master": {"preset": 0, "source": "Analog"},
         "input_levels": [-70.0, -70.0],
@@ -3734,6 +3743,7 @@ def test_signal_path_test_mid_tone_levels_fail(client, tmp_path, monkeypatch):
     from calibrate.adapters.minidsp import MinidspApiError
     monkeypatch.setattr("calibrate.web.CONFIG_PATH", _signal_path_cfg(tmp_path))
     receiver = AsyncMock()
+    receiver.input_func_list = ["HDMI 1"]
     ok_payload = {
         "master": {"preset": 0, "source": "Analog"},
         "input_levels": [-70.0, -70.0],
