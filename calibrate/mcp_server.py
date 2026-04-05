@@ -57,6 +57,7 @@ from typing import Any
 
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import (
     CallToolResult,
     ListResourcesResult,
@@ -746,28 +747,38 @@ async def read_resource(uri: str) -> str:
 
 # ── Starlette ASGI app ─────────────────────────────────────────────────────────
 
-@asynccontextmanager
-async def lifespan(app: Starlette):
-    """Load drivers on startup; tear them down on shutdown."""
-    global _avr, _dsp
-    cfg = _config()
-    _avr = load_avr_driver(cfg)
-    _dsp = load_dsp_driver(cfg)
-    await _avr.setup()
-    await _dsp.setup()
-    log.info(
-        "Drivers loaded: avr=%s dsp=%s",
-        cfg.avr_driver_name,
-        cfg.dsp_driver_name,
-    )
-    yield
-    await _avr.close()
-    await _dsp.close()
-
-
 def create_app() -> Starlette:
-    """Build the ASGI application wrapping the MCP server via SSE transport."""
+    """Build the ASGI application with Streamable HTTP (primary) + SSE (legacy)."""
+    # Modern transport — Claude Code uses this via /mcp endpoint
+    http_manager = StreamableHTTPSessionManager(app=server, stateless=True)
+
+    # Legacy SSE transport — kept for backwards compatibility
     sse = SseServerTransport("/messages/")
+
+    @asynccontextmanager
+    async def lifespan(app: Starlette):
+        """Load drivers on startup; start transports; tear down on shutdown."""
+        global _avr, _dsp
+        cfg = _config()
+        _avr = load_avr_driver(cfg)
+        _dsp = load_dsp_driver(cfg)
+        await _avr.setup()
+        await _dsp.setup()
+        log.info(
+            "Drivers loaded: avr=%s dsp=%s",
+            cfg.avr_driver_name,
+            cfg.dsp_driver_name,
+        )
+        async with http_manager.run():
+            yield
+        await _avr.close()
+        await _dsp.close()
+
+    async def handle_mcp(request: Request) -> Response:
+        await http_manager.handle_request(
+            request.scope, request.receive, request._send
+        )
+        return Response()
 
     async def handle_sse(request: Request) -> Response:
         async with sse.connect_sse(
@@ -785,6 +796,7 @@ def create_app() -> Starlette:
     return Starlette(
         lifespan=lifespan,
         routes=[
+            Route("/mcp", endpoint=handle_mcp, methods=["GET", "POST", "DELETE"]),
             Route("/sse", endpoint=handle_sse),
             Mount("/messages/", app=sse.handle_post_message),
         ],
