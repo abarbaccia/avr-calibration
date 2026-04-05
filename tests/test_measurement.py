@@ -179,9 +179,6 @@ class TestMeasure:
         engine.measure()
         mock_pytta.PlayRecMeasure.assert_called_once_with(
             excitation=mock_pytta.generate.sweep.return_value,
-            samplingRate=48000,
-            numInChannels=1,
-            numOutChannels=1,
             inChannels=[2],
             outChannels=[3],
         )

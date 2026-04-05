@@ -392,11 +392,9 @@ class MeasurementEngine:
         finally:
             _traceback.walk_stack = _orig_walk_stack
 
+        # pytta 0.1.1: samplingRate is inferred from excitation; numInChannels removed
         meas = pytta.PlayRecMeasure(
             excitation=sweep,
-            samplingRate=sample_rate,
-            numInChannels=1,
-            numOutChannels=1,
             inChannels=[in_channel],
             outChannels=[out_channel],
         )
