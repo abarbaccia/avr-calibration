@@ -9,7 +9,8 @@ Coverage diagram:
   ├── [TESTED] measure() raises RuntimeError (PortAudioError) → HTTP 503
   ├── [TESTED] Denon: configured + powered off → power on, switch input, measure, restore, power off
   ├── [TESTED] Denon: configured + already on → switch input, measure, restore (no power off)
-  └── [TESTED] Denon: unreachable → HTTP 503 before measurement
+  ├── [TESTED] Denon: unreachable → HTTP 503 before measurement
+  └── [TESTED] Denon: input not in input_func_list → HTTP 503 with available inputs listed
 """
 
 from __future__ import annotations
@@ -161,6 +162,7 @@ class TestMeasureHeadlessEndpoint:
         mock_receiver.power = "OFF"
         mock_receiver.input_func = "SHIELD"
         mock_receiver.volume = -30.0
+        mock_receiver.input_func_list = ["AUX1", "AUX2", "SHIELD", "CBL/SAT"]
         mock_receiver.async_setup = AsyncMock()
         mock_receiver.async_update = AsyncMock()
         mock_receiver.async_power_on = AsyncMock()
@@ -211,6 +213,7 @@ class TestMeasureHeadlessEndpoint:
         mock_receiver.power = "ON"
         mock_receiver.input_func = "CBL/SAT"
         mock_receiver.volume = -20.0
+        mock_receiver.input_func_list = ["AUX1", "AUX2", "SHIELD", "CBL/SAT"]
         mock_receiver.async_setup = AsyncMock()
         mock_receiver.async_update = AsyncMock()
         mock_receiver.async_power_on = AsyncMock()
@@ -262,4 +265,40 @@ class TestMeasureHeadlessEndpoint:
 
         assert r.status_code == 503
         assert "Denon" in r.json()["detail"]
+        MockEngine.return_value.measure.assert_not_called()
+
+    def test_denon_invalid_input_returns_503(self, client, tmp_path):
+        """Configured input not in Denon's input list → HTTP 503, no measurement."""
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text(yaml.dump({
+            "denon": {"host": "192.168.1.209"},
+            "minidsp": {"host": "localhost", "port": 5380},
+            "mic": {"name": "UMIK"},
+            "measurement": {"denon_sweep_input": "AUX1"},
+        }))
+
+        mock_sd = sys.modules["sounddevice"]
+        mock_sd.query_devices.return_value = [
+            {"name": "UMIK-1", "max_input_channels": 1},
+        ]
+
+        mock_receiver = MagicMock()
+        mock_receiver.power = "ON"
+        mock_receiver.input_func = "SHIELD"
+        mock_receiver.volume = -25.0
+        mock_receiver.input_func_list = ["AUX2", "Blu-ray", "CBL/SAT", "SHIELD", "Videocore"]
+        mock_receiver.async_setup = AsyncMock()
+        mock_receiver.async_update = AsyncMock()
+
+        with (
+            patch("calibrate.web.CONFIG_PATH", cfg_path),
+            patch("calibrate.web.MeasurementEngine") as MockEngine,
+            patch("denonavr.DenonAVR", return_value=mock_receiver),
+        ):
+            r = client.post("/api/measure", json={})
+
+        assert r.status_code == 503
+        detail = r.json()["detail"]
+        assert "AUX1" in detail
+        assert "Available" in detail
         MockEngine.return_value.measure.assert_not_called()

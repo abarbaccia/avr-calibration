@@ -2562,6 +2562,13 @@ async def measure_headless(body: HeadlessMeasureRequest) -> dict:
                 await asyncio.sleep(3.0)  # Denon boot takes ~2-3s
                 await receiver.async_update()
 
+            available = receiver.input_func_list or []
+            if sweep_input not in available:
+                raise ValueError(
+                    f"Input '{sweep_input}' not found on Denon. "
+                    f"Available: {sorted(available)}"
+                )
+
             prev_input = receiver.input_func
             prev_volume = receiver.volume
 
@@ -3300,6 +3307,12 @@ async def test_signal_path() -> dict:
         receiver = _denonavr.DenonAVR(denon_host)
         await asyncio.wait_for(receiver.async_setup(), timeout=5.0)
         await receiver.async_update()
+        available = receiver.input_func_list or []
+        if sweep_input not in available:
+            raise ValueError(
+                f"Input '{sweep_input}' not found on Denon. "
+                f"Available: {sorted(available)}"
+            )
         await receiver.async_set_input_func(sweep_input)
         await asyncio.sleep(0.8)
         steps.append({"name": "Denon", "passed": True,
