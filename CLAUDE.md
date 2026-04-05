@@ -2,25 +2,58 @@
 
 AI-first home theater calibration — closed-loop bass optimization for Denon X3800H + miniDSP 2x4 HD + SVS PB12-NSD.
 
-## Architecture
+## Architecture — Claude is the Orchestrator
+
+**Core principle: Claude Code drives calibration, not Python.**
+
+Python provides MCP tool primitives (measure, apply EQ, mute/unmute, set delay).
+Claude reads human-readable recipe files and calls those tools in a loop.
+
+**Do NOT build Python orchestrators, phase runners, or loop state machines.**
+If you're writing a `for` loop in Python that calls measure→analyze→apply→repeat,
+STOP — that logic belongs in a Claude skill or recipe, not in Python code.
 
 ```
-[ Claude Code (MCP) ]  ←── control plane
-         |
-         ▼
+[ Claude Code ]  ←── reads recipe, drives calibration loop
+       |
+       | MCP tool calls (high-level actions)
+       ▼
 [ Pi 5 @ 192.168.1.117 — Docker (arm64) ]
-  ├── MCP server     ← Claude drives calibration
-  ├── Web UI         ← browser dashboard (read-only)
-  ├── MeasurementEngine (PyTTa)
-  │     └── PlaybackStrategy (USB | HDMI)
-  ├── DenonDriver    ← AVR control (denonavr)
-  │     └── DenonSweepContext (input/volume lifecycle)
-  ├── MinidspDriver  ← DSP control (minidsp-rs HTTP)
-  │     └── SafetyValidator (hard limits, never bypassed)
-  └── SessionStore   ← SQLite history
-         |
-  measure → AI analysis → propose EQ → validate → apply → re-measure → converge
+  ├── MCP server (thin facade)
+  │     ├── measure             take a sweep, return FR data
+  │     ├── apply_eq            write PEQ filters (SafetyValidator enforced)
+  │     ├── mute/unmute_output  per-output muting for solo measurement
+  │     ├── set_delay           per-output delay for time alignment
+  │     ├── set_polarity        per-output polarity inversion
+  │     ├── get_state           combined hardware state
+  │     ├── check_system        preflight all hardware
+  │     └── fetch_recipe        load recipe text
+  │           |
+  │     Plugin drivers (Claude never sees these directly)
+  │     ├── DenonDriver         AVR volume, input, sweep context
+  │     ├── MinidspDriver       DSP EQ, mute, delay, polarity
+  │     ├── MeasurementEngine   UMIK + PyTTa sweep/deconvolution
+  │     └── SafetyValidator     hard limits, NEVER bypassed
+  ├── Web UI            ← browser dashboard (read-only)
+  └── SessionStore      ← SQLite history
 ```
+
+### What belongs where
+
+| Concern | Where | Example |
+|---------|-------|---------|
+| Loop logic (measure→analyze→adjust→repeat) | Claude skill / recipe | `/calibrate` reads recipe, calls MCP tools |
+| Decision-making (what to adjust next) | Claude | "subs are 3ms apart, increase delay on sub 1" |
+| Hardware protocol (ordering, cleanup) | Plugin drivers | DenonSweepContext sets input before play, restores after |
+| Hardware I/O | MCP tools → plugin drivers | `measure` → DenonDriver + MeasurementEngine + UMIK |
+| Safety enforcement | SafetyValidator (code) | Max boost, HPF, frequency limits — NEVER in prompts only |
+| Recipes | Markdown files in `recipes/core/` | Human-readable English instructions |
+| Hardware config | `config.yaml` | Output slot types, IP addresses, mic name |
+
+### MCP tool design principle
+Claude sees **actions** ("measure", "apply EQ"), not **hardware** ("set Denon input",
+"POST to minidsp-rs"). The MCP server is a thin facade. Each tool handler is ~5 lines
+delegating to a plugin driver. Hardware protocol complexity stays in the drivers.
 
 ## Hardware
 
@@ -96,14 +129,64 @@ SSH hotfix → validate → git push → CI build → pull latest image → vali
 ssh pi@192.168.1.117 "sudo docker pull ghcr.io/abarbaccia/avr-calibration:latest && sudo systemctl restart avr-calibration"
 ```
 
+## Calibration Knowledge (for Claude driving calibration)
+
+### Signal chain
+Pi (sweep via HDMI LFE) → Denon X3800H → miniDSP 2x4 HD → subs/shakers → room → UMIK mic → Pi (recording)
+
+### How to interpret frequency response
+- **Room modes**: Large peaks/nulls in 30-80Hz are room modes. Cut peaks (always safe). Nulls cannot be filled with EQ — they're cancellation.
+- **Port tuning**: SVS PB12-NSD tuned ~22Hz. Output rolls off steeply below port frequency. Do not boost below 25Hz.
+- **Fixable with EQ**: Broad humps, gentle slopes, peaks from room modes (cut them)
+- **NOT fixable with EQ**: Deep nulls (cancellation), frequencies below sub capability, anything above sub crossover
+
+### Sub alignment procedure
+1. Mute all subs except one. Measure. Repeat for each sub.
+2. Compare IR peak times — the difference is the travel-time delay between subs.
+3. Apply delay to earlier-arriving subs so all peaks align.
+4. Check polarity — if one sub's IR peak is inverted relative to others, flip it.
+5. Level-match — adjust gains so all subs have equal SPL at the mic.
+6. Re-measure to verify alignment. Repeat if needed.
+
+### Sub crawl procedure
+1. Place the sub at the primary listening position (on/near the seat).
+2. Place the mic at each candidate sub position.
+3. Measure at each position. Compare FR smoothness across 20-80Hz.
+4. Choose the position with the smoothest response (fewest/shallowest nulls).
+5. For multiple subs, crawl each independently, then measure combined.
+
+### Harman bass target (relative to 80Hz reference)
+| Hz  | Target |
+|-----|--------|
+| 25  | +5 dB  |
+| 31  | +4 dB  |
+| 40  | +3 dB  |
+| 50  | +2 dB  |
+| 63  | +1 dB  |
+| 80  | 0 dB   |
+
+## Safety Limits (SVS PB12-NSD) — Code-Enforced, Non-Negotiable
+
+These are enforced in `SafetyValidator` before any write to miniDSP.
+They exist in Python code, not just in prompts. Never bypass them.
+
+- Minimum boost frequency: **25Hz**
+- Max boost per EQ band: **+6 dB**
+- Max cumulative boost in any 1/3 octave: **+9 dB**
+- Max change per iteration: **+3 dB/band**
+- Mandatory infrasonic HPF: **18Hz, 4th-order Butterworth** (always on)
+- Cuts: no floor (cuts are always safe)
+
 ## Key design decisions
 
-- **PyTTa** replaces REW as the measurement engine (REW Pro API costs $100; PyTTa is free and sufficient for bass calibration)
+- **Claude Code is the orchestrator** — reads recipes, drives calibration loop, makes decisions
+- **Python provides MCP primitives** — measure, apply EQ, mute/unmute, set delay (no orchestration)
+- **Recipes are English markdown** — human-readable instructions in `recipes/core/`
+- **PyTTa** replaces REW as the measurement engine (free, sufficient for bass calibration)
 - **minidsp-rs** daemon handles USB control of the 2x4 HD; Python speaks HTTP to it
-- **denonavr** library handles Denon X3800H control (no reverse-engineering)
-- **SQLite** for measurement history storage (single file, queryable)
-- **Harman target curve** as the optimization convergence target
-- **Claude API with structured JSON output** for AI analysis
+- **denonavr** library handles Denon X3800H control
+- **SQLite** for measurement history storage
+- **Harman target curve** as the default optimization target
 
 ## Skill routing
 
@@ -112,13 +195,14 @@ tool as your FIRST action. Do NOT answer directly, do NOT use other tools first.
 The skill has specialized workflows that produce better results than ad-hoc answers.
 
 Key routing rules:
-- Product ideas, "is this worth building", brainstorming → invoke office-hours
-- Bugs, errors, "why is this broken", 500 errors → invoke investigate
+- "Calibrate", "run calibration", "tune the subs" → invoke calibrate
+- "Set up", "configure", "new hardware" → invoke setup
+- "Build a recipe", "new recipe" → invoke recipe
+- "Sub crawl", "find best position" → invoke subcrawl
+- "Take a measurement", "how does it sound" → invoke measure
+- "Check system", "is everything connected" → invoke check
+- "What's the current state", "where are we" → invoke status
+- Bugs, errors, "why is this broken" → invoke investigate
 - Ship, deploy, push, create PR → invoke ship
-- QA, test the site, find bugs → invoke qa
 - Code review, check my diff → invoke review
-- Update docs after shipping → invoke document-release
-- Weekly retro → invoke retro
-- Design system, brand → invoke design-consultation
-- Visual audit, design polish → invoke design-review
 - Architecture review → invoke plan-eng-review

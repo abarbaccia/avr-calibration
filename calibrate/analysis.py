@@ -25,6 +25,19 @@ from .safety import FilterSpec, THIRD_OCTAVE_CENTRES_HZ, _third_octave_for_freq
 log = logging.getLogger(__name__)
 
 
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _median_spl(fr: FrequencyResponse) -> float:
+    """Return the median SPL value from a FrequencyResponse."""
+    if not fr.spl:
+        return 0.0
+    sorted_spl = sorted(fr.spl)
+    n = len(sorted_spl)
+    if n % 2 == 0:
+        return (sorted_spl[n // 2 - 1] + sorted_spl[n // 2]) / 2
+    return sorted_spl[n // 2]
+
+
 # ── Harman target curve ───────────────────────────────────────────────────────
 
 # Harman bass target: relative dB offsets at 1/3-octave centres.
@@ -167,9 +180,7 @@ def harman_rms(
     and returns the RMS deviation within *band*. Useful for computing a single
     "how close to Harman" number for any stored measurement.
     """
-    from .loop import median_spl
-
-    ref = median_spl(fr)
+    ref = _median_spl(fr)
     target = HarmanTarget(reference_spl=ref, band=band)
     return rms_deviation(fr, target, band)
 

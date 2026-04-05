@@ -19,10 +19,10 @@ DEFAULT_CONFIG: dict = {
         "signal_path": None,
         "input_labels": {},
         "output_slots": [
-            {"index": 0, "label": "", "location": "", "preset": ""},
-            {"index": 1, "label": "", "location": "", "preset": ""},
-            {"index": 2, "label": "", "location": "", "preset": ""},
-            {"index": 3, "label": "", "location": "", "preset": ""},
+            {"index": 0, "label": "", "type": "sub"},
+            {"index": 1, "label": "", "type": "sub"},
+            {"index": 2, "label": "", "type": "unused"},
+            {"index": 3, "label": "", "type": "unused"},
         ],
     },
     "mic": {
@@ -132,6 +132,21 @@ class Config:
     @property
     def connections(self) -> dict:
         return self._data.get("connections", {})
+
+    @property
+    def sub_outputs(self) -> list[int]:
+        """Output indices where type='sub'. Falls back to measurement.sub_outputs."""
+        slots = self.minidsp.get("output_slots", [])
+        typed = [s["index"] for s in slots if s.get("type") == "sub"]
+        if typed:
+            return typed
+        return self.measurement.get("sub_outputs", [0, 1])
+
+    @property
+    def shaker_outputs(self) -> list[int]:
+        """Output indices where type='shaker'."""
+        slots = self.minidsp.get("output_slots", [])
+        return [s["index"] for s in slots if s.get("type") == "shaker"]
 
     @classmethod
     def load(cls, path: Path = CONFIG_PATH) -> "Config":

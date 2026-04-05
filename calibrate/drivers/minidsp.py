@@ -162,6 +162,20 @@ class MinidspDriver(DSPDriver):
         except (ValueError, MinidspApiError) as exc:
             raise DriverError(str(exc))
 
+    async def mute_outputs(self, output_indices: list[int]) -> None:
+        """Mute outputs by setting gain to -127 dB."""
+        try:
+            await self._client.mute_outputs(output_indices)
+        except MinidspApiError as exc:
+            raise DriverError(str(exc))
+
+    async def unmute_outputs(self, output_indices: list[int]) -> None:
+        """Unmute outputs by restoring gain to 0 dB."""
+        try:
+            await self._client.unmute_outputs(output_indices)
+        except MinidspApiError as exc:
+            raise DriverError(str(exc))
+
     async def set_routing(self, routing: dict) -> None:
         try:
             for input_index, output_enabled in routing.items():
