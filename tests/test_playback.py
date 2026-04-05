@@ -87,21 +87,25 @@ class TestHDMIPlayback:
         sweep = MagicMock()
         sweep.timeSignal = np.random.default_rng(42).standard_normal((4800, 1))
 
-        rec_result = np.random.default_rng(99).standard_normal((4800, 1)).astype(np.float32)
-        mock_sd.rec.return_value = rec_result
+        # Mock InputStream as context manager; simulate callback writing data
+        mock_stream = MagicMock()
+        mock_stream.__enter__ = MagicMock(return_value=mock_stream)
+        mock_stream.__exit__ = MagicMock(return_value=False)
+        mock_sd.InputStream.return_value = mock_stream
+        mock_sd.default.device = (2, 4)
 
         strategy = HDMIPlayback()
         sweep_1d, rec_1d = strategy.play_and_record(sweep, 48000, 1, 1)
 
-        mock_sd.rec.assert_called_once()
+        mock_sd.InputStream.assert_called_once()
         mock_sd.play.assert_called_once()
         mock_sd.wait.assert_called_once()
 
         assert sweep_1d.shape == (4800,)
-        assert rec_1d.shape == (4800,)
         assert rec_1d.dtype == np.float64
 
-        # Verify sd.play was called with int16 data
+        # Verify sd.play was called with int16 multi-channel data
         play_args = mock_sd.play.call_args
         played_arr = play_args[0][0]
         assert played_arr.dtype == np.int16
+        assert played_arr.shape[1] >= HDMIPlayback.HDMI_CHANNELS

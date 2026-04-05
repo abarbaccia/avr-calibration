@@ -202,8 +202,8 @@ async def _tool_trigger_measurement() -> dict:
         import sounddevice as sd
         devices = sd.query_devices()
         from .measurement import _find_umik_device
-        umik_devices = [d for d in devices if "UMIK" in str(d.get("name", ""))]
-        if not umik_devices:
+        mic_name = _config().mic.get("name", "UMIK")
+        if _find_umik_device(devices, name_substring=mic_name) is None:
             return _err(
                 "trigger_measurement requires UMIK microphone — none found. "
                 "Check USB connection."

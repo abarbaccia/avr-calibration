@@ -3,7 +3,7 @@ description: >
   Harman bass target curve for ported subwoofers. +3 dB/octave slope below 80 Hz,
   flat above. The standard for "sounds good to most listeners" in bass calibration.
 target: harman
-band: [20, 200]
+band: [20, 80]
 convergence:
   metric: rms_deviation
   threshold_db: 2.0
