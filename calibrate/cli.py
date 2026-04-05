@@ -102,8 +102,18 @@ def measure(config_path: Path | None, label: str | None) -> None:
     click.echo("  Playing sweep and recording response...")
 
     try:
-        engine = MeasurementEngine(cfg)
-        fr = engine.measure()
+        import asyncio as _asyncio
+        from .drivers.denon import DenonSweepContext
+
+        async def _run_measure():
+            engine = MeasurementEngine(cfg)
+            denon_ctx = DenonSweepContext.from_config(cfg)
+            if denon_ctx:
+                async with denon_ctx:
+                    return await engine.measure()
+            return await engine.measure()
+
+        fr = _asyncio.run(_run_measure())
     except RuntimeError as exc:
         click.echo(click.style(f"\n  Error: {exc}", fg="red"))
         sys.exit(1)

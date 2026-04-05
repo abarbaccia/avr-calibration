@@ -74,6 +74,7 @@ from starlette.routing import Mount, Route
 from .config import Config, update_config
 from .drivers.avr_driver import AVRDriver
 from .drivers.base import DriverError
+from .drivers.denon import DenonSweepContext
 from .drivers.dsp_driver import DSPDriver
 from .drivers.registry import load_avr_driver, load_dsp_driver
 
@@ -189,40 +190,44 @@ async def _tool_avr_set_volume(level_db: float) -> dict:
 async def _tool_trigger_measurement() -> dict:
     """Trigger a measurement via UMIK-1 + PyTTa.
 
-    Requires Pi 5 with UMIK-1 connected. On Pi Zero 2 W, returns a structured
-    degraded-mode error directing the user to the browser.
+    Calls MeasurementEngine.measure() directly (no HTTP hop). Wraps with
+    DenonSweepContext when HDMI route is configured.
     """
     try:
         import sounddevice as sd
         devices = sd.query_devices()
+        from .measurement import _find_umik_device
         umik_devices = [d for d in devices if "UMIK" in str(d.get("name", ""))]
         if not umik_devices:
             return _err(
-                "trigger_measurement requires Pi 5 — no UMIK microphone found. "
-                "Take a measurement in the browser and use get_measurement_history() "
-                "to retrieve it."
+                "trigger_measurement requires UMIK microphone — none found. "
+                "Check USB connection."
             )
     except Exception:
         return _err(
-            "trigger_measurement requires Pi 5 — audio device enumeration failed. "
-            "Take a measurement in the browser and use get_measurement_history() "
-            "to retrieve it."
+            "trigger_measurement requires sounddevice — audio device enumeration failed."
         )
 
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                "http://localhost:8000/api/measure",
-                json={"label": "mcp-triggered"},
-            )
-        if response.status_code == 200:
-            data = response.json()
-            return _ok(
-                session_id=data.get("session_id"),
-                message="Measurement complete — use get_measurement_history() to retrieve results.",
-            )
-        return _err(f"measurement API returned HTTP {response.status_code}")
+        from .measurement import MeasurementEngine
+        from .storage import SessionStore
+
+        cfg = _config()
+        engine = MeasurementEngine(cfg)
+        denon_ctx = DenonSweepContext.from_config(cfg)
+
+        if denon_ctx:
+            async with denon_ctx:
+                fr = await engine.measure()
+        else:
+            fr = await engine.measure()
+
+        store = SessionStore()
+        session_id = store.save_measurement(fr, label="mcp-triggered")
+        return _ok(
+            session_id=session_id,
+            message="Measurement complete — use get_measurement_history() to retrieve results.",
+        )
     except Exception as exc:
         return _err(f"measurement failed: {exc}")
 
@@ -296,6 +301,82 @@ async def _tool_discover_avr() -> dict:
         return _ok(receivers=hosts)
     except Exception as exc:
         return _err(f"discovery error: {exc}")
+
+
+async def _tool_run_calibration_loop(
+    recipe_name: str = "harman-bass",
+    preset: int = 0,
+    fresh: bool = True,
+) -> dict:
+    """Run the full calibration loop: measure → analyze → apply EQ → re-measure → converge.
+
+    Returns per-iteration results with RMS deviation tracking.
+    """
+    from .loop import LoopOrchestrator, LoopError
+    from .measurement import MeasurementEngine
+    from .recipe import load_recipe, RecipeError
+    from .storage import SessionStore
+
+    try:
+        recipe = load_recipe(recipe_name)
+    except RecipeError as exc:
+        return _err(f"recipe error: {exc}")
+
+    cfg = _config()
+
+    try:
+        engine = MeasurementEngine(cfg)
+    except Exception as exc:
+        return _err(f"measurement engine init failed: {exc}")
+
+    try:
+        store = SessionStore()
+    except Exception:
+        store = None  # non-critical, loop runs without persistence
+
+    # Wrap measurement with DenonSweepContext if HDMI route configured
+    denon_ctx = DenonSweepContext.from_config(cfg)
+
+    async def _measure_with_denon() -> "FrequencyResponse":
+        from .measurement import FrequencyResponse as _FR
+        if denon_ctx:
+            async with denon_ctx:
+                return await engine.measure()
+        return await engine.measure()
+
+    orchestrator = LoopOrchestrator(
+        minidsp=_dsp,  # type: ignore[arg-type]
+        measurement_engine=None,  # use measure_fn instead
+        store=store,
+    )
+
+    try:
+        result = await orchestrator.run(recipe, preset=preset, fresh=fresh, measure_fn=_measure_with_denon)
+    except LoopError as exc:
+        return _err(f"loop error: {exc}")
+    except Exception as exc:
+        return _err(f"unexpected error: {exc}")
+
+    iterations = []
+    for ir in result.iteration_results:
+        iterations.append({
+            "iteration": ir.iteration,
+            "rms_before": round(ir.rms_before, 2),
+            "rms_after": round(ir.rms_after, 2),
+            "filters_proposed": len(ir.filters_proposed),
+            "filters_applied": len(ir.filters_applied),
+            "safety_ok": ir.safety_ok,
+            "safety_error": ir.safety_error or None,
+        })
+
+    return _ok(
+        converged=result.converged,
+        iterations_run=result.iterations_run,
+        baseline_rms=round(result.baseline_rms, 2),
+        final_rms=round(result.final_rms, 2),
+        iterations=iterations,
+        error=result.error or None,
+    )
 
 
 # ── MCP Server ─────────────────────────────────────────────────────────────────
@@ -522,6 +603,37 @@ _TOOLS: list[Tool] = [
             "properties": {},
         },
     ),
+    Tool(
+        name="run_calibration_loop",
+        description=(
+            "Run the full closed-loop calibration: measure room response, "
+            "analyze vs Harman target, propose EQ corrections, apply to miniDSP, "
+            "re-measure, and iterate until converged (RMS deviation ≤ threshold). "
+            "SafetyValidator guards every write. Rolls back on fatal error. "
+            "Returns per-iteration RMS tracking and convergence status. "
+            "This is a long-running operation (minutes, not seconds)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "recipe_name": {
+                    "type": "string",
+                    "description": "Recipe name to load (default: 'harman-bass'). Defines target curve, convergence threshold, max iterations.",
+                    "default": "harman-bass",
+                },
+                "preset": {
+                    "type": "integer",
+                    "description": "miniDSP preset index to operate on (default: 0)",
+                    "default": 0,
+                },
+                "fresh": {
+                    "type": "boolean",
+                    "description": "If true, start from empty EQ state. If false, require existing EQ snapshot for rollback (default: true).",
+                    "default": True,
+                },
+            },
+        },
+    ),
 ]
 
 
@@ -560,6 +672,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_set_config(arguments["updates"])
     elif name == "discover_avr":
         result = await _tool_discover_avr()
+    elif name == "run_calibration_loop":
+        result = await _tool_run_calibration_loop(
+            recipe_name=arguments.get("recipe_name", "harman-bass"),
+            preset=int(arguments.get("preset", 0)),
+            fresh=bool(arguments.get("fresh", True)),
+        )
     else:
         result = _err(f"unknown tool: {name}")
 

@@ -11,9 +11,10 @@ Covers:
   - apply_eq: DriverError propagated as {ok: false}
   - avr_set_volume: success and failure cases
   - set_denon_volume: deprecated alias → same behaviour as avr_set_volume
-  - trigger_measurement: Pi Zero degraded-mode error (no UMIK found)
-  - trigger_measurement: Pi 5 success path (UMIK found, 200 from /api/measure)
-  - trigger_measurement: httpx timeout is 60s (not 30s)
+  - trigger_measurement: no UMIK found → error
+  - trigger_measurement: success (direct engine call, session saved)
+  - trigger_measurement: engine error propagated
+  - trigger_measurement: DenonSweepContext wraps engine when HDMI configured
   - fetch_recipe: found → returns content; not found → {ok: false}
   - fetch_recipe: path traversal via ".." → rejected
   - fetch_recipe: path traversal via symlink → rejected
@@ -29,9 +30,7 @@ import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import pytest
-import respx
 
 from calibrate import mcp_server as sut
 from calibrate.mcp_server import (
@@ -45,8 +44,6 @@ from calibrate.mcp_server import (
     _tool_trigger_measurement,
 )
 from calibrate.drivers.base import DriverError
-
-MEASURE_URL = "http://localhost:8000/api/measure"
 
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
@@ -345,8 +342,8 @@ async def test_set_denon_volume_alias_dispatches(mock_avr) -> None:
 # ── trigger_measurement ────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_trigger_measurement_pi_zero_no_umik() -> None:
-    """Pi Zero: no UMIK found → degraded-mode error."""
+async def test_trigger_measurement_no_umik() -> None:
+    """No UMIK found → error."""
     mock_sd = sys.modules.get("sounddevice")
     if mock_sd:
         mock_sd.query_devices.return_value = [
@@ -354,76 +351,87 @@ async def test_trigger_measurement_pi_zero_no_umik() -> None:
         ]
     result = await _tool_trigger_measurement()
     assert not result["ok"]
-    assert "Pi 5" in result["error"] or "UMIK" in result["error"]
-    assert "browser" in result["error"].lower() or "get_measurement_history" in result["error"]
+    assert "UMIK" in result["error"]
 
 
-@respx.mock
 @pytest.mark.asyncio
-async def test_trigger_measurement_pi5_success() -> None:
+async def test_trigger_measurement_success() -> None:
+    """UMIK found → engine.measure() called directly → session saved."""
     mock_sd = MagicMock()
     mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
-    respx.post(MEASURE_URL).mock(return_value=httpx.Response(
-        200, json={"session_id": 7}
-    ))
-    with patch.dict(sys.modules, {"sounddevice": mock_sd}):
+
+    mock_fr = MagicMock()
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(return_value=mock_fr)
+
+    mock_store = MagicMock()
+    mock_store.save_measurement.return_value = 7
+
+    with (
+        patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.storage.SessionStore", return_value=mock_store),
+        patch.object(sut, "DenonSweepContext") as MockCtx,
+    ):
+        MockCtx.from_config.return_value = None  # USB route
         result = await _tool_trigger_measurement()
+
     assert result["ok"]
     assert result["session_id"] == 7
+    mock_engine.measure.assert_called_once()
 
 
-@respx.mock
 @pytest.mark.asyncio
-async def test_trigger_measurement_pi5_api_error() -> None:
+async def test_trigger_measurement_engine_error() -> None:
+    """engine.measure() raises → error returned."""
     mock_sd = MagicMock()
     mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
-    respx.post(MEASURE_URL).mock(return_value=httpx.Response(500))
-    with patch.dict(sys.modules, {"sounddevice": mock_sd}):
-        result = await _tool_trigger_measurement()
-    assert not result["ok"]
-    assert "HTTP 500" in result["error"]
 
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(side_effect=RuntimeError("Audio device error"))
 
-@respx.mock
-@pytest.mark.asyncio
-async def test_trigger_measurement_pi5_network_failure() -> None:
-    mock_sd = MagicMock()
-    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
-    respx.post(MEASURE_URL).mock(side_effect=httpx.ConnectError("refused"))
-    with patch.dict(sys.modules, {"sounddevice": mock_sd}):
+    with (
+        patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch.object(sut, "DenonSweepContext") as MockCtx,
+    ):
+        MockCtx.from_config.return_value = None
         result = await _tool_trigger_measurement()
+
     assert not result["ok"]
     assert "measurement failed" in result["error"]
 
 
-@respx.mock
 @pytest.mark.asyncio
-async def test_trigger_measurement_uses_60s_timeout() -> None:
-    """Pi 5: httpx client timeout should be 60s to allow 3s sweep + processing."""
-    import httpx as _httpx
+async def test_trigger_measurement_with_denon_context() -> None:
+    """HDMI route → DenonSweepContext wraps engine.measure()."""
     mock_sd = MagicMock()
     mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
-    respx.post(MEASURE_URL).mock(return_value=_httpx.Response(200, json={"session_id": 1}))
 
-    captured_timeout: list[float] = []
+    mock_fr = MagicMock()
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(return_value=mock_fr)
 
-    original_client = _httpx.AsyncClient
+    mock_store = MagicMock()
+    mock_store.save_measurement.return_value = 3
 
-    class CapturingClient(original_client):
-        def __init__(self, *args, **kwargs):
-            captured_timeout.append(kwargs.get("timeout", -1))
-            super().__init__(*args, **kwargs)
+    mock_ctx_instance = AsyncMock()
+    mock_ctx_instance.__aenter__ = AsyncMock(return_value=mock_ctx_instance)
+    mock_ctx_instance.__aexit__ = AsyncMock(return_value=False)
 
-    # httpx is imported inside _tool_trigger_measurement, so we patch it in the
-    # httpx module directly (that's what the local `import httpx` resolves to).
     with (
         patch.dict(sys.modules, {"sounddevice": mock_sd}),
-        patch.object(_httpx, "AsyncClient", CapturingClient),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.storage.SessionStore", return_value=mock_store),
+        patch.object(sut, "DenonSweepContext") as MockCtx,
     ):
-        await _tool_trigger_measurement()
+        MockCtx.from_config.return_value = mock_ctx_instance
+        result = await _tool_trigger_measurement()
 
-    assert captured_timeout, "httpx.AsyncClient was not instantiated"
-    assert captured_timeout[0] == 60.0, f"Expected timeout=60.0, got {captured_timeout[0]}"
+    assert result["ok"]
+    assert result["session_id"] == 3
+    mock_ctx_instance.__aenter__.assert_called_once()
+    mock_ctx_instance.__aexit__.assert_called_once()
 
 
 # ── fetch_recipe ───────────────────────────────────────────────────────────────
@@ -599,13 +607,12 @@ async def test_read_eq_driver_error(mock_dsp) -> None:
 
 
 @pytest.mark.asyncio
-async def test_trigger_measurement_sounddevice_exception() -> None:
-    """sounddevice raises an unexpected exception → degraded-mode error."""
+async def test_trigger_measurement_sounddevice_unavailable() -> None:
+    """sounddevice not available → error."""
     with patch.dict(sys.modules, {"sounddevice": None}):
         result = await _tool_trigger_measurement()
     assert not result["ok"]
-    assert "Pi 5" in result["error"]
-    assert "get_measurement_history" in result["error"]
+    assert "sounddevice" in result["error"] or "audio" in result["error"].lower()
 
 
 @pytest.mark.asyncio
@@ -827,3 +834,102 @@ async def test_get_calibration_runs_no_crash() -> None:
         result = await _tool_get_calibration_runs()
     assert result["ok"]
     assert result["runs"] == []
+
+
+# ── run_calibration_loop ────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_run_calibration_loop_converged(mock_dsp) -> None:
+    """Loop converges in 1 iteration with mock backend."""
+    from calibrate.mcp_server import _tool_run_calibration_loop
+    from calibrate.loop import LoopResult, IterationResult
+    from calibrate.safety import FilterSpec
+
+    fake_result = LoopResult(
+        converged=True,
+        iterations_run=1,
+        final_rms=1.5,
+        baseline_rms=4.2,
+        iteration_results=[
+            IterationResult(
+                iteration=1,
+                rms_before=4.2,
+                rms_after=1.5,
+                filters_proposed=[FilterSpec(freq=18.0, gain_db=0.0, q=0.707, type="hpf")],
+                filters_applied=[FilterSpec(freq=18.0, gain_db=0.0, q=0.707, type="hpf")],
+                safety_ok=True,
+            ),
+        ],
+    )
+
+    with (
+        patch("calibrate.mcp_server._config") as mock_cfg,
+        patch("calibrate.mcp_server._dsp", mock_dsp),
+        patch("calibrate.loop.LoopOrchestrator.run", return_value=fake_result),
+        patch("calibrate.storage.SessionStore"),
+    ):
+        mock_cfg.return_value = MagicMock()
+        result = await _tool_run_calibration_loop(recipe_name="harman-bass", fresh=True)
+
+    assert result["ok"]
+    assert result["converged"]
+    assert result["iterations_run"] == 1
+    assert result["baseline_rms"] == 4.2
+    assert result["final_rms"] == 1.5
+    assert len(result["iterations"]) == 1
+    assert result["iterations"][0]["safety_ok"]
+
+
+@pytest.mark.asyncio
+async def test_run_calibration_loop_bad_recipe() -> None:
+    """Invalid recipe name → error."""
+    from calibrate.mcp_server import _tool_run_calibration_loop
+
+    result = await _tool_run_calibration_loop(recipe_name="nonexistent-recipe")
+    assert not result["ok"]
+    assert "recipe error" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_run_calibration_loop_loop_error(mock_dsp) -> None:
+    """LoopError during run → error returned."""
+    from calibrate.mcp_server import _tool_run_calibration_loop
+    from calibrate.loop import LoopError
+
+    with (
+        patch("calibrate.mcp_server._config") as mock_cfg,
+        patch("calibrate.mcp_server._dsp", mock_dsp),
+        patch("calibrate.loop.LoopOrchestrator.run", side_effect=LoopError("measurement failed")),
+        patch("calibrate.storage.SessionStore"),
+    ):
+        mock_cfg.return_value = MagicMock()
+        result = await _tool_run_calibration_loop(recipe_name="harman-bass", fresh=True)
+
+    assert not result["ok"]
+    assert "loop error" in result["error"]
+    assert "measurement failed" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_run_calibration_loop_dispatch() -> None:
+    """Dispatcher routes run_calibration_loop correctly."""
+    from calibrate.mcp_server import call_tool
+    from calibrate.loop import LoopResult
+
+    fake_result = LoopResult(
+        converged=True, iterations_run=0,
+        final_rms=1.0, baseline_rms=1.0,
+    )
+
+    with (
+        patch("calibrate.mcp_server._config") as mock_cfg,
+        patch("calibrate.mcp_server._dsp", AsyncMock()),
+        patch("calibrate.loop.LoopOrchestrator.run", return_value=fake_result),
+        patch("calibrate.storage.SessionStore"),
+    ):
+        mock_cfg.return_value = MagicMock()
+        texts = await call_tool("run_calibration_loop", {"recipe_name": "harman-bass", "fresh": True})
+
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert data["converged"]

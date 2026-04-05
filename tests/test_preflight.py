@@ -197,27 +197,26 @@ class TestMinidspCheck:
 
 class TestDenonCheck:
     async def test_avr_online(self, config):
-        mock_receiver = MagicMock()
-        mock_receiver.model_name = "Denon AVR-X3800H"
-        mock_receiver.async_setup = AsyncMock()
-        with patch("denonavr.DenonAVR", return_value=mock_receiver):
+        state = {"connected": True, "host": "192.168.1.100", "model": "Denon AVR-X3800H"}
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver:
+            MockDriver.return_value.get_state = AsyncMock(return_value=state)
             result = await PreflightChecker(config).check_denon()
         assert result.passed
         assert "X3800H" in result.detail
         assert "192.168.1.100" in result.detail
 
     async def test_avr_model_name_none_falls_back(self, config):
-        mock_receiver = MagicMock()
-        mock_receiver.model_name = None
-        mock_receiver.async_setup = AsyncMock()
-        with patch("denonavr.DenonAVR", return_value=mock_receiver):
+        state = {"connected": True, "host": "192.168.1.100", "model": "Denon AVR"}
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver:
+            MockDriver.return_value.get_state = AsyncMock(return_value=state)
             result = await PreflightChecker(config).check_denon()
         assert result.passed
         assert "Denon AVR" in result.detail
 
     async def test_host_not_configured_discovery_finds_nothing(self, config):
         config._data["denon"]["host"] = None
-        with patch("denonavr.async_discover", new=AsyncMock(return_value=[])):
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver:
+            MockDriver.return_value.discover = AsyncMock(return_value=[])
             result = await PreflightChecker(config).check_denon()
         assert not result.passed
         assert "discovered" in result.detail.lower() or "found" in result.detail.lower()
@@ -225,47 +224,35 @@ class TestDenonCheck:
 
     async def test_host_auto_discovered_via_ssdp(self, config):
         config._data["denon"]["host"] = None
-        mock_receiver = MagicMock()
-        mock_receiver.model_name = "Denon AVR-X3800H"
-        mock_receiver.async_setup = AsyncMock()
-        with (
-            patch("denonavr.async_discover", new=AsyncMock(return_value=[{"host": "192.168.1.42"}])),
-            patch("denonavr.DenonAVR", return_value=mock_receiver),
-        ):
+        state = {"connected": True, "host": "192.168.1.42", "model": "Denon AVR-X3800H"}
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver:
+            MockDriver.return_value.discover = AsyncMock(return_value=["192.168.1.42"])
+            MockDriver.return_value.get_state = AsyncMock(return_value=state)
             result = await PreflightChecker(config).check_denon()
         assert result.passed
         assert "192.168.1.42" in result.detail
         assert "auto-discovered" in result.detail
 
-    async def test_ssdp_discovery_timeout(self, config):
-        """SSDP discovery should fail gracefully if it takes more than 10 seconds."""
+    async def test_ssdp_discovery_empty(self, config):
+        """SSDP discovery returning nothing → fail."""
         config._data["denon"]["host"] = None
-        with patch("denonavr.async_discover", new=AsyncMock(side_effect=asyncio.TimeoutError())):
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver:
+            MockDriver.return_value.discover = AsyncMock(return_value=[])
             result = await PreflightChecker(config).check_denon()
         assert not result.passed
-        assert "timed out" in result.detail.lower()
-        assert "denon.host" in result.error
-
-    async def test_ssdp_device_has_no_host(self, config):
-        """SSDP returning a device with no host address should fail gracefully."""
-        config._data["denon"]["host"] = None
-        with patch("denonavr.async_discover", new=AsyncMock(return_value=[{"host": None}])):
-            result = await PreflightChecker(config).check_denon()
-        assert not result.passed
-        assert "no host address" in result.error.lower()
 
     async def test_avr_unreachable(self, config):
-        mock_receiver = MagicMock()
-        mock_receiver.async_setup = AsyncMock(side_effect=ConnectionRefusedError("refused"))
-        with patch("denonavr.DenonAVR", return_value=mock_receiver):
+        from calibrate.drivers.base import DriverError
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver:
+            MockDriver.return_value.get_state = AsyncMock(side_effect=DriverError("refused"))
             result = await PreflightChecker(config).check_denon()
         assert not result.passed
         assert "192.168.1.100" in result.detail
 
     async def test_avr_timeout(self, config):
-        mock_receiver = MagicMock()
-        mock_receiver.async_setup = AsyncMock(side_effect=TimeoutError("timed out"))
-        with patch("denonavr.DenonAVR", return_value=mock_receiver):
+        from calibrate.drivers.base import DriverError
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver:
+            MockDriver.return_value.get_state = AsyncMock(side_effect=DriverError("timed out"))
             result = await PreflightChecker(config).check_denon()
         assert not result.passed
 
@@ -352,10 +339,9 @@ class TestPlaybackRouteCheck:
     async def test_hdmi_route_denon_reachable(self, config):
         config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
         config._data["denon"]["host"] = "192.168.1.100"
-        mock_receiver = MagicMock()
-        mock_receiver.model_name = "Denon AVR-X3800H"
-        mock_receiver.async_setup = AsyncMock()
-        with patch("denonavr.DenonAVR", return_value=mock_receiver):
+        state = {"connected": True, "host": "192.168.1.100", "model": "Denon AVR-X3800H"}
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver:
+            MockDriver.return_value.get_state = AsyncMock(return_value=state)
             result = await PreflightChecker(config).check_playback_route()
         assert result.passed
         assert "HDMI" in result.detail
@@ -364,7 +350,8 @@ class TestPlaybackRouteCheck:
     async def test_hdmi_route_no_denon_host(self, config):
         config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
         config._data["denon"]["host"] = None
-        with patch("denonavr.async_discover", new=AsyncMock(return_value=[])):
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver:
+            MockDriver.return_value.discover = AsyncMock(return_value=[])
             result = await PreflightChecker(config).check_playback_route()
         assert not result.passed
         assert "denon.host" in result.error or "network" in result.error.lower()
@@ -372,9 +359,9 @@ class TestPlaybackRouteCheck:
     async def test_hdmi_route_denon_unreachable(self, config):
         config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
         config._data["denon"]["host"] = "192.168.1.100"
-        mock_receiver = MagicMock()
-        mock_receiver.async_setup = AsyncMock(side_effect=ConnectionRefusedError("refused"))
-        with patch("denonavr.DenonAVR", return_value=mock_receiver):
+        from calibrate.drivers.base import DriverError
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver:
+            MockDriver.return_value.get_state = AsyncMock(side_effect=DriverError("refused"))
             result = await PreflightChecker(config).check_playback_route()
         assert not result.passed
 
@@ -593,18 +580,15 @@ class TestHdmiDeduplication:
         assert "HDMI" in result.detail
         assert "X3800H" in result.detail
 
-    async def test_hdmi_route_no_duplicate_denonavr_instantiation(self, config):
-        """When playback_route=hdmi, denonavr.DenonAVR must NOT be called directly."""
+    async def test_hdmi_route_uses_check_denon_not_raw_denonavr(self, config):
+        """When playback_route=hdmi, check_playback_route delegates to check_denon."""
         config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
         config._data["denon"]["host"] = "192.168.1.100"
         checker = PreflightChecker(config)
         denon_result = CheckResult("Denon AVR", True, "X3800H online at 192.168.1.100")
-        with (
-            patch.object(checker, "check_denon", return_value=denon_result),
-            patch("denonavr.DenonAVR") as mock_avr,
-        ):
+        with patch.object(checker, "check_denon", return_value=denon_result) as mock_denon:
             await checker.check_playback_route()
-        mock_avr.assert_not_called()
+        mock_denon.assert_awaited_once()
 
     async def test_hdmi_route_propagates_denon_failure(self, config):
         """HDMI route failure reflects check_denon's failure."""
@@ -622,10 +606,11 @@ class TestHdmiDeduplication:
 
 class TestSsdpGenericException:
     async def test_ssdp_generic_exception_returns_failed_result(self, config):
-        """Generic (non-TimeoutError) exception during SSDP → failed CheckResult (lines 235-236)."""
+        """Generic (non-TimeoutError) exception during SSDP → failed CheckResult."""
         from unittest.mock import AsyncMock, patch
         config._data["denon"]["host"] = None
-        with patch("denonavr.async_discover", new=AsyncMock(side_effect=OSError("network unreachable"))):
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver:
+            MockDriver.return_value.discover = AsyncMock(side_effect=OSError("network unreachable"))
             result = await PreflightChecker(config).check_denon()
         assert not result.passed
         assert "SSDP discovery failed" in result.error

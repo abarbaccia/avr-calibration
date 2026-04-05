@@ -8,14 +8,22 @@ Design notes:
   - close() is a no-op; no persistent connections to clean up.
   - All network calls are wrapped with asyncio.wait_for(timeout=5.0) and
     re-raised as DriverError so callers handle one exception type.
+
+DenonSweepContext: async context manager for measurement sweep lifecycle.
+  Saves current Denon input/volume, switches to sweep input/volume, settles,
+  then restores on exit (best-effort). Used by MCP tools and web endpoints
+  that need to run a sweep through the Denon's HDMI path.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from .avr_driver import AVRDriver
 from .base import DriverError
+
+log = logging.getLogger(__name__)
 
 _DENON_MIN_DB: float = -80.0
 _DENON_MAX_DB: float = 18.0
@@ -38,6 +46,7 @@ class DenonDriver(AVRDriver):
             return {
                 "connected": True,
                 "host": self._host,
+                "model": receiver.model_name or "Denon AVR",
                 "volume": receiver.volume,
                 "input": receiver.input_func,
                 "mute": receiver.muted,
@@ -76,3 +85,90 @@ class DenonDriver(AVRDriver):
             return []
         except Exception:
             return []
+
+
+class DenonSweepContext:
+    """Async context manager for Denon sweep lifecycle.
+
+    Usage:
+        async with DenonSweepContext(host, sweep_input, sweep_volume) as ctx:
+            fr = await engine.measure()
+
+    On enter: connects to Denon, saves current input/volume, switches to
+    sweep input/volume, waits for settle. On exit: restores saved state
+    (best-effort, exceptions caught).
+
+    Volume safety: sweep_volume must be <= -25.0 dB.
+    """
+
+    @classmethod
+    def from_config(cls, config) -> "DenonSweepContext | None":
+        """Build from a Config object, or return None if HDMI sweep not configured."""
+        route = config.measurement.get("playback_route", "usb")
+        if route != "hdmi":
+            return None
+        host = config.denon.get("host")
+        sweep_input = config.measurement.get("denon_sweep_input")
+        if not host or not sweep_input:
+            return None
+        return cls(
+            host=host,
+            sweep_input=sweep_input,
+            sweep_volume=float(config.measurement.get("denon_sweep_volume", -25.0)),
+            settle_ms=config.measurement.get("denon_settle_ms", 800),
+        )
+
+    def __init__(
+        self,
+        host: str,
+        sweep_input: str,
+        sweep_volume: float = -25.0,
+        settle_ms: int = 800,
+    ) -> None:
+        if sweep_volume > -25.0:
+            raise ValueError(
+                f"sweep_volume must be <= -25.0 dB to prevent loud sweeps, got {sweep_volume}"
+            )
+        self._host = host
+        self._sweep_input = sweep_input
+        self._sweep_volume = sweep_volume
+        self._settle_ms = settle_ms
+        self._receiver = None
+        self._saved_input: str | None = None
+        self._saved_volume: float | None = None
+
+    async def __aenter__(self) -> "DenonSweepContext":
+        import denonavr
+
+        self._receiver = denonavr.DenonAVR(self._host)
+        await asyncio.wait_for(self._receiver.async_setup(), timeout=5.0)
+        await self._receiver.async_update()
+
+        self._saved_input = self._receiver.input_func
+        self._saved_volume = self._receiver.volume
+
+        log.info(
+            "Denon sweep: switching to input=%s volume=%.1f dB (was %s / %s)",
+            self._sweep_input, self._sweep_volume,
+            self._saved_input, self._saved_volume,
+        )
+        await self._receiver.async_set_input_func(self._sweep_input)
+        await self._receiver.async_set_volume(self._sweep_volume)
+        await asyncio.sleep(self._settle_ms / 1000.0)
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._receiver is None:
+            return
+        try:
+            if self._saved_input is not None:
+                log.info(
+                    "Denon sweep: restoring input=%s volume=%s",
+                    self._saved_input, self._saved_volume,
+                )
+                await self._receiver.async_set_input_func(self._saved_input)
+            if self._saved_volume is not None:
+                await self._receiver.async_set_volume(self._saved_volume)
+        except Exception as exc:
+            log.warning("Failed to restore Denon state: %s", exc)
+        self._receiver = None
