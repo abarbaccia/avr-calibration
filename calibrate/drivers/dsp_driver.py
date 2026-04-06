@@ -61,21 +61,33 @@ class DSPDriver(ABC):
         """
 
     @abstractmethod
-    async def apply_eq(self, preset: int, filters: list[dict]) -> None:
-        """Validate and apply EQ filters to DSP hardware.
+    async def apply_eq(
+        self, preset: int, filters: list[dict],
+        output_index: int | None = None,
+    ) -> None:
+        """Validate and apply EQ filters to DSP output(s).
 
         *filters* is a list of dicts with keys: freq, gain_db, q, type.
+        If *output_index* is given, writes only to that output (per-sub EQ).
+        Otherwise writes to all configured sub outputs.
 
         Runs SafetyValidator under an asyncio lock before any hardware write.
-        Updates in-memory EQ state only if ALL hardware writes succeed
-        (partial-write rollback).
+        Updates in-memory EQ state only if ALL hardware writes succeed.
 
-        Raises DriverError on:
-          - Invalid filter spec (KeyError/ValueError/TypeError in parsing)
-          - SafetyValidator rejection ("SafetyValidator: ...")
-          - Too many filters for available hardware slots ("too many filters: ...")
-          - Hardware write failure ("minidsp write failed: ...")
-          - Unexpected error ("apply_eq error: ...")
+        Raises DriverError on validation, safety, or hardware failure.
+        """
+
+    @abstractmethod
+    async def apply_input_eq(
+        self, preset: int, filters: list[dict],
+        input_index: int | None = None,
+    ) -> None:
+        """Validate and apply EQ filters to the DSP input channel.
+
+        Use for shared EQ (e.g. Harman target) that should affect all outputs.
+        If *input_index* is given, targets that input; otherwise uses active_input.
+
+        Raises DriverError on validation, safety, or hardware failure.
         """
 
     @abstractmethod

@@ -97,11 +97,15 @@ def mock_dsp():
     async def read_eq(preset: int) -> list[dict]:
         return list(_eq_state.get(preset, []))
 
-    async def apply_eq(preset: int, filters: list[dict]) -> None:
+    async def apply_eq(preset: int, filters: list[dict], output_index: int | None = None) -> None:
         _eq_state[preset] = list(filters)
+
+    async def apply_input_eq(preset: int, filters: list[dict], input_index: int | None = None) -> None:
+        _eq_state[("input", preset)] = list(filters)
 
     dsp.read_eq.side_effect = read_eq
     dsp.apply_eq.side_effect = apply_eq
+    dsp.apply_input_eq.side_effect = apply_input_eq
 
     with patch("calibrate.mcp_server._dsp", dsp):
         yield dsp

@@ -298,6 +298,23 @@ class MinidspClient:
             "outputs": [{"index": output, "peq": entries}]
         })
 
+    async def set_input_peq_batch(
+        self,
+        input_index: int,
+        entries: list[dict[str, Any]],
+    ) -> None:
+        """Write multiple PEQ slots to input *input_index* in a single HTTP request.
+
+        Each entry in *entries* must have: {"index": slot, "coeff": {b0,b1,b2,a1,a2}}
+        and optionally "bypass": bool.
+
+        Used to apply shared EQ (e.g. Harman target curve) to the input channel,
+        affecting all outputs equally.
+        """
+        await self._post_config({
+            "inputs": [{"index": input_index, "peq": entries}]
+        })
+
     async def set_input_routing(
         self,
         input_index: int,
