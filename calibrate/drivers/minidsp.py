@@ -176,6 +176,20 @@ class MinidspDriver(DSPDriver):
         except MinidspApiError as exc:
             raise DriverError(str(exc))
 
+    async def set_output_delay(self, output_index: int, delay_ms: float) -> None:
+        """Set delay for a single output in milliseconds."""
+        try:
+            await self._client.set_output_delay(output_index, delay_ms)
+        except (ValueError, MinidspApiError) as exc:
+            raise DriverError(str(exc))
+
+    async def set_output_polarity(self, output_index: int, inverted: bool) -> None:
+        """Set polarity for a single output (inverted=True flips phase)."""
+        try:
+            await self._client.set_output_polarity(output_index, inverted)
+        except MinidspApiError as exc:
+            raise DriverError(str(exc))
+
     async def set_routing(self, routing: dict) -> None:
         try:
             for input_index, output_enabled in routing.items():
