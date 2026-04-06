@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1.0] - 2026-04-05
+
+### Added
+- **New MCP tools:** `set_delay`, `set_polarity`, and `check_system` for sub alignment and pre-flight hardware checks.
+- **Split mute/unmute:** `mute_output` and `unmute_output` replace the combined `mute_sub_outputs` tool for cleaner per-sub isolation during calibration.
+- **6 new Claude skills:** `/setup` (equipment config), `/recipe` (interactive recipe builder), `/subcrawl` (sub placement optimization), `/measure` (single measurement + analysis), `/check` (pre-flight system check), `/status` (current state review).
+
+### Changed
+- **Tool renames:** `trigger_measurement` → `measure`, `avr_set_volume` → `set_volume`, `mute_sub_outputs` → `mute_output`/`unmute_output`. Legacy names still dispatch correctly for backwards compatibility.
+- **Removed deprecated `set_denon_volume` from tool list** (legacy alias kept in dispatch only).
+- **`MinidspDriver`:** Added `set_output_delay` and `set_output_polarity` methods delegating to the adapter layer.
+
+### Fixed
+- **Defensive bool coercion:** `set_polarity` dispatch uses `is True` instead of `bool()` to prevent string "false" from coercing to True.
+
 ## [0.5.0.0] - 2026-04-01
 
 ### Added

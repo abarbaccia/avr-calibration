@@ -23,18 +23,23 @@ protocol, ordering, and cleanup. Recipes stay hardware-agnostic.
 
 ### MCP tools Claude sees
 
-| Tool | What Claude thinks | Plugin layer handles |
-|------|-------------------|---------------------|
-| `measure` | "take a measurement" | Denon context, HDMI routing, UMIK, PyTTa |
-| `apply_eq` | "write these filters" | Safety, biquad math, miniDSP HTTP |
-| `mute_output` / `unmute_output` | "silence this sub" | miniDSP gain manipulation |
-| `set_delay` | "delay this output" | miniDSP delay API |
-| `set_polarity` | "flip this output" | miniDSP polarity API |
-| `get_state` | "what's the system state" | Queries all hardware, combines |
-| `check_system` | "is everything working" | Pings all hardware, reports |
-| `fetch_recipe` | "load a recipe" | Filesystem |
-| `get_config` / `set_config` | "read/write config" | Filesystem |
-| `get_history` | "past measurements" | SQLite |
+| Tool | What Claude thinks | Plugin layer handles | Status |
+|------|-------------------|---------------------|--------|
+| `measure` | "take a measurement" | Denon context, HDMI routing, UMIK, PyTTa | Done |
+| `apply_eq` | "write these filters" | Safety, biquad math, miniDSP HTTP | Done |
+| `mute_output` | "silence these outputs" | miniDSP gain → -127 dB | Done |
+| `unmute_output` | "restore these outputs" | miniDSP gain → 0 dB | Done |
+| `set_delay` | "delay this output" | miniDSP delay API | Done |
+| `set_polarity` | "flip this output" | miniDSP polarity API | Done |
+| `set_volume` | "set AVR volume" | Denon volume control | Done |
+| `get_device_state` | "what's the system state" | Queries all hardware, combines | Done |
+| `check_system` | "is everything working" | PreflightChecker.run_all() | Done |
+| `read_eq` | "current EQ state" | In-memory EQ tracking | Done |
+| `fetch_recipe` | "load a recipe" | Filesystem | Done |
+| `get_config` / `set_config` | "read/write config" | Filesystem | Done |
+| `get_measurement_history` | "past measurements" | SQLite | Done |
+| `get_calibration_runs` | "past calibrations" | SQLite | Done |
+| `discover_avr` | "find my AVR" | SSDP scan | Done |
 
 ### Plugin drivers (Python, behind the facade)
 - `drivers/denon.py` — AVR control (volume, input, sweep context)
@@ -45,29 +50,30 @@ protocol, ordering, and cleanup. Recipes stay hardware-agnostic.
 
 ### Cleanup tasks
 - [ ] Simplify `mcp_server.py` to thin facade — each tool handler is ~5 lines delegating to a plugin
-- [ ] Remove `set_denon_volume` alias (keep only `avr_set_volume` or rename to just `set_volume`)
-- [ ] Add `set_delay(output_index, delay_ms)` MCP tool
-- [ ] Add `set_polarity(output_index, inverted)` MCP tool
-- [ ] Add `check_system` MCP tool (preflight checks as a single tool)
-- [ ] Rename `trigger_measurement` → `measure` (simpler)
-- [ ] Rename `mute_sub_outputs` → `mute_output` / `unmute_output` (not sub-specific)
+- [x] Remove `set_denon_volume` alias (renamed to `set_volume`, legacy aliases kept in dispatch)
+- [x] Add `set_delay(output_index, delay_ms)` MCP tool
+- [x] Add `set_polarity(output_index, inverted)` MCP tool
+- [x] Add `check_system` MCP tool (preflight checks as a single tool)
+- [x] Rename `trigger_measurement` → `measure` (legacy alias kept in dispatch)
+- [x] Rename `mute_sub_outputs` → `mute_output` / `unmute_output` (legacy alias kept in dispatch)
 
 ---
 
 ## Skills to Build
 
-### `/setup` — Equipment Configuration
-- [ ] Ask user about hardware: AVR model, DSP, sub count/models, mic, bass shakers
-- [ ] Generate `config.yaml` with output_slots (sub/shaker/unused types), IP addresses, mic name
-- [ ] Configure MCP server connection (`.claude/mcp.json`)
-- [ ] Verify connectivity: ping Denon, miniDSP HTTP, mic detection
-- [ ] Verify signal path: test tone through each output, confirm levels on miniDSP
+### `/setup` — Equipment Configuration (SKILL CREATED)
+- [x] SKILL.md created at `.claude/skills/setup/SKILL.md`
+- [x] Ask user about hardware: AVR model, DSP, sub count/models, mic, bass shakers
+- [x] Generate `config.yaml` with output_slots (sub/shaker/unused types), IP addresses, mic name
+- [x] Configure MCP server connection (`.claude/mcp.json`)
+- [x] Verify connectivity via `check_system` MCP tool
 
-### `/recipe` — Interactive Recipe Builder
-- [ ] Ask user about calibration goals (target curve, frequency range, sub alignment needs)
-- [ ] Ask about room issues (known modes, placement constraints)
-- [ ] Write a recipe `.md` file in `recipes/` following the established format
-- [ ] Validate recipe references valid MCP tools and safe parameters
+### `/recipe` — Interactive Recipe Builder (SKILL CREATED)
+- [x] SKILL.md created at `.claude/skills/recipe/SKILL.md`
+- [x] Ask user about calibration goals (target curve, frequency range, sub alignment needs)
+- [x] Ask about room issues (known modes, placement constraints)
+- [x] Write a recipe `.md` file in `recipes/` following the established format
+- [x] Validate recipe references valid MCP tools and safe parameters
 
 ### `/calibrate` — Run Calibration (PRIORITY)
 - [x] Default recipe: align subs → Harman curve fit 20-80Hz
@@ -77,29 +83,30 @@ protocol, ordering, and cleanup. Recipes stay hardware-agnostic.
 - [ ] Reports progress conversationally
 - [ ] Stops on convergence or max iterations
 
-### `/subcrawl` — Sub Placement Optimization
-- [ ] Guide user through sub crawl procedure (sub at listening position, mic at candidate positions)
-- [ ] Measure at each candidate position
-- [ ] Compare FR smoothness, modal distribution, bass extension at each position
-- [ ] Recommend optimal placement with reasoning
-- [ ] Support multiple subs (crawl each independently, then measure combined)
+### `/subcrawl` — Sub Placement Optimization (SKILL CREATED)
+- [x] SKILL.md created at `.claude/skills/subcrawl/SKILL.md`
+- [x] Guide user through sub crawl procedure (sub at listening position, mic at candidate positions)
+- [x] Measure at each candidate position
+- [x] Compare FR smoothness, modal distribution, bass extension at each position
+- [x] Recommend optimal placement with reasoning
+- [x] Support multiple subs (crawl each independently, then measure combined)
 
-### `/measure` — Single Measurement + Analysis
-- [ ] Take one measurement via MCP
-- [ ] Analyze FR, compare to target curve if specified
-- [ ] Report: RMS deviation, room modes, rolloff points, problem frequencies
+### `/measure` — Single Measurement + Analysis (SKILL CREATED)
+- [x] SKILL.md created at `.claude/skills/measure/SKILL.md`
+- [x] Take one measurement via MCP
+- [x] Analyze FR, compare to target curve if specified
+- [x] Report: RMS deviation, room modes, rolloff points, problem frequencies
 
-### `/check` — Pre-flight System Check
-- [ ] Verify Denon reachable and on correct input
-- [ ] Verify miniDSP reachable, read current preset/EQ state
-- [ ] Verify mic detected (UMIK)
-- [ ] Verify signal path (test tone → miniDSP levels)
-- [ ] Report status summary
+### `/check` — Pre-flight System Check (SKILL CREATED)
+- [x] SKILL.md created at `.claude/skills/check/SKILL.md`
+- [x] Wraps `check_system` MCP tool
+- [x] Report status summary with troubleshooting guidance
 
-### `/status` — Current State Review
-- [ ] Current EQ filters on miniDSP
-- [ ] Last measurement and distance from target
-- [ ] Calibration history summary
+### `/status` — Current State Review (SKILL CREATED)
+- [x] SKILL.md created at `.claude/skills/status/SKILL.md`
+- [x] Current EQ filters on miniDSP
+- [x] Last measurement and distance from target
+- [x] Calibration history summary
 
 ### `/investigate` — Debug Issues
 - [ ] Already exists in gstack skills
@@ -141,10 +148,11 @@ Max 5 EQ iterations. Prefer cuts over boosts.
 ```
 
 ### Migration Tasks
-- [ ] Write default recipe: `recipes/core/harman-bass-aligned.md`
+- [x] Write default recipe: `recipes/core/harman-bass-aligned.md`
 - [ ] Keep `recipes/core/harman-bass.md` (EQ only, no alignment)
-- [ ] YAML recipes can stay for backwards compat but are not the primary format
-- [ ] PhaseRunner (`calibrate/phase_runner.py`) is deprecated — remove once skills are working
+- [x] YAML recipes can stay for backwards compat but are not the primary format
+- [x] PhaseRunner (`calibrate/phase_runner.py`) is removed
+- [x] LoopOrchestrator (`calibrate/loop.py`) is removed
 
 ---
 
@@ -168,9 +176,9 @@ Max 5 EQ iterations. Prefer cuts over boosts.
 ### New MCP Tools Needed
 - [ ] `measure_sub_solo(sub_index)` — mute others, measure, unmute (atomic operation)
 - [ ] `get_alignment_state()` — current delay/polarity/level for each sub
-- [ ] `apply_sub_delay(sub_index, delay_ms)` — set delay for one sub
-- [ ] `apply_sub_polarity(sub_index, inverted)` — set polarity for one sub
-- [ ] `run_sweep()` — trigger a sweep and return raw FR data (no analysis)
+- [x] `set_delay(output_index, delay_ms)` — set delay for one output (was apply_sub_delay)
+- [x] `set_polarity(output_index, inverted)` — set polarity for one output (was apply_sub_polarity)
+- [x] `measure` — trigger a sweep and return session ID (was run_sweep/trigger_measurement)
 
 ---
 
@@ -179,4 +187,4 @@ Max 5 EQ iterations. Prefer cuts over boosts.
 - [x] Add calibration knowledge section (signal chain, how to interpret FR, loop pattern)
 - [x] Add MCP tool reference
 - [x] Add safety rules (non-negotiable, code-enforced)
-- [ ] Add skill routing for calibration skills
+- [x] Add skill routing for calibration skills
