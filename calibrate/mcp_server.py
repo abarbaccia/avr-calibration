@@ -206,10 +206,11 @@ async def _tool_trigger_measurement() -> dict:
         import sounddevice as sd
         devices = sd.query_devices()
         from .measurement import _find_umik_device
-        umik_devices = [d for d in devices if "umik" in str(d.get("name", "")).lower()]
-        if not umik_devices:
+        cfg = _config()
+        mic_name = cfg.mic.get("name", "UMIK")
+        if _find_umik_device(devices, name_substring=mic_name) is None:
             return _err(
-                "trigger_measurement requires UMIK microphone — none found. "
+                f"trigger_measurement requires {mic_name} microphone — none found. "
                 "Check USB connection."
             )
     except Exception:
@@ -258,51 +259,88 @@ async def _tool_calibrate_level(
 
     from .measurement import MeasurementEngine, MeasurementQualityError
     from .config import update_config
+    from .drivers.denon import _connect_receiver
 
     cfg = _config()
     engine = MeasurementEngine(cfg)
     volume = start_db
 
-    while volume <= max_volume_db:
-        try:
-            await _avr.set_volume(volume)
-            await asyncio.sleep(0.5)  # brief settle
+    # Set up Denon for sweeps: switch input and enable Pure Direct.
+    # We manage volume ourselves in the loop rather than using DenonSweepContext.
+    sweep_input = cfg.measurement.get("denon_sweep_input")
+    settle_ms = cfg.measurement.get("denon_settle_ms", 800)
+    receiver = None
+    saved_input = None
+    saved_volume = None
+    saved_sound_mode = None
 
-            # Measure without DenonSweepContext — we're managing volume directly
-            fr = await engine.measure()
+    try:
+        host = cfg.denon.get("host", "")
+        if host:
+            receiver = await _connect_receiver(host)
+            saved_input = receiver.input_func
+            saved_volume = receiver.volume
+            try:
+                saved_sound_mode = receiver.soundmode.sound_mode
+            except Exception:
+                pass
 
-            # If we get here, SNR passed validation
-            # Save calibrated volume to config for future measure calls
-            update_config({"measurement": {"denon_sweep_volume": volume}})
-            return _ok(
-                calibrated_volume_db=volume,
-                message=f"Level calibrated at {volume} dB. SNR is good.",
-            )
+            if sweep_input:
+                await receiver.async_set_input_func(sweep_input)
+            try:
+                await receiver.soundmode.async_set_sound_mode("PURE DIRECT")
+            except Exception as exc:
+                log.warning("calibrate_level: could not set Pure Direct: %s", exc)
 
-        except MeasurementQualityError as exc:
-            if exc.check == "snr":
-                log.info(
-                    "calibrate_level: SNR too low at %.1f dB (%s), ramping up",
-                    volume, exc.detail,
+            await asyncio.sleep(settle_ms / 1000.0)
+    except Exception as exc:
+        log.warning("calibrate_level: Denon setup failed: %s (continuing anyway)", exc)
+        receiver = None
+
+    try:
+        while volume <= max_volume_db:
+            try:
+                await _avr.set_volume(volume)
+                await asyncio.sleep(0.5)
+
+                fr = await engine.measure()
+
+                # SNR passed — save calibrated volume
+                update_config({"measurement": {"denon_sweep_volume": volume}})
+                return _ok(
+                    calibrated_volume_db=volume,
+                    message=f"Level calibrated at {volume} dB. SNR is good.",
                 )
-                volume += step_db
-                continue
-            elif exc.check == "sweep_capture":
-                log.info(
-                    "calibrate_level: sweep not detected at %.1f dB, ramping up",
-                    volume,
-                )
-                volume += step_db
-                continue
-            else:
-                return _err(f"measurement quality error: {exc.detail}")
-        except Exception as exc:
-            return _err(f"calibrate_level failed: {exc}")
 
-    return _err(
-        f"Could not achieve SNR >= {target_snr_db} dB even at {max_volume_db} dB. "
-        "Check that subs are powered on and signal path is correct."
-    )
+            except MeasurementQualityError as exc:
+                if exc.check in ("snr", "sweep_capture"):
+                    log.info(
+                        "calibrate_level: %s at %.1f dB, ramping up",
+                        exc.detail, volume,
+                    )
+                    volume += step_db
+                    continue
+                else:
+                    return _err(f"measurement quality error: {exc.detail}")
+            except Exception as exc:
+                return _err(f"calibrate_level failed: {exc}")
+
+        return _err(
+            f"Could not achieve SNR >= {target_snr_db} dB even at {max_volume_db} dB. "
+            "Check that subs are powered on and signal path is correct."
+        )
+    finally:
+        # Restore Denon state
+        if receiver is not None:
+            try:
+                if saved_sound_mode:
+                    await receiver.soundmode.async_set_sound_mode(saved_sound_mode)
+                if saved_input:
+                    await receiver.async_set_input_func(saved_input)
+                if saved_volume is not None:
+                    await receiver.async_set_volume(saved_volume)
+            except Exception as exc:
+                log.warning("calibrate_level: failed to restore Denon state: %s", exc)
 
 
 async def _tool_fetch_recipe(name: str) -> dict:
