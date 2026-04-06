@@ -49,10 +49,14 @@ _BYPASS_BIQUAD: dict[str, Any] = {
 class MinidspDriver(DSPDriver):
     """DSPDriver for miniDSP 2x4 HD via minidspd REST API."""
 
-    def __init__(self, host: str, port: int, device_index: int = 0) -> None:
+    def __init__(self, host: str, port: int, device_index: int = 0,
+                 sub_outputs: list[int] | None = None,
+                 active_input: int = 0) -> None:
         self._client = MinidspClient(host=host, port=port, device_index=device_index)
         self._host = host
-        self._eq_state: dict[int, list[dict]] = {}
+        self._sub_outputs = sub_outputs or [0, 1]
+        self._active_input = active_input
+        self._eq_state: dict = {}
         self._lock = asyncio.Lock()
 
     async def get_state(self) -> dict:
@@ -90,19 +94,10 @@ class MinidspDriver(DSPDriver):
         """Return in-memory EQ state for *preset* ([] if never applied)."""
         return list(self._eq_state.get(preset, []))
 
-    async def apply_eq(self, preset: int, filters: list[dict]) -> None:
-        """Validate and apply EQ filters atomically under asyncio lock.
-
-        The full sequence — parse → SafetyValidator → biquad convert →
-        hardware write → state update — runs under a single asyncio.Lock.
-        This prevents two concurrent apply_eq calls from both passing
-        SafetyValidator against the same baseline before either writes.
-
-        _eq_state is updated ONLY if all hardware writes succeed (P0 rollback).
-        """
-        # Parse filter specs (outside lock — pure computation, no network)
+    def _parse_filter_specs(self, filters: list[dict]) -> list[FilterSpec]:
+        """Parse raw filter dicts into FilterSpec objects."""
         try:
-            filter_specs = [
+            return [
                 FilterSpec(
                     freq=float(f["freq"]),
                     gain_db=float(f["gain_db"]),
@@ -114,16 +109,51 @@ class MinidspDriver(DSPDriver):
         except (KeyError, ValueError, TypeError) as exc:
             raise DriverError(f"invalid filter spec: {exc}")
 
-        # Slot count check (outside lock — no shared state)
+    def _build_peq_entries(self, filter_specs: list[FilterSpec]) -> list[dict[str, Any]]:
+        """Convert filter specs into minidspd PEQ entries (active + bypassed slots)."""
+        peq_entries: list[dict[str, Any]] = []
+        for slot_offset, fspec in enumerate(filter_specs):
+            slot = _AVAILABLE_SLOTS[slot_offset]
+            biquad = freq_gain_q_to_biquad(
+                freq=fspec.freq,
+                gain_db=fspec.gain_db,
+                q=fspec.q,
+                filter_type=fspec.type,
+            )
+            peq_entries.append({"index": slot, "coeff": biquad})
+        for slot in _AVAILABLE_SLOTS[len(filter_specs):]:
+            peq_entries.append({
+                "index": slot,
+                "coeff": {"b0": 1.0, "b1": 0.0, "b2": 0.0, "a1": 0.0, "a2": 0.0},
+                "bypass": True,
+            })
+        return peq_entries
+
+    async def apply_eq(
+        self, preset: int, filters: list[dict],
+        output_index: int | None = None,
+    ) -> None:
+        """Validate and apply EQ filters atomically under asyncio lock.
+
+        If *output_index* is given, writes only to that single output.
+        Otherwise writes to all configured sub_outputs (broadcast mode).
+
+        _eq_state is updated ONLY if all hardware writes succeed (P0 rollback).
+        """
+        filter_specs = self._parse_filter_specs(filters)
+
         if len(filter_specs) > len(_AVAILABLE_SLOTS):
             raise DriverError(
                 f"too many filters: {len(filter_specs)} requested, "
                 f"{len(_AVAILABLE_SLOTS)} PEQ slots available (slots 2-9)"
             )
 
+        targets = [output_index] if output_index is not None else self._sub_outputs
+
         async with self._lock:
             # Read current state under lock (prevents concurrent baseline divergence)
-            prev_raw = self._eq_state.get(preset, [])
+            state_key = (preset, output_index) if output_index is not None else preset
+            prev_raw = self._eq_state.get(state_key, [])
             prev_specs = [
                 FilterSpec(
                     freq=float(f["freq"]),
@@ -134,41 +164,72 @@ class MinidspDriver(DSPDriver):
                 for f in prev_raw
             ] if prev_raw else None
 
-            # SafetyValidator under lock
             validator = SafetyValidator()
             result = validator.validate(filter_specs, prev_specs)
             if not result.ok:
                 raise DriverError(f"SafetyValidator: {result.error}")
 
-            # Hardware write — ALL must succeed before state update
+            # Hardware write — batch all PEQ slots per output into one request
+            peq_entries = self._build_peq_entries(filter_specs)
             try:
-                for output in [0, 1]:
-                    for slot_offset, fspec in enumerate(filter_specs):
-                        slot = _AVAILABLE_SLOTS[slot_offset]
-                        biquad = freq_gain_q_to_biquad(
-                            freq=fspec.freq,
-                            gain_db=fspec.gain_db,
-                            q=fspec.q,
-                            filter_type=fspec.type,
-                        )
-                        await self._client.set_output_peq(
-                            output=output, slot=slot, biquad=biquad
-                        )
-                    # Bypass unused slots
-                    for slot in _AVAILABLE_SLOTS[len(filter_specs):]:
-                        await self._client.set_output_peq(
-                            output=output,
-                            slot=slot,
-                            biquad=dict(_BYPASS_BIQUAD),
-                        )
+                for output in targets:
+                    await self._client.set_output_peq_batch(output, peq_entries)
             except MinidspApiError as exc:
-                # Do NOT update _eq_state — hardware is partially configured
                 raise DriverError(f"minidsp write failed: {exc}")
             except Exception as exc:
                 raise DriverError(f"apply_eq error: {exc}")
 
-            # All writes succeeded — update in-memory state
-            self._eq_state[preset] = [
+            self._eq_state[state_key] = [
+                {"freq": f.freq, "gain_db": f.gain_db, "q": f.q, "type": f.type}
+                for f in filter_specs
+            ]
+
+    async def apply_input_eq(
+        self, preset: int, filters: list[dict],
+        input_index: int | None = None,
+    ) -> None:
+        """Apply EQ filters to the DSP input channel (shared across all outputs).
+
+        Uses the same SafetyValidator as output EQ. Writes to the active input
+        from config, or *input_index* if specified.
+        """
+        filter_specs = self._parse_filter_specs(filters)
+
+        if len(filter_specs) > len(_AVAILABLE_SLOTS):
+            raise DriverError(
+                f"too many filters: {len(filter_specs)} requested, "
+                f"{len(_AVAILABLE_SLOTS)} PEQ slots available (slots 2-9)"
+            )
+
+        target_input = input_index if input_index is not None else self._active_input
+
+        async with self._lock:
+            state_key = ("input", target_input, preset)
+            prev_raw = self._eq_state.get(state_key, [])
+            prev_specs = [
+                FilterSpec(
+                    freq=float(f["freq"]),
+                    gain_db=float(f["gain_db"]),
+                    q=float(f.get("q", 0.707)),
+                    type=f["type"],
+                )
+                for f in prev_raw
+            ] if prev_raw else None
+
+            validator = SafetyValidator()
+            result = validator.validate(filter_specs, prev_specs)
+            if not result.ok:
+                raise DriverError(f"SafetyValidator: {result.error}")
+
+            peq_entries = self._build_peq_entries(filter_specs)
+            try:
+                await self._client.set_input_peq_batch(target_input, peq_entries)
+            except MinidspApiError as exc:
+                raise DriverError(f"minidsp write failed: {exc}")
+            except Exception as exc:
+                raise DriverError(f"apply_input_eq error: {exc}")
+
+            self._eq_state[state_key] = [
                 {"freq": f.freq, "gain_db": f.gain_db, "q": f.q, "type": f.type}
                 for f in filter_specs
             ]

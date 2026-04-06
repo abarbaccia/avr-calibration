@@ -271,6 +271,50 @@ class MinidspClient:
             "outputs": [{"index": output, "peq": [peq_entry]}]
         })
 
+    async def set_output_peq_batch(
+        self,
+        output: int,
+        entries: list[dict[str, Any]],
+    ) -> None:
+        """Write multiple PEQ slots to *output* in a single HTTP request.
+
+        Each entry in *entries* must have: {"index": slot, "coeff": {b0,b1,b2,a1,a2}}
+        and optionally "bypass": bool.
+
+        This is much safer than individual set_output_peq calls — one atomic POST
+        instead of N sequential ones, reducing the chance of partial writes that
+        can leave the miniDSP in a stuck state.
+
+        Raises ValueError if any slot is in APF_RESERVED_SLOTS.
+        """
+        self._validate_output(output)
+        for entry in entries:
+            if entry["index"] in APF_RESERVED_SLOTS:
+                raise ValueError(
+                    f"PEQ slot {entry['index']} is reserved for APF filters; "
+                    f"use slots {list(ALIGNMENT_PEQ_SLOTS)}"
+                )
+        await self._post_config({
+            "outputs": [{"index": output, "peq": entries}]
+        })
+
+    async def set_input_peq_batch(
+        self,
+        input_index: int,
+        entries: list[dict[str, Any]],
+    ) -> None:
+        """Write multiple PEQ slots to input *input_index* in a single HTTP request.
+
+        Each entry in *entries* must have: {"index": slot, "coeff": {b0,b1,b2,a1,a2}}
+        and optionally "bypass": bool.
+
+        Used to apply shared EQ (e.g. Harman target curve) to the input channel,
+        affecting all outputs equally.
+        """
+        await self._post_config({
+            "inputs": [{"index": input_index, "peq": entries}]
+        })
+
     async def set_input_routing(
         self,
         input_index: int,

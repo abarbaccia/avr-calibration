@@ -165,18 +165,37 @@ async def _tool_read_eq() -> dict:
         return _err(f"read_eq error: {exc}")
 
 
-async def _tool_apply_eq(filters: list[dict]) -> dict:
-    """Validate and apply EQ filters to the DSP.
+async def _tool_apply_eq(
+    filters: list[dict], output_index: int | None = None,
+) -> dict:
+    """Validate and apply EQ filters to DSP output(s).
 
-    Delegates validation (SafetyValidator), biquad conversion, hardware write,
-    and state tracking to MinidspDriver.apply_eq — all under an asyncio lock.
+    If *output_index* is given, writes only to that single output (per-sub EQ).
+    Otherwise writes to all configured sub outputs (broadcast mode).
 
     Returns {ok: True} or {ok: False, error: "SafetyValidator: ..."} on rejection.
     """
     try:
         preset = await _dsp.current_preset()  # type: ignore[union-attr]
-        await _dsp.apply_eq(preset, filters)  # type: ignore[union-attr]
-        return _ok(filters_applied=len(filters), preset=preset)
+        await _dsp.apply_eq(preset, filters, output_index=output_index)  # type: ignore[union-attr]
+        return _ok(filters_applied=len(filters), preset=preset,
+                    output_index=output_index)
+    except DriverError as exc:
+        return _err(str(exc))
+
+
+async def _tool_apply_input_eq(filters: list[dict]) -> dict:
+    """Validate and apply EQ filters to the DSP input channel.
+
+    Applies shared EQ (e.g. Harman target curve) to the active input,
+    affecting all outputs equally. Uses the same SafetyValidator as output EQ.
+
+    Returns {ok: True} or {ok: False, error: "SafetyValidator: ..."} on rejection.
+    """
+    try:
+        preset = await _dsp.current_preset()  # type: ignore[union-attr]
+        await _dsp.apply_input_eq(preset, filters)  # type: ignore[union-attr]
+        return _ok(filters_applied=len(filters), preset=preset, target="input")
     except DriverError as exc:
         return _err(str(exc))
 
@@ -346,10 +365,57 @@ async def _tool_get_calibration_runs(limit: int = 10, run_id: int | None = None)
 
 
 async def _tool_get_config() -> dict:
-    """Return the current config.yaml as a dict."""
+    """Return the current config.yaml plus EQ capabilities discovery."""
     try:
         cfg = _config()
-        return _ok(config=cfg._data)
+        data = dict(cfg._data)
+
+        # EQ capabilities — tells Claude what PEQ resources are available
+        active_input = cfg.minidsp.get("active_input") or 0
+        sub_outputs = cfg.sub_outputs
+        slots = list(range(2, 10))  # slots 2-9
+
+        eq_capabilities: dict = {
+            "input_peq": {
+                "input_index": active_input,
+                "available_slots": slots,
+                "num_slots": len(slots),
+                "description": "Shared EQ applied to all outputs (e.g. Harman target curve)",
+                "tool": "apply_input_eq",
+            },
+            "output_peq": [],
+        }
+
+        for slot_cfg in cfg.minidsp.get("output_slots", []):
+            idx = slot_cfg["index"]
+            if idx in sub_outputs:
+                eq_capabilities["output_peq"].append({
+                    "output_index": idx,
+                    "label": slot_cfg.get("label", f"Output {idx}"),
+                    "available_slots": slots,
+                    "num_slots": len(slots),
+                    "description": "Per-sub room correction EQ",
+                    "tool": "apply_eq with output_index",
+                })
+
+        # Include current EQ state if driver is loaded
+        if _dsp is not None:
+            try:
+                preset = await _dsp.current_preset()
+                # Broadcast state (legacy key)
+                eq_capabilities["input_peq"]["current_filters"] = (
+                    _dsp._eq_state.get(("input", active_input, preset), [])  # type: ignore[attr-defined]
+                )
+                for entry in eq_capabilities["output_peq"]:
+                    oidx = entry["output_index"]
+                    entry["current_filters"] = (
+                        _dsp._eq_state.get((preset, oidx), [])  # type: ignore[attr-defined]
+                    )
+            except Exception:
+                pass  # EQ state is best-effort
+
+        data["eq_capabilities"] = eq_capabilities
+        return _ok(config=data)
     except Exception as exc:
         return _err(f"config error: {exc}")
 
@@ -495,7 +561,8 @@ _TOOLS: list[Tool] = [
     Tool(
         name="apply_eq",
         description=(
-            "Apply EQ filters to the DSP subwoofer outputs. "
+            "Apply EQ filters to DSP output(s). By default writes to all sub outputs "
+            "(broadcast mode). Pass output_index to target a single output for per-sub EQ. "
             "Filters are validated by SafetyValidator before any hardware write — "
             "unsafe filters return {ok: false, error: 'SafetyValidator: ...'} rather than "
             "throwing. Each filter: {freq: Hz, gain_db: dB, q: float, type: 'peaking'|"
@@ -520,7 +587,47 @@ _TOOLS: list[Tool] = [
                         },
                         "required": ["freq", "gain_db", "q", "type"],
                     },
-                }
+                },
+                "output_index": {
+                    "type": "integer",
+                    "description": (
+                        "Target a single DSP output index (0-3) for per-sub EQ. "
+                        "If omitted, writes to all configured sub outputs."
+                    ),
+                },
+            },
+            "required": ["filters"],
+        },
+    ),
+    Tool(
+        name="apply_input_eq",
+        description=(
+            "Apply EQ filters to the DSP input channel (shared across all outputs). "
+            "Use this for the Harman target curve or any EQ that should affect all subs equally. "
+            "Filters are validated by SafetyValidator. "
+            "Each filter: {freq: Hz, gain_db: dB, q: float, type: 'peaking'|"
+            "'low_shelf'|'high_shelf'|'hpf'}. A mandatory 18Hz HPF must always be included."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": "array",
+                    "description": "List of EQ filter specifications",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "freq": {"type": "number", "description": "Centre/corner frequency in Hz"},
+                            "gain_db": {"type": "number", "description": "Gain in dB (positive=boost, negative=cut)"},
+                            "q": {"type": "number", "description": "Quality factor (ignored for hpf)"},
+                            "type": {
+                                "type": "string",
+                                "enum": ["peaking", "low_shelf", "high_shelf", "hpf"],
+                            },
+                        },
+                        "required": ["freq", "gain_db", "q", "type"],
+                    },
+                },
             },
             "required": ["filters"],
         },
@@ -786,7 +893,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     elif name == "read_eq":
         result = await _tool_read_eq()
     elif name == "apply_eq":
-        result = await _tool_apply_eq(arguments.get("filters", []))
+        output_index = arguments.get("output_index")
+        if output_index is not None:
+            output_index = int(output_index)
+        result = await _tool_apply_eq(arguments.get("filters", []), output_index=output_index)
+    elif name == "apply_input_eq":
+        result = await _tool_apply_input_eq(arguments.get("filters", []))
     elif name in ("set_volume", "avr_set_volume", "set_denon_volume"):
         result = await _tool_avr_set_volume(float(arguments["level_db"]))
     elif name in ("measure", "trigger_measurement"):
