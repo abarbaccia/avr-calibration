@@ -29,6 +29,21 @@ _DENON_MIN_DB: float = -80.0
 _DENON_MAX_DB: float = 18.0
 
 
+async def _connect_receiver(host: str):
+    """Create, setup, and update a DenonAVR instance. Raises DriverError on failure."""
+    import denonavr
+
+    try:
+        receiver = denonavr.DenonAVR(host)
+        await asyncio.wait_for(receiver.async_setup(), timeout=5.0)
+        await receiver.async_update()
+        return receiver
+    except asyncio.TimeoutError:
+        raise DriverError(f"timeout connecting to {host}")
+    except Exception as exc:
+        raise DriverError(str(exc))
+
+
 class DenonDriver(AVRDriver):
     """AVRDriver for Denon X-series (and Marantz) receivers via denonavr."""
 
@@ -38,41 +53,25 @@ class DenonDriver(AVRDriver):
     async def get_state(self) -> dict:
         if not self._host:
             return {"connected": False, "error": "no host configured"}
-        try:
-            import denonavr
-            receiver = denonavr.DenonAVR(self._host)
-            await asyncio.wait_for(receiver.async_setup(), timeout=5.0)
-            await receiver.async_update()
-            return {
-                "connected": True,
-                "host": self._host,
-                "model": receiver.model_name or "Denon AVR",
-                "volume": receiver.volume,
-                "input": receiver.input_func,
-                "mute": receiver.muted,
-            }
-        except asyncio.TimeoutError:
-            raise DriverError(f"timeout connecting to {self._host}")
-        except Exception as exc:
-            raise DriverError(str(exc))
+        receiver = await _connect_receiver(self._host)
+        return {
+            "connected": True,
+            "host": self._host,
+            "model": receiver.model_name or "Denon AVR",
+            "volume": receiver.volume,
+            "input": receiver.input_func,
+            "mute": receiver.muted,
+        }
 
     async def set_volume(self, level_db: float) -> float:
         """Set volume to *level_db* dB. Returns confirmed level from hardware."""
         if not self._host:
             raise DriverError("no host configured")
-        try:
-            import denonavr
-            receiver = denonavr.DenonAVR(self._host)
-            await asyncio.wait_for(receiver.async_setup(), timeout=5.0)
-            await receiver.async_update()
-            clamped = max(_DENON_MIN_DB, min(_DENON_MAX_DB, level_db))
-            await receiver.async_set_volume(clamped)
-            await receiver.async_update()
-            return receiver.volume  # type: ignore[no-any-return]
-        except asyncio.TimeoutError:
-            raise DriverError(f"timeout connecting to {self._host}")
-        except Exception as exc:
-            raise DriverError(str(exc))
+        receiver = await _connect_receiver(self._host)
+        clamped = max(_DENON_MIN_DB, min(_DENON_MAX_DB, level_db))
+        await receiver.async_set_volume(clamped)
+        await receiver.async_update()
+        return receiver.volume  # type: ignore[no-any-return]
 
     async def discover(self) -> list[str]:
         """SSDP scan for Denon/Marantz AVRs on the local network."""
@@ -140,11 +139,7 @@ class DenonSweepContext:
         self._saved_sound_mode: str | None = None
 
     async def __aenter__(self) -> "DenonSweepContext":
-        import denonavr
-
-        self._receiver = denonavr.DenonAVR(self._host)
-        await asyncio.wait_for(self._receiver.async_setup(), timeout=5.0)
-        await self._receiver.async_update()
+        self._receiver = await _connect_receiver(self._host)
 
         self._saved_input = self._receiver.input_func
         self._saved_volume = self._receiver.volume
