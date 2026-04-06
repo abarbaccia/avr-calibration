@@ -48,13 +48,18 @@ Read the recipe step by step and execute each instruction by calling the appropr
 **You are the orchestrator.** The recipe tells you WHAT to do. You decide HOW by calling MCP tools.
 
 Key MCP tools available on the `avr-calibration` server:
-- `trigger_measurement` — take a sweep measurement, returns frequency response data
+- `measure` — take a sweep measurement, returns frequency response data
 - `apply_eq` — write PEQ filters to miniDSP (SafetyValidator enforced)
 - `read_eq` — read current EQ state from miniDSP
-- `mute_sub_outputs` — mute/unmute specific outputs for solo measurement
-- `get_device_state` — current miniDSP state (gains, delays, mutes)
-- `avr_set_volume` — set Denon volume for sweep playback
+- `mute_output` — mute specific DSP outputs for solo measurement
+- `unmute_output` — unmute DSP outputs (always unmute when done)
+- `set_delay` — set output delay in ms (for sub alignment)
+- `set_polarity` — set output polarity (for sub alignment)
+- `get_device_state` — current AVR + DSP state
+- `set_volume` — set AVR volume for sweep playback
 - `check_system` — verify all hardware is reachable
+- `fetch_recipe` — load a recipe by name
+- `get_config` / `set_config` — read/write config
 
 ### Step 4 — Report progress
 
