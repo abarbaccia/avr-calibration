@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import functools
+
 from ..adapters.minidsp import (
     ALIGNMENT_PEQ_SLOTS,
     MinidspApiError,
@@ -24,6 +26,19 @@ from ..dsp import freq_gain_q_to_biquad
 from ..safety import FilterSpec, SafetyValidator
 from .base import DriverError
 from .dsp_driver import DSPDriver
+
+
+def _driver_api(fn):
+    """Decorator that wraps MinidspApiError/ValueError into DriverError."""
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except DriverError:
+            raise
+        except (ValueError, MinidspApiError) as exc:
+            raise DriverError(str(exc))
+    return wrapper
 
 _AVAILABLE_SLOTS: list[int] = list(ALIGNMENT_PEQ_SLOTS)  # slots 2-9
 _BYPASS_BIQUAD: dict[str, Any] = {
@@ -156,43 +171,31 @@ class MinidspDriver(DSPDriver):
                 for f in filter_specs
             ]
 
+    @_driver_api
     async def set_preset(self, preset: int) -> None:
-        try:
-            await self._client.switch_preset(preset)
-        except (ValueError, MinidspApiError) as exc:
-            raise DriverError(str(exc))
+        await self._client.switch_preset(preset)
 
+    @_driver_api
     async def mute_outputs(self, output_indices: list[int]) -> None:
         """Mute outputs by setting gain to -127 dB."""
-        try:
-            await self._client.mute_outputs(output_indices)
-        except MinidspApiError as exc:
-            raise DriverError(str(exc))
+        await self._client.mute_outputs(output_indices)
 
+    @_driver_api
     async def unmute_outputs(self, output_indices: list[int]) -> None:
         """Unmute outputs by restoring gain to 0 dB."""
-        try:
-            await self._client.unmute_outputs(output_indices)
-        except MinidspApiError as exc:
-            raise DriverError(str(exc))
+        await self._client.unmute_outputs(output_indices)
 
+    @_driver_api
     async def set_output_delay(self, output_index: int, delay_ms: float) -> None:
         """Set delay for a single output in milliseconds."""
-        try:
-            await self._client.set_output_delay(output_index, delay_ms)
-        except (ValueError, MinidspApiError) as exc:
-            raise DriverError(str(exc))
+        await self._client.set_output_delay(output_index, delay_ms)
 
+    @_driver_api
     async def set_output_polarity(self, output_index: int, inverted: bool) -> None:
         """Set polarity for a single output (inverted=True flips phase)."""
-        try:
-            await self._client.set_output_polarity(output_index, inverted)
-        except MinidspApiError as exc:
-            raise DriverError(str(exc))
+        await self._client.set_output_polarity(output_index, inverted)
 
+    @_driver_api
     async def set_routing(self, routing: dict) -> None:
-        try:
-            for input_index, output_enabled in routing.items():
-                await self._client.set_input_routing(int(input_index), output_enabled)
-        except MinidspApiError as exc:
-            raise DriverError(str(exc))
+        for input_index, output_enabled in routing.items():
+            await self._client.set_input_routing(int(input_index), output_enabled)

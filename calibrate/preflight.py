@@ -138,8 +138,7 @@ class PreflightChecker:
 
     async def check_minidsp(self) -> CheckResult:
         """Check that minidspd is running and has a device connected."""
-        host = self.config.minidsp.get("host", "localhost")
-        port = self.config.minidsp.get("port", 5380)
+        host, port = self.config.minidsp_host_port
         url = f"http://{host}:{port}/devices"
 
         try:
@@ -318,8 +317,7 @@ class PreflightChecker:
                 detail="no source/preset defined (skipped)",
             )
 
-        host = self.config.minidsp.get("host", "localhost")
-        port = self.config.minidsp.get("port", 5380)
+        host, port = self.config.minidsp_host_port
         client = MinidspClient(host, port)
 
         try:

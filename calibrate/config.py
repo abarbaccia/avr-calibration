@@ -134,6 +134,14 @@ class Config:
         return self._data.get("connections", {})
 
     @property
+    def minidsp_host_port(self) -> tuple[str, int]:
+        """Return (host, port) for the miniDSP daemon connection."""
+        return (
+            self.minidsp.get("host", "localhost"),
+            int(self.minidsp.get("port", 5380)),
+        )
+
+    @property
     def sub_outputs(self) -> list[int]:
         """Output indices where type='sub'. Falls back to measurement.sub_outputs."""
         slots = self.minidsp.get("output_slots", [])

@@ -272,8 +272,7 @@ def signal_path_show(config_path: Path | None) -> None:
         sys.exit(1)
 
     cfg = Config.load(path)
-    host = cfg.minidsp.get("host", "localhost")
-    port = cfg.minidsp.get("port", 5380)
+    host, port = cfg.minidsp_host_port
     sp = cfg.minidsp.get("signal_path") or {}
 
     click.echo()
@@ -345,8 +344,7 @@ def signal_path_apply(config_path: Path | None, source: str | None, preset: int 
         click.echo(click.style(f"Error: preset must be 0-{MAX_PRESET_INDEX}", fg="red"), err=True)
         sys.exit(1)
 
-    host = cfg.minidsp.get("host", "localhost")
-    port = cfg.minidsp.get("port", 5380)
+    host, port = cfg.minidsp_host_port
     client = MinidspClient(host, port)
 
     async def _apply() -> None:
