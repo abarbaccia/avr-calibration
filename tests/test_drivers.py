@@ -35,7 +35,7 @@ def _make_denonavr_mock(volume: float = -30.0, connected: bool = True):
     receiver.volume = volume
     receiver.input_func = "CBL/SAT"
     receiver.muted = False
-    receiver.async_set_volume_level = AsyncMock()
+    receiver.async_set_volume = AsyncMock()
     mod = MagicMock()
     mod.DenonAVR = MagicMock(return_value=receiver)
     return mod, receiver
@@ -89,7 +89,7 @@ async def test_denon_set_volume_success() -> None:
         driver = DenonDriver(host="192.168.1.100")
         confirmed = await driver.set_volume(-25.0)
     assert confirmed == -25.0
-    mock_receiver.async_set_volume_level.assert_called_once()
+    mock_receiver.async_set_volume.assert_called_once_with(-25.0)
 
 
 @pytest.mark.asyncio
@@ -105,8 +105,7 @@ async def test_denon_set_volume_clamps_below_min() -> None:
     with patch.dict(sys.modules, {"denonavr": mock_mod}):
         driver = DenonDriver(host="192.168.1.100")
         await driver.set_volume(-999.0)  # should clamp to -80
-    call_arg = mock_receiver.async_set_volume_level.call_args[0][0]
-    assert call_arg == pytest.approx(0.0)
+    mock_receiver.async_set_volume.assert_called_once_with(-80.0)
 
 
 @pytest.mark.asyncio
@@ -115,8 +114,7 @@ async def test_denon_set_volume_clamps_above_max() -> None:
     with patch.dict(sys.modules, {"denonavr": mock_mod}):
         driver = DenonDriver(host="192.168.1.100")
         await driver.set_volume(999.0)  # should clamp to +18
-    call_arg = mock_receiver.async_set_volume_level.call_args[0][0]
-    assert call_arg == pytest.approx(1.0)
+    mock_receiver.async_set_volume.assert_called_once_with(18.0)
 
 
 @pytest.mark.asyncio

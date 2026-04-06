@@ -66,8 +66,7 @@ class DenonDriver(AVRDriver):
             await asyncio.wait_for(receiver.async_setup(), timeout=5.0)
             await receiver.async_update()
             clamped = max(_DENON_MIN_DB, min(_DENON_MAX_DB, level_db))
-            volume_level = (clamped - _DENON_MIN_DB) / (_DENON_MAX_DB - _DENON_MIN_DB)
-            await receiver.async_set_volume_level(volume_level)
+            await receiver.async_set_volume(clamped)
             await receiver.async_update()
             return receiver.volume  # type: ignore[no-any-return]
         except asyncio.TimeoutError:

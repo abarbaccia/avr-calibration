@@ -264,18 +264,20 @@ class TestRunAll:
         checker = PreflightChecker(config)
         with (
             patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
+            patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1 (device 0, 48000Hz)")),
             patch.object(checker, "check_minidsp_combined", return_value=CheckResult("miniDSP", True, "2x4HD; /dev/hidraw0 present")),
             patch.object(checker, "check_denon_and_playback", return_value=CheckResult("Denon AVR", True, "X3800H; USB: miniDSP")),
             patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
         ):
             results = await checker.run_all()
         assert all(r.passed for r in results)
-        assert len(results) == 4
+        assert len(results) == 5
 
     async def test_unhandled_exception_becomes_failed_result(self, config):
         checker = PreflightChecker(config)
         with (
             patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
+            patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1")),
             patch.object(checker, "check_minidsp_combined", side_effect=RuntimeError("boom")),
             patch.object(checker, "check_denon_and_playback", return_value=CheckResult("Denon AVR", True, "X3800H")),
             patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
@@ -289,26 +291,29 @@ class TestRunAll:
         checker = PreflightChecker(config)
         with (
             patch.object(checker, "check_config", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_mic", side_effect=RuntimeError("err")),
             patch.object(checker, "check_minidsp_combined", side_effect=RuntimeError("err")),
             patch.object(checker, "check_denon_and_playback", side_effect=RuntimeError("err")),
             patch.object(checker, "check_signal_path_sync", side_effect=RuntimeError("err")),
         ):
             results = await checker.run_all()
-        assert [r.name for r in results] == ["Config", "miniDSP", "Denon AVR", "Signal Path"]
+        assert [r.name for r in results] == ["Config", "Microphone", "miniDSP", "Denon AVR", "Signal Path"]
 
     async def test_partial_failure(self, config):
         checker = PreflightChecker(config)
         with (
             patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
+            patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1")),
             patch.object(checker, "check_minidsp_combined", return_value=CheckResult("miniDSP", False, "", "start minidspd")),
             patch.object(checker, "check_denon_and_playback", return_value=CheckResult("Denon AVR", True, "X3800H")),
             patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
         ):
             results = await checker.run_all()
-        assert results[0].passed   # Config
-        assert not results[1].passed  # miniDSP
-        assert results[2].passed   # Denon AVR
-        assert results[3].passed   # Signal Path
+        assert results[0].passed       # Config
+        assert results[1].passed       # Microphone
+        assert not results[2].passed   # miniDSP
+        assert results[3].passed       # Denon AVR
+        assert results[4].passed       # Signal Path
 
 
 # ── Playback route checks ─────────────────────────────────────────────────────
