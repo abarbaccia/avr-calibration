@@ -20,11 +20,6 @@ import functools
 
 log = logging.getLogger(__name__)
 
-# Settle time (seconds) after muting/unmuting an output before writing PEQ.
-# Gives the DSP engine time to quiesce — writing biquad coefficients while
-# audio is actively routing through an output can hang the miniDSP meters.
-_PEQ_SETTLE_SECS: float = 0.15
-
 from ..adapters.minidsp import (
     ALIGNMENT_PEQ_SLOTS,
     MinidspApiError,
@@ -177,31 +172,17 @@ class MinidspDriver(DSPDriver):
             if not result.ok:
                 raise DriverError(f"SafetyValidator: {result.error}")
 
-            # Hardware write — master-mute → settle → write PEQ → settle → unmute
-            # Master mute stops all DSP processing, preventing biquad coefficient
-            # updates from hanging the DSP engine (per-output gain mute alone
-            # was insufficient — the DSP still processes on muted-gain outputs).
+            # Hardware write — batch all PEQ slots per output into one request.
+            # Note: output 0 on this miniDSP 2x4 HD unit is defective (PEQ
+            # writes hang it). Config should use sub_outputs=[1,2] to avoid it.
             peq_entries = self._build_peq_entries(filter_specs)
             try:
-                log.info("apply_eq: master-mute before PEQ write to %s", targets)
-                await self._client.set_master_mute(True)
-                await asyncio.sleep(_PEQ_SETTLE_SECS)
                 for output in targets:
+                    log.info("apply_eq: writing PEQ to output %d", output)
                     await self._client.set_output_peq_batch(output, peq_entries)
-                await asyncio.sleep(_PEQ_SETTLE_SECS)
-                await self._client.set_master_mute(False)
-                log.info("apply_eq: master-unmuted after PEQ write")
             except MinidspApiError as exc:
-                try:
-                    await self._client.set_master_mute(False)
-                except Exception:
-                    pass
                 raise DriverError(f"minidsp write failed: {exc}")
             except Exception as exc:
-                try:
-                    await self._client.set_master_mute(False)
-                except Exception:
-                    pass
                 raise DriverError(f"apply_eq error: {exc}")
 
             self._eq_state[state_key] = [
@@ -246,27 +227,13 @@ class MinidspDriver(DSPDriver):
             if not result.ok:
                 raise DriverError(f"SafetyValidator: {result.error}")
 
-            # Master-mute before input PEQ write to prevent DSP hangs
             peq_entries = self._build_peq_entries(filter_specs)
             try:
-                log.info("apply_input_eq: master-mute before PEQ write")
-                await self._client.set_master_mute(True)
-                await asyncio.sleep(_PEQ_SETTLE_SECS)
+                log.info("apply_input_eq: writing PEQ to input %d", target_input)
                 await self._client.set_input_peq_batch(target_input, peq_entries)
-                await asyncio.sleep(_PEQ_SETTLE_SECS)
-                await self._client.set_master_mute(False)
-                log.info("apply_input_eq: master-unmuted after PEQ write")
             except MinidspApiError as exc:
-                try:
-                    await self._client.set_master_mute(False)
-                except Exception:
-                    pass
                 raise DriverError(f"minidsp write failed: {exc}")
             except Exception as exc:
-                try:
-                    await self._client.set_master_mute(False)
-                except Exception:
-                    pass
                 raise DriverError(f"apply_input_eq error: {exc}")
 
             self._eq_state[state_key] = [

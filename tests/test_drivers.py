@@ -211,8 +211,6 @@ async def test_minidsp_read_eq_starts_empty() -> None:
 @pytest.mark.asyncio
 async def test_minidsp_apply_eq_valid_writes_hardware() -> None:
     config_route = respx.post(CONFIG_URL).mock(return_value=httpx.Response(200))
-    # Master mute/unmute goes to DEVICE_URL
-    device_post = respx.post(DEVICE_URL).mock(return_value=httpx.Response(200))
     respx.get(DEVICE_URL).mock(return_value=httpx.Response(200, json={
         "master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False}
     }))
@@ -223,10 +221,8 @@ async def test_minidsp_apply_eq_valid_writes_hardware() -> None:
     ]
     await driver.apply_eq(0, filters)
     assert config_route.called
-    # Master-mute pattern: PEQ batch per output (2 outputs default)
+    # One batched PEQ write per output (default sub_outputs=[0,1])
     assert config_route.call_count == 2
-    # Master mute + unmute = 2 POSTs to device URL
-    assert device_post.call_count == 2
     # State should be updated after successful write
     assert len(await driver.read_eq(0)) == len(filters)
 
@@ -271,8 +267,6 @@ async def test_minidsp_apply_eq_too_many_filters_raises() -> None:
 @pytest.mark.asyncio
 async def test_minidsp_apply_eq_hardware_failure_no_state_update() -> None:
     """P0: if hardware write fails, _eq_state must NOT be updated."""
-    # Master mute succeeds, but PEQ write fails
-    respx.post(DEVICE_URL).mock(return_value=httpx.Response(200))
     respx.post(CONFIG_URL).mock(return_value=httpx.Response(500))
     driver = MinidspDriver(host="localhost", port=5380)
     filters = [
@@ -291,7 +285,6 @@ async def test_minidsp_apply_eq_hardware_failure_no_state_update() -> None:
 async def test_minidsp_apply_eq_updates_state_only_on_success() -> None:
     """State update and hardware write are atomic: state updates iff all writes pass."""
     respx.post(CONFIG_URL).mock(return_value=httpx.Response(200))
-    respx.post(DEVICE_URL).mock(return_value=httpx.Response(200))
     driver = MinidspDriver(host="localhost", port=5380)
     filters = [
         {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
@@ -306,68 +299,44 @@ async def test_minidsp_apply_eq_updates_state_only_on_success() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_minidsp_apply_eq_master_mutes_before_peq_write() -> None:
-    """Master-mute before PEQ write, unmute after."""
+async def test_minidsp_apply_eq_per_output() -> None:
+    """Per-output EQ writes one batched PEQ request to the target output."""
     config_calls: list[dict] = []
-    device_calls: list[dict] = []
 
-    def _capture_config(request):
+    def _capture(request):
         import json
         config_calls.append(json.loads(request.content))
         return httpx.Response(200)
 
-    def _capture_device(request):
-        import json
-        device_calls.append(json.loads(request.content))
-        return httpx.Response(200)
-
-    respx.post(CONFIG_URL).mock(side_effect=_capture_config)
-    respx.post(DEVICE_URL).mock(side_effect=_capture_device)
-    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[0])
+    respx.post(CONFIG_URL).mock(side_effect=_capture)
+    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1])
     filters = [
         {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
         {"freq": 80.0, "gain_db": -3.0, "q": 1.0, "type": "peaking"},
     ]
-    await driver.apply_eq(0, filters, output_index=0)
-    # Master mute → PEQ → master unmute
-    assert len(device_calls) == 2
-    assert device_calls[0] == {"mute": True}
-    assert device_calls[1] == {"mute": False}
-    # One PEQ batch write
+    await driver.apply_eq(0, filters, output_index=1)
     assert len(config_calls) == 1
     assert "peq" in config_calls[0]["outputs"][0]
 
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_minidsp_apply_input_eq_master_mutes_during_write() -> None:
-    """Input PEQ write master-mutes, writes, then unmutes."""
+async def test_minidsp_apply_input_eq_writes_batch() -> None:
+    """Input PEQ writes one batched request to the target input."""
     config_calls: list[dict] = []
-    device_calls: list[dict] = []
 
-    def _capture_config(request):
+    def _capture(request):
         import json
         config_calls.append(json.loads(request.content))
         return httpx.Response(200)
 
-    def _capture_device(request):
-        import json
-        device_calls.append(json.loads(request.content))
-        return httpx.Response(200)
-
-    respx.post(CONFIG_URL).mock(side_effect=_capture_config)
-    respx.post(DEVICE_URL).mock(side_effect=_capture_device)
-    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[0, 2])
+    respx.post(CONFIG_URL).mock(side_effect=_capture)
+    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1, 2])
     filters = [
         {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
         {"freq": 50.0, "gain_db": -2.0, "q": 1.0, "type": "peaking"},
     ]
     await driver.apply_input_eq(0, filters)
-    # Master mute → input PEQ → master unmute
-    assert len(device_calls) == 2
-    assert device_calls[0] == {"mute": True}
-    assert device_calls[1] == {"mute": False}
-    # One input PEQ batch write
     assert len(config_calls) == 1
     assert "inputs" in config_calls[0]
 
