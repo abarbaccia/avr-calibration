@@ -102,8 +102,13 @@ class DenonSweepContext:
     MAX_SWEEP_VOLUME_DB: float = 0.0  # reference level — configurable ceiling
 
     @classmethod
-    def from_config(cls, config) -> "DenonSweepContext | None":
-        """Build from a Config object, or return None if HDMI sweep not configured."""
+    def from_config(cls, config, manage_volume: bool = True) -> "DenonSweepContext | None":
+        """Build from a Config object, or return None if HDMI sweep not configured.
+
+        Args:
+            manage_volume: If False, skip setting/restoring volume on enter/exit.
+                Useful when the caller manages volume itself (e.g. calibrate_level).
+        """
         route = config.measurement.get("playback_route", "usb")
         if route != "hdmi":
             return None
@@ -116,6 +121,7 @@ class DenonSweepContext:
             sweep_input=sweep_input,
             sweep_volume=float(config.measurement.get("denon_sweep_volume", -10.0)),
             settle_ms=config.measurement.get("denon_settle_ms", 800),
+            manage_volume=manage_volume,
         )
 
     def __init__(
@@ -124,8 +130,9 @@ class DenonSweepContext:
         sweep_input: str,
         sweep_volume: float = -10.0,
         settle_ms: int = 800,
+        manage_volume: bool = True,
     ) -> None:
-        if sweep_volume > self.MAX_SWEEP_VOLUME_DB:
+        if manage_volume and sweep_volume > self.MAX_SWEEP_VOLUME_DB:
             raise ValueError(
                 f"sweep_volume must be <= {self.MAX_SWEEP_VOLUME_DB} dB, got {sweep_volume}"
             )
@@ -133,6 +140,7 @@ class DenonSweepContext:
         self._sweep_input = sweep_input
         self._sweep_volume = sweep_volume
         self._settle_ms = settle_ms
+        self._manage_volume = manage_volume
         self._receiver = None
         self._saved_input: str | None = None
         self._saved_volume: float | None = None
@@ -154,12 +162,14 @@ class DenonSweepContext:
             log.warning("Could not read sound mode: %s", exc)
 
         log.info(
-            "Denon sweep: switching to input=%s volume=%.1f dB Pure Direct (was %s / %s / %s)",
-            self._sweep_input, self._sweep_volume,
+            "Denon sweep: switching to input=%s %sPure Direct (was %s / %s / %s)",
+            self._sweep_input,
+            f"volume={self._sweep_volume:.1f} dB " if self._manage_volume else "",
             self._saved_input, self._saved_volume, self._saved_sound_mode,
         )
         await self._receiver.async_set_input_func(self._sweep_input)
-        await self._receiver.async_set_volume(self._sweep_volume)
+        if self._manage_volume:
+            await self._receiver.async_set_volume(self._sweep_volume)
 
         try:
             await self._receiver.soundmode.async_set_sound_mode("PURE DIRECT")
@@ -177,14 +187,22 @@ class DenonSweepContext:
                 "Denon sweep: restoring input=%s volume=%s sound_mode=%s",
                 self._saved_input, self._saved_volume, self._saved_sound_mode,
             )
+            # Timeout each restore call to prevent hanging if Denon is unresponsive
             if self._saved_sound_mode is not None:
-                await self._receiver.soundmode.async_set_sound_mode(
-                    self._saved_sound_mode
+                await asyncio.wait_for(
+                    self._receiver.soundmode.async_set_sound_mode(self._saved_sound_mode),
+                    timeout=5.0,
                 )
             if self._saved_input is not None:
-                await self._receiver.async_set_input_func(self._saved_input)
-            if self._saved_volume is not None:
-                await self._receiver.async_set_volume(self._saved_volume)
+                await asyncio.wait_for(
+                    self._receiver.async_set_input_func(self._saved_input),
+                    timeout=5.0,
+                )
+            if self._manage_volume and self._saved_volume is not None:
+                await asyncio.wait_for(
+                    self._receiver.async_set_volume(self._saved_volume),
+                    timeout=5.0,
+                )
         except Exception as exc:
             log.warning("Failed to restore Denon state: %s", exc)
         self._receiver = None

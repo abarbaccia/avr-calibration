@@ -117,26 +117,20 @@ def _config() -> Config:
     return Config.load()
 
 
+async def _safe_driver_state(driver: Any) -> dict:
+    """Get driver state, returning {connected: False} on any error."""
+    try:
+        return await driver.get_state()
+    except Exception as exc:
+        return {"connected": False, "error": str(exc)}
+
+
 # ── Tool implementations ───────────────────────────────────────────────────────
 
 async def _tool_get_device_state() -> dict:
     """Return current AVR + DSP hardware state."""
-    avr_result: dict = {"connected": False}
-    try:
-        avr_result = await _avr.get_state()  # type: ignore[union-attr]
-    except DriverError as exc:
-        avr_result = {"connected": False, "error": str(exc)}
-    except Exception as exc:
-        avr_result = {"connected": False, "error": str(exc)}
-
-    dsp_result: dict = {"connected": False}
-    try:
-        dsp_result = await _dsp.get_state()  # type: ignore[union-attr]
-    except DriverError as exc:
-        dsp_result = {"connected": False, "error": str(exc)}
-    except Exception as exc:
-        dsp_result = {"connected": False, "error": str(exc)}
-
+    avr_result = await _safe_driver_state(_avr)
+    dsp_result = await _safe_driver_state(_dsp)
     return _ok(avr=avr_result, dsp=dsp_result)
 
 
@@ -213,9 +207,9 @@ async def _tool_trigger_measurement() -> dict:
                 f"trigger_measurement requires {mic_name} microphone — none found. "
                 "Check USB connection."
             )
-    except Exception:
+    except Exception as exc:
         return _err(
-            "trigger_measurement requires sounddevice — audio device enumeration failed."
+            f"trigger_measurement requires sounddevice — audio device enumeration failed: {exc}"
         )
 
     try:
@@ -259,48 +253,20 @@ async def _tool_calibrate_level(
 
     from .measurement import MeasurementEngine, MeasurementQualityError
     from .config import update_config
-    from .drivers.denon import _connect_receiver
 
     cfg = _config()
     engine = MeasurementEngine(cfg)
     volume = start_db
 
-    # Set up Denon for sweeps: switch input and enable Pure Direct.
-    # We manage volume ourselves in the loop rather than using DenonSweepContext.
-    sweep_input = cfg.measurement.get("denon_sweep_input")
-    settle_ms = cfg.measurement.get("denon_settle_ms", 800)
-    receiver = None
-    saved_input = None
-    saved_volume = None
-    saved_sound_mode = None
+    # Use DenonSweepContext with manage_volume=False — it handles input switching,
+    # Pure Direct, and state restore; we control volume ourselves in the ramp loop.
+    denon_ctx = DenonSweepContext.from_config(cfg, manage_volume=False)
 
-    try:
-        host = cfg.denon.get("host", "")
-        if host:
-            receiver = await _connect_receiver(host)
-            saved_input = receiver.input_func
-            saved_volume = receiver.volume
-            try:
-                saved_sound_mode = receiver.soundmode.sound_mode
-            except Exception:
-                pass
-
-            if sweep_input:
-                await receiver.async_set_input_func(sweep_input)
-            try:
-                await receiver.soundmode.async_set_sound_mode("PURE DIRECT")
-            except Exception as exc:
-                log.warning("calibrate_level: could not set Pure Direct: %s", exc)
-
-            await asyncio.sleep(settle_ms / 1000.0)
-    except Exception as exc:
-        log.warning("calibrate_level: Denon setup failed: %s (continuing anyway)", exc)
-        receiver = None
-
-    try:
+    async def _ramp_loop() -> dict:
+        nonlocal volume
         while volume <= max_volume_db:
             try:
-                await _avr.set_volume(volume)
+                await _avr.set_volume(volume)  # type: ignore[union-attr]
                 await asyncio.sleep(0.5)
 
                 fr = await engine.measure()
@@ -329,18 +295,11 @@ async def _tool_calibrate_level(
             f"Could not achieve SNR >= {target_snr_db} dB even at {max_volume_db} dB. "
             "Check that subs are powered on and signal path is correct."
         )
-    finally:
-        # Restore Denon state
-        if receiver is not None:
-            try:
-                if saved_sound_mode:
-                    await receiver.soundmode.async_set_sound_mode(saved_sound_mode)
-                if saved_input:
-                    await receiver.async_set_input_func(saved_input)
-                if saved_volume is not None:
-                    await receiver.async_set_volume(saved_volume)
-            except Exception as exc:
-                log.warning("calibrate_level: failed to restore Denon state: %s", exc)
+
+    if denon_ctx:
+        async with denon_ctx:
+            return await _ramp_loop()
+    return await _ramp_loop()
 
 
 async def _tool_fetch_recipe(name: str) -> dict:

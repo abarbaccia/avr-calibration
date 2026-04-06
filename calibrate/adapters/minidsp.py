@@ -32,6 +32,9 @@ import httpx
 MAX_DELAY_MS: float = 30.0
 """Hardware maximum output delay for miniDSP 2x4 HD."""
 
+MAX_OUTPUT_INDEX: int = 3
+"""Highest valid output index for miniDSP 2x4 HD (4 outputs: 0-3)."""
+
 APF_RESERVED_SLOTS: frozenset[int] = frozenset({0, 1})
 """PEQ slot indices reserved for APF all-pass filters (TODO-10).
 
@@ -175,17 +178,36 @@ class MinidspClient:
 
     MUTE_GAIN_DB: float = -127.0
 
+    @staticmethod
+    def _validate_output(output: int) -> None:
+        """Raise ValueError if output index is out of range."""
+        if not (0 <= output <= MAX_OUTPUT_INDEX):
+            raise ValueError(
+                f"output={output} out of range; must be 0-{MAX_OUTPUT_INDEX}"
+            )
+
     async def set_output_gain(self, output: int, gain_db: float) -> None:
         """Set output *output* gain to *gain_db* dB.
 
         Typical use: mute with MUTE_GAIN_DB (-127) or restore to 0.0.
         """
+        self._validate_output(output)
         await self._post_config({"outputs": [{"index": output, "gain": gain_db}]})
 
     async def mute_outputs(self, output_indices: list[int]) -> None:
-        """Mute multiple outputs in parallel by setting gain to -127 dB."""
+        """Mute multiple outputs in parallel by setting gain to -127 dB.
+
+        Raises MinidspApiError if any output fails to mute.
+        """
         tasks = [self.set_output_gain(idx, self.MUTE_GAIN_DB) for idx in output_indices]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        errors = [
+            (idx, r) for idx, r in zip(output_indices, results)
+            if isinstance(r, Exception)
+        ]
+        if errors:
+            detail = "; ".join(f"output {idx}: {e}" for idx, e in errors)
+            raise MinidspApiError(0, f"mute_outputs partial failure: {detail}")
 
     async def unmute_outputs(self, output_indices: list[int]) -> None:
         """Unmute multiple outputs in parallel by restoring gain to 0 dB."""
@@ -194,8 +216,11 @@ class MinidspClient:
     async def set_output_delay(self, output: int, delay_ms: float) -> None:
         """Set output *output* delay to *delay_ms* milliseconds.
 
-        Raises ValueError if delay_ms > MAX_DELAY_MS (hardware limit).
+        Raises ValueError if delay_ms is negative or > MAX_DELAY_MS.
         """
+        self._validate_output(output)
+        if delay_ms < 0.0:
+            raise ValueError(f"delay_ms={delay_ms} cannot be negative")
         if delay_ms > MAX_DELAY_MS:
             raise ValueError(
                 f"delay_ms={delay_ms} exceeds hardware maximum {MAX_DELAY_MS} ms"
@@ -209,8 +234,10 @@ class MinidspClient:
     async def set_output_polarity(self, output: int, inverted: bool) -> None:
         """Set output *output* phase inversion.
 
+        Raises ValueError if output index is invalid.
         Raises MinidspApiError on hardware or daemon error.
         """
+        self._validate_output(output)
         await self._post_config({"outputs": [{"index": output, "invert": inverted}]})
 
     async def set_output_peq(
@@ -226,6 +253,7 @@ class MinidspClient:
 
         Raises ValueError if *slot* is in APF_RESERVED_SLOTS (0 or 1).
         """
+        self._validate_output(output)
         if slot in APF_RESERVED_SLOTS:
             raise ValueError(
                 f"PEQ slot {slot} is reserved for APF filters; "

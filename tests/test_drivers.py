@@ -318,6 +318,7 @@ def _mock_config(avr_driver: str = "denon", dsp_driver: str = "minidsp"):
     cfg.dsp_driver_name = dsp_driver
     cfg.denon = {"host": "192.168.1.100"}
     cfg.minidsp = {"host": "localhost", "port": 5380}
+    cfg.minidsp_host_port = ("localhost", 5380)
     return cfg
 
 

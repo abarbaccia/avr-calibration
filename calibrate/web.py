@@ -1198,8 +1198,7 @@ async def system_status() -> dict:
             devices.append({"name": "Denon AVR", "connected": False, "detail": denon_host})
 
     # miniDSP
-    minidsp_host = cfg.minidsp.get("host", "localhost")
-    minidsp_port = cfg.minidsp.get("port", 5380)
+    minidsp_host, minidsp_port = cfg.minidsp_host_port
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
             r = await client.get(f"http://{minidsp_host}:{minidsp_port}/devices/0")
