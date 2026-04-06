@@ -64,5 +64,5 @@ def load_dsp_driver(config: Config) -> DSPDriver:
         )
     if cls is MinidspDriver:
         host, port = config.minidsp_host_port
-        return MinidspDriver(host=host, port=port)
+        return MinidspDriver(host=host, port=port, sub_outputs=config.sub_outputs)
     return cls()  # type: ignore[call-arg]

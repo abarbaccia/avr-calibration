@@ -49,9 +49,11 @@ _BYPASS_BIQUAD: dict[str, Any] = {
 class MinidspDriver(DSPDriver):
     """DSPDriver for miniDSP 2x4 HD via minidspd REST API."""
 
-    def __init__(self, host: str, port: int, device_index: int = 0) -> None:
+    def __init__(self, host: str, port: int, device_index: int = 0,
+                 sub_outputs: list[int] | None = None) -> None:
         self._client = MinidspClient(host=host, port=port, device_index=device_index)
         self._host = host
+        self._sub_outputs = sub_outputs or [0, 1]
         self._eq_state: dict[int, list[dict]] = {}
         self._lock = asyncio.Lock()
 
@@ -142,7 +144,7 @@ class MinidspDriver(DSPDriver):
 
             # Hardware write — ALL must succeed before state update
             try:
-                for output in [0, 1]:
+                for output in self._sub_outputs:
                     for slot_offset, fspec in enumerate(filter_specs):
                         slot = _AVAILABLE_SLOTS[slot_offset]
                         biquad = freq_gain_q_to_biquad(
