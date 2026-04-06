@@ -41,6 +41,7 @@ from calibrate.mcp_server import (
     _read_resource,
     _tool_apply_eq,
     _tool_avr_set_volume,
+    _tool_calibrate_level,
     _tool_check_system,
     _tool_fetch_recipe,
     _tool_get_device_state,
@@ -451,6 +452,123 @@ async def test_trigger_measurement_with_denon_context() -> None:
     assert result["session_id"] == 3
     mock_ctx_instance.__aenter__.assert_called_once()
     mock_ctx_instance.__aexit__.assert_called_once()
+
+
+# ── calibrate_level ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_calibrate_level_succeeds_first_try() -> None:
+    """If SNR is good at starting volume, returns immediately."""
+    mock_avr = AsyncMock()
+    mock_avr.set_volume = AsyncMock(return_value=-10.0)
+
+    mock_fr = MagicMock()
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(return_value=mock_fr)
+
+    with (
+        patch.object(sut, "_avr", mock_avr),
+        patch.object(sut, "_config"),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.config.update_config") as mock_update,
+    ):
+        result = await _tool_calibrate_level(start_db=-10.0)
+
+    assert result["ok"]
+    assert result["calibrated_volume_db"] == -10.0
+    mock_update.assert_called_once_with({"measurement": {"denon_sweep_volume": -10.0}})
+
+
+@pytest.mark.asyncio
+async def test_calibrate_level_ramps_on_low_snr() -> None:
+    """SNR too low at start → ramps up until good."""
+    from calibrate.measurement import MeasurementQualityError
+
+    mock_avr = AsyncMock()
+    mock_avr.set_volume = AsyncMock(return_value=-10.0)
+
+    mock_fr = MagicMock()
+    mock_engine = MagicMock()
+    # Fail twice with low SNR, then succeed
+    mock_engine.measure = AsyncMock(side_effect=[
+        MeasurementQualityError("snr", "SNR 12 dB < 20 dB", "increase volume"),
+        MeasurementQualityError("snr", "SNR 16 dB < 20 dB", "increase volume"),
+        mock_fr,
+    ])
+
+    with (
+        patch.object(sut, "_avr", mock_avr),
+        patch.object(sut, "_config"),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.config.update_config"),
+    ):
+        result = await _tool_calibrate_level(start_db=-10.0, step_db=3.0)
+
+    assert result["ok"]
+    assert result["calibrated_volume_db"] == -4.0  # -10 + 3 + 3
+
+
+@pytest.mark.asyncio
+async def test_calibrate_level_hits_ceiling() -> None:
+    """SNR never good enough → returns error at ceiling."""
+    from calibrate.measurement import MeasurementQualityError
+
+    mock_avr = AsyncMock()
+    mock_avr.set_volume = AsyncMock(return_value=-10.0)
+
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(
+        side_effect=MeasurementQualityError("snr", "SNR 10 dB < 20 dB", "check subs"),
+    )
+
+    with (
+        patch.object(sut, "_avr", mock_avr),
+        patch.object(sut, "_config"),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.config.update_config"),
+    ):
+        result = await _tool_calibrate_level(start_db=-4.0, max_volume_db=0.0, step_db=3.0)
+
+    assert not result["ok"]
+    assert "Could not achieve SNR" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_calibrate_level_no_avr() -> None:
+    """No AVR driver loaded → error."""
+    with patch.object(sut, "_avr", None):
+        result = await _tool_calibrate_level()
+
+    assert not result["ok"]
+    assert "AVR driver not loaded" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_calibrate_level_ramps_on_sweep_not_detected() -> None:
+    """Sweep not captured → ramps up (same as low SNR)."""
+    from calibrate.measurement import MeasurementQualityError
+
+    mock_avr = AsyncMock()
+    mock_avr.set_volume = AsyncMock(return_value=-10.0)
+
+    mock_fr = MagicMock()
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(side_effect=[
+        MeasurementQualityError("sweep_capture", "Sweep not detected", "check input"),
+        mock_fr,
+    ])
+
+    with (
+        patch.object(sut, "_avr", mock_avr),
+        patch.object(sut, "_config"),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.config.update_config"),
+    ):
+        result = await _tool_calibrate_level(start_db=-10.0, step_db=3.0)
+
+    assert result["ok"]
+    assert result["calibrated_volume_db"] == -7.0
 
 
 # ── fetch_recipe ───────────────────────────────────────────────────────────────

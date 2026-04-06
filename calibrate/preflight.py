@@ -41,11 +41,12 @@ class PreflightChecker:
     async def run_all(self) -> list[CheckResult]:
         """Run all hardware checks concurrently. Never raises — errors become failed results.
 
-        Phase 2 equipment checks (microphone is checked later during signal sweep):
-            [Config]  [miniDSP (USB+daemon)]  [Denon AVR + Playback]  [Signal Path]
+        Equipment checks:
+            [Config]  [Microphone]  [miniDSP (USB+daemon)]  [Denon AVR + Playback]  [Signal Path]
         """
         checks = [
             ("Config", self.check_config()),
+            ("Microphone", self.check_mic()),
             ("miniDSP", self.check_minidsp_combined()),
             ("Denon AVR", self.check_denon_and_playback()),
             ("Signal Path", self.check_signal_path_sync()),
