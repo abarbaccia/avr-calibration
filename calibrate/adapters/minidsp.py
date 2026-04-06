@@ -87,6 +87,10 @@ class MinidspClient:
         await client.restore_all_gains([0, 1])
     """
 
+    # TODO: Pool httpx client instead of creating one per call — prevents fd leaks
+    #       in long-running sessions. Replace per-method AsyncClient() with a shared
+    #       instance created in __init__ and closed explicitly.
+
     def __init__(self, host: str, port: int, device_index: int = 0) -> None:
         self._base = f"http://{host}:{port}"
         self._device_index = device_index

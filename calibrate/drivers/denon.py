@@ -88,6 +88,9 @@ class DenonDriver(AVRDriver):
 class DenonSweepContext:
     """Async context manager for Denon sweep lifecycle.
 
+    TODO: Add a class-level asyncio.Lock so concurrent HDMI sweeps serialize
+          rather than interleaving state save/restore.
+
     Usage:
         async with DenonSweepContext(host, sweep_input, sweep_volume) as ctx:
             fr = await engine.measure()

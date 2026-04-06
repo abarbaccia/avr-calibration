@@ -187,6 +187,9 @@ class MeasurementEngine:
 
         return warnings_out
 
+    # TODO: Wrap measure() with asyncio.wait_for(timeout=30s) so a hung
+    #       audio device doesn't block the calibration loop forever.
+
     async def measure(
         self,
         input_device_name: str | None = None,
@@ -235,6 +238,8 @@ class MeasurementEngine:
         try:
             import sounddevice as sd
             devices = sd.query_devices()
+            # TODO: sd.default.device is global state — concurrent measure() calls
+            #       can collide. Add an asyncio.Lock to serialize access.
             umik_idx = _find_umik_device(devices, name_substring=mic_name)
             if umik_idx is not None:
                 out_idx = int(sd.default.device[1])

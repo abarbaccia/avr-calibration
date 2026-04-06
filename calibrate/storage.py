@@ -313,6 +313,8 @@ class SessionStore:
                 row = conn.execute("SELECT * FROM equipment WHERE id=?", (equipment_id,)).fetchone()
                 return self._equipment_row(row) if row else None
             fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+            # TODO: Field names come from caller, not user input, but consider
+            #       a whitelist check if this is ever exposed via API.
             sets = ", ".join(f"{k}=?" for k in fields)
             vals = list(fields.values()) + [equipment_id]
             conn.execute(f"UPDATE equipment SET {sets} WHERE id=?", vals)
