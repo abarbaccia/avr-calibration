@@ -11,24 +11,20 @@ and keeps per-sub corrections independent from the target curve.
 
 ## EQ Architecture
 
-```
-Input PEQ (shared Harman target)
-    │
-    ├── Output 0 PEQ (Sub 0 room correction)  → Left Front Sub
-    ├── Output 2 PEQ (Sub 2 room correction)  → Nearfield Sub
-    └── Output 3 (shakers, muted during cal)
-```
+Call `get_config` to discover `eq_capabilities`. This tells you:
+- Which input and outputs have PEQ slots available
+- How many slots each has
+- Which tool to call for each (`apply_input_eq` vs `apply_eq` with `output_index`)
+- What filters are currently loaded
 
-- **Input PEQ**: Harman target curve + mandatory 18Hz HPF. Applied once,
-  affects all outputs equally. Lives on the active input channel.
-- **Output PEQ**: Per-sub room correction. Each output gets its own filters
-  to flatten that sub's unique room interaction before the shared target
-  curve is applied.
+Use this to map the strategy below to the actual hardware:
+- **Input PEQ** → shared Harman target curve + mandatory 18Hz HPF
+- **Output PEQ** → per-sub room correction (one filter set per sub output)
 
 ## Pre-flight
 
 Verify all hardware is connected and reachable before starting.
-Mute any non-sub outputs (e.g. bass shakers) during calibration.
+Mute any non-sub outputs (e.g. shakers) during calibration.
 
 ## Phase 0 — Level Setup
 
@@ -91,12 +87,13 @@ Maximum 3 alignment iterations.
 
 ## Phase 2 — Per-Sub Room Correction (Output PEQ)
 
-This is the new phase. Each sub gets its own EQ to flatten its individual
-room response before the shared Harman target is applied.
+Each sub gets its own EQ to flatten its individual room response before
+the shared Harman target is applied. Use `eq_capabilities.output_peq`
+from `get_config` to find the available per-sub PEQ resources.
 
 ### 2.1 Measure each sub solo (post-alignment)
 
-For each subwoofer:
+For each sub listed in `eq_capabilities.output_peq`:
 1. Mute all other subs
 2. Take a measurement
 3. Compute a "flat" target: the average SPL across 25-80Hz for this sub
@@ -112,15 +109,12 @@ For each sub, compare its solo FR to flat (its own average level):
 **Prefer cuts heavily.** The goal is to flatten each sub's response,
 not to boost it to match a target. Nulls cannot be filled with EQ.
 
-Always include the mandatory 18Hz HPF on each output.
+Always include the mandatory 18Hz HPF.
 
-### 2.3 Apply per-sub EQ to output PEQ slots
+### 2.3 Apply per-sub EQ
 
-For each sub output, call `apply_eq` with that sub's correction filters.
-Each output gets its own independent filter set.
-
-**Important:** This requires per-output EQ writes — the `apply_eq` tool
-must support targeting a specific output, not all sub outputs at once.
+For each sub, call `apply_eq` with `output_index` set to that sub's
+output index. Each sub gets its own independent filter set.
 
 ### 2.4 Re-measure each sub solo and iterate
 
@@ -132,8 +126,8 @@ After applying per-sub EQ:
 
 ## Phase 3 — Harman Target (Input PEQ)
 
-Now all subs are individually flattened. Apply the shared Harman target
-curve to the DSP input, which affects all subs equally.
+All subs are now individually flattened. Apply the shared Harman target
+curve to the DSP input using `eq_capabilities.input_peq` from `get_config`.
 
 ### Harman bass target (relative to 80Hz)
 
@@ -151,14 +145,14 @@ curve to the DSP input, which affects all subs equally.
 Measure the combined sub response (all subs unmuted, per-sub EQ active).
 Calculate RMS deviation from the Harman target.
 
-### 3.2 Apply Harman EQ to input PEQ
+### 3.2 Apply Harman EQ to input
 
 Design filters to match the Harman target:
 - Above target: cut (always safe)
 - Below target: boost (limited by safety)
 
-Apply these filters to the **input PEQ** (not outputs). This ensures all
-subs receive the same target curve correction.
+Call `apply_input_eq` with the target curve filters. This writes to the
+input PEQ so all subs receive the same correction.
 
 Always include the mandatory 18Hz HPF.
 
@@ -186,14 +180,12 @@ If max iterations reached:
 - If the combined Harman pass can't converge, the per-sub corrections
   may need revisiting — check for cancellation between subs
 
-## Driver requirements
+## MCP tools used
 
-This recipe requires two capabilities not yet in the MCP tools:
-
-1. **Input PEQ writes** — `apply_input_eq` tool to write PEQ filters to
-   the active input channel (not outputs). Uses the same minidspd partial
-   config API: `{"inputs": [{"index": N, "peq": [...]}]}`
-
-2. **Per-output EQ writes** — `apply_eq` must support targeting a single
-   output index, not broadcasting to all sub outputs. This allows each
-   sub to have independent room correction filters.
+- `get_config` — discover `eq_capabilities` (input/output PEQ slots, labels, current state)
+- `measure` — take a sweep measurement
+- `apply_eq` — write per-sub correction filters (with `output_index` for single-output targeting)
+- `apply_input_eq` — write shared Harman target curve to DSP input
+- `mute_output` / `unmute_output` — isolate subs for solo measurement
+- `set_delay` / `set_polarity` — sub alignment
+- `calibrate_level` — find optimal sweep volume

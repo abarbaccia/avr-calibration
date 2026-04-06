@@ -365,10 +365,57 @@ async def _tool_get_calibration_runs(limit: int = 10, run_id: int | None = None)
 
 
 async def _tool_get_config() -> dict:
-    """Return the current config.yaml as a dict."""
+    """Return the current config.yaml plus EQ capabilities discovery."""
     try:
         cfg = _config()
-        return _ok(config=cfg._data)
+        data = dict(cfg._data)
+
+        # EQ capabilities — tells Claude what PEQ resources are available
+        active_input = cfg.minidsp.get("active_input") or 0
+        sub_outputs = cfg.sub_outputs
+        slots = list(range(2, 10))  # slots 2-9
+
+        eq_capabilities: dict = {
+            "input_peq": {
+                "input_index": active_input,
+                "available_slots": slots,
+                "num_slots": len(slots),
+                "description": "Shared EQ applied to all outputs (e.g. Harman target curve)",
+                "tool": "apply_input_eq",
+            },
+            "output_peq": [],
+        }
+
+        for slot_cfg in cfg.minidsp.get("output_slots", []):
+            idx = slot_cfg["index"]
+            if idx in sub_outputs:
+                eq_capabilities["output_peq"].append({
+                    "output_index": idx,
+                    "label": slot_cfg.get("label", f"Output {idx}"),
+                    "available_slots": slots,
+                    "num_slots": len(slots),
+                    "description": "Per-sub room correction EQ",
+                    "tool": "apply_eq with output_index",
+                })
+
+        # Include current EQ state if driver is loaded
+        if _dsp is not None:
+            try:
+                preset = await _dsp.current_preset()
+                # Broadcast state (legacy key)
+                eq_capabilities["input_peq"]["current_filters"] = (
+                    _dsp._eq_state.get(("input", active_input, preset), [])  # type: ignore[attr-defined]
+                )
+                for entry in eq_capabilities["output_peq"]:
+                    oidx = entry["output_index"]
+                    entry["current_filters"] = (
+                        _dsp._eq_state.get((preset, oidx), [])  # type: ignore[attr-defined]
+                    )
+            except Exception:
+                pass  # EQ state is best-effort
+
+        data["eq_capabilities"] = eq_capabilities
+        return _ok(config=data)
     except Exception as exc:
         return _err(f"config error: {exc}")
 
