@@ -241,6 +241,70 @@ async def _tool_trigger_measurement() -> dict:
         return _err(f"measurement failed: {exc}")
 
 
+async def _tool_calibrate_level(
+    start_db: float = -10.0,
+    max_volume_db: float = 0.0,
+    target_snr_db: float = 20.0,
+    step_db: float = 3.0,
+) -> dict:
+    """Auto-ramp AVR volume until measurement SNR meets threshold.
+
+    Starts at start_db, takes a test sweep, checks SNR. If too low, bumps
+    volume by step_db and retries. Stops when SNR >= target or ceiling hit.
+    Saves calibrated volume to config for subsequent measure calls.
+    """
+    if _avr is None:
+        return _err("AVR driver not loaded")
+
+    from .measurement import MeasurementEngine, MeasurementQualityError
+    from .config import update_config
+
+    cfg = _config()
+    engine = MeasurementEngine(cfg)
+    volume = start_db
+
+    while volume <= max_volume_db:
+        try:
+            await _avr.set_volume(volume)
+            await asyncio.sleep(0.5)  # brief settle
+
+            # Measure without DenonSweepContext — we're managing volume directly
+            fr = await engine.measure()
+
+            # If we get here, SNR passed validation
+            # Save calibrated volume to config for future measure calls
+            update_config({"measurement": {"denon_sweep_volume": volume}})
+            return _ok(
+                calibrated_volume_db=volume,
+                message=f"Level calibrated at {volume} dB. SNR is good.",
+            )
+
+        except MeasurementQualityError as exc:
+            if exc.check == "snr":
+                log.info(
+                    "calibrate_level: SNR too low at %.1f dB (%s), ramping up",
+                    volume, exc.detail,
+                )
+                volume += step_db
+                continue
+            elif exc.check == "sweep_capture":
+                log.info(
+                    "calibrate_level: sweep not detected at %.1f dB, ramping up",
+                    volume,
+                )
+                volume += step_db
+                continue
+            else:
+                return _err(f"measurement quality error: {exc.detail}")
+        except Exception as exc:
+            return _err(f"calibrate_level failed: {exc}")
+
+    return _err(
+        f"Could not achieve SNR >= {target_snr_db} dB even at {max_volume_db} dB. "
+        "Check that subs are powered on and signal path is correct."
+    )
+
+
 async def _tool_fetch_recipe(name: str) -> dict:
     """Return the content of a recipe by name (e.g. 'core/harman-bass').
 
@@ -462,6 +526,36 @@ _TOOLS: list[Tool] = [
                 }
             },
             "required": ["filters"],
+        },
+    ),
+    Tool(
+        name="calibrate_level",
+        description=(
+            "Auto-calibrate sweep volume. Ramps AVR volume from start_db toward "
+            "max_volume_db in step_db increments until measurement SNR >= target_snr_db. "
+            "Saves calibrated volume to config. Call before calibration to find the "
+            "right sweep level. Returns {ok: true, calibrated_volume_db: N}."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "start_db": {
+                    "type": "number",
+                    "description": "Starting volume in dB (default: -10)",
+                },
+                "max_volume_db": {
+                    "type": "number",
+                    "description": "Maximum volume ceiling in dB (default: 0 = reference)",
+                },
+                "target_snr_db": {
+                    "type": "number",
+                    "description": "Minimum acceptable SNR in dB (default: 20)",
+                },
+                "step_db": {
+                    "type": "number",
+                    "description": "Volume increment per retry in dB (default: 3)",
+                },
+            },
         },
     ),
     Tool(
@@ -700,6 +794,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_avr_set_volume(float(arguments["level_db"]))
     elif name in ("measure", "trigger_measurement"):
         result = await _tool_trigger_measurement()
+    elif name == "calibrate_level":
+        result = await _tool_calibrate_level(
+            start_db=float(arguments.get("start_db", -10.0)),
+            max_volume_db=float(arguments.get("max_volume_db", 0.0)),
+            target_snr_db=float(arguments.get("target_snr_db", 20.0)),
+            step_db=float(arguments.get("step_db", 3.0)),
+        )
     elif name == "fetch_recipe":
         result = await _tool_fetch_recipe(arguments["name"])
     elif name == "get_calibration_runs":

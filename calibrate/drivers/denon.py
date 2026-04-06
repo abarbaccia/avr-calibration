@@ -97,8 +97,10 @@ class DenonSweepContext:
     sweep input/volume, waits for settle. On exit: restores saved state
     (best-effort, exceptions caught).
 
-    Volume safety: sweep_volume must be <= -25.0 dB.
+    Volume safety: sweep_volume must be <= MAX_SWEEP_VOLUME_DB (default 0 dB / reference).
     """
+
+    MAX_SWEEP_VOLUME_DB: float = 0.0  # reference level — configurable ceiling
 
     @classmethod
     def from_config(cls, config) -> "DenonSweepContext | None":
@@ -113,7 +115,7 @@ class DenonSweepContext:
         return cls(
             host=host,
             sweep_input=sweep_input,
-            sweep_volume=float(config.measurement.get("denon_sweep_volume", -25.0)),
+            sweep_volume=float(config.measurement.get("denon_sweep_volume", -10.0)),
             settle_ms=config.measurement.get("denon_settle_ms", 800),
         )
 
@@ -121,12 +123,12 @@ class DenonSweepContext:
         self,
         host: str,
         sweep_input: str,
-        sweep_volume: float = -25.0,
+        sweep_volume: float = -10.0,
         settle_ms: int = 800,
     ) -> None:
-        if sweep_volume > -25.0:
+        if sweep_volume > self.MAX_SWEEP_VOLUME_DB:
             raise ValueError(
-                f"sweep_volume must be <= -25.0 dB to prevent loud sweeps, got {sweep_volume}"
+                f"sweep_volume must be <= {self.MAX_SWEEP_VOLUME_DB} dB, got {sweep_volume}"
             )
         self._host = host
         self._sweep_input = sweep_input
@@ -135,6 +137,7 @@ class DenonSweepContext:
         self._receiver = None
         self._saved_input: str | None = None
         self._saved_volume: float | None = None
+        self._saved_sound_mode: str | None = None
 
     async def __aenter__(self) -> "DenonSweepContext":
         import denonavr
@@ -146,13 +149,28 @@ class DenonSweepContext:
         self._saved_input = self._receiver.input_func
         self._saved_volume = self._receiver.volume
 
+        # Save and switch sound mode to Pure Direct for clean signal path.
+        # Pure Direct disables all processing (Audyssey, Dynamic EQ, tone)
+        # but still passes the LFE channel to sub pre-outs.
+        try:
+            self._saved_sound_mode = self._receiver.soundmode.sound_mode
+            log.info("Denon sweep: saved sound mode: %s", self._saved_sound_mode)
+        except Exception as exc:
+            log.warning("Could not read sound mode: %s", exc)
+
         log.info(
-            "Denon sweep: switching to input=%s volume=%.1f dB (was %s / %s)",
+            "Denon sweep: switching to input=%s volume=%.1f dB Pure Direct (was %s / %s / %s)",
             self._sweep_input, self._sweep_volume,
-            self._saved_input, self._saved_volume,
+            self._saved_input, self._saved_volume, self._saved_sound_mode,
         )
         await self._receiver.async_set_input_func(self._sweep_input)
         await self._receiver.async_set_volume(self._sweep_volume)
+
+        try:
+            await self._receiver.soundmode.async_set_sound_mode("PURE DIRECT")
+        except Exception as exc:
+            log.warning("Could not set Pure Direct: %s", exc)
+
         await asyncio.sleep(self._settle_ms / 1000.0)
         return self
 
@@ -160,11 +178,15 @@ class DenonSweepContext:
         if self._receiver is None:
             return
         try:
-            if self._saved_input is not None:
-                log.info(
-                    "Denon sweep: restoring input=%s volume=%s",
-                    self._saved_input, self._saved_volume,
+            log.info(
+                "Denon sweep: restoring input=%s volume=%s sound_mode=%s",
+                self._saved_input, self._saved_volume, self._saved_sound_mode,
+            )
+            if self._saved_sound_mode is not None:
+                await self._receiver.soundmode.async_set_sound_mode(
+                    self._saved_sound_mode
                 )
+            if self._saved_input is not None:
                 await self._receiver.async_set_input_func(self._saved_input)
             if self._saved_volume is not None:
                 await self._receiver.async_set_volume(self._saved_volume)

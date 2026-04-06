@@ -40,7 +40,7 @@ DEFAULT_CONFIG: dict = {
         "output_channel": 1,
         "playback_route": "usb",
         "denon_sweep_input": None,
-        "denon_sweep_volume": -25.0,
+        "denon_sweep_volume": -10.0,
         "denon_settle_ms": 800,
         "sweep_channel": "lfe",
         "playback_device": "miniDSP",
@@ -87,7 +87,7 @@ measurement:
   playback_route: "usb"  # "usb" = direct to miniDSP, "hdmi" = via Denon full chain
   denon_sweep_input: null       # Denon input to switch to during HDMI sweep
                                 # Run: python -c "import asyncio, denonavr; r=denonavr.DenonAVR('YOUR_IP'); asyncio.run(r.async_setup()); asyncio.run(r.async_update()); print(r.input_func_list)"
-  denon_sweep_volume: -25.0    # dB — MUST be ≤ -25.0 (safety limit)
+  denon_sweep_volume: -10.0    # dB — default starting volume (max 0 dB / reference)
   denon_settle_ms: 800         # ms to wait after Denon input/volume change
   sweep_channel: "lfe"         # "lfe" = LFE/subwoofer channel, "left"/"right" = main
   playback_device: "miniDSP"   # substring matched against USB audio device names
