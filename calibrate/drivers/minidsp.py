@@ -68,6 +68,8 @@ class MinidspDriver(DSPDriver):
                 "source": master.get("source"),
                 "volume": master.get("volume"),
                 "mute": master.get("mute"),
+                "input_levels": status.get("input_levels"),
+                "output_levels": status.get("output_levels"),
             }
         except asyncio.TimeoutError:
             raise DriverError(f"timeout connecting to {self._host}")
@@ -199,3 +201,16 @@ class MinidspDriver(DSPDriver):
     async def set_routing(self, routing: dict) -> None:
         for input_index, output_enabled in routing.items():
             await self._client.set_input_routing(int(input_index), output_enabled)
+
+    @_driver_api
+    async def configure_active_input(self, active_input: int) -> None:
+        """Route *active_input* to all outputs and mute the other input.
+
+        Used when one analog input is broken or unused — ensures all sub
+        outputs receive signal from the working input.
+        """
+        all_outputs = {0: True, 1: True, 2: True, 3: True}
+        all_muted = {0: False, 1: False, 2: False, 3: False}
+        other_input = 1 - active_input
+        await self._client.set_input_routing(active_input, all_outputs)
+        await self._client.set_input_routing(other_input, all_muted)

@@ -11,7 +11,7 @@ Coverage diagram:
   └── [TESTED] PortAudioError → re-raised as RuntimeError
 
   HDMIPlayback.play_and_record()
-  └── [TESTED] happy path — calls sd.rec + sd.play + sd.wait, returns arrays
+  └── [TESTED] happy path — opens explicit InputStream/OutputStream, returns arrays
 """
 
 from __future__ import annotations
@@ -84,24 +84,55 @@ class TestHDMIPlayback:
         mock_sd = sys.modules["sounddevice"]
         mock_sd.reset_mock()
 
+        n_samples = 4800
         sweep = MagicMock()
-        sweep.timeSignal = np.random.default_rng(42).standard_normal((4800, 1))
+        sweep.timeSignal = np.random.default_rng(42).standard_normal((n_samples, 1))
 
-        rec_result = np.random.default_rng(99).standard_normal((4800, 1)).astype(np.float32)
-        mock_sd.rec.return_value = rec_result
+        # Mock the default device tuple
+        mock_sd.default.device = [0, 1]
+
+        # Capture the InputStream callback so we can feed it fake mic data
+        in_stream = MagicMock()
+        out_stream = MagicMock()
+        captured_callback = [None]
+
+        def fake_input_stream(**kwargs):
+            captured_callback[0] = kwargs.get("callback")
+            return in_stream
+
+        def fake_output_stream(**kwargs):
+            return out_stream
+
+        mock_sd.InputStream = MagicMock(side_effect=fake_input_stream)
+        mock_sd.OutputStream = MagicMock(side_effect=fake_output_stream)
+
+        # Simulate the OutputStream.write triggering the callback with mic data
+        fake_mic = np.random.default_rng(99).standard_normal((n_samples, 1)).astype(np.float32)
+
+        def fake_write(buf):
+            # Feed fake mic data via the captured callback
+            if captured_callback[0]:
+                captured_callback[0](fake_mic, n_samples, None, None)
+
+        out_stream.write = MagicMock(side_effect=fake_write)
 
         strategy = HDMIPlayback()
         sweep_1d, rec_1d = strategy.play_and_record(sweep, 48000, 1, 1)
 
-        mock_sd.rec.assert_called_once()
-        mock_sd.play.assert_called_once()
-        mock_sd.wait.assert_called_once()
+        mock_sd.InputStream.assert_called_once()
+        mock_sd.OutputStream.assert_called_once()
+        in_stream.start.assert_called_once()
+        out_stream.start.assert_called_once()
+        out_stream.write.assert_called_once()
 
-        assert sweep_1d.shape == (4800,)
-        assert rec_1d.shape == (4800,)
+        assert sweep_1d.shape == (n_samples,)
+        assert rec_1d.shape == (n_samples,)
         assert rec_1d.dtype == np.float64
 
-        # Verify sd.play was called with int16 data
-        play_args = mock_sd.play.call_args
-        played_arr = play_args[0][0]
-        assert played_arr.dtype == np.int16
+        # Verify OutputStream was opened with int16 dtype
+        out_kwargs = mock_sd.OutputStream.call_args[1]
+        assert out_kwargs["dtype"] == "int16"
+
+        # Verify the write buffer is int16
+        write_args = out_stream.write.call_args[0]
+        assert write_args[0].dtype == np.int16

@@ -41,6 +41,7 @@ Ask the user about their equipment. Be conversational, not a form. Ask one topic
 3. **Subwoofers**: How many, which miniDSP outputs they're connected to, any bass shakers?
 4. **Microphone**: UMIK-1 or UMIK-2? Do they have a .cal correction file?
 5. **Playback route**: USB (direct to miniDSP) or HDMI (through AVR)?
+6. **DSP signal path**: If the DSP has multiple inputs (e.g. miniDSP 2x4 HD has 2 analog inputs), ask which input the AVR feeds. This determines routing — the active input must be routed to all sub outputs. Also ask if any inputs are broken/unused so they can be muted to avoid noise.
 
 ### Step 3 — Generate config.yaml
 
@@ -53,6 +54,7 @@ denon:
 minidsp:
   host: "localhost"
   port: 5380
+  active_input: 1  # which analog input the AVR feeds (0 or 1)
   output_slots:
     - index: 0
       type: sub
