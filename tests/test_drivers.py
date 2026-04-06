@@ -221,9 +221,8 @@ async def test_minidsp_apply_eq_valid_writes_hardware() -> None:
     ]
     await driver.apply_eq(0, filters)
     assert config_route.called
-    # Mute-before-write pattern: mute gain + PEQ batch + unmute gain = 3 POSTs per output
-    # Default sub_outputs = [0, 1], so 6 POSTs total for broadcast mode
-    assert config_route.call_count == 6
+    # One batched PEQ write per output (default sub_outputs=[0,1])
+    assert config_route.call_count == 2
     # State should be updated after successful write
     assert len(await driver.read_eq(0)) == len(filters)
 
@@ -300,60 +299,46 @@ async def test_minidsp_apply_eq_updates_state_only_on_success() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_minidsp_apply_eq_mutes_before_peq_write() -> None:
-    """Mute-before-write: output is muted before PEQ, unmuted after."""
-    call_log: list[dict] = []
+async def test_minidsp_apply_eq_per_output() -> None:
+    """Per-output EQ writes one batched PEQ request to the target output."""
+    config_calls: list[dict] = []
 
     def _capture(request):
         import json
-        call_log.append(json.loads(request.content))
+        config_calls.append(json.loads(request.content))
         return httpx.Response(200)
 
     respx.post(CONFIG_URL).mock(side_effect=_capture)
-    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[0])
+    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1])
     filters = [
         {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
         {"freq": 80.0, "gain_db": -3.0, "q": 1.0, "type": "peaking"},
     ]
-    await driver.apply_eq(0, filters, output_index=0)
-    # Expect: mute(gain=-127) → PEQ batch → unmute(gain=0)
-    assert len(call_log) == 3
-    # First call: mute
-    assert call_log[0]["outputs"][0]["gain"] == -127.0
-    # Second call: PEQ write
-    assert "peq" in call_log[1]["outputs"][0]
-    # Third call: unmute
-    assert call_log[2]["outputs"][0]["gain"] == 0.0
+    await driver.apply_eq(0, filters, output_index=1)
+    assert len(config_calls) == 1
+    assert "peq" in config_calls[0]["outputs"][0]
 
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_minidsp_apply_input_eq_mutes_outputs_during_write() -> None:
-    """Input PEQ write mutes all sub outputs, writes, then unmutes."""
-    call_log: list[dict] = []
+async def test_minidsp_apply_input_eq_writes_batch() -> None:
+    """Input PEQ writes one batched request to the target input."""
+    config_calls: list[dict] = []
 
     def _capture(request):
         import json
-        call_log.append(json.loads(request.content))
+        config_calls.append(json.loads(request.content))
         return httpx.Response(200)
 
     respx.post(CONFIG_URL).mock(side_effect=_capture)
-    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[0, 2])
+    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1, 2])
     filters = [
         {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
         {"freq": 50.0, "gain_db": -2.0, "q": 1.0, "type": "peaking"},
     ]
     await driver.apply_input_eq(0, filters)
-    # Expect: mute out0 + mute out2 → PEQ batch → unmute out0 + unmute out2
-    assert len(call_log) == 5
-    # First two: mute each output
-    assert call_log[0]["outputs"][0]["gain"] == -127.0
-    assert call_log[1]["outputs"][0]["gain"] == -127.0
-    # Third: input PEQ write
-    assert "inputs" in call_log[2]
-    # Last two: unmute each output
-    assert call_log[3]["outputs"][0]["gain"] == 0.0
-    assert call_log[4]["outputs"][0]["gain"] == 0.0
+    assert len(config_calls) == 1
+    assert "inputs" in config_calls[0]
 
 
 @respx.mock

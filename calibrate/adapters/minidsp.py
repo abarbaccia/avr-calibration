@@ -182,6 +182,10 @@ class MinidspClient:
 
     MUTE_GAIN_DB: float = -127.0
 
+    async def set_master_mute(self, muted: bool) -> None:
+        """Set master mute on/off. Stops all DSP processing when muted."""
+        await self._patch_master({"mute": muted})
+
     @staticmethod
     def _validate_output(output: int) -> None:
         """Raise ValueError if output index is out of range."""
