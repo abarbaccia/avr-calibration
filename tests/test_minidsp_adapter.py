@@ -16,6 +16,7 @@ from calibrate.adapters.minidsp import (
     MinidspClient,
     MinidspApiError,
     MAX_DELAY_MS,
+    MAX_OUTPUT_INDEX,
     MAX_PRESET_INDEX,
     VALID_SOURCES,
     APF_RESERVED_SLOTS,
@@ -398,3 +399,64 @@ def test_valid_sources_contains_expected() -> None:
 
 def test_max_preset_index_is_three() -> None:
     assert MAX_PRESET_INDEX == 3
+
+
+# ── Output index validation ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_output_index_negative_rejected(client: MinidspClient) -> None:
+    with pytest.raises(ValueError, match="out of range"):
+        await client.set_output_gain(-1, 0.0)
+
+
+@pytest.mark.asyncio
+async def test_output_index_too_high_rejected(client: MinidspClient) -> None:
+    with pytest.raises(ValueError, match="out of range"):
+        await client.set_output_gain(MAX_OUTPUT_INDEX + 1, 0.0)
+
+
+@pytest.mark.asyncio
+async def test_delay_negative_rejected(client: MinidspClient) -> None:
+    with pytest.raises(ValueError, match="cannot be negative"):
+        await client.set_output_delay(0, -1.0)
+
+
+@pytest.mark.asyncio
+async def test_polarity_invalid_output_rejected(client: MinidspClient) -> None:
+    with pytest.raises(ValueError, match="out of range"):
+        await client.set_output_polarity(5, inverted=True)
+
+
+@pytest.mark.asyncio
+async def test_delay_invalid_output_rejected(client: MinidspClient) -> None:
+    with pytest.raises(ValueError, match="out of range"):
+        await client.set_output_delay(10, 1.0)
+
+
+@pytest.mark.asyncio
+async def test_peq_invalid_output_rejected(client: MinidspClient) -> None:
+    with pytest.raises(ValueError, match="out of range"):
+        await client.set_output_peq(5, 2, {"b0": 1.0})
+
+
+# ── mute_outputs error propagation ──────────────────────────────────────────
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_mute_outputs_raises_on_partial_failure(client: MinidspClient) -> None:
+    """If one output fails to mute, MinidspApiError is raised."""
+    call_count = 0
+
+    def side_effect(req):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return httpx.Response(500)
+        return httpx.Response(200)
+
+    respx.post(CONFIG_URL).mock(side_effect=side_effect)
+
+    with pytest.raises(MinidspApiError, match="partial failure"):
+        await client.mute_outputs([0, 1])

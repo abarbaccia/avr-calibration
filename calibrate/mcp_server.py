@@ -207,9 +207,9 @@ async def _tool_trigger_measurement() -> dict:
                 f"trigger_measurement requires {mic_name} microphone — none found. "
                 "Check USB connection."
             )
-    except Exception:
+    except Exception as exc:
         return _err(
-            "trigger_measurement requires sounddevice — audio device enumeration failed."
+            f"trigger_measurement requires sounddevice — audio device enumeration failed: {exc}"
         )
 
     try:

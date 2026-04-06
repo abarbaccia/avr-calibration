@@ -187,14 +187,22 @@ class DenonSweepContext:
                 "Denon sweep: restoring input=%s volume=%s sound_mode=%s",
                 self._saved_input, self._saved_volume, self._saved_sound_mode,
             )
+            # Timeout each restore call to prevent hanging if Denon is unresponsive
             if self._saved_sound_mode is not None:
-                await self._receiver.soundmode.async_set_sound_mode(
-                    self._saved_sound_mode
+                await asyncio.wait_for(
+                    self._receiver.soundmode.async_set_sound_mode(self._saved_sound_mode),
+                    timeout=5.0,
                 )
             if self._saved_input is not None:
-                await self._receiver.async_set_input_func(self._saved_input)
+                await asyncio.wait_for(
+                    self._receiver.async_set_input_func(self._saved_input),
+                    timeout=5.0,
+                )
             if self._manage_volume and self._saved_volume is not None:
-                await self._receiver.async_set_volume(self._saved_volume)
+                await asyncio.wait_for(
+                    self._receiver.async_set_volume(self._saved_volume),
+                    timeout=5.0,
+                )
         except Exception as exc:
             log.warning("Failed to restore Denon state: %s", exc)
         self._receiver = None
