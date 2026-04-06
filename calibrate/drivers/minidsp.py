@@ -142,9 +142,12 @@ class MinidspDriver(DSPDriver):
             if not result.ok:
                 raise DriverError(f"SafetyValidator: {result.error}")
 
-            # Hardware write — ALL must succeed before state update
+            # Hardware write — batch all PEQ slots per output into one request
+            # to avoid rapid-fire individual writes that can corrupt the DSP.
             try:
                 for output in self._sub_outputs:
+                    peq_entries: list[dict[str, Any]] = []
+                    # Active filter slots
                     for slot_offset, fspec in enumerate(filter_specs):
                         slot = _AVAILABLE_SLOTS[slot_offset]
                         biquad = freq_gain_q_to_biquad(
@@ -153,16 +156,15 @@ class MinidspDriver(DSPDriver):
                             q=fspec.q,
                             filter_type=fspec.type,
                         )
-                        await self._client.set_output_peq(
-                            output=output, slot=slot, biquad=biquad
-                        )
+                        peq_entries.append({"index": slot, "coeff": biquad})
                     # Bypass unused slots
                     for slot in _AVAILABLE_SLOTS[len(filter_specs):]:
-                        await self._client.set_output_peq(
-                            output=output,
-                            slot=slot,
-                            biquad=dict(_BYPASS_BIQUAD),
-                        )
+                        peq_entries.append({
+                            "index": slot,
+                            "coeff": {"b0": 1.0, "b1": 0.0, "b2": 0.0, "a1": 0.0, "a2": 0.0},
+                            "bypass": True,
+                        })
+                    await self._client.set_output_peq_batch(output, peq_entries)
             except MinidspApiError as exc:
                 # Do NOT update _eq_state — hardware is partially configured
                 raise DriverError(f"minidsp write failed: {exc}")
