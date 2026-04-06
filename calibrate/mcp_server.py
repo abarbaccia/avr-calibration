@@ -924,6 +924,15 @@ def create_app() -> Starlette:
             cfg.avr_driver_name,
             cfg.dsp_driver_name,
         )
+
+        # Configure DSP input routing if active_input is set
+        active_input = cfg.minidsp.get("active_input")
+        if active_input is not None and hasattr(_dsp, "configure_active_input"):
+            try:
+                await _dsp.configure_active_input(int(active_input))
+                log.info("DSP routing: active_input=%d → all outputs", active_input)
+            except Exception as exc:
+                log.warning("Failed to configure active_input routing: %s", exc)
         async with http_manager.run():
             yield
         await _avr.close()

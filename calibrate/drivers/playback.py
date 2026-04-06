@@ -53,7 +53,10 @@ class USBPlayback:
 
 
 class HDMIPlayback:
-    """Split sd.rec() + sd.play() with int16 output for HDMI.
+    """Explicit InputStream + OutputStream for HDMI play + mic record.
+
+    Uses separate streams to avoid a sounddevice bug where sd.rec(float32)
+    + sd.play(int16) corrupts the recording buffer with playback data.
 
     Places the sweep on the specified out_channel (1-based, e.g. 4 = LFE in
     5.1 layout) within a multi-channel HDMI buffer. Other channels are silent.
@@ -75,12 +78,40 @@ class HDMIPlayback:
         ch_idx = out_channel - 1  # convert 1-based to 0-based
         hdmi_buf[:, ch_idx] = (np.clip(sweep_array, -1.0, 1.0) * 32767).astype(np.int16)
 
-        rec_buf = sd.rec(n_samples, samplerate=sample_rate, channels=1, dtype="float32")
-        sd.play(hdmi_buf, samplerate=sample_rate)
-        sd.wait()
+        in_dev = int(sd.default.device[0])
+        out_dev = int(sd.default.device[1])
+
+        rec_data = np.zeros((n_samples, 1), dtype=np.float32)
+        rec_pos = [0]
+
+        def _rec_callback(indata, frames, time_info, status):
+            end = min(rec_pos[0] + frames, n_samples)
+            count = end - rec_pos[0]
+            rec_data[rec_pos[0]:end] = indata[:count]
+            rec_pos[0] = end
+
+        in_stream = sd.InputStream(
+            device=in_dev, samplerate=sample_rate,
+            channels=1, dtype="float32", callback=_rec_callback,
+        )
+        out_stream = sd.OutputStream(
+            device=out_dev, samplerate=sample_rate,
+            channels=n_channels, dtype="int16",
+        )
+
+        in_stream.start()
+        out_stream.start()
+        out_stream.write(hdmi_buf)
+        out_stream.stop()
+        # Drain remaining mic samples after playback ends
+        import time
+        time.sleep(0.5)
+        in_stream.stop()
+        in_stream.close()
+        out_stream.close()
 
         sweep_1d = sweep.timeSignal[:, 0]
-        rec_1d = rec_buf[:, 0].astype(np.float64)
+        rec_1d = rec_data[:rec_pos[0], 0].astype(np.float64)
         return sweep_1d, rec_1d
 
 

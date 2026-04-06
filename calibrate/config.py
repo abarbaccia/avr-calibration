@@ -16,6 +16,7 @@ DEFAULT_CONFIG: dict = {
     "minidsp": {
         "host": "localhost",
         "port": 5380,
+        "active_input": None,
         "signal_path": None,
         "input_labels": {},
         "output_slots": [
