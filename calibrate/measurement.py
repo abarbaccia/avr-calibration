@@ -297,7 +297,8 @@ class MeasurementEngine:
         strategy = playback_for_route(route)
         sweep_1d, rec_1d = strategy.play_and_record(sweep, sample_rate, in_channel, out_channel)
 
-        self.validate_recording(np, sweep_1d, rec_1d, sample_rate)
+        min_snr = float(cfg.get("min_snr_db", 20.0))
+        self.validate_recording(np, sweep_1d, rec_1d, sample_rate, min_snr_db=min_snr)
 
         frequencies, spl, ir_samples = self._compute_fr_arrays(
             np, sweep_1d, rec_1d, freq_min, freq_max, sample_rate
