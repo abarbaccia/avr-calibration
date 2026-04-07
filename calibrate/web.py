@@ -264,6 +264,7 @@ _HTML = """<!DOCTYPE html>
       <div class="hero-meta">
         <div class="label" id="heroLabel">No measurements yet</div>
         <div class="detail" id="heroDetail">Take a measurement to see your room's bass response</div>
+        <div class="detail" id="heroContext" style="font-size:.75rem;color:var(--dim);margin-top:-.25rem;margin-bottom:.5rem;"></div>
         <div class="hw-bar" id="hwBar">Loading...</div>
       </div>
     </div>
@@ -323,7 +324,7 @@ _HTML = """<!DOCTYPE html>
       </div>
       <table id="histTable">
         <thead>
-          <tr><th class="cb-col"></th><th>#</th><th>Date</th><th>Label</th><th>Peak SPL</th><th>&Delta; Harman</th></tr>
+          <tr><th class="cb-col"></th><th>#</th><th>Date</th><th>Type</th><th>Peak SPL</th><th>&Delta; Harman</th></tr>
         </thead>
         <tbody id="histBody"></tbody>
       </table>
@@ -472,7 +473,8 @@ function renderChart() {
   if (!p || !p.freqs || !p.freqs.length) return;
 
   document.getElementById('plotCard').style.display = '';
-  document.getElementById('plotStatus').textContent = p.label || '';
+  const info = classifyLabel(p.label);
+  document.getElementById('plotStatus').textContent = info.desc + (p.label && p.label !== info.desc ? ' (' + p.label + ')' : '');
 
   const sel = document.getElementById('curveSelect');
   if (sel) sel.value = targetCurveType;
@@ -484,7 +486,7 @@ function renderChart() {
 
   const datasets = [
     {
-      label: p.label || 'SPL (dBFS)',
+      label: classifyLabel(p.label).desc,
       data: p.spl,
       borderColor: OVERLAY_COLORS[0],
       backgroundColor: 'rgba(59,130,246,.08)',
@@ -678,7 +680,9 @@ async function loadHistory() {
   const tbody = document.getElementById('histBody');
   tbody.innerHTML = allSessions.map(s => {
     const ts = s.timestamp.slice(0,19).replace('T',' ');
-    const label = s.label || '\\u2014';
+    const info = classifyLabel(s.label);
+    const typeColors = {combined:'#3b82f6', solo:'#a78bfa', crawl:'#fb923c', baseline:'#64748b', iteration:'#4ade80', other:'#94a3b8', unknown:'#94a3b8'};
+    const typeLabel = '<span style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:.7rem;background:'+typeColors[info.type]+'22;color:'+typeColors[info.type]+';border:1px solid '+typeColors[info.type]+'44">'+info.type+'</span>';
     const peak = s.peak_spl.toFixed(1) + ' dBFS';
     let deltaStr = '\\u2014';
     let deltaCls = '';
@@ -688,7 +692,7 @@ async function loadHistory() {
     }
     return '<tr class="clickable" data-session-id="'+s.id+'" onclick="loadSession('+s.id+')">'
       + '<td class="cb-col" onclick="event.stopPropagation()"><input type="checkbox" data-id="'+s.id+'" onchange="updateHistButtons()"></td>'
-      + '<td>'+s.id+'</td><td>'+ts+'</td><td>'+label+'</td>'
+      + '<td>'+s.id+'</td><td>'+ts+'</td><td>'+typeLabel+'</td>'
       + '<td style="color:#38bdf8">'+peak+'</td><td class="'+deltaCls+'">'+deltaStr+'</td></tr>';
   }).join('');
 
@@ -709,11 +713,34 @@ function updateHistButtons() {
 }
 
 // ── Hero score ──────────────────────────────────────────────────────────────
+function classifyLabel(label) {
+  if (!label) return { type: 'unknown', desc: 'Unknown measurement' };
+  const l = label.toLowerCase();
+  if (l.includes('combined') || l.includes('both'))
+    return { type: 'combined', desc: 'Combined sub response (all subs playing)' };
+  if (l.match(/sub\\s*1|sub1|solo.*1|output.*0/i))
+    return { type: 'solo', desc: 'Sub 1 solo measurement' };
+  if (l.match(/sub\\s*2|sub2|solo.*2|output.*1/i))
+    return { type: 'solo', desc: 'Sub 2 solo measurement' };
+  if (l.includes('solo'))
+    return { type: 'solo', desc: 'Solo sub measurement' };
+  if (l.includes('subcrawl') || l.includes('crawl'))
+    return { type: 'crawl', desc: 'Sub crawl position test' };
+  if (l.includes('baseline'))
+    return { type: 'baseline', desc: 'Baseline measurement (before EQ)' };
+  if (l.includes('iter'))
+    return { type: 'iteration', desc: 'Calibration iteration' };
+  if (l === 'mcp-triggered' || l === 'headless')
+    return { type: 'combined', desc: 'Combined response at listening position' };
+  return { type: 'other', desc: label };
+}
+
 function updateHero(session) {
   const ring = document.getElementById('scoreRing');
   const val = document.getElementById('scoreValue');
   const label = document.getElementById('heroLabel');
   const detail = document.getElementById('heroDetail');
+  const ctx = document.getElementById('heroContext');
 
   if (!session) return;
 
@@ -729,7 +756,9 @@ function updateHero(session) {
   }
 
   const ts = session.timestamp.slice(0,19).replace('T',' ');
-  detail.textContent = (session.label || 'Session #'+session.id) + ' \\u2014 ' + ts;
+  const info = classifyLabel(session.label);
+  detail.textContent = 'Session #' + session.id + ' \\u2014 ' + ts;
+  ctx.textContent = info.desc + (rms != null ? ' \\u2014 vs ' + curveLabel() : '');
 }
 
 // ── System status (hardware bar) ────────────────────────────────────────────
