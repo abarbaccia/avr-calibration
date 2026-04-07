@@ -91,6 +91,20 @@ CREATE TABLE IF NOT EXISTS calibration_iterations (
     safety_ok        INTEGER NOT NULL DEFAULT 1,
     safety_error     TEXT
 );
+
+CREATE TABLE IF NOT EXISTS saved_states (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                  TEXT    NOT NULL,
+    timestamp             TEXT    NOT NULL,
+    eq_filters            TEXT,
+    delays                TEXT,
+    polarities            TEXT,
+    gains                 TEXT,
+    target_curve          TEXT,
+    rms_deviation         REAL,
+    measurement_session_id INTEGER REFERENCES sessions(id),
+    notes                 TEXT
+);
 """
 
 
@@ -447,6 +461,76 @@ class SessionStore:
 
         run["iterations"] = iterations
         return run
+
+    # ── Saved states ────────────────────────────────────────────────────────
+
+    def save_state(
+        self,
+        name: str,
+        eq_filters: list[dict] | None = None,
+        delays: dict | None = None,
+        polarities: dict | None = None,
+        gains: dict | None = None,
+        target_curve: str | None = None,
+        rms_deviation: float | None = None,
+        measurement_session_id: int | None = None,
+        notes: str | None = None,
+    ) -> int:
+        """Save a full DSP snapshot. Returns the new state id."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO saved_states"
+                " (name, timestamp, eq_filters, delays, polarities, gains,"
+                "  target_curve, rms_deviation, measurement_session_id, notes)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    name,
+                    now,
+                    json.dumps(eq_filters) if eq_filters else None,
+                    json.dumps(delays) if delays else None,
+                    json.dumps(polarities) if polarities else None,
+                    json.dumps(gains) if gains else None,
+                    target_curve,
+                    rms_deviation,
+                    measurement_session_id,
+                    notes,
+                ),
+            )
+            return cur.lastrowid
+
+    def list_states(self) -> list[dict]:
+        """Return all saved states, most recent first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, name, timestamp, target_curve, rms_deviation,"
+                " measurement_session_id, notes"
+                " FROM saved_states ORDER BY id DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_state(self, state_id: int) -> dict | None:
+        """Return a full saved state by id, or None if not found."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM saved_states WHERE id=?", (state_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        for key in ("eq_filters", "delays", "polarities", "gains"):
+            if d.get(key):
+                try:
+                    d[key] = json.loads(d[key])
+                except (json.JSONDecodeError, TypeError):
+                    d[key] = None
+        return d
+
+    def delete_state(self, state_id: int) -> bool:
+        """Delete a saved state. Returns True if a row was deleted."""
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM saved_states WHERE id=?", (state_id,))
+            return cur.rowcount > 0
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
