@@ -75,7 +75,7 @@ future Denon feature), connect the room measurement dashboard data to drive EQ r
 ### TODO-R3: Waterfall / decay plots
 **What:** Add time-domain waterfall (spectrogram) to `/room` dashboard.
 **Why:** Room mode decay (ringing) is as important as steady-state frequency response.
-Deferred from this PR — adds significant rendering complexity.
+**Note:** `analyze_decay` MCP tool (v0.6.0.0) provides the CLI/MCP primitive — Claude can now identify and prioritize ringing modes. The web waterfall visualization (spectrogram chart) remains this item.
 **Priority:** P2 — natural follow-on once FR measurement is working.
 
 ### TODO-R4: Room health monitor (recurring automated measurement)
@@ -144,6 +144,132 @@ alert when room response shifts significantly (furniture moved, season change, e
 **Context:** All three thresholds are already config-overridable (`noise_floor_window_ms`, `correlation_threshold`, `min_snr_db` params with config defaults). This is a tuning exercise after first real Stage 1 (USB) measurements. Update config.yaml defaults once empirical values are known.
 **Depends on:** TODO-4 (this PR) — need a working measurement session first.
 **Priority:** P2 — thresholds are conservative defaults; the system works before this is done.
+
+----
+
+### TODO-RATTLE: Harmonic distortion measurement for rattle detection
+**What:** Extend `MeasurementEngine` to extract 2nd and 3rd harmonic impulse responses from the PyTTa log sweep deconvolution. Return `thd_db` (THD by frequency) alongside `spl_db` in the session store and `measure` tool response. Add a `measure_distortion` MCP tool (or flag on `measure`) that sweeps at higher level to provoke rattles, then reports elevated harmonic content with per-frequency THD.
+**Why:** Rattles and port noise are a common source of listening fatigue that users can't diagnose by ear at low levels. Showing the user where harmonic distortion peaks are (e.g. "elevated 2nd harmonic at 35 Hz — likely port resonance or loose panel") is actionable feedback. The log sweep deconvolution already separates harmonics — PyTTa computes these; they're just not being returned.
+**How it works:**
+- A log sweep naturally separates harmonics in the time domain after deconvolution. The 2nd harmonic IR arrives at a predictable earlier time offset; the 3rd harmonic even earlier.
+- `ImpulsiveResponse.py` in PyTTa already handles harmonic extraction when `method='linear'` is used with the right window.
+- Signal classification:
+  - Narrow harmonic peak (elevated 2nd/3rd harmonic) → speaker/port/panel rattle
+  - Broadband THD spike + coherence dip at a single frequency → room object rattle (picture frame, shelf, vent cover, lamp)
+  - Broad coherence dip across a frequency range → port wind noise / turbulence at high excursion
+- Solo each sub (mute others) to localize which sub is driving a rattle; if it persists across all solos, it's room-only.
+- PyTTa can compute **coherence** (correlation of recorded vs reference at each frequency). Room rattles cause sharp coherence dips — often a cleaner detector than THD for high-Q object resonances.
+**User-facing feedback:** Report top frequencies with elevated THD or low coherence, classify the type, and suggest mitigations:
+- Port rattle: add port plug to convert to sealed, tighten HPF below port tuning
+- Driver rattle: reduce boost below port tuning, check spider/surround
+- Panel rattle: brace the enclosure, check binding posts, tighten screws
+- Room object rattle: identify the object at the reported frequency (blu-tack, foam pad under the object, move it)
+**Effort:** M — `measurement.py` changes to extract harmonic IRs and coherence from PyTTa; new `thd_db` + `coherence` fields in `FrequencyResponse`/session store; new or extended MCP tool; Claude skill guidance.
+**Priority:** P2 — valuable diagnostic for multi-sub calibration where rattles are hard to localize. Natural follow-on after basic calibration loop is stable.
+
+----
+
+### TODO-MODES: Room mode identification and classification
+**What:** Analyze the measured FR to distinguish room modes (standing waves) from boundary gain (wall/corner loading). Report identified modes with their frequencies, estimated Q, and whether they are fixable with EQ or not.
+**Why:** Users and even calibration tools routinely try to EQ room modes that can't be fixed — deep nulls from cancellation are unfixable, and boosting them wastes headroom and risks driver damage. Knowing which peaks are modes vs. boundary gain changes the EQ strategy entirely.
+**How it works:**
+- Room modes in a rectangular room occur at predictable frequencies: f = c/2 × sqrt((l/Lx)² + (m/Ly)² + (n/Lz)²). If the user provides room dimensions, we can calculate expected mode frequencies and compare to measured peaks.
+- Without room dimensions: identify peaks with high Q (narrow bandwidth) as likely modes; broad peaks are likely boundary gain. Nulls (deep dips) are cancellation — flag as unfixable.
+- Classify each feature: "broad peak (boundary gain, EQ-able)", "narrow peak (room mode, cut only)", "null (cancellation, leave alone)"
+**User-facing guidance:**
+- Boundary gain: "safe to cut, reduces overall bass level but won't create new problems"
+- Room mode peak: "cut only — boosting the dip on the other side won't fill it in"
+- Null: "this is acoustic cancellation — EQ cannot fix it. Consider repositioning the sub or moving the listening seat."
+**Effort:** M — FR analysis + optional room dimension input in config; Claude skill integration.
+**Priority:** P2 — prevents users from chasing unfixable problems; improves EQ strategy.
+
+----
+
+### TODO-CLIP: Clipping and gain staging detection
+**What:** During measurement, inspect the recorded waveform for clipping (samples at ±full scale) and check gain staging across the chain (AVR volume, DSP input level, DSP output gain). Report if any stage is clipping or if headroom is unbalanced.
+**Why:** Clipping upstream of the DSP means EQ is irrelevant — you're measuring a distorted signal. Gain staging problems are silent: the system appears to work but measurements are unreliable and audio quality is degraded.
+**How it works:**
+- Check `max(abs(recording))` after each sweep — if > 0.95 FS, flag as likely clipping.
+- Check DSP input levels from `get_device_state()` during the sweep — if either input hits 0 dBFS, the DSP is clipping internally.
+- Suggest gain adjustments: lower AVR sweep volume, adjust DSP input gain, or reduce sub amplifier gain.
+**Effort:** S — recording is already available in `MeasurementEngine`; add a post-capture check. DSP input levels already returned by `get_device_state`.
+**Priority:** P1 — silent correctness issue; cheap to detect.
+
+----
+
+### TODO-BOUNDARY: Sub boundary distance estimation with placement suggestions
+**What:** From the measured frequency response shape, estimate how far the sub is from the nearest wall and corner. Compare to the optimal boundary distance for smooth bass response, and suggest whether moving the sub closer or further from boundaries would improve the FR.
+**Why:** Boundary proximity is the single biggest factor in a sub's in-room response after room modes. A sub 30cm from a corner gets ~9 dB of boundary gain at low frequencies; a sub in free space gets none. Understanding placement explains why the FR looks the way it does — and gives actionable improvement advice before any EQ is applied.
+**How it works:**
+- Boundary gain produces a predictable shelving boost at frequencies where the sub-to-wall distance is less than a quarter wavelength. The shelf frequency and boost level encode the approximate distance.
+- Corner loading (two boundaries): ~6 dB more gain than a single boundary; the FR tilt at low frequencies is steeper.
+- Estimate: fit the measured low-frequency shelf to a boundary gain model, extract approximate distance(s).
+- Compare to "golden ratio" placement (room length × 0.276 from front wall is a common starting point for minimizing modal excitation).
+**User-facing guidance:**
+- "Your sub appears to be ~40cm from the rear wall with no side wall loading. Moving it into the corner would add ~6 dB of low bass but may excite the room mode at 32 Hz more strongly."
+- "Your sub appears to be corner-loaded. Moving it 60–90cm from the corner may reduce the 28 Hz peak without losing much output."
+**Effort:** L — requires a curve-fitting model for boundary gain; multiple sub positions make it more complex. Start with single-sub solo measurements.
+**Priority:** P2 — high-value guidance, especially for users with placement flexibility.
+
+----
+
+### TODO-SEATS: Seat-to-seat consistency measurement
+**What:** Measure the frequency response at multiple listening positions (primary seat, left seat, right seat, rear seats) and report how consistent the bass response is across seats. Flag frequencies with high seat-to-seat variance.
+**Why:** A calibration that sounds great in one seat may sound completely different in another. Multi-sub arrays specifically aim to improve seat-to-seat consistency. Knowing the variance before and after calibration is a key success metric.
+**How it works:**
+- Claude guides the user to move the mic to each seat position and take a measurement.
+- Compute mean FR and standard deviation at each frequency across all seats.
+- Report: overall consistency score (mean std dev across 20–80 Hz), worst frequencies, best/worst seats.
+- Compare pre- and post-calibration consistency to show whether the calibration helped.
+**User-facing guidance:**
+- "Seat variance is ±4 dB at 42 Hz — this is a room mode that affects different seats differently. EQ at one seat will make other seats worse. Consider sub repositioning."
+- "After calibration, seat-to-seat variance improved from ±6 dB to ±3 dB across 20–80 Hz."
+**Effort:** M — multiple measurement sessions with positional labels; variance computation; Claude skill to guide the user through each seat.
+**Priority:** P2 — essential metric for multi-sub calibration quality assessment.
+
+----
+
+### TODO-BEFOREAFTER: Calibration before/after comparison
+**What:** Automatically take a "before" measurement at the start of every calibration run and compare it to the "after" measurement at the end. Report the improvement as: RMS deviation reduction from target, peak reduction at identified problem frequencies, and a plain-language summary.
+**Why:** Calibration is abstract — users can't hear a ±2 dB RMS improvement easily. Showing "your 38 Hz peak was +8 dB, now it's +1 dB" makes the value of calibration concrete and builds trust in the system.
+**How it works:**
+- Store the pre-calibration baseline measurement at the start of the recipe execution.
+- After convergence, measure again and diff against the baseline.
+- Compute: RMS deviation (pre vs post vs target), peak count above threshold (pre vs post), worst-case deviation (pre vs post).
+- Generate a summary: "3 peaks reduced by average 5.2 dB. RMS deviation from Harman target: 6.1 dB → 2.3 dB."
+**Effort:** S — measurement infrastructure already exists; just needs a before/after diff step in the recipe execution flow and a summary formatter.
+**Priority:** P1 — low effort, high user satisfaction impact. Should be part of every calibration run.
+
+----
+
+### TODO-PHASE: AVR phase sweep optimization
+**What:** For AVRs with a continuously variable subwoofer phase control (Denon X3800H supports 0°–180°), sweep the phase in increments and measure SPL at each setting. Report the optimal phase for the primary listening position.
+**Why:** Phase alignment between the sub and satellite speakers at the crossover frequency (typically 80 Hz) significantly affects bass punch and clarity. The optimal phase depends on sub placement relative to the main speakers — it cannot be calculated from first principles without measurement.
+**How it works:**
+- Set AVR to a mode where both satellites and sub are playing (or play a sine wave at the crossover frequency, e.g. 80 Hz).
+- Sweep sub phase 0°→180° in 15° increments via denonavr API (if supported) or prompt the user to adjust manually.
+- Measure SPL at the crossover frequency at each phase setting.
+- The phase with the highest SPL at 80 Hz gives the best sub-satellite integration.
+**Note:** Denon X3800H phase control via denonavr library — needs verification that the API supports programmatic phase adjustment. If not, guide the user to adjust manually and press a key at each step.
+**Effort:** M — denonavr phase control verification; sweep loop; crossover-frequency SPL measurement (may need to extend measurement frequency range or use a single-tone measurement).
+**Priority:** P2 — meaningful improvement in perceived bass quality; often overlooked in calibration guides.
+
+----
+
+### TODO-REPORT: Calibration report generation
+**What:** After a calibration run completes, generate a human-readable HTML or PDF report summarizing: hardware configuration, measurements taken, problems found (room modes, rattles, clipping), corrections applied (EQ filters, delay, polarity), before/after FR comparison chart, and recommendations for further improvement.
+**Why:** Users want to share results with home theater forums, keep a record for future reference, or understand what the system did. A report also builds trust — it shows the user exactly what was changed and why.
+**What it includes:**
+- System config (subs, DSP, AVR, mic)
+- Alignment results (delay corrections, polarity flips, level trims)
+- Per-sub FR charts (before/after)
+- Combined FR chart (before/after vs Harman target)
+- Filters applied (listed as human-readable EQ bands, not raw biquad coefficients)
+- Diagnostics: room modes identified, rattles detected, clipping warnings
+- Remaining issues and suggestions (placement, room treatment)
+- Calibration timestamp and session IDs for reproducibility
+**Effort:** M — data is all available in the session store and EQ state; needs a report template (HTML is simplest, PDF via weasyprint or similar). Claude generates the narrative sections.
+**Priority:** P2 — polish feature; implement after core calibration loop is stable and reliable.
 
 ---
 

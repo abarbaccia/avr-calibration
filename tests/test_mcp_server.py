@@ -39,16 +39,23 @@ import pytest
 from calibrate import mcp_server as sut
 from calibrate.mcp_server import (
     _read_resource,
+    _tool_analyze_decay,
+    _tool_analyze_ir,
     _tool_apply_eq,
+    _tool_apply_fir,
     _tool_avr_set_volume,
     _tool_calibrate_level,
     _tool_check_system,
+    _tool_clear_fir,
+    _tool_configure_matrix,
     _tool_fetch_recipe,
     _tool_get_device_state,
     _tool_get_measurement_history,
+    _tool_get_output_state,
     _tool_mute_output,
     _tool_read_eq,
     _tool_set_delay,
+    _tool_set_output_gain,
     _tool_set_polarity,
     _tool_trigger_measurement,
     _tool_unmute_output,
@@ -865,6 +872,13 @@ async def test_list_tools_returns_all_tools() -> None:
     assert "unmute_output" in names
     assert "set_delay" in names
     assert "set_polarity" in names
+    assert "get_output_state" in names
+    assert "set_output_gain" in names
+    assert "apply_fir" in names
+    assert "clear_fir" in names
+    assert "analyze_ir" in names
+    assert "configure_matrix" in names
+    assert "analyze_decay" in names
     assert "check_system" in names
     assert "fetch_recipe" in names
     # Deprecated names should NOT be in tool list
@@ -1190,4 +1204,459 @@ async def test_call_tool_set_volume_dispatch(mock_avr) -> None:
     data = json.loads(texts[0].text)
     assert data["ok"]
     assert data["level_db"] == -30.0
+
+
+# ── get_output_state ─────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_output_state_fresh_returns_defaults(mock_dsp) -> None:
+    """Fresh driver returns defaults: 0dB gain, 0ms delay, not inverted."""
+    defaults = {i: {"gain_db": 0.0, "delay_ms": 0.0, "polarity_inverted": False} for i in range(4)}
+    mock_dsp.get_output_state = MagicMock(return_value=defaults)
+    result = await _tool_get_output_state()
+    assert result["ok"]
+    assert len(result["outputs"]) == 4
+    assert result["outputs"][0]["gain_db"] == 0.0
+    assert result["outputs"][1]["delay_ms"] == 0.0
+    assert result["outputs"][2]["polarity_inverted"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_output_state_reflects_applied_values(mock_dsp) -> None:
+    """After set_delay/set_polarity/set_output_gain, state should reflect them."""
+    mock_dsp.get_output_state = MagicMock(return_value={
+        0: {"gain_db": 0.0, "delay_ms": 0.0, "polarity_inverted": False},
+        1: {"gain_db": -3.5, "delay_ms": 4.2, "polarity_inverted": True},
+        2: {"gain_db": 0.0, "delay_ms": 0.0, "polarity_inverted": False},
+        3: {"gain_db": 0.0, "delay_ms": 0.0, "polarity_inverted": False},
+    })
+    result = await _tool_get_output_state()
+    assert result["ok"]
+    assert result["outputs"][1]["gain_db"] == -3.5
+    assert result["outputs"][1]["delay_ms"] == 4.2
+    assert result["outputs"][1]["polarity_inverted"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_output_state_error(mock_dsp) -> None:
+    mock_dsp.get_output_state = MagicMock(side_effect=Exception("driver gone"))
+    result = await _tool_get_output_state()
+    assert not result["ok"]
+    assert "get_output_state error" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_get_output_state_dispatch(mock_dsp) -> None:
+    from calibrate.mcp_server import call_tool
+    defaults = {i: {"gain_db": 0.0, "delay_ms": 0.0, "polarity_inverted": False} for i in range(4)}
+    mock_dsp.get_output_state = MagicMock(return_value=defaults)
+    texts = await call_tool("get_output_state", {})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "outputs" in data
+
+
+# ── analyze_ir ───────────────────────────────────────────────────────────────
+
+def _make_session_with_ir(session_id: int, peak_time_s: float = 0.005,
+                           positive_peak: bool = True, spl_db: float = -20.0) -> MagicMock:
+    """Build a mock Session with a synthetic IR having a known peak."""
+    import numpy as np
+    sample_rate = 48000
+    n = int(sample_rate * 0.5)  # 500ms
+    ir = np.zeros(n)
+    peak_idx = int(peak_time_s * sample_rate)
+    peak_idx = min(peak_idx, n - 1)
+    amplitude = 10 ** (spl_db / 20.0)
+    ir[peak_idx] = amplitude if positive_peak else -amplitude
+
+    mock_fr = MagicMock()
+    mock_fr.sample_rate = sample_rate
+
+    session = MagicMock()
+    session.id = session_id
+    session.start_fr = mock_fr
+    session.impulse_response = ir.tolist()
+    return session
+
+
+@pytest.mark.asyncio
+async def test_analyze_ir_latest_session() -> None:
+    session = _make_session_with_ir(session_id=3, peak_time_s=0.008, positive_peak=True)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_analyze_ir()
+    assert result["ok"]
+    assert result["session_id"] == 3
+    assert abs(result["peak_time_s"] - 0.008) < 0.001
+    assert result["peak_time_ms"] == pytest.approx(result["peak_time_s"] * 1000, abs=0.1)
+    assert result["peak_sign"] == 1
+    assert "spl_db" in result
+
+
+@pytest.mark.asyncio
+async def test_analyze_ir_negative_peak_sign() -> None:
+    """Inverted polarity should report peak_sign = -1."""
+    session = _make_session_with_ir(session_id=1, positive_peak=False)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_analyze_ir()
+    assert result["ok"]
+    assert result["peak_sign"] == -1
+
+
+@pytest.mark.asyncio
+async def test_analyze_ir_by_session_id() -> None:
+    older = _make_session_with_ir(session_id=2, peak_time_s=0.010)
+    newer = _make_session_with_ir(session_id=5, peak_time_s=0.005)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [newer, older]
+        result = await _tool_analyze_ir(session_id=2)
+    assert result["ok"]
+    assert result["session_id"] == 2
+    assert abs(result["peak_time_s"] - 0.010) < 0.001
+
+
+@pytest.mark.asyncio
+async def test_analyze_ir_session_not_found() -> None:
+    session = _make_session_with_ir(session_id=1)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_analyze_ir(session_id=99)
+    assert not result["ok"]
+    assert "not found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_ir_no_sessions() -> None:
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = []
+        result = await _tool_analyze_ir()
+    assert not result["ok"]
+    assert "no measurements found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_ir_missing_ir() -> None:
+    session = MagicMock()
+    session.id = 1
+    session.start_fr = MagicMock()
+    session.impulse_response = None
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_analyze_ir()
+    assert not result["ok"]
+    assert "no impulse response" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_ir_delay_computation() -> None:
+    """Validate that peak_time_s differences give correct delay offsets."""
+    sub1 = _make_session_with_ir(session_id=1, peak_time_s=0.005)
+    sub2 = _make_session_with_ir(session_id=2, peak_time_s=0.012)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [sub1]
+        r1 = await _tool_analyze_ir(session_id=1)
+        MockStore.return_value.list_sessions.return_value = [sub2]
+        r2 = await _tool_analyze_ir(session_id=2)
+    delay_offset_ms = (r2["peak_time_s"] - r1["peak_time_s"]) * 1000.0
+    assert abs(delay_offset_ms - 7.0) < 1.0, f"Expected ~7ms offset, got {delay_offset_ms:.2f}ms"
+
+
+@pytest.mark.asyncio
+async def test_call_tool_analyze_ir_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+    session = _make_session_with_ir(session_id=1)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        texts = await call_tool("analyze_ir", {})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "peak_time_s" in data
+    assert "peak_sign" in data
+    assert "spl_db" in data
+
+
+# ── set_output_gain ──────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_set_output_gain_success(mock_dsp) -> None:
+    result = await _tool_set_output_gain(output_index=1, gain_db=-6.0)
+    assert result["ok"]
+    assert result["output_index"] == 1
+    assert result["gain_db"] == -6.0
+    mock_dsp.set_output_gain.assert_awaited_once_with(1, -6.0)
+
+
+@pytest.mark.asyncio
+async def test_set_output_gain_driver_error(mock_dsp) -> None:
+    mock_dsp.set_output_gain.side_effect = DriverError("hw failure")
+    result = await _tool_set_output_gain(output_index=2, gain_db=0.0)
+    assert not result["ok"]
+    assert "hw failure" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_set_output_gain_dispatch(mock_dsp) -> None:
+    from calibrate.mcp_server import call_tool
+    texts = await call_tool("set_output_gain", {"output_index": 1, "gain_db": -3.0})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert data["output_index"] == 1
+    assert data["gain_db"] == -3.0
+
+
+# ── apply_fir / clear_fir ────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_apply_fir_success(mock_dsp) -> None:
+    coeffs = [0.0] * 127 + [1.0]  # 128 taps, impulse at end
+    result = await _tool_apply_fir(output_index=1, coefficients=coeffs)
+    assert result["ok"]
+    assert result["output_index"] == 1
+    assert result["taps"] == 128
+    mock_dsp.apply_fir.assert_awaited_once_with(1, coeffs)
+
+
+@pytest.mark.asyncio
+async def test_apply_fir_too_many_taps(mock_dsp) -> None:
+    mock_dsp.apply_fir.side_effect = DriverError("too many FIR taps: 2049 > 2048")
+    result = await _tool_apply_fir(output_index=0, coefficients=[0.0] * 2049)
+    assert not result["ok"]
+    assert "too many FIR taps" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_apply_fir_driver_error(mock_dsp) -> None:
+    mock_dsp.apply_fir.side_effect = DriverError("hw failure")
+    result = await _tool_apply_fir(output_index=1, coefficients=[1.0])
+    assert not result["ok"]
+    assert "hw failure" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_clear_fir_success(mock_dsp) -> None:
+    result = await _tool_clear_fir(output_index=2)
+    assert result["ok"]
+    assert result["output_index"] == 2
+    mock_dsp.clear_fir.assert_awaited_once_with(2)
+
+
+@pytest.mark.asyncio
+async def test_clear_fir_driver_error(mock_dsp) -> None:
+    mock_dsp.clear_fir.side_effect = DriverError("clear failed")
+    result = await _tool_clear_fir(output_index=0)
+    assert not result["ok"]
+    assert "clear failed" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_apply_fir_dispatch(mock_dsp) -> None:
+    from calibrate.mcp_server import call_tool
+    coeffs = [0.5, 0.5]
+    texts = await call_tool("apply_fir", {"output_index": 1, "coefficients": coeffs})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert data["taps"] == 2
+
+
+@pytest.mark.asyncio
+async def test_call_tool_clear_fir_dispatch(mock_dsp) -> None:
+    from calibrate.mcp_server import call_tool
+    texts = await call_tool("clear_fir", {"output_index": 0})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+
+
+# ── configure_matrix ─────────────────────────────────────────────────────────
+
+@pytest.fixture
+def mock_config_with_slots():
+    """Mock _config() returning a config with two active output slots (indices 1, 2)."""
+    cfg = MagicMock()
+    cfg.minidsp.get.side_effect = lambda key, default=None: {
+        "active_input": 0,
+        "output_slots": [
+            {"index": 1, "type": "sub"},
+            {"index": 2, "type": "sub"},
+            {"index": 3, "type": "unused"},
+        ],
+    }.get(key, default)
+    return cfg
+
+
+@pytest.mark.asyncio
+async def test_configure_matrix_default_input(mock_dsp, mock_config_with_slots) -> None:
+    with patch("calibrate.mcp_server._config", return_value=mock_config_with_slots):
+        result = await _tool_configure_matrix()
+    assert result["ok"]
+    assert result["active_input"] == 0
+    assert result["routed_outputs"] == [1, 2]
+    mock_dsp.set_routing.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_configure_matrix_override_input(mock_dsp, mock_config_with_slots) -> None:
+    with patch("calibrate.mcp_server._config", return_value=mock_config_with_slots):
+        result = await _tool_configure_matrix(active_input=1)
+    assert result["ok"]
+    assert result["active_input"] == 1
+    # Other input (0) should be fully muted in the routing call
+    call_args = mock_dsp.set_routing.call_args[0][0]
+    assert all(not v for v in call_args[0].values()), "input 0 should be fully muted"
+
+
+@pytest.mark.asyncio
+async def test_configure_matrix_driver_error(mock_dsp, mock_config_with_slots) -> None:
+    mock_dsp.set_routing.side_effect = DriverError("routing hw failure")
+    with patch("calibrate.mcp_server._config", return_value=mock_config_with_slots):
+        result = await _tool_configure_matrix()
+    assert not result["ok"]
+    assert "routing hw failure" in result["error"]
+
+
+# ── analyze_decay ─────────────────────────────────────────────────────────────
+
+def _make_session_with_ringing_ir(session_id: int = 1) -> MagicMock:
+    """Build a mock Session with a ringing 50Hz IR."""
+    import numpy as np
+    n = 48000 * 2
+    t = np.arange(n) / 48000
+    ir = (np.sin(2 * np.pi * 50 * t) * np.exp(-6.9 / 0.6 * t)).tolist()
+    ir[0] = 1.0
+
+    mock_fr = MagicMock()
+    mock_fr.sample_rate = 48000
+
+    session = MagicMock()
+    session.id = session_id
+    session.start_fr = mock_fr
+    session.impulse_response = ir
+    return session
+
+
+def _make_session_clean_ir(session_id: int = 1) -> MagicMock:
+    """Build a mock Session with a clean (non-ringing) IR."""
+    import numpy as np
+    n = 48000
+    t = np.arange(n) / 48000
+    rng = np.random.default_rng(42)
+    ir = (rng.normal(0, 1.0, n) * np.exp(-6.9 / 0.005 * t)).tolist()
+    ir[0] = 1.0
+
+    mock_fr = MagicMock()
+    mock_fr.sample_rate = 48000
+
+    session = MagicMock()
+    session.id = session_id
+    session.start_fr = mock_fr
+    session.impulse_response = ir
+    return session
+
+
+@pytest.mark.asyncio
+async def test_analyze_decay_latest_session() -> None:
+    session = _make_session_with_ringing_ir(session_id=5)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_analyze_decay()
+    assert result["ok"]
+    assert result["session_id"] == 5
+    assert result["mode_count"] >= 1
+    first = result["modes"][0]
+    assert "freq_hz" in first
+    assert "t60_ms" in first
+    assert "suggested_q" in first
+    assert first["priority"] == 1
+
+
+@pytest.mark.asyncio
+async def test_analyze_decay_by_session_id() -> None:
+    older = _make_session_with_ringing_ir(session_id=3)
+    newer = _make_session_clean_ir(session_id=7)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [newer, older]
+        result = await _tool_analyze_decay(session_id=3)
+    assert result["ok"]
+    assert result["session_id"] == 3
+
+
+@pytest.mark.asyncio
+async def test_analyze_decay_session_not_found() -> None:
+    session = _make_session_with_ringing_ir(session_id=1)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_analyze_decay(session_id=9999)
+    assert not result["ok"]
+    assert "not found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_decay_no_sessions() -> None:
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = []
+        result = await _tool_analyze_decay()
+    assert not result["ok"]
+    assert "no measurements found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_decay_session_missing_ir() -> None:
+    session = MagicMock()
+    session.id = 1
+    session.start_fr = MagicMock()
+    session.impulse_response = None
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_analyze_decay()
+    assert not result["ok"]
+    assert "no impulse response" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_decay_clean_ir() -> None:
+    session = _make_session_clean_ir(session_id=2)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_analyze_decay(t60_threshold_ms=300.0)
+    assert result["ok"]
+    assert result["mode_count"] == 0
+    assert result["modes"] == []
+
+
+@pytest.mark.asyncio
+async def test_analyze_decay_threshold_param() -> None:
+    """A mode with T60~600ms should be filtered out when threshold is 800ms."""
+    session = _make_session_with_ringing_ir(session_id=1)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_analyze_decay(t60_threshold_ms=2000.0)
+    assert result["ok"]
+    assert result["mode_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_analyze_decay_freq_range_param() -> None:
+    """A 50Hz mode should not appear when freq_min=80."""
+    session = _make_session_with_ringing_ir(session_id=1)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_analyze_decay(freq_min=80.0, freq_max=200.0)
+    assert result["ok"]
+    # 50Hz mode should be excluded from the 80-200Hz range
+    for mode in result["modes"]:
+        assert mode["freq_hz"] >= 80.0
+
+
+@pytest.mark.asyncio
+async def test_call_tool_analyze_decay_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+    session = _make_session_with_ringing_ir(session_id=1)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        texts = await call_tool("analyze_decay", {})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "mode_count" in data
+    assert "modes" in data
 

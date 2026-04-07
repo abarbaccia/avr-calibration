@@ -1,335 +1,271 @@
-<!-- /autoplan restore point: /home/andrew/.gstack/projects/abarbaccia-avr-calibration/feat-pi5-headless-readiness-autoplan-restore-20260401-210330.md -->
+# Plan: Decay Analysis + Calibration Improvements
 
-# Plan: Pi 5 Headless Readiness
-
-**Branch:** feat/pi5-headless-readiness
-**Base:** main
-**Date:** 2026-04-01
+**Branch:** main (uncommitted)
+**Date:** 2026-04-07
 
 ## Feature Brief
 
-**One-liner:** The Docker image builds for arm64, the UMIK-1 is auto-detected on Pi 5, and a measurement sweep can be triggered headlessly via CLI or MCP tool without a browser.
+**One-liner:** Expose room-mode T60 decay analysis as an MCP tool so Claude can identify ringing bass frequencies, prioritize them, and recommend EQ correction Q values as part of the calibration loop.
 
-**Why now:** Pi 5 arrives this week. It has 4 USB ports meaning miniDSP and UMIK-1 can coexist for the first time. This unlocks the autonomous calibration loop the Zero 2 W could never run.
+**Problem being solved:** Frequency response measurements capture steady-state magnitude but not time behaviour. A room mode at 50 Hz can ring for 600 ms after a bass transient even if the magnitude peak is already cut by PEQ. `decay.py` identifies which frequencies ring and for how long, provides a priority ranking, and recommends a PEQ Q value to surgically target each mode. Claude uses this after each `measure` call to inform filter design.
 
 **In scope:**
-- arm64 Docker CI build target (GitHub Actions — add `linux/arm64` to platforms)
-- UMIK-1 auto-detection on Pi 5 (sounddevice device enumeration, select UMIK by name)
-- `/api/measure` headless endpoint (Pi-side record via UMIK, not browser getUserMedia)
-- `calibrate measure` CLI works headlessly on Pi 5 (already uses `MeasurementEngine.measure()`)
-- `trigger_measurement` MCP tool returns real result on Pi 5, not degraded mode
+- `analyze_decay` MCP tool — loads IR from `SessionStore`, calls `analyze_decay()`, returns prioritised modes
+- `configure_matrix` MCP tool — already added to `mcp_server.py`; finalize + add tests
+- Recipe reference — add `analyze_decay` note to `harman-bass-persub.md` Phase 2
+- Calibrate skill update — already done (recipe picker with hardware-aware recommendation)
+- Tests for both new MCP tools
 
 **Out of scope:**
-- Full autonomous loop (sweep → analyze → apply EQ → re-measure) — next feature
-- Pi Zero 2 W changes — arm/v7 path stays as-is (browser audio remains)
-- UMIK calibration file (.cal) application — already wired; just needs UMIK detected
+- Waterfall / spectrogram web dashboard (TODO-R3 — P2 UI work, separate PR)
+- `compare_decay` as a separate MCP tool — Claude interprets two sequential `analyze_decay` calls
+- FIR filter generation (miniDSP 2x4 HD doesn't support FIR)
 
-## Problem Decomposition
+---
 
-### What exists today
+## What Already Exists
 
-| Sub-problem | File | Status |
-|-------------|------|--------|
-| CI arm/v7 + amd64 build | `.github/workflows/docker.yml` | Working — platforms: `linux/arm/v7,linux/amd64` |
-| PyTTa included for amd64 | `Dockerfile` else-branch | Working — `--extra measurement` |
-| PyTTa excluded for arm/v7 | `Dockerfile` arm-branch | Correct — browser captures audio on Pi Zero |
-| `calibrate measure` CLI | `calibrate/cli.py:83` + `MeasurementEngine.measure()` | Works on amd64; uses PyTTa PlayRecMeasure |
-| `MeasurementEngine.measure()` | `calibrate/measurement.py:313` | Exists; uses `pytta.PlayRecMeasure`; no UMIK device selection |
-| UMIK detection | `calibrate/mcp_server.py:196-203` | Inline in `_tool_trigger_measurement`; not reusable |
-| MCP `trigger_measurement` | `calibrate/mcp_server.py:189-227` | Detects UMIK, then POSTs to `/api/measure` |
-| `/api/measure` endpoint | `calibrate/web.py` | DOES NOT EXIST — only `/api/measure/start` + `/api/measure/record` |
+| Item | File | State |
+|------|------|-------|
+| `analyze_decay()` pure function | `calibrate/decay.py:29` | Done |
+| `compare_decay()` pure function | `calibrate/decay.py:187` | Done |
+| `DecayMode` dataclass | `calibrate/decay.py:20` | Done |
+| `_t60_to_q()` mapping | `calibrate/decay.py:172` | Done |
+| Unit tests for all decay functions | `tests/test_decay.py` | Done |
+| `configure_matrix` tool impl | `mcp_server.py:482` | Done |
+| `configure_matrix` Tool descriptor | `mcp_server.py:876` | Done |
+| `configure_matrix` dispatch case | `mcp_server.py:971` | Done |
+| `MinidspDriver.configure_active_input()` | `drivers/minidsp.py:275` | Done |
+| IR stored per session in SQLite | `storage.py` | Done (`FrequencyResponse.impulse_response`, first 24 000 samples = 500 ms at 48 kHz) |
+| `harman-bass-persub.md` recipe | `recipes/core/harman-bass-persub.md` | Done (Phases 0–3) |
+| Recipe picker in `/calibrate` skill | `.claude/skills/calibrate/SKILL.md` | Done |
 
-### The critical gap
-
-The MCP tool (`trigger_measurement`) calls `POST /api/measure` which returns 404 today. The whole headless path is blocked on this missing endpoint.
-
-`/api/measure/start` and `/api/measure/record` are the browser-split path. We need a unified headless endpoint that calls `MeasurementEngine.measure()` directly on the Pi.
-
-### Arm64 Docker gap
-
-The Dockerfile's conditional is:
-```bash
-if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]
-```
-Pi 5 has `TARGETARCH=arm64`, `TARGETVARIANT=` (empty). This falls to the else-branch which already runs `uv sync --extra measurement` — PyTTa IS included for arm64. The Dockerfile already handles arm64 correctly. Only CI platforms needs adding.
+---
 
 ## Implementation Steps
 
-### Step 1: CI — Add arm64 platform
-**File:** `.github/workflows/docker.yml`
-**Change:** `platforms: linux/arm/v7,linux/amd64` → `platforms: linux/arm/v7,linux/arm64,linux/amd64`
-**QEMU:** `docker/setup-qemu-action@v3` with `platforms: arm` needs to add `arm64` (or `all`)
-**Build time concern (CEO Finding 5):** aarch64 manylinux wheels exist on PyPI for numpy and scipy. sounddevice C extension needs PortAudio; builder stage already has `portaudio19-dev`. PyTTa is pure Python. Build time for arm64 should be similar to arm/v7 (~30-60 min in QEMU). Consider making arm64 a separate non-blocking workflow job if it proves flaky during initial bringup.
+### Step 1 — Add `_tool_analyze_decay()` async function to `mcp_server.py`
 
-### Step 2.5: Gate — Validate PyTTa device selection (BLOCKING, CEO Finding 2)
-**Before writing Step 3 or Step 4 code, verify this:**
+**Location:** After `_tool_configure_matrix()` (around line 493), before `_tool_check_system()`.
+
 ```python
-import sounddevice as sd
-import pytta
-sd.default.device = (UMIK_INDEX, sd.default.device[1])
-# Does pytta.PlayRecMeasure respect this? Check by logging which device index is opened.
-```
-If PyTTa ignores `sd.default.device`, use sounddevice directly for recording:
-```python
-# Alternative: play via sd.play(), record via sd.rec() with device=UMIK_INDEX
-recording = sd.rec(frames, samplerate=sr, channels=1, device=UMIK_INDEX)
-sd.play(sweep, samplerate=sr, device=output_idx)
-sd.wait()
-```
-This is the sounddevice fallback. Implement this path if PyTTa doesn't expose device selection.
+async def _tool_analyze_decay(
+    session_id: int | None = None,
+    t60_threshold_ms: float = 300.0,
+    freq_min: float = 20.0,
+    freq_max: float = 200.0,
+) -> dict:
+    """Run T60 decay analysis on the impulse response from a stored session."""
+    from .storage import SessionStore
+    from .decay import analyze_decay as _analyze_decay
 
-### Step 2: Add UMIK device detection utility
-**File:** `calibrate/measurement.py`
-**Change:** Add `_find_umik_device(devices) -> int | None` function that searches sounddevice device list for UMIK by name substring.
-
-### Step 3: Wire UMIK device into MeasurementEngine.measure()
-**File:** `calibrate/measurement.py`
-**Change:** Add `input_device_name: str | None = None` parameter to `measure()`. Before creating `pytta.PlayRecMeasure`, if `input_device_name` is set, use sounddevice to find the device index and call `sd.default.device = (input_idx, output_idx)`. PyTTa respects sounddevice defaults.
-
-### Step 4: Add /api/measure headless endpoint
-**File:** `calibrate/web.py`
-**New endpoint:** `POST /api/measure`
-```python
-class HeadlessMeasureRequest(BaseModel):
-    label: str | None = None
-
-@app.post("/api/measure")
-async def measure_headless(body: HeadlessMeasureRequest) -> dict:
-    """Headless measurement for Pi 5. Requires UMIK-1 connected and PyTTa installed."""
     try:
-        import sounddevice as sd
-        devices = sd.query_devices()
-        umik_devices = [(i, d) for i, d in enumerate(devices)
-                        if "UMIK" in str(d.get("name", "")) and d.get("max_input_channels", 0) > 0]
-        if not umik_devices:
-            raise HTTPException(status_code=503, detail="No UMIK microphone found")
-    except ImportError:
-        raise HTTPException(status_code=503, detail="sounddevice not available on this platform")
+        store = SessionStore()
+        sessions = store.list_sessions()
+        if not sessions:
+            return _err("no measurements found — run measure first")
 
-    cfg = Config.load()
-    engine = MeasurementEngine(cfg)
-    device_name = umik_devices[0][1]["name"]
-    try:
-        fr = await asyncio.to_thread(engine.measure, input_device_name=device_name)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        if session_id is not None:
+            session = next((s for s in sessions if s.id == session_id), None)
+            if session is None:
+                return _err(f"session {session_id} not found")
+        else:
+            session = sessions[0]
 
-    store = SessionStore(cfg.db_path)
-    session_id = store.save_measurement(fr, label=body.label or "headless")
-    return {"session_id": session_id, "status": "ok"}
+        ir = session.impulse_response
+        if not ir:
+            return _err(
+                f"session {session.id} has no impulse response stored — "
+                "re-run measure to capture IR"
+            )
+
+        sample_rate = session.start_fr.sample_rate if session.start_fr else 48000
+        modes = _analyze_decay(
+            ir,
+            sample_rate=sample_rate,
+            t60_threshold_ms=t60_threshold_ms,
+            freq_min=freq_min,
+            freq_max=freq_max,
+        )
+
+        return _ok(
+            session_id=session.id,
+            mode_count=len(modes),
+            modes=[
+                {
+                    "freq_hz": m.freq_hz,
+                    "t60_ms": m.t60_ms,
+                    "peak_db": m.peak_db,
+                    "suggested_q": m.suggested_q,
+                    "priority": m.priority,
+                }
+                for m in modes
+            ],
+        )
+    except ValueError as exc:
+        return _err(f"decay analysis error: {exc}")
+    except Exception as exc:
+        return _err(f"analyze_decay failed: {exc}")
 ```
 
-### Step 5: Update MCP trigger_measurement
-**File:** `calibrate/mcp_server.py`
-**Changes (CEO Finding 3 — all 4 locations):**
-- Line 191: docstring "Requires Pi 4" → "Requires Pi 5"
-- Line 201-203: "trigger_measurement requires Pi 4 — no UMIK" → "trigger_measurement requires Pi 5"
-- Line 206-209: "trigger_measurement requires Pi 4 — audio device" → "trigger_measurement requires Pi 5"
-- `_TOOLS` tool description line 388-390: "Requires Pi 4 4GB" → "Requires Pi 5 (4 USB ports)"
-- Pass `{"label": "mcp-triggered"}` — already correct
-- No structural changes needed (already POSTs to `/api/measure`)
+**Notes on IR window:** 500 ms (24 000 samples) supports reliable T60 estimation up to ~1.5 s. Modes with T60 > 1.5 s will be underestimated, not silently missed. Adequate for typical room modes in the 300–800 ms range.
 
-### Step 6: Tests
-- `tests/test_measurement_headless.py`: test `/api/measure` endpoint
-  - UMIK detected: returns session_id
-  - No UMIK: 503
-  - sounddevice unavailable: 503
-  - sounddevice device detection mocked
-- `tests/test_measurement.py`: test `MeasurementEngine.measure(input_device_name=...)` sets sd.default.device
-- CI arm64 build: validated by GitHub Actions (no unit test)
+---
+
+### Step 2 — Add `Tool` descriptor to `_TOOLS` list
+
+**Location:** After `configure_matrix` Tool block (around line 893), before `check_system` Tool.
+
+```python
+Tool(
+    name="analyze_decay",
+    description=(
+        "Analyze room-mode T60 decay in the impulse response from a stored measurement. "
+        "Returns a list of ringing modes sorted by priority (T60 × peak_amplitude), "
+        "each with freq_hz, t60_ms, peak_db, and suggested_q for EQ targeting. "
+        "Modes with T60 > 300ms are flagged — PEQ cuts at suggested_q will reduce "
+        "peak energy. "
+        "Call after measure() to identify problem frequencies before designing EQ filters."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "integer",
+                "description": "Session ID to analyse. Omit to analyse the most recent session.",
+            },
+            "t60_threshold_ms": {
+                "type": "number",
+                "description": "Minimum T60 in ms to flag as a ringing mode (default: 300).",
+                "default": 300.0,
+            },
+            "freq_min": {
+                "type": "number",
+                "description": "Lower frequency bound in Hz (default: 20).",
+                "default": 20.0,
+            },
+            "freq_max": {
+                "type": "number",
+                "description": "Upper frequency bound in Hz (default: 200).",
+                "default": 200.0,
+            },
+        },
+    },
+),
+```
+
+---
+
+### Step 3 — Add dispatch case in `call_tool()`
+
+**Location:** After `configure_matrix` elif, before `check_system` elif:
+
+```python
+elif name == "analyze_decay":
+    result = await _tool_analyze_decay(
+        session_id=int(arguments["session_id"]) if "session_id" in arguments else None,
+        t60_threshold_ms=float(arguments.get("t60_threshold_ms", 300.0)),
+        freq_min=float(arguments.get("freq_min", 20.0)),
+        freq_max=float(arguments.get("freq_max", 200.0)),
+    )
+```
+
+---
+
+### Step 4 — Fix `configure_matrix` Tool description (signal path write warning)
+
+Per the hard rule in `mcp_server.py` docstring: all tools that write to hardware must carry `_SIGNAL_PATH_WRITE_WARNING` in their description. `configure_matrix` writes to the miniDSP routing matrix (hardware write) but is missing this warning. Fix the Tool descriptor description to append `_SIGNAL_PATH_WRITE_WARNING`.
+
+---
+
+### Step 5 — Add `analyze_decay` to calibrate SKILL.md tool list
+
+In `.claude/skills/calibrate/SKILL.md` tool list (Step 3 section), add:
+```
+- `analyze_decay` — T60 decay analysis on the IR from a measurement; returns ringing modes with priority and suggested_q
+```
+
+---
+
+### Step 6 — Add decay analysis note to `harman-bass-persub.md`
+
+In Phase 2 (Per-Sub Room Correction), after applying per-sub EQ, add:
+
+```markdown
+**Optional: Decay analysis after per-sub EQ**
+After applying per-sub corrections, call `analyze_decay(session_id)` on the most
+recent solo measurement to check if any modes exhibit T60 > 500ms. If so, use
+`suggested_q` from that mode when designing the PEQ cut — a narrower Q targets
+the ringing frequency more surgically without over-cutting broadband.
+```
+
+---
+
+### Step 7 — Tests
+
+#### New tests for `_tool_analyze_decay` (add to `tests/test_mcp_server.py`)
+
+| Test | Setup | Assert |
+|------|-------|--------|
+| `test_analyze_decay_latest_session` | Mock store with a session with a ringing IR | `ok=True`, `mode_count >= 1`, priority-1 mode has `freq_hz`, `t60_ms`, `suggested_q` |
+| `test_analyze_decay_by_session_id` | Two sessions; pass `session_id` of older one | `result["session_id"] == older_id` |
+| `test_analyze_decay_session_not_found` | Pass `session_id=9999`, store returns `[]` | `ok=False`, error contains "not found" |
+| `test_analyze_decay_no_sessions` | `list_sessions()` returns `[]` | `ok=False`, error contains "no measurements found" |
+| `test_analyze_decay_session_missing_ir` | Session with `impulse_response=None` | `ok=False`, error contains "no impulse response" |
+| `test_analyze_decay_clean_ir` | Session with clean impulse (no modes > 300 ms) | `ok=True`, `mode_count=0`, `modes=[]` |
+| `test_analyze_decay_threshold_param` | Mode with T60=400 ms; call with `t60_threshold_ms=500.0` | `mode_count=0` (filtered out) |
+| `test_analyze_decay_freq_range_param` | Mode at 150 Hz; call with `freq_max=120.0` | Mode not returned |
+
+#### New tests for `configure_matrix` (add to `tests/test_mcp_server.py`)
+
+| Test | Setup | Assert |
+|------|-------|--------|
+| `test_configure_matrix_default_input` | Patch `_dsp.configure_active_input`; config `active_input: 0` | Called with `0`, `ok=True` |
+| `test_configure_matrix_override_input` | Pass `active_input=1` | Called with `1` |
+| `test_configure_matrix_driver_error` | `configure_active_input` raises `DriverError` | `ok=False` |
+
+---
 
 ## Risk Assessment
 
-### R1: PyTTa/sounddevice arm64 build — MEDIUM
-PyTTa requires sounddevice which requires PortAudio. PortAudio (`portaudio19-dev`) is already in the builder stage. sounddevice on arm64 should build from source via PyPI (manylinux wheels exist for aarch64). PyTTa itself is a pure-Python wrapper around sounddevice + numpy. Verdict: likely works, but untested. If it fails, fallback is to skip PyTTa `PlayRecMeasure` and implement play+record via sounddevice directly.
+| Risk | Severity | Mitigation |
+|------|----------|------------|
+| IR window (500 ms) underestimates T60 > 1.5 s | Low | Underestimated, not missed. Note in tool description. |
+| `analyze_decay` compute cost on Pi 5 | Low | 24 000 samples × nperseg=2048 is tiny for scipy. |
+| Claude calls `analyze_decay` with no prior `measure` | Low | Returns `_err("no measurements found")` |
+| `configure_matrix` missing signal path write warning | Low | Fixed in Step 4. |
 
-### R2: pytta.PlayRecMeasure ignores sd.default.device — HIGH (must verify)
-If PyTTa opens its own PortAudio stream without respecting `sd.default.device`, UMIK selection won't work. Mitigation: test on amd64 first; if PyTTa ignores defaults, implement UMIK recording via `sounddevice.rec()` directly (bypass PyTTa for the record step; still use PyTTa for sweep generation).
-
-### R3: /api/measure called from browser accidentally — LOW
-New endpoint should only be called from MCP or CLI. No browser JS calls it. Already isolated by endpoint name.
-
-### R4: Pi 5 USB enumeration order — LOW
-On Pi 5, USB devices enumerate in plug-in order. UMIK device index could be 0, 1, or 2 depending on what else is plugged in. The name-based search (`_find_umik_device`) handles this correctly regardless of index.
-
-## Eng Review Additions
-
-### P0: Measurement lock required (F1 + F2)
-`sd.default.device` is a global shared across threads. Two concurrent `/api/measure` calls will race on PortAudio. Fix: add module-level `asyncio.Lock` in web.py, held for the full duration of `measure()`. Return HTTP 409 if lock is already held.
-
-```python
-_measurement_lock = asyncio.Lock()
-
-@app.post("/api/measure")
-async def measure_headless(body: HeadlessMeasureRequest) -> dict:
-    if _measurement_lock.locked():
-        raise HTTPException(status_code=409, detail="measurement already in progress")
-    async with _measurement_lock:
-        ...
-```
-
-The lock also prevents the `sd.default.device` race (F1) since no two calls can set the device concurrently.
-
-### P1: Dockerfile — arm64 gets wrong minidsp binary (F6)
-Current: `if [ "$ARCH" = "amd64" ]; then DEB_ARCH="amd64"; else DEB_ARCH="armhf"; fi`
-For TARGETARCH=arm64, ARCH="arm64" → falls to else → DEB_ARCH="armhf" → 32-bit binary on 64-bit kernel → Exec format error.
-
-Fix:
-```bash
-if [ "$ARCH" = "amd64" ]; then DEB_ARCH="amd64"; \
-elif [ "$ARCH" = "arm64" ]; then DEB_ARCH="arm64"; \
-else DEB_ARCH="armhf"; fi
-```
-(Verify `minidsp_0.1.12-1_arm64.deb` exists in mrene/minidsp-rs releases.)
-
-### P1: QEMU needs arm64 (F7)
-Fix: `platforms: arm,arm64` (or `platforms: all`) in `docker/setup-qemu-action@v3`.
-
-### P1: measure() missing input_device_name param (F4)
-Must implement BEFORE Step 4 endpoint. Current signature has no params. Add:
-```python
-def measure(self, input_device_name: str | None = None) -> FrequencyResponse:
-    ...
-    if input_device_name:
-        import sounddevice as sd
-        devs = sd.query_devices()
-        for i, d in enumerate(devs):
-            if input_device_name in str(d.get("name", "")) and d.get("max_input_channels", 0) > 0:
-                sd.default.device = (i, sd.default.device[1] if isinstance(sd.default.device, tuple) else sd.default.device)
-                break
-```
-
-### P1: SessionStore() call pattern (F5)
-All existing calls use `SessionStore()` with no args. Plan draft incorrectly used `SessionStore(cfg.db_path)`. Fix: use `store = SessionStore()`.
-
-### P1: UMIK disconnect / PortAudioError not caught (F3 + F11)
-`measure()` calls `_compute_fr()` directly (not `compute_fr()`), bypassing quality checks. Two fixes:
-1. Wrap `meas.run()` in try/except for all exceptions, re-raise as RuntimeError
-2. Call `validate_recording()` inside `measure()` before deconvolution
-3. In the endpoint, catch both `RuntimeError` and `sounddevice.PortAudioError` → 503
-
-### P2: Add mic_device_name config key (F9)
-UMIK may present as "C-Media USB Audio Device" on Linux. Add to config defaults:
-```yaml
-measurement:
-  mic_device_name: "UMIK"   # substring match for input device name
-```
-`_find_umik_device()` uses this config key instead of hardcoded "UMIK".
-
-### P2: MCP timeout too short (F10)
-`httpx.AsyncClient(timeout=30.0)` in `_tool_trigger_measurement()` — a 3s sweep + Pi 5 startup can exceed 30s under load. Increase to `timeout=60.0`. Document expected latency in tool description.
-
-### P2: sounddevice aarch64 wheel validation (F8)
-Before declaring arm64 ready: verify PyPI `sounddevice` has `manylinux_2_17_aarch64` wheel. If falls back to source build, builder stage has `portaudio19-dev` — will succeed but be slower.
-
-### P3: measure() headless path skips quality gate (F12)
-Add `validate_recording()` call inside `measure()` before `_compute_fr()`. Already in plan (F3 fix — same change).
+---
 
 ## Done Criteria
-- `docker build --platform linux/arm64` succeeds in CI and image pushes to ghcr.io
-- On Pi 5: `calibrate measure` completes, saves a measurement file with real data (UMIK used as input)
-- On Pi 5: MCP `trigger_measurement` call returns `{"status": "ok", "session_id": N}` not `{"error": "..."}`
-- All existing tests pass (arm/v7 + amd64 paths unchanged)
 
-## Eng Review — Test Plan
-Test plan artifact: `~/.gstack/projects/abarbaccia-avr-calibration/andrew-feat-pi5-headless-readiness-test-plan-20260401-211515.md`
+- [ ] `_tool_analyze_decay()` added to `mcp_server.py`
+- [ ] `analyze_decay` Tool descriptor added to `_TOOLS`
+- [ ] Dispatch elif added in `call_tool()` for `analyze_decay`
+- [ ] `configure_matrix` Tool descriptor has `_SIGNAL_PATH_WRITE_WARNING` appended
+- [ ] `analyze_decay` in calibrate SKILL.md tool list
+- [ ] Decay analysis note added to `harman-bass-persub.md` Phase 2
+- [ ] 8 tests for `_tool_analyze_decay` in `tests/test_mcp_server.py`
+- [ ] 3 tests for `configure_matrix` in `tests/test_mcp_server.py`
+- [ ] All existing `tests/test_decay.py` tests pass
+- [ ] TODOS.md: TODO-R3 updated — `analyze_decay` MCP tool is the CLI/MCP primitive; web waterfall dashboard remains P2
 
-New test files:
-- `tests/test_measurement_headless.py` — 9 new tests for `measure()` device param + `_find_umik_device()`
-- `tests/test_api_measure_headless.py` — 5 new integration tests for `POST /api/measure`
-- Update `tests/test_mcp_server.py` — update "Pi 4" → "Pi 5" assertions, verify 60s timeout
+---
 
-## Eng Review — NOT In Scope (confirmed deferred)
-- CamillaDSP or other DSP driver (zero relevance to Pi 5)
-- sounddevice aarch64 wheel caching in CI (optimization, not correctness)
-- Full PyTTa device selection rewrite (try `sd.default.device` first; fallback only if broken)
-- arm64 native runner (too expensive for hobby project; QEMU acceptable)
+## How Claude Uses `analyze_decay` in the Calibration Loop
 
-## Eng Review — What Already Exists
-| Sub-problem | Existing code |
-|---|---|
-| Headless sweep measurement | `measurement.py:313` `measure()` — exists; needs device param + quality gate |
-| UMIK detection (inline) | `mcp_server.py:196-203` — extract into utility |
-| Session persistence | `web.py SessionStore()` pattern — established; use no-arg form |
-| Measurement quality validation | `measurement.py validate_recording()` — exists; wire into `measure()` |
-| PortAudio runtime | `libportaudio2` in Dockerfile runtime stage — already installed |
-| PyTTa deps for arm64 | Dockerfile else-branch — already includes `--extra measurement` |
-
-## Not In Scope (confirmed deferred)
-- Full autonomous loop (analyze → apply EQ → re-measure)
-- MicDriver abstraction (TODO-DA1) — design doc exists; implement after headless path is validated
-- Multi-channel sweep (TODO-6) — Pi 5 HDMI audio driver opens that door, but deferred
-- Pi Zero 2 W: zero changes to arm/v7 Dockerfile path
-
-## CEO Review — NOT In Scope (deferred)
-- PyTTa measurement quality validation vs. REW (TODO-MQ1 — prerequisite before autonomous loop feature)
-- Making arm64 a non-blocking CI job — do if arm64 build proves flaky
-- MicDriver abstraction (TODO-DA1) — implement after this feature validates the Pi 5 path
-
-## CEO Review — What Already Exists
-- `calibrate measure` CLI uses `MeasurementEngine.measure()` — headless path already validated on amd64
-- UMIK detection logic in `mcp_server.py:196-203` — inline, extract into utility
-- Dockerfile else-branch already handles arm64 with PyTTa included
-- CI QEMU setup already configured; just needs `arm64` added
-
-## CEO Review — Failure Modes Registry
-
-| Mode | Trigger | Impact | Mitigation |
-|------|---------|--------|------------|
-| PyTTa ignores sd.default.device | PyTTa opens own PortAudio stream | Wrong device records; garbage FR | Step 2.5 gate; sounddevice fallback |
-| sounddevice C extension fails arm64 | Missing PortAudio headers | PyTTa import fails; CLI 503 | portaudio19-dev already in builder stage |
-| UMIK not found by name | Device shows as "C-Media USB" not "UMIK" | 503 on all measurements | Add `mic_device_name` config key for substring |
-| /api/measure called during browser session | Concurrent measurement | Double-sweep, race condition | Add `_measurement_lock: asyncio.Lock()` in web.py |
-| arm64 CI QEMU timeout | Large C extension builds | CI failure | Separate non-blocking arm64 job |
-
-## CEO Review — Dream State Delta
 ```
-CURRENT STATE (today, Pi Zero 2 W):
-  miniDSP connected via USB OTG (single port)
-  UMIK-1 on laptop → browser getUserMedia → Float32 sent to Pi
-  Manual: human opens browser, clicks measure, reads results
-
-THIS PLAN (Pi 5, this branch):
-  miniDSP + UMIK-1 both connected (4 ports)
-  MCP trigger_measurement → /api/measure → MeasurementEngine → FR saved
-  calibrate measure CLI also works on Pi 5
-  Browser path unchanged (still works for manual use)
-
-12-MONTH IDEAL:
-  Claude agent calls trigger_measurement → gets FR → calls apply_eq → calls trigger_measurement again
-  Closed loop runs until FR matches Harman target within tolerance
-  Human reviews at end; each iteration takes <60s
+measure()                     → session_id
+analyze_decay(session_id)     → [{freq_hz: 50, t60_ms: 620, peak_db: +4.2, suggested_q: 2.8, priority: 1}, ...]
+apply_eq(filters using suggested_q for priority modes)
+measure()                     → new session_id
+analyze_decay(new session_id) → verify T60 reduced
 ```
 
-## Decision Audit Trail
+PEQ cuts at `suggested_q` reduce peak energy at the ringing frequency. This is the limit of what the miniDSP 2x4 HD supports (no FIR). Claude reports residual T60 after EQ and advises on room treatment if ringing persists.
 
-| # | Phase | Decision | Classification | Principle | Rationale | Rejected |
-|---|-------|----------|----------------|-----------|-----------|----------|
-| 1 | CEO | Add Step 2.5 gate — validate PyTTa device selection before endpoint ships | Mechanical | P1 completeness | R2 is Critical; endpoint with wrong device records garbage FR | Ship without validation |
-| 2 | CEO | Fix all 4 "Pi 4" references in mcp_server.py (docstring + 2 errors + tool desc) | Mechanical | P1 completeness | All 4 are wrong; plan Step 5 originally missed docstring | Fix only error messages |
-| 3 | CEO | Reject SSH-to-CLI alternative (Finding 4) | Mechanical | P3 pragmatic | MCP server is the designed integration point; SSH is a workaround | Replace MCP with SSH |
-| 4 | CEO | Note arm64 CI build time concern; check aarch64 wheels | Mechanical | P1 completeness | QEMU arm64 could be slow; document the risk | Ignore |
-| 5 | CEO | Add measurement quality validation to TODOS.md | Mechanical | P2 boil lakes | Valid concern; prerequisite for autonomous loop; zero code in this PR | Include in this PR |
-| 6 | CEO | TASTE: Ship infra-only vs. include loop iteration | TASTE | User chose scope | User explicitly picked "headless trigger + infra" scope in /feature | See gate |
-| 7 | CEO | TASTE: PyTTa quality validation as prerequisite for next feature | TASTE | P3 pragmatic | Important long-term concern; zero relevance to arm64 infra work | See gate |
-| 8 | Eng | P0: Add _measurement_lock asyncio.Lock to prevent concurrent sweep + sd.default.device race | Mechanical | P1 completeness | Two concurrent calls race on PortAudio global state | Accept race |
-| 9 | Eng | P1: Fix Dockerfile arm64 minidsp binary selection (armhf → arm64) | Mechanical | P1 completeness | armhf binary on arm64 kernel = Exec format error; minidspd never starts | Leave armhf |
-| 10 | Eng | P1: Fix QEMU platforms to include arm64 | Mechanical | P1 completeness | Without aarch64 QEMU, arm64 build fails at first RUN | Leave arm only |
-| 11 | Eng | P1: Implement measure(input_device_name) before Step 4 | Mechanical | P5 explicit | Plan's endpoint calls this param; current signature has none → TypeError | Hardcode device |
-| 12 | Eng | P1: Use SessionStore() not SessionStore(cfg.db_path) | Mechanical | P3 pragmatic | All existing calls use no-arg pattern; inconsistency causes TypeError | Use db_path |
-| 13 | Eng | P1: Catch PortAudioError + add validate_recording in measure() | Mechanical | P1 completeness | Disconnect mid-measure returns garbage FR silently saved to DB | Accept garbage |
-| 14 | Eng | P2: Add mic_device_name config key for Linux device name mismatch | Mechanical | P1 completeness | UMIK presents as "C-Media USB" on Linux; hardcoded "UMIK" fails | Hardcode "UMIK" |
-| 15 | Eng | P2: Increase MCP trigger_measurement timeout to 60s | Mechanical | P1 completeness | 30s too short for 3s sweep + deconvolution on Pi 5 under load | Leave 30s |
-| 16 | Eng | P3: validate_recording in measure() headless path | Mechanical | P1 completeness | Same fix as decision 13; no separate work | Separate task |
+---
 
-## GSTACK REVIEW REPORT
+## Previous Plan
 
-| Review | Trigger | Why | Runs | Status | Findings |
-|--------|---------|-----|------|--------|----------|
-| CEO Review | `/autoplan` | Scope & strategy | 1 | issues_open | 7 findings; 2 taste decisions at gate; 5 auto-decided; QEMU + PyTTa gate + "Pi 4" coverage added |
-| CEO Voices | `/autoplan` | Dual independent review | 1 | subagent-only | Codex unavailable; Claude subagent: 6 findings (1 critical, 2 high, 3 medium/low) |
-| Design Review | skipped | No UI scope | 0 | — | — |
-| Eng Review | `/autoplan` | Architecture & tests | 1 | issues_open | 13 findings (2 P0, 5 P1, 4 P2, 2 P3); all auto-decided; test plan written |
-| Eng Voices | `/autoplan` | Dual independent review | 1 | subagent-only | Codex unavailable; Claude subagent: 13 findings |
-
-**VERDICT:** REVIEWED [subagent-only, Codex unavailable]. Critical bugs caught: armhf minidsp binary on arm64 (P1), QEMU missing arm64 (P1), no measurement lock (P0). Plan is implementation-ready.
+The prior plan (`Pi 5 Headless Readiness`, 2026-04-01) covered arm64 CI, UMIK auto-detection, and the headless `/api/measure` endpoint. That plan is preserved in git history. The work in this plan is independent and can be merged to main without dependency on the Pi 5 infrastructure changes.

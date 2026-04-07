@@ -67,15 +67,6 @@ class SubIRResult:
     spl_db: float
 
 
-@dataclass
-class AlignmentSummary:
-    """Final alignment result returned to the browser after all phases complete."""
-
-    sub_results: list[SubIRResult]
-    delay_offsets_ms: list[float]   # per-sub delay written to miniDSP
-    gain_trims_db: list[float]      # per-sub gain trim written to miniDSP
-
-
 # ── Phase helpers ──────────────────────────────────────────────────────────────
 
 def extract_ir(
@@ -296,93 +287,3 @@ async def apply_delays(
             )
 
 
-async def run_alignment_phases(
-    ir_results: list[SubIRResult],
-    sub_outputs: list[int],
-    client: "MinidspClient",
-) -> AlignmentSummary:
-    """Run Phases 2-4 and return the alignment summary.
-
-    Phases:
-      2 — compute + apply delay offsets
-      3 — detect + correct polarity
-      4 — level-match gains
-    """
-    # Phase 2 — delays
-    delay_offsets = compute_delay_offsets(ir_results)
-    await apply_delays(delay_offsets, ir_results, sub_outputs, client)
-
-    # Phase 3 — polarity
-    ir_results = await detect_and_correct_polarity(ir_results, sub_outputs, client)
-
-    # Phase 4 — level matching
-    gain_trims = await level_match_subs(ir_results, sub_outputs, client)
-
-    return AlignmentSummary(
-        sub_results=ir_results,
-        delay_offsets_ms=delay_offsets,
-        gain_trims_db=gain_trims,
-    )
-
-
-async def run_full_alignment(
-    sub_outputs: list[int],
-    client: "MinidspClient",
-    engine: "MeasurementEngine",
-    measure_fn=None,
-) -> dict:
-    """Run all alignment phases (1-4) including per-sub measurement.
-
-    Phase 1: mute all subs except one, measure, extract IR, repeat
-    Phases 2-4: compute delays, correct polarity, level-match
-
-    Returns a dict with alignment summary fields.
-    """
-    ir_results: list[SubIRResult] = []
-
-    # Phase 1 — measure each sub individually
-    for i, output_idx in enumerate(sub_outputs):
-        others = [o for o in sub_outputs if o != output_idx]
-        log.info("Phase 1: measuring sub %d (output %d), muting %s", i, output_idx, others)
-        await client.mute_outputs(others)
-        try:
-            # Use measure_fn (DenonSweepContext wrapper) if available, else direct
-            if measure_fn:
-                fr = await measure_fn()
-            else:
-                fr = await engine.measure(label=f"align-sub-{i}")
-
-            # Extract IR from the measurement
-            import numpy as np
-            sweep_samples = fr.frequencies  # placeholder — need raw sweep/recording
-            # For now, use the frequency response SPL as a proxy for alignment
-            # The full IR extraction requires raw time-domain data from the sweep
-            ir_result = SubIRResult(
-                sub_index=i,
-                peak_time_s=0.0,  # TODO: extract from raw IR
-                peak_sign=1,
-                polarity_inverted=False,
-                spl_db=float(np.mean(fr.spl_db)) if fr.spl_db else -99.0,
-            )
-            ir_results.append(ir_result)
-        finally:
-            await client.unmute_outputs(others)
-
-    # Phases 2-4 — delay, polarity, level matching
-    summary = await run_alignment_phases(ir_results, sub_outputs, client)
-
-    return {
-        "delays": {
-            sub_outputs[i]: round(d, 2)
-            for i, d in enumerate(summary.delay_offsets_ms)
-        },
-        "polarity_flipped": [
-            sub_outputs[i]
-            for i, r in enumerate(summary.sub_results)
-            if r.polarity_inverted
-        ],
-        "gain_trims": {
-            sub_outputs[i]: round(g, 2)
-            for i, g in enumerate(summary.gain_trims_db)
-        },
-    }

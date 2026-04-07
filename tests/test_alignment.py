@@ -358,24 +358,3 @@ async def test_apply_delays_client_failure_logged() -> None:
     # Must not raise — failure is swallowed with a warning
     await apply_delays([5.0], results, [0], client)
 
-
-# ── run_alignment_phases ───────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_run_alignment_phases_returns_summary() -> None:
-    """run_alignment_phases runs all four phases and returns an AlignmentSummary."""
-    from calibrate.alignment import run_alignment_phases, AlignmentSummary
-
-    client = AsyncMock()
-    results = [
-        SubIRResult(sub_index=0, peak_time_s=0.010, peak_sign=1, polarity_inverted=False, spl_db=-20.0),
-        SubIRResult(sub_index=1, peak_time_s=0.012, peak_sign=1, polarity_inverted=False, spl_db=-22.0),
-    ]
-    summary = await run_alignment_phases(results, [0, 1], client)
-    assert isinstance(summary, AlignmentSummary)
-    assert len(summary.sub_results) == 2
-    assert len(summary.delay_offsets_ms) == 2
-    assert len(summary.gain_trims_db) == 2
-    # Sub 0 needs +2 ms delay; sub 1 is reference (0.0)
-    assert abs(summary.delay_offsets_ms[0] - 2.0) < 0.01
-    assert abs(summary.delay_offsets_ms[1]) < 0.01

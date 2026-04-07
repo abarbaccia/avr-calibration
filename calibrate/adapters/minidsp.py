@@ -35,6 +35,15 @@ MAX_DELAY_MS: float = 30.0
 MAX_OUTPUT_INDEX: int = 3
 """Highest valid output index for miniDSP 2x4 HD (4 outputs: 0-3)."""
 
+FIR_MAX_TAPS_PER_OUTPUT: int = 2048
+"""Maximum FIR taps per output channel on the miniDSP 2x4 HD."""
+
+FIR_SHARED_TAP_POOL: int = 4096
+"""Total FIR taps shared across all 4 outputs. Each output takes from this pool."""
+
+FIR_SAMPLE_RATE: int = 96000
+"""Internal sample rate of the miniDSP 2x4 HD FIR engine."""
+
 APF_RESERVED_SLOTS: frozenset[int] = frozenset({0, 1})
 """PEQ slot indices reserved for APF all-pass filters (TODO-10).
 
@@ -69,11 +78,16 @@ class MinidspApiError(RuntimeError):
 
 # ── CLI helper ─────────────────────────────────────────────────────────────────
 
-async def _run_minidsp_cli(*args: str) -> None:
+async def _run_minidsp_cli(*args: str, ignore_exit_codes: tuple[int, ...] = ()) -> None:
     """Run a minidsp CLI command, raising MinidspApiError on non-zero exit.
 
     The CLI connects to minidspd's WebSocket transport, which correctly handles
     PEQ biquad writes without the DSP hang caused by the HTTP batch-write path.
+
+    *ignore_exit_codes*: exit codes that are treated as success. Used for FIR
+    commands (import, clear) which return exit code 1 due to an unrecognised
+    post-load device response (cmd_id: 01) even though the write succeeds.
+    See mrene/minidsp-rs#766.
     """
     proc = await asyncio.create_subprocess_exec(
         "minidsp", *args,
@@ -81,7 +95,7 @@ async def _run_minidsp_cli(*args: str) -> None:
         stderr=asyncio.subprocess.PIPE,
     )
     _, stderr = await proc.communicate()
-    if proc.returncode != 0:
+    if proc.returncode != 0 and proc.returncode not in ignore_exit_codes:
         raise MinidspApiError(
             proc.returncode or 1,
             f"minidsp {' '.join(args)}: {stderr.decode().strip()}",
@@ -216,34 +230,30 @@ class MinidspClient:
             )
 
     async def set_output_gain(self, output: int, gain_db: float) -> None:
-        """Set output *output* gain to *gain_db* dB.
+        """Set output *output* gain to *gain_db* dB via CLI.
 
+        Uses CLI (not HTTP) to avoid state resets from the HTTP transport.
         Typical use: mute with MUTE_GAIN_DB (-127) or restore to 0.0.
         """
         self._validate_output(output)
-        await self._post_config({"outputs": [{"index": output, "gain": gain_db}]})
+        await _run_minidsp_cli("output", str(output), "gain", "--", str(gain_db))
 
     async def mute_outputs(self, output_indices: list[int]) -> None:
-        """Mute multiple outputs in parallel by setting gain to -127 dB.
+        """Mute outputs sequentially via CLI (output mute on).
 
-        Raises MinidspApiError if any output fails to mute.
+        Sequential (not parallel) to avoid concurrent CLI invocations that
+        can corrupt device state via the WebSocket transport.
         """
-        tasks = [self.set_output_gain(idx, self.MUTE_GAIN_DB) for idx in output_indices]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        errors = [
-            (idx, r) for idx, r in zip(output_indices, results)
-            if isinstance(r, Exception)
-        ]
-        if errors:
-            detail = "; ".join(f"output {idx}: {e}" for idx, e in errors)
-            raise MinidspApiError(0, f"mute_outputs partial failure: {detail}")
+        for idx in output_indices:
+            await _run_minidsp_cli("output", str(idx), "mute", "on")
 
     async def unmute_outputs(self, output_indices: list[int]) -> None:
-        """Unmute multiple outputs in parallel by restoring gain to 0 dB."""
-        await self.restore_all_gains(output_indices)
+        """Unmute outputs sequentially via CLI (output mute off)."""
+        for idx in output_indices:
+            await _run_minidsp_cli("output", str(idx), "mute", "off")
 
     async def set_output_delay(self, output: int, delay_ms: float) -> None:
-        """Set output *output* delay to *delay_ms* milliseconds.
+        """Set output *output* delay to *delay_ms* milliseconds via CLI.
 
         Raises ValueError if delay_ms is negative or > MAX_DELAY_MS.
         """
@@ -254,20 +264,16 @@ class MinidspClient:
             raise ValueError(
                 f"delay_ms={delay_ms} exceeds hardware maximum {MAX_DELAY_MS} ms"
             )
-        total_nanos = int(round(delay_ms * 1_000_000))
-        secs, nanos = divmod(total_nanos, 1_000_000_000)
-        await self._post_config({
-            "outputs": [{"index": output, "delay": {"secs": secs, "nanos": nanos}}]
-        })
+        await _run_minidsp_cli("output", str(output), "delay", str(delay_ms))
 
     async def set_output_polarity(self, output: int, inverted: bool) -> None:
-        """Set output *output* phase inversion.
+        """Set output *output* phase inversion via CLI.
 
         Raises ValueError if output index is invalid.
         Raises MinidspApiError on hardware or daemon error.
         """
         self._validate_output(output)
-        await self._post_config({"outputs": [{"index": output, "invert": inverted}]})
+        await _run_minidsp_cli("output", str(output), "invert", "on" if inverted else "off")
 
     async def set_output_peq(
         self,
@@ -392,41 +398,67 @@ class MinidspClient:
                 )
                 await _run_minidsp_cli("input", str(input_index), "peq", slot, "bypass", "off")
 
+    async def set_output_fir_from_file(self, output: int, path: str) -> None:
+        """Load FIR coefficients from a WAV file and activate them via CLI.
+
+        The WAV file must be mono float32 at FIR_SAMPLE_RATE (96000 Hz).
+        After loading, bypass is set to off (filter active).
+        """
+        self._validate_output(output)
+        # fir import returns exit code 1 on success (minidsp-rs#766) — ignore it
+        await _run_minidsp_cli("output", str(output), "fir", "import", path, ignore_exit_codes=(1,))
+        await _run_minidsp_cli("output", str(output), "fir", "bypass", "off")
+
+    async def set_output_fir_bypass(self, output: int, bypassed: bool) -> None:
+        """Enable or disable the FIR bypass for *output* via CLI."""
+        self._validate_output(output)
+        await _run_minidsp_cli(
+            "output", str(output), "fir", "bypass", "on" if bypassed else "off"
+        )
+
+    async def clear_output_fir(self, output: int) -> None:
+        """Clear FIR coefficients and reset to passthrough (bypass off) via CLI.
+
+        Explicitly sets bypass=off after clearing to ensure a deterministic
+        passthrough state regardless of firmware behaviour post-clear.
+        """
+        self._validate_output(output)
+        # fir clear returns exit code 1 on success (minidsp-rs#766) — ignore it
+        await _run_minidsp_cli("output", str(output), "fir", "clear", ignore_exit_codes=(1,))
+        await _run_minidsp_cli("output", str(output), "fir", "bypass", "off")
+
     async def set_input_routing(
         self,
         input_index: int,
         output_enabled: dict[int, bool],
     ) -> None:
-        """Set the routing matrix for *input_index*.
+        """Set the routing matrix for *input_index* via CLI.
+
+        Uses CLI (not HTTP) so routing survives subsequent CLI PEQ writes.
+        The HTTP routing API is reset by the CLI WebSocket transport on connect.
 
         *output_enabled* maps each output index to whether it should receive
-        signal from this input.  Example to route input 1 (input 2, 0-based)
-        to outputs 0, 2, 3 only:
+        signal from this input.  Example to route input 1 to outputs 0, 2, 3:
 
             await client.set_input_routing(1, {0: True, 1: False, 2: True, 3: True})
-
-        Outputs not listed in *output_enabled* are left unchanged.
         """
-        routing = [
-            {"index": out_idx, "mute": not enabled}
-            for out_idx, enabled in output_enabled.items()
-        ]
-        await self._post_config({
-            "inputs": [{"index": input_index, "routing": routing}]
-        })
+        for out_idx, enabled in output_enabled.items():
+            await _run_minidsp_cli(
+                "input", str(input_index), "routing", str(out_idx),
+                "enable", "true" if enabled else "false",
+            )
 
     async def restore_all_gains(self, output_indices: list[int]) -> None:
-        """Restore gain to 0.0 dB on every output in *output_indices*.
+        """Unmute outputs sequentially via CLI.
 
         Called in finally blocks and TTL cleanup to ensure no sub is left muted
         after an alignment session ends (normally or due to browser disconnect).
         """
-        tasks = [self.set_output_gain(idx, 0.0) for idx in output_indices]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for output, result in zip(output_indices, results):
-            if isinstance(result, Exception):
-                # Log but do not raise — we want to restore as many as possible.
+        for idx in output_indices:
+            try:
+                await _run_minidsp_cli("output", str(idx), "mute", "off")
+            except Exception:
                 import logging
                 logging.getLogger(__name__).warning(
-                    "restore_all_gains: failed to restore output %d: %s", output, result
+                    "restore_all_gains: failed to unmute output %d", idx
                 )

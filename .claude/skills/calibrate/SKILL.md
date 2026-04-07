@@ -4,7 +4,7 @@ version: 1.0.0
 description: |
   Run a calibration recipe end-to-end. Reads a human-readable recipe file,
   drives the calibration loop by calling MCP tools (measure, apply EQ, mute/unmute,
-  set delay, etc.), and converges to the target curve. Default recipe: harman-bass-aligned.
+  set delay, etc.), and converges to the target curve. Default recipe: harman-bass-persub.
 allowed-tools:
   - Bash
   - Read
@@ -22,15 +22,31 @@ Run a calibration recipe by reading it and executing each step via MCP tools.
 
 ## Arguments
 
-- `$ARGUMENTS` — recipe name (default: `harman-bass-aligned`). Looks in `recipes/core/{name}.md`.
+- `$ARGUMENTS` — recipe name (default: none — show picker). Looks in `recipes/core/{name}.md`.
 
 ## Workflow
 
-### Step 1 — Load the recipe
+### Step 1 — List recipes and recommend based on hardware
 
 ```
-Read the recipe file from recipes/core/{recipe_name}.md
-If not found, list available recipes and ask the user to pick one.
+1. Call `get_config` to read the user's hardware setup (number of subs, shakers, etc.)
+2. List all .md files in recipes/core/ using Glob.
+3. Read the first few lines of each recipe to get the Goal/Overview.
+4. Display them as a numbered list with a brief description.
+5. Recommend a recipe based on the hardware config:
+
+   Recommendation logic:
+   - Count sub outputs (type: "sub") in config.minidsp.output_slots
+   - If 2+ subs → recommend "harman-bass-persub" (per-sub EQ gives best multi-sub results)
+   - If 1 sub → recommend "harman-bass" (simpler, no alignment needed)
+   - If user has alignment issues (subs at different distances) → mention "harman-bass-aligned"
+
+   Show the recommendation with a brief reason, e.g.:
+   "Recommended: **harman-bass-persub** — you have 2 subs, per-sub EQ will flatten each
+    sub's room response independently before applying the shared Harman target."
+
+6. If $ARGUMENTS names a valid recipe, pre-select it but still confirm.
+7. Let the user pick or accept the recommendation.
 ```
 
 ### Step 2 — Pre-flight check
@@ -60,6 +76,9 @@ Key MCP tools available on the `avr-calibration` server:
 - `check_system` — verify all hardware is reachable
 - `fetch_recipe` — load a recipe by name
 - `get_config` / `set_config` — read/write config
+- `get_output_state` — per-output gain_db, delay_ms, polarity_inverted (in-memory tracking for this session)
+- `analyze_ir` — IR peak time, polarity sign, SPL from a stored session (key input for computing alignment corrections)
+- `analyze_decay` — T60 decay analysis on the IR from a measurement; returns ringing modes with priority and suggested_q
 
 ### Step 4 — Report progress
 

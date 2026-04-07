@@ -22,6 +22,8 @@ log = logging.getLogger(__name__)
 
 from ..adapters.minidsp import (
     ALIGNMENT_PEQ_SLOTS,
+    FIR_MAX_TAPS_PER_OUTPUT,
+    FIR_SAMPLE_RATE,
     MinidspApiError,
     MinidspClient,
 )
@@ -61,6 +63,11 @@ class MinidspDriver(DSPDriver):
         self._active_input = active_input
         self._eq_state: dict = {}
         self._lock = asyncio.Lock()
+        # In-memory tracking for write-only hardware params (no GET endpoint in minidspd)
+        self._output_gain: dict[int, float] = {}      # output_index → gain_db (default 0.0)
+        self._output_delay: dict[int, float] = {}     # output_index → delay_ms (default 0.0)
+        self._output_polarity: dict[int, bool] = {}   # output_index → inverted (default False)
+        self._fir_state: dict[int, list[float]] = {}  # output_index → coefficients ([] = cleared)
 
     async def get_state(self) -> dict:
         try:
@@ -257,14 +264,89 @@ class MinidspDriver(DSPDriver):
         await self._client.unmute_outputs(output_indices)
 
     @_driver_api
+    async def set_output_gain(self, output_index: int, gain_db: float) -> None:
+        """Set gain for a single output in dB. Range: -127 to +6 dB."""
+        await self._client.set_output_gain(output_index, gain_db)
+        self._output_gain[output_index] = gain_db
+
+    @_driver_api
     async def set_output_delay(self, output_index: int, delay_ms: float) -> None:
         """Set delay for a single output in milliseconds."""
         await self._client.set_output_delay(output_index, delay_ms)
+        self._output_delay[output_index] = delay_ms
 
     @_driver_api
     async def set_output_polarity(self, output_index: int, inverted: bool) -> None:
         """Set polarity for a single output (inverted=True flips phase)."""
         await self._client.set_output_polarity(output_index, inverted)
+        self._output_polarity[output_index] = inverted
+
+    @_driver_api
+    async def apply_fir(
+        self,
+        output_index: int,
+        coefficients: list[float],
+        sample_rate: int = FIR_SAMPLE_RATE,
+    ) -> None:
+        """Write FIR coefficients to a single output via the minidsp CLI.
+
+        Coefficients are written as a temporary mono float32 WAV file at
+        *sample_rate* (default 96000 Hz — the miniDSP 2x4 HD FIR engine rate).
+        The temp file is removed whether or not the write succeeds.
+
+        Raises DriverError if len(coefficients) > FIR_MAX_TAPS_PER_OUTPUT.
+        """
+        import os
+        import tempfile
+
+        import numpy as np
+        from scipy.io import wavfile
+
+        if len(coefficients) > FIR_MAX_TAPS_PER_OUTPUT:
+            raise DriverError(
+                f"too many FIR taps: {len(coefficients)} > {FIR_MAX_TAPS_PER_OUTPUT}"
+            )
+        if len(coefficients) == 0:
+            raise DriverError("coefficients list is empty; use clear_fir() to reset")
+
+        arr = np.array(coefficients, dtype=np.float32)
+
+        async with self._lock:
+            fd, path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            try:
+                wavfile.write(path, sample_rate, arr)
+                await self._client.set_output_fir_from_file(output_index, path)
+                # Update state only after ALL hardware writes succeed (P0 rollback)
+                self._fir_state[output_index] = list(coefficients)
+            finally:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    @_driver_api
+    async def clear_fir(self, output_index: int) -> None:
+        """Clear FIR coefficients and reset to passthrough (bypass off)."""
+        async with self._lock:
+            await self._client.clear_output_fir(output_index)
+            self._fir_state[output_index] = []
+
+    def get_output_state(self) -> dict[int, dict]:
+        """Return in-memory per-output state: gain_db, delay_ms, polarity_inverted.
+
+        Only reflects values set via this driver instance since startup.
+        Hardware state from before this session is not readable from minidspd.
+        """
+        return {
+            idx: {
+                "gain_db": self._output_gain.get(idx, 0.0),
+                "delay_ms": self._output_delay.get(idx, 0.0),
+                "polarity_inverted": self._output_polarity.get(idx, False),
+                "fir_taps": len(self._fir_state.get(idx, [])),
+            }
+            for idx in range(4)
+        }
 
     @_driver_api
     async def set_routing(self, routing: dict) -> None:
