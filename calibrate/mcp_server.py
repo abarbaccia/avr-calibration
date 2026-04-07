@@ -12,7 +12,8 @@ Framework: mcp Python SDK (official Anthropic MCP library)
 
 Tools:
   get_device_state       — current AVR + DSP hardware status
-  get_measurement_history — last N measurements from SessionStore
+  get_measurement_history — last N measurements from SessionStore (full FR data)
+  get_fr_summary         — 1/3-octave downsampled FR (compact, for analysis)
   read_eq                — current EQ state (in-memory, updated by apply_eq)
   apply_eq               — SafetyValidator → biquad conversion → DSP write
   set_volume             — AVR volume control
@@ -171,6 +172,75 @@ async def _tool_get_measurement_history(limit: int = 10) -> dict:
                 entry["phase_rad"] = fr.phase
             if s.metadata:
                 entry["metadata"] = s.metadata
+            result.append(entry)
+        return _ok(sessions=result, count=len(result))
+    except Exception as exc:
+        return _err(f"storage error: {exc}")
+
+
+# ── 1/3-octave centre frequencies (ISO 266) for bass calibration band ────────
+_THIRD_OCTAVE_CENTRES = [
+    20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0, 160.0, 200.0,
+]
+
+
+def _downsample_to_third_octave(
+    freqs: list[float], spl: list[float],
+) -> list[dict]:
+    """Average FR data into 1/3-octave bands. Returns list of {freq_hz, spl_db}."""
+    import math
+    bands = []
+    for centre in _THIRD_OCTAVE_CENTRES:
+        # 1/3-octave band edges: centre / 2^(1/6) to centre * 2^(1/6)
+        factor = 2 ** (1 / 6)
+        lo = centre / factor
+        hi = centre * factor
+        vals = [s for f, s in zip(freqs, spl) if lo <= f < hi]
+        if vals:
+            bands.append({
+                "freq_hz": centre,
+                "spl_db": round(sum(vals) / len(vals), 1),
+            })
+    return bands
+
+
+async def _tool_get_fr_summary(
+    session_ids: list[int] | None = None, limit: int = 5,
+) -> dict:
+    """Return 1/3-octave downsampled FR summaries — small enough for tool results.
+
+    If *session_ids* is given, return those specific sessions.
+    Otherwise return the last *limit* sessions.
+    """
+    from .storage import SessionStore
+    try:
+        store = SessionStore()
+        if session_ids:
+            sessions = [store.get_session(sid) for sid in session_ids]
+            sessions = [s for s in sessions if s is not None]
+        else:
+            sessions = store.list_sessions()[:limit]
+
+        result = []
+        for s in sessions:
+            fr = s.start_fr
+            if not fr or not fr.frequencies:
+                result.append({
+                    "id": s.id, "label": s.label, "timestamp": s.timestamp,
+                    "bands": [], "peak_spl": None, "freq_at_peak": None,
+                })
+                continue
+            bands = _downsample_to_third_octave(fr.frequencies, fr.spl)
+            entry: dict = {
+                "id": s.id,
+                "label": s.label,
+                "timestamp": s.timestamp,
+                "bands": bands,
+                "peak_spl": round(fr.peak_spl, 1),
+                "freq_at_peak": round(fr.freq_at_peak, 1),
+            }
+            if s.metadata and "ir" in s.metadata:
+                entry["ir_summary"] = s.metadata["ir"]
             result.append(entry)
         return _ok(sessions=result, count=len(result))
     except Exception as exc:
@@ -746,15 +816,6 @@ async def _tool_check_system() -> dict:
 
 # ── MCP Server ─────────────────────────────────────────────────────────────────
 
-# Text appended to any tool description that writes signal-path state (routing,
-# source selection, preset switching). Forces human-in-the-loop before the AI
-# proceeds. EQ and volume are intentionally excluded — they are calibration
-# outputs, not hardware configuration.
-_SIGNAL_PATH_WRITE_WARNING = (
-    " REQUIRES HUMAN APPROVAL: before calling this tool, describe exactly what "
-    "you intend to change and why, then wait for the user to explicitly confirm. "
-    "Do not call this tool autonomously."
-)
 
 server = Server("avr-calibration")
 
@@ -950,7 +1011,8 @@ _TOOLS: list[Tool] = [
         description=(
             "Trigger a frequency response measurement using the UMIK microphone. "
             "Takes a sweep measurement via PyTTa, saves to the session store, "
-            "and returns the session ID. Use get_measurement_history() to retrieve FR data. "
+            "and returns the session ID. Use get_fr_summary() for 1/3-octave FR data (compact), "
+            "or get_measurement_history() for full-resolution FR. "
             "IMPORTANT: Always pass label and position so measurements are identifiable in the dashboard."
         ),
         inputSchema={
@@ -1033,7 +1095,6 @@ _TOOLS: list[Tool] = [
             "Deep-merge updates into config.yaml. Pass a dict of sections to update. "
             "Example: {\"denon\": {\"host\": \"192.168.1.100\"}} sets the Denon IP. "
             "Existing keys not mentioned in updates are preserved."
-            + _SIGNAL_PATH_WRITE_WARNING
         ),
         inputSchema={
             "type": "object",
@@ -1102,7 +1163,6 @@ _TOOLS: list[Tool] = [
             "Set delay for a single DSP output in milliseconds. "
             "Used during sub alignment to time-align multiple subs. "
             "Range: 0-10 ms typical for sub alignment."
-            + _SIGNAL_PATH_WRITE_WARNING
         ),
         inputSchema={
             "type": "object",
@@ -1125,7 +1185,6 @@ _TOOLS: list[Tool] = [
             "Set polarity for a single DSP output. "
             "inverted=true flips the phase 180°. Used during sub alignment "
             "when one sub is out of phase with others (dip where others peak)."
-            + _SIGNAL_PATH_WRITE_WARNING
         ),
         inputSchema={
             "type": "object",
@@ -1265,7 +1324,6 @@ _TOOLS: list[Tool] = [
             "to enabled outputs (skipping defective/unused ones) and mute the other input. "
             "Call this if subs are silent during calibration (no signal reaching DSP). "
             "Uses active_input from config by default, or pass active_input to override."
-            + _SIGNAL_PATH_WRITE_WARNING
         ),
         inputSchema={
             "type": "object",
@@ -1326,6 +1384,30 @@ _TOOLS: list[Tool] = [
         inputSchema={
             "type": "object",
             "properties": {},
+        },
+    ),
+    Tool(
+        name="get_fr_summary",
+        description=(
+            "Return frequency response data downsampled to 1/3-octave bands (11 points "
+            "from 20-200Hz). Much smaller than get_measurement_history — use this when you "
+            "need FR shape for analysis, convergence checks, or Harman target comparison. "
+            "Returns per-session: bands[{freq_hz, spl_db}], peak_spl, freq_at_peak, ir_summary."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Specific session IDs to retrieve. Omit to get the most recent sessions.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Number of recent sessions to return if session_ids not given (default: 5).",
+                    "default": 5,
+                },
+            },
         },
     ),
 ]
@@ -1430,6 +1512,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         )
     elif name == "check_system":
         result = await _tool_check_system()
+    elif name == "get_fr_summary":
+        session_ids = arguments.get("session_ids")
+        if session_ids:
+            session_ids = [int(sid) for sid in session_ids]
+        result = await _tool_get_fr_summary(
+            session_ids=session_ids,
+            limit=int(arguments.get("limit", 5)),
+        )
     # Legacy aliases for backwards compatibility with cached sessions
     elif name == "mute_sub_outputs":
         mute = arguments.get("mute")

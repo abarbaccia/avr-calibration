@@ -208,6 +208,10 @@ class MinidspDriver(DSPDriver):
 
         Uses the same SafetyValidator as output EQ. Writes to the active input
         from config, or *input_index* if specified.
+
+        IMPORTANT: The miniDSP 2x4 HD default matrix routes each analog input
+        to a subset of outputs. For input PEQ to affect ALL outputs, call
+        configure_active_input() first to route a single input to all outputs.
         """
         filter_specs = self._parse_filter_specs(filters)
 
@@ -239,7 +243,7 @@ class MinidspDriver(DSPDriver):
 
             peq_entries = self._build_peq_entries(filter_specs)
             try:
-                log.info("apply_input_eq: writing PEQ to input %d via CLI (master-muted)", target_input)
+                log.info("apply_input_eq: writing PEQ to input %d via CLI", target_input)
                 await self._client.set_input_peq_cli(target_input, peq_entries)
                 # Health check: verify sub outputs aren't frozen after input EQ write
                 await self._client.check_for_dsp_hang(self._sub_outputs)
