@@ -653,9 +653,13 @@ async def test_calibrate_level_hits_ceiling() -> None:
 
 
 @pytest.mark.asyncio
-async def test_calibrate_level_no_avr() -> None:
-    """No AVR driver loaded → error."""
-    with patch.object(sut, "_avr", None):
+async def test_calibrate_level_no_avr_hdmi_mode() -> None:
+    """HDMI mode with no AVR driver loaded → error."""
+    mock_cfg = MagicMock()
+    mock_cfg.measurement.get.side_effect = lambda key, default=None: "hdmi" if key == "playback_route" else default
+
+    with patch.object(sut, "_avr", None), \
+         patch.object(sut, "_config", return_value=mock_cfg):
         result = await _tool_calibrate_level()
 
     assert not result["ok"]

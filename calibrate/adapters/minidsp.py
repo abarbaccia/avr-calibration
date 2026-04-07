@@ -53,7 +53,7 @@ Slots 2-9 are available for amplitude EQ (ALIGNMENT_PEQ_SLOTS).
 ALIGNMENT_PEQ_SLOTS: range = range(2, 10)
 """PEQ slots used by the alignment amplitude-EQ pass."""
 
-VALID_SOURCES: frozenset[str] = frozenset({"Analog", "Toslink", "USB"})
+VALID_SOURCES: frozenset[str] = frozenset({"Analog", "Toslink", "Usb", "Spdif", "Aes"})
 """Valid input source names for the miniDSP 2x4 HD."""
 
 MAX_PRESET_INDEX: int = 3

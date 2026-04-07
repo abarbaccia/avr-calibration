@@ -413,10 +413,10 @@ class MinidspSweepContext:
 
     async def __aenter__(self) -> "MinidspSweepContext":
         try:
-            status = await self._client.get_status()
+            status = await self._client.get_device_status()
             self._original_source = status.get("master", {}).get("source", "Analog")
-            await self._client.switch_source("USB")
-            log.info("MinidspSweepContext: switched source Analog→USB for sweep")
+            await self._client.switch_source("Usb")
+            log.info("MinidspSweepContext: switched source Analog→Usb for sweep")
         except Exception as exc:
             log.warning("MinidspSweepContext: failed to switch to USB source: %s", exc)
         return self
