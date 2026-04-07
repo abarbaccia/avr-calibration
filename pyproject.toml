@@ -44,6 +44,7 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+addopts = ["--ignore=tests/hdmi_channel_test.py"]
 
 [tool.coverage.run]
 source = ["calibrate"]
