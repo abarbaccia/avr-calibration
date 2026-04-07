@@ -765,3 +765,143 @@ class TestLoadConfigError:
 
         assert resp.status_code == 503
         assert "No config" in resp.json()["detail"]
+
+
+# ── Saved states API ────────────────────────────────────────────────────────
+
+
+class TestSavedStatesAPI:
+    def test_list_states_empty(self, client: TestClient, db_store: SessionStore) -> None:
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.get("/api/states")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_save_state(self, client: TestClient, db_store: SessionStore) -> None:
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.post("/api/states", json={"name": "Test State"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "saved"
+        assert data["id"] > 0
+
+    def test_save_and_list(self, client: TestClient, db_store: SessionStore) -> None:
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            client.post("/api/states", json={"name": "State A", "target_curve": "harman"})
+            client.post("/api/states", json={"name": "State B", "rms_deviation": 2.1})
+            resp = client.get("/api/states")
+        states = resp.json()
+        assert len(states) == 2
+        assert states[0]["name"] == "State B"
+        assert states[1]["name"] == "State A"
+
+    def test_get_state_detail(self, client: TestClient, db_store: SessionStore) -> None:
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            save_resp = client.post("/api/states", json={
+                "name": "Full",
+                "eq_filters": [{"freq": 40, "gain_db": -3}],
+                "delays": {"0": 1.5},
+                "target_curve": "harman",
+            })
+            state_id = save_resp.json()["id"]
+            resp = client.get(f"/api/states/{state_id}")
+        data = resp.json()
+        assert data["name"] == "Full"
+        assert data["eq_filters"] == [{"freq": 40, "gain_db": -3}]
+        assert data["delays"] == {"0": 1.5}
+
+    def test_get_state_not_found(self, client: TestClient, db_store: SessionStore) -> None:
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.get("/api/states/999")
+        assert resp.status_code == 404
+
+    def test_delete_state(self, client: TestClient, db_store: SessionStore) -> None:
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            save_resp = client.post("/api/states", json={"name": "Doomed"})
+            state_id = save_resp.json()["id"]
+            resp = client.delete(f"/api/states/{state_id}")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "deleted"
+
+    def test_delete_state_not_found(self, client: TestClient, db_store: SessionStore) -> None:
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.delete("/api/states/999")
+        assert resp.status_code == 404
+
+
+# ── Overlay API ──────────────────────────────────────────────────────────────
+
+
+class TestOverlayAPI:
+    def test_overlay_sessions(self, client: TestClient, seeded_store: SessionStore) -> None:
+        with patch("calibrate.web.SessionStore", return_value=seeded_store):
+            resp = client.get("/api/sessions/overlay?ids=1,2")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 2
+        assert data[0]["id"] == 1
+        assert "frequencies" in data[0]
+        assert "spl" in data[0]
+        assert "label" in data[0]
+
+    def test_overlay_invalid_ids(self, client: TestClient, db_store: SessionStore) -> None:
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.get("/api/sessions/overlay?ids=abc")
+        assert resp.status_code == 422
+
+    def test_overlay_missing_sessions(self, client: TestClient, db_store: SessionStore) -> None:
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.get("/api/sessions/overlay?ids=999")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_overlay_capped_at_6(self, client: TestClient, seeded_store: SessionStore) -> None:
+        """Only first 6 ids are processed."""
+        with patch("calibrate.web.SessionStore", return_value=seeded_store):
+            resp = client.get("/api/sessions/overlay?ids=1,2,1,2,1,2,1,2")
+        data = resp.json()
+        assert len(data) <= 6
+
+
+# ── GET /api/dsp-state ─────────────────────────────────────────────────────
+
+
+class TestDspState:
+    def test_empty_state(self, client: TestClient, db_store: SessionStore) -> None:
+        cfg = _make_config()
+        with patch("calibrate.web.SessionStore", return_value=db_store), \
+             patch("calibrate.web._load_config", return_value=cfg):
+            resp = client.get("/api/dsp-state")
+        data = resp.json()
+        assert data["active"] is False
+
+    def test_with_persisted_state(self, client: TestClient, db_store: SessionStore) -> None:
+        db_store.set_active_dsp("output_eq_1", {"filters": [{"freq": 47, "gain_db": -3, "q": 3.4, "type": "peaking"}]})
+        db_store.set_active_dsp("delay_1", {"delay_ms": 12.2})
+        db_store.set_active_dsp("polarity_2", {"inverted": True})
+        db_store.set_active_dsp("gain_1", {"gain_db": 3.2})
+        db_store.set_active_dsp("input_eq", {"filters": [{"freq": 18, "gain_db": 0, "q": 0.707, "type": "hpf"}]})
+
+        cfg = Config({
+            "denon": {"host": "192.168.1.100"},
+            "minidsp": {
+                "host": "localhost", "port": 5380,
+                "output_slots": [
+                    {"index": 1, "label": "Sub 1", "type": "sub"},
+                    {"index": 2, "label": "Sub 2", "type": "sub"},
+                    {"index": 3, "label": "Shaker", "type": "shaker"},
+                ],
+            },
+            "mic": {"name": "UMIK"},
+            "measurement": {"denon_sweep_input": "CD", "denon_sweep_volume": -25.0},
+        })
+        with patch("calibrate.web.SessionStore", return_value=db_store), \
+             patch("calibrate.web._load_config", return_value=cfg):
+            resp = client.get("/api/dsp-state")
+        data = resp.json()
+        assert data["active"] is True
+        assert data["outputs"]["1"]["delay_ms"] == 12.2
+        assert data["outputs"]["1"]["gain_db"] == 3.2
+        assert data["outputs"]["1"]["eq"][0]["freq"] == 47
+        assert data["outputs"]["2"]["polarity_inverted"] is True
+        assert data["input_eq"]["filters"][0]["type"] == "hpf"

@@ -262,3 +262,42 @@ def test_harman_rms_near_zero_for_matching_shape():
     fr = _make_fr(spl_value=ref, spl_offsets=offsets)
     result = harman_rms(fr)
     assert result < 3.0  # close to Harman shape (interpolation causes some deviation)
+
+
+def test_min_rms_reference_spl_lower_than_max_safe():
+    """min_rms ref should be at or below max_safe ref (trades level for fit)."""
+    from calibrate.analysis import min_rms_reference_spl, max_safe_reference_spl
+
+    # Flat measurement — Harman needs bass boost, so min_rms will drop the ref
+    # to reduce the boost needed at 20-25 Hz (sub rolloff region)
+    fr = _make_fr(spl_value=75.0)
+    max_safe = max_safe_reference_spl(fr)
+    min_rms = min_rms_reference_spl(fr)
+    assert min_rms <= max_safe
+
+
+def test_min_rms_gives_lower_rms_than_max_safe():
+    """min_rms anchoring should produce equal or lower RMS than max_safe."""
+    from calibrate.analysis import harman_rms
+
+    # Flat measurement — max_safe will max out boost at 20Hz, min_rms will drop ref
+    fr = _make_fr(spl_value=75.0)
+    rms_max_safe = harman_rms(fr, anchor="max_safe")
+    rms_min = harman_rms(fr, anchor="min_rms")
+    assert rms_min <= rms_max_safe + 0.1  # allow small float tolerance
+
+
+def test_min_rms_equals_max_safe_for_harman_shaped():
+    """If measurement already matches Harman shape, both anchors converge."""
+    from calibrate.analysis import min_rms_reference_spl, max_safe_reference_spl
+
+    offsets = {
+        20.0: +6.0, 25.0: +5.0, 31.5: +4.0, 40.0: +3.0,
+        50.0: +2.0, 63.0: +1.0, 80.0: 0.0, 100.0: 0.0,
+        125.0: 0.0, 160.0: -1.0, 200.0: -2.0,
+    }
+    fr = _make_fr(spl_value=75.0, spl_offsets=offsets)
+    max_safe = max_safe_reference_spl(fr)
+    min_rms = min_rms_reference_spl(fr)
+    # Should be very close — Harman-shaped measurement needs no correction
+    assert abs(max_safe - min_rms) < 2.0

@@ -708,3 +708,109 @@ class TestSessionMetadata:
         meta = {"ir": {"peak_time_ms": 5.0}}
         sid = s.save_measurement(make_fr(), metadata=meta)
         assert s.get_session(sid).metadata == meta
+
+
+# ── Saved states ─────────────────────────────────────────────────────────────
+
+class TestSavedStates:
+    def test_save_state_returns_id(self, store):
+        sid = store.save_state(name="Harman v1")
+        assert isinstance(sid, int) and sid > 0
+
+    def test_list_states_most_recent_first(self, store):
+        store.save_state(name="First")
+        store.save_state(name="Second")
+        states = store.list_states()
+        assert len(states) == 2
+        assert states[0]["name"] == "Second"
+        assert states[1]["name"] == "First"
+
+    def test_list_states_empty(self, store):
+        assert store.list_states() == []
+
+    def test_get_state_full_snapshot(self, store):
+        filters = [{"freq": 40, "gain_db": -3, "q": 2, "type": "peaking"}]
+        delays = {"0": 1.5, "1": 0.0}
+        polarities = {"0": False, "1": True}
+        gains = {"0": 0.0, "1": -2.0}
+        sid = store.save_state(
+            name="Full test",
+            eq_filters=filters,
+            delays=delays,
+            polarities=polarities,
+            gains=gains,
+            target_curve="harman",
+            rms_deviation=1.9,
+            notes="converged run",
+        )
+        state = store.get_state(sid)
+        assert state["name"] == "Full test"
+        assert state["eq_filters"] == filters
+        assert state["delays"] == delays
+        assert state["polarities"] == polarities
+        assert state["gains"] == gains
+        assert state["target_curve"] == "harman"
+        assert state["rms_deviation"] == 1.9
+        assert state["notes"] == "converged run"
+
+    def test_get_state_not_found(self, store):
+        assert store.get_state(999) is None
+
+    def test_get_state_with_measurement_link(self, store):
+        session_id = store.save_measurement(make_fr(), label="test")
+        sid = store.save_state(name="Linked", measurement_session_id=session_id)
+        state = store.get_state(sid)
+        assert state["measurement_session_id"] == session_id
+
+    def test_delete_state(self, store):
+        sid = store.save_state(name="Doomed")
+        assert store.delete_state(sid) is True
+        assert store.get_state(sid) is None
+        assert store.list_states() == []
+
+    def test_delete_state_not_found(self, store):
+        assert store.delete_state(999) is False
+
+    def test_save_state_minimal(self, store):
+        """Save with only a name, all other fields None."""
+        sid = store.save_state(name="Minimal")
+        state = store.get_state(sid)
+        assert state["name"] == "Minimal"
+        assert state["eq_filters"] is None
+        assert state["delays"] is None
+        assert state["target_curve"] is None
+
+
+# ── Active DSP state ─────────────────────────────────────────────────────────
+
+
+class TestActiveDspState:
+    def test_set_and_get(self, store):
+        store.set_active_dsp("output_eq_1", {"filters": [{"freq": 80, "gain_db": -3}]})
+        result = store.get_active_dsp()
+        assert "output_eq_1" in result
+        assert result["output_eq_1"]["filters"] == [{"freq": 80, "gain_db": -3}]
+        assert "timestamp" in result["output_eq_1"]
+
+    def test_upsert_overwrites(self, store):
+        store.set_active_dsp("delay_1", {"delay_ms": 5.0})
+        store.set_active_dsp("delay_1", {"delay_ms": 12.2})
+        result = store.get_active_dsp()
+        assert result["delay_1"]["delay_ms"] == 12.2
+
+    def test_multiple_keys(self, store):
+        store.set_active_dsp("output_eq_1", {"filters": []})
+        store.set_active_dsp("output_eq_2", {"filters": []})
+        store.set_active_dsp("input_eq", {"filters": []})
+        store.set_active_dsp("delay_1", {"delay_ms": 0})
+        result = store.get_active_dsp()
+        assert len(result) == 4
+
+    def test_empty_returns_empty(self, store):
+        assert store.get_active_dsp() == {}
+
+    def test_clear(self, store):
+        store.set_active_dsp("output_eq_1", {"filters": []})
+        store.set_active_dsp("delay_1", {"delay_ms": 0})
+        store.clear_active_dsp()
+        assert store.get_active_dsp() == {}

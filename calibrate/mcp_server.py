@@ -132,6 +132,16 @@ async def _safe_driver_state(driver: Any) -> dict:
         return {"connected": False, "error": str(exc)}
 
 
+def _persist_dsp_state(key: str, data: dict) -> None:
+    """Save a DSP state entry to SQLite (fire-and-forget, never fails the caller)."""
+    try:
+        from .storage import SessionStore
+        store = SessionStore()
+        store.set_active_dsp(key, data)
+    except Exception as exc:
+        log.warning("failed to persist DSP state key=%s: %s", key, exc)
+
+
 # ── Tool implementations ───────────────────────────────────────────────────────
 
 async def _tool_get_device_state() -> dict:
@@ -190,23 +200,42 @@ async def _tool_apply_eq(
     try:
         preset = await _dsp.current_preset()  # type: ignore[union-attr]
         await _dsp.apply_eq(preset, filters, output_index=output_index)  # type: ignore[union-attr]
+        # Persist to SQLite so the web dashboard can show active DSP state
+        if output_index is not None:
+            _persist_dsp_state(f"output_eq_{output_index}", {"filters": filters, "preset": preset})
+        else:
+            # Broadcast mode — persist for all sub outputs
+            cfg = _config()
+            for slot in cfg.minidsp.get("output_slots", []):
+                if slot.get("type") == "sub":
+                    _persist_dsp_state(f"output_eq_{slot['index']}", {"filters": filters, "preset": preset})
         return _ok(filters_applied=len(filters), preset=preset,
                     output_index=output_index)
     except DriverError as exc:
         return _err(str(exc))
 
 
-async def _tool_apply_input_eq(filters: list[dict]) -> dict:
+async def _tool_apply_input_eq(
+    filters: list[dict],
+    target_curve: dict | None = None,
+) -> dict:
     """Validate and apply EQ filters to the DSP input channel.
 
     Applies shared EQ (e.g. Harman target curve) to the active input,
     affecting all outputs equally. Uses the same SafetyValidator as output EQ.
+
+    Optional *target_curve* persists the optimization target for dashboard display:
+      {"type": "harman", "reference_spl": 72.5, "band": [20, 200],
+       "points": [{"freq": 20, "spl": 78.5}, ...]}
 
     Returns {ok: True} or {ok: False, error: "SafetyValidator: ..."} on rejection.
     """
     try:
         preset = await _dsp.current_preset()  # type: ignore[union-attr]
         await _dsp.apply_input_eq(preset, filters)  # type: ignore[union-attr]
+        _persist_dsp_state("input_eq", {"filters": filters, "preset": preset})
+        if target_curve:
+            _persist_dsp_state("target_curve", target_curve)
         return _ok(filters_applied=len(filters), preset=preset, target="input")
     except DriverError as exc:
         return _err(str(exc))
@@ -221,7 +250,10 @@ async def _tool_avr_set_volume(level_db: float) -> dict:
         return _err(f"avr unreachable: {exc}")
 
 
-async def _tool_trigger_measurement() -> dict:
+async def _tool_trigger_measurement(
+    label: str | None = None,
+    position: str | None = None,
+) -> dict:
     """Trigger a measurement via UMIK-1 + PyTTa.
 
     Calls MeasurementEngine.measure() directly (no HTTP hop). Wraps with
@@ -259,11 +291,21 @@ async def _tool_trigger_measurement() -> dict:
 
         # Compute IR-derived metadata at capture time
         metadata = compute_session_metadata(fr)
+        if position:
+            metadata["position"] = position
+
+        # Build descriptive label: "combined @ MLP", "sub1-solo @ MLP"
+        parts = []
+        parts.append(label or "combined")
+        if position:
+            parts.append("@ " + position)
+        full_label = " ".join(parts)
 
         store = SessionStore()
-        session_id = store.save_measurement(fr, label="mcp-triggered", metadata=metadata)
+        session_id = store.save_measurement(fr, label=full_label, metadata=metadata)
         return _ok(
             session_id=session_id,
+            label=full_label,
             metadata=metadata,
             message="Measurement complete — use get_measurement_history() to retrieve results.",
         )
@@ -481,6 +523,7 @@ async def _tool_set_delay(output_index: int, delay_ms: float) -> dict:
     """Set delay for a single DSP output in milliseconds."""
     try:
         await _dsp.set_output_delay(output_index, delay_ms)  # type: ignore[union-attr]
+        _persist_dsp_state(f"delay_{output_index}", {"delay_ms": delay_ms})
         return _ok(output_index=output_index, delay_ms=delay_ms)
     except DriverError as exc:
         return _err(str(exc))
@@ -492,6 +535,7 @@ async def _tool_set_polarity(output_index: int, inverted: bool) -> dict:
     """Set polarity for a single DSP output (inverted=True flips phase)."""
     try:
         await _dsp.set_output_polarity(output_index, inverted)  # type: ignore[union-attr]
+        _persist_dsp_state(f"polarity_{output_index}", {"inverted": inverted})
         return _ok(output_index=output_index, inverted=inverted)
     except DriverError as exc:
         return _err(str(exc))
@@ -591,6 +635,7 @@ async def _tool_set_output_gain(output_index: int, gain_db: float) -> dict:
     """Set gain for a single DSP output in dB."""
     try:
         await _dsp.set_output_gain(output_index, gain_db)  # type: ignore[union-attr]
+        _persist_dsp_state(f"gain_{output_index}", {"gain_db": gain_db})
         return _ok(output_index=output_index, gain_db=gain_db)
     except DriverError as exc:
         return _err(str(exc))
@@ -826,6 +871,27 @@ _TOOLS: list[Tool] = [
                         "required": ["freq", "gain_db", "q", "type"],
                     },
                 },
+                "target_curve": {
+                    "type": "object",
+                    "description": "Optional: the optimization target curve for dashboard display. "
+                        "Include when applying a target curve (e.g. Harman). "
+                        "Shape: {type, reference_spl, band, points: [{freq, spl}]}",
+                    "properties": {
+                        "type": {"type": "string", "description": "Curve name, e.g. 'harman'"},
+                        "reference_spl": {"type": "number", "description": "Anchor reference SPL in dB"},
+                        "band": {"type": "array", "items": {"type": "number"}, "description": "[low_hz, high_hz]"},
+                        "points": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "freq": {"type": "number"},
+                                    "spl": {"type": "number"},
+                                },
+                            },
+                        },
+                    },
+                },
             },
             "required": ["filters"],
         },
@@ -884,11 +950,29 @@ _TOOLS: list[Tool] = [
         description=(
             "Trigger a frequency response measurement using the UMIK microphone. "
             "Takes a sweep measurement via PyTTa, saves to the session store, "
-            "and returns the session ID. Use get_measurement_history() to retrieve FR data."
+            "and returns the session ID. Use get_measurement_history() to retrieve FR data. "
+            "IMPORTANT: Always pass label and position so measurements are identifiable in the dashboard."
         ),
         inputSchema={
             "type": "object",
-            "properties": {},
+            "properties": {
+                "label": {
+                    "type": "string",
+                    "description": (
+                        "Descriptive label for this measurement. Use a consistent format: "
+                        "'combined' (all subs), 'sub1-solo', 'sub2-solo', 'subcrawl-pos1', "
+                        "'baseline', 'iter-1', 'iter-2', etc."
+                    ),
+                },
+                "position": {
+                    "type": "string",
+                    "description": (
+                        "Listening/mic position description. Examples: "
+                        "'MLP' (main listening position), 'front-left', 'nearfield', "
+                        "'subcrawl-candidate-1', 'seat-2'."
+                    ),
+                },
+            },
         },
     ),
     Tool(
@@ -1269,11 +1353,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             output_index = int(output_index)
         result = await _tool_apply_eq(arguments.get("filters", []), output_index=output_index)
     elif name == "apply_input_eq":
-        result = await _tool_apply_input_eq(arguments.get("filters", []))
+        result = await _tool_apply_input_eq(
+            arguments.get("filters", []),
+            target_curve=arguments.get("target_curve"),
+        )
     elif name in ("set_volume", "avr_set_volume", "set_denon_volume"):
         result = await _tool_avr_set_volume(float(arguments["level_db"]))
     elif name in ("measure", "trigger_measurement"):
-        result = await _tool_trigger_measurement()
+        result = await _tool_trigger_measurement(
+            label=arguments.get("label"),
+            position=arguments.get("position"),
+        )
     elif name == "calibrate_level":
         result = await _tool_calibrate_level(
             start_db=float(arguments.get("start_db", -10.0)),
