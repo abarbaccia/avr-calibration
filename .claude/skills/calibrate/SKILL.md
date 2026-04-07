@@ -33,23 +33,43 @@ Run a calibration recipe by reading it and executing each step via MCP tools.
 2. List all .md files in recipes/core/ using Glob.
 3. Read the first few lines of each recipe to get the Goal/Filter Strategy/Overview.
 4. Display them as a numbered list with a brief description.
-5. Before the recipe list, show a hardware summary derived from get_config:
+5. Before the recipe list, show a visual signal chain derived from get_config.
+   Build the diagram dynamically from the config — do not hardcode labels or counts.
 
-   Hardware summary format:
-   ┌─ Hardware Chain ──────────────────────────────────────────────┐
-   │ Subs:    [label] (output N) — [N] PEQ slots                   │
-   │          [label] (output N) — [N] PEQ slots                   │
-   │ Shakers: [label] (output N) — muted during calibration        │
-   │ Input PEQ: [N] slots (shared across all outputs)              │
-   │ FIR:     [N] taps/output ([N] shared pool @ [rate]kHz)        │
-   └───────────────────────────────────────────────────────────────┘
+   Signal chain diagram format (populate from config):
 
-   Read this from:
-   - config.minidsp.output_slots → sub/shaker labels and output indices
+   ```
+   Denon X3800H ──HDMI LFE──▶ miniDSP 2x4 HD
+                                │
+                      ┌─────────┴─────────┐
+                      ▼                   ▼
+                 Input PEQ           (shared to all)
+                 [N] slots
+                      │
+          ┌───────────┼───────────┐───────────┐
+          ▼           ▼           ▼           ▼
+      Output 0    Output 1    Output 2    Output 3
+      [label]     [label]     [label]     [label]
+      [type]      [type]      [type]      [type]
+      [N] PEQ     [N] PEQ     [N] PEQ     [N] PEQ
+      [N] FIR     [N] FIR     [N] FIR     [N] FIR
+          │           │           │           │
+          ▼           ▼           ▼           ▼
+       [driver]    [driver]    [driver]    [driver]
+                                          
+                      ◀─── UMIK mic ◀─── room
+   ```
+
+   Read labels, types, PEQ slot counts from:
+   - config.minidsp.output_slots → per-output label and type (sub/shaker/unused)
    - config.eq_capabilities.output_peq → PEQ slots per sub output
    - config.eq_capabilities.input_peq → shared input PEQ slots
    - config.eq_capabilities.fir_capable, fir_max_taps_per_output,
      fir_shared_tap_pool, fir_sample_rate_hz → FIR capability
+
+   Mark shaker outputs as "MUTED during cal". Mark unused outputs as dimmed/skipped.
+   For sub outputs, show the PEQ slot count and FIR tap count.
+   Show the input PEQ slot count on the shared input stage.
 
 6. Recommend a recipe based on the hardware config:
 
@@ -78,7 +98,16 @@ Before starting calibration, verify the system is ready:
 2. If any component is unreachable, report the issue and STOP
 3. Confirm with the user: "System is ready. Starting calibration with recipe: {name}. Proceed?"
 
-### Step 3 — Execute the recipe
+### Step 3 — Choose execution mode
+
+Ask the user:
+
+> Run in **safe mode** (confirm each DSP write) or **autonomous mode** (proceed without confirmation, SafetyValidator still enforces limits)?
+
+- **Safe mode:** Before each signal-path write (`set_polarity`, `set_delay`, `set_output_gain`, `apply_eq`, `apply_input_eq`), describe the intended change and wait for the user to explicitly confirm before calling the tool.
+- **Autonomous mode:** Call tools without asking for confirmation. SafetyValidator in code still enforces all safety limits.
+
+### Step 4 — Execute the recipe
 
 Read the recipe step by step and execute each instruction by calling the appropriate MCP tools.
 
@@ -101,7 +130,7 @@ Key MCP tools available on the `avr-calibration` server:
 - `analyze_ir` — IR peak time, polarity sign, SPL from a stored session (key input for computing alignment corrections)
 - `analyze_decay` — T60 decay analysis on the IR from a measurement; returns ringing modes with priority and suggested_q
 
-### Step 4 — Report progress
+### Step 5 — Report progress
 
 After each measurement or adjustment:
 - Report what you measured (key frequencies, RMS deviation)
@@ -110,7 +139,7 @@ After each measurement or adjustment:
 
 Keep the user informed but be concise — they don't need to see raw data unless they ask.
 
-### Step 5 — Convergence or max iterations
+### Step 6 — Convergence or max iterations
 
 When the recipe's convergence criteria are met:
 - Report final state: RMS deviation, filters applied, alignment corrections

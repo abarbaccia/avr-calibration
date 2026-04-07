@@ -40,11 +40,18 @@ Mute any non-sub outputs (e.g. shakers) during calibration.
 
 ## Phase 0 — Level Setup
 
-### 0.1 Set initial volume
+### 0.1 Configure input routing
+
+Call `configure_matrix` with the `active_input` from config. This routes the active
+analog input to ALL four outputs and mutes the unused input. Without this step, the
+miniDSP 2x4 HD default matrix splits inputs across outputs, and input PEQ in Phase 3
+will only affect a subset of outputs.
+
+### 0.2 Set initial volume
 
 Set AVR to -10 dB as a known-good starting point for measurements.
 
-### 0.2 Measure each sub solo
+### 0.3 Measure each sub solo
 
 For each subwoofer output in the config:
 1. Mute all other sub outputs
@@ -52,24 +59,24 @@ For each subwoofer output in the config:
 3. Record the peak SPL from the frequency response
 4. Unmute
 
-### 0.3 Compare levels and compute trim
+### 0.4 Compare levels and compute trim
 
 The loudest sub is the reference (trim = 0 dB).
 For each quieter sub: trim = reference_spl - measured_spl.
 
-### 0.4 Check for large level gaps
+### 0.5 Check for large level gaps
 
 If any sub needs more than **10 dB** of digital trim:
 - **STOP and tell the user.** Large digital trims waste headroom.
 - Suggest turning up the volume knob on the quieter sub.
 - Wait for user confirmation before continuing.
 
-### 0.5 Apply level trims
+### 0.6 Apply level trims
 
 Apply the computed gain trims to miniDSP output gains.
 The loudest sub stays at 0 dB gain. Quieter subs get positive trim.
 
-### 0.6 Calibrate sweep level
+### 0.7 Calibrate sweep level
 
 Call `calibrate_level` to find the optimal sweep volume with good SNR.
 

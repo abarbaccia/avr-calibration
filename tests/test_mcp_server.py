@@ -38,6 +38,7 @@ import pytest
 
 from calibrate import mcp_server as sut
 from calibrate.mcp_server import (
+    _downsample_to_third_octave,
     _read_resource,
     _tool_analyze_decay,
     _tool_analyze_ir,
@@ -50,6 +51,7 @@ from calibrate.mcp_server import (
     _tool_configure_matrix,
     _tool_fetch_recipe,
     _tool_get_device_state,
+    _tool_get_fr_summary,
     _tool_get_measurement_history,
     _tool_get_output_state,
     _tool_mute_output,
@@ -219,6 +221,109 @@ async def test_get_measurement_history_storage_error() -> None:
 
     assert not result["ok"]
     assert "storage error" in result["error"]
+
+
+# ── get_fr_summary ────────────────────────────────────────────────────────────
+
+
+def test_downsample_to_third_octave_basic() -> None:
+    """Downsample flat FR to 1/3-octave bands."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(200), 500).tolist()
+    spl = [75.0] * len(freqs)
+    bands = _downsample_to_third_octave(freqs, spl)
+    assert len(bands) == 11  # 20 to 200 Hz in 1/3-octave steps
+    for b in bands:
+        assert b["spl_db"] == 75.0
+
+
+def test_downsample_to_third_octave_preserves_peak() -> None:
+    """A peak in the 80Hz band should show up in the downsampled data."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(200), 500).tolist()
+    spl = [75.0] * len(freqs)
+    # Add a peak near 80Hz
+    for i, f in enumerate(freqs):
+        if 70 < f < 90:
+            spl[i] = 85.0
+    bands = _downsample_to_third_octave(freqs, spl)
+    band_80 = next(b for b in bands if b["freq_hz"] == 80.0)
+    assert band_80["spl_db"] > 80.0
+
+
+@pytest.mark.asyncio
+async def test_get_fr_summary_returns_bands() -> None:
+    """get_fr_summary returns 1/3-octave downsampled FR data."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(200), 500).tolist()
+    spl = [75.0] * len(freqs)
+
+    mock_fr = MagicMock()
+    mock_fr.frequencies = freqs
+    mock_fr.spl = spl
+    mock_fr.peak_spl = 75.0
+    mock_fr.freq_at_peak = 80.0
+
+    mock_session = MagicMock()
+    mock_session.id = 42
+    mock_session.timestamp = "2026-04-07T00:00:00Z"
+    mock_session.label = "test-summary"
+    mock_session.start_fr = mock_fr
+    mock_session.metadata = {"ir": {"peak_time_ms": 5.0, "spl_db": 75.0}}
+
+    with patch("calibrate.storage.SessionStore") as mock_store_cls:
+        mock_store = MagicMock()
+        mock_store.list_sessions.return_value = [mock_session]
+        mock_store_cls.return_value = mock_store
+        result = await _tool_get_fr_summary(limit=5)
+
+    assert result["ok"]
+    assert result["count"] == 1
+    session = result["sessions"][0]
+    assert session["id"] == 42
+    assert len(session["bands"]) == 11
+    assert session["peak_spl"] == 75.0
+    assert session["ir_summary"] == {"peak_time_ms": 5.0, "spl_db": 75.0}
+
+
+@pytest.mark.asyncio
+async def test_get_fr_summary_by_session_ids() -> None:
+    """get_fr_summary fetches specific sessions by ID."""
+    mock_fr = MagicMock()
+    mock_fr.frequencies = [20.0, 80.0, 200.0]
+    mock_fr.spl = [75.0, 75.0, 75.0]
+    mock_fr.peak_spl = 75.0
+    mock_fr.freq_at_peak = 80.0
+
+    mock_session = MagicMock()
+    mock_session.id = 10
+    mock_session.timestamp = "2026-04-07T00:00:00Z"
+    mock_session.label = "specific"
+    mock_session.start_fr = mock_fr
+    mock_session.metadata = None
+
+    with patch("calibrate.storage.SessionStore") as mock_store_cls:
+        mock_store = MagicMock()
+        mock_store.get_session.return_value = mock_session
+        mock_store_cls.return_value = mock_store
+        result = await _tool_get_fr_summary(session_ids=[10])
+
+    assert result["ok"]
+    assert result["count"] == 1
+    assert result["sessions"][0]["id"] == 10
+    assert "ir_summary" not in result["sessions"][0]  # no metadata
+
+
+@pytest.mark.asyncio
+async def test_get_fr_summary_empty() -> None:
+    with patch("calibrate.storage.SessionStore") as mock_store_cls:
+        mock_store = MagicMock()
+        mock_store.list_sessions.return_value = []
+        mock_store_cls.return_value = mock_store
+        result = await _tool_get_fr_summary()
+
+    assert result["ok"]
+    assert result["count"] == 0
 
 
 # ── read_eq ────────────────────────────────────────────────────────────────────
