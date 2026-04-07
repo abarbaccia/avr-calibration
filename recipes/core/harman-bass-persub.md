@@ -67,15 +67,18 @@ Call `calibrate_level` to find the optimal sweep volume with good SNR.
 
 For each subwoofer:
 1. Mute all other subs
-2. Take a measurement
-3. Record the impulse response (IR peak time and polarity)
+2. Take a measurement — note the session_id
+3. Call `analyze_ir(session_id)` — get `peak_time_s`, `peak_sign`, `spl_db`
 4. Unmute
 
 ### 1.2 Apply corrections
 
-Compare the per-sub impulse responses:
-- **Delay**: Delay earlier-arriving subs to match the latest
-- **Polarity**: Flip polarity if IR peak is inverted relative to others
+Compare the per-sub `analyze_ir` results:
+- **Delay**: The sub with the latest `peak_time_s` is the reference (delay = 0).
+  Each other sub gets delay = (reference_peak_time_s − its_peak_time_s) × 1000 ms.
+  Apply via `set_delay`.
+- **Polarity**: Sub 0 is the polarity reference. Any sub with opposite `peak_sign`
+  gets `set_polarity(inverted=True)`.
 
 ### 1.3 Verify alignment
 
@@ -116,7 +119,14 @@ Always include the mandatory 18Hz HPF.
 For each sub, call `apply_eq` with `output_index` set to that sub's
 output index. Each sub gets its own independent filter set.
 
-### 2.4 Re-measure each sub solo and iterate
+### 2.4 Optional — Decay analysis after per-sub EQ
+
+After applying per-sub corrections, call `analyze_decay(session_id)` on the most
+recent solo measurement to check if any modes exhibit T60 > 500ms. If so, use
+`suggested_q` from that mode when designing the PEQ cut — a narrower Q targets
+the ringing frequency more surgically without over-cutting broadband energy.
+
+### 2.6 Re-measure each sub solo and iterate
 
 After applying per-sub EQ:
 1. Measure each sub solo again
@@ -187,5 +197,8 @@ If max iterations reached:
 - `apply_eq` — write per-sub correction filters (with `output_index` for single-output targeting)
 - `apply_input_eq` — write shared Harman target curve to DSP input
 - `mute_output` / `unmute_output` — isolate subs for solo measurement
-- `set_delay` / `set_polarity` — sub alignment
+- `set_delay` / `set_polarity` / `set_output_gain` — sub alignment
+- `get_output_state` — verify current per-output state mid-calibration
+- `analyze_ir` — IR peak time/sign/SPL for computing delay and polarity corrections
+- `analyze_decay` — T60 ringing analysis for EQ Q selection (optional, Phase 2)
 - `calibrate_level` — find optimal sweep volume
