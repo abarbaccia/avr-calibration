@@ -353,14 +353,12 @@ class MinidspClient:
     ) -> None:
         """Write PEQ entries to *output* via the minidsp CLI (not HTTP).
 
-        Writing real IIR biquad coefficients (a1≈-2, a2≈+1) to an active DSP output
-        causes the output level meter to freeze at 0.0 dBFS and audio to stop — a
-        hardware-level hang that requires a physical power-cycle to recover.
-
-        Fix: master-mute the DSP before writing any active (bypass=False) biquad
-        slot, then unmute after all writes complete.  The mute stops DSP processing
-        so coefficients can be safely loaded.  Bypassed slots are safe to write
-        without muting (they don't alter the signal path).
+        The miniDSP 2x4 HD firmware uses a POSITIVE-sign recurrence:
+            y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] + a1_hw*y[n-1] + a2_hw*y[n-2]
+        scipy/standard convention uses NEGATIVE signs for the feedback coefficients.
+        We must negate a1 and a2 before sending to hardware, otherwise the effective
+        poles are at |z|≈2.4 (unstable), causing the DSP to immediately overflow and
+        freeze at 0.0 dBFS — a hang requiring physical power-cycle to recover.
 
         Each entry: {"index": slot, "coeff": {b0,b1,b2,a1,a2}, "bypass": bool}
         Active slots (bypass=False): write coefficients then un-bypass.
@@ -368,35 +366,27 @@ class MinidspClient:
         """
         self._validate_output(output)
 
-        has_active = any(not e.get("bypass", False) for e in entries)
-        if has_active:
-            await _run_minidsp_cli("mute", "on")
-        try:
-            for entry in entries:
-                slot = str(entry["index"])
-                if entry.get("bypass", False):
-                    await _run_minidsp_cli("output", str(output), "peq", slot, "bypass", "on")
-                else:
-                    c = entry["coeff"]
-                    await _run_minidsp_cli(
-                        "output", str(output), "peq", slot, "set", "--",
-                        str(c["b0"]), str(c["b1"]), str(c["b2"]),
-                        str(c["a1"]), str(c["a2"]),
-                    )
-                    await _run_minidsp_cli("output", str(output), "peq", slot, "bypass", "off")
-        finally:
-            if has_active:
-                await _run_minidsp_cli("mute", "off")
+        for entry in entries:
+            slot = str(entry["index"])
+            if entry.get("bypass", False):
+                await _run_minidsp_cli("output", str(output), "peq", slot, "bypass", "on")
+            else:
+                c = entry["coeff"]
+                await _run_minidsp_cli(
+                    "output", str(output), "peq", slot, "set", "--",
+                    str(c["b0"]), str(c["b1"]), str(c["b2"]),
+                    str(-c["a1"]), str(-c["a2"]),  # negate: scipy→miniDSP sign convention
+                )
+                await _run_minidsp_cli("output", str(output), "peq", slot, "bypass", "off")
 
     async def check_for_dsp_hang(self, suspect_outputs: list[int]) -> None:
         """Poll output levels and raise MinidspApiError if any output is frozen.
 
-        A DSP hang manifests as an output level meter stuck at 0.0 dBFS when no
-        audio is playing.  Normal idle levels are -100 to -120 dBFS.  If detected,
-        the miniDSP must be physically power-cycled to recover — bypassing slots or
-        switching presets will not clear it.
-
-        Call this after PEQ writes to detect hangs early with a clear error.
+        A DSP hang (output level frozen at 0.0 dBFS) indicates the filter pipeline
+        overflowed — typically from a sign convention bug (sending scipy's negative
+        a1/a2 instead of the negated values the hardware expects).  Normal idle
+        levels are -94 to -120 dBFS.  Recovery requires a physical power-cycle;
+        bypassing slots or switching presets will not clear it.
         """
         try:
             status = await self.get_device_status()
@@ -420,28 +410,21 @@ class MinidspClient:
     ) -> None:
         """Write PEQ entries to input *input_index* via the minidsp CLI (not HTTP).
 
-        Same rationale as set_output_peq_cli — master-mutes before writing active
-        biquad slots to prevent DSP hang.
+        Same sign convention fix as set_output_peq_cli — negate a1/a2 before
+        sending to hardware (scipy negative → miniDSP positive convention).
         """
-        has_active = any(not e.get("bypass", False) for e in entries)
-        if has_active:
-            await _run_minidsp_cli("mute", "on")
-        try:
-            for entry in entries:
-                slot = str(entry["index"])
-                if entry.get("bypass", False):
-                    await _run_minidsp_cli("input", str(input_index), "peq", slot, "bypass", "on")
-                else:
-                    c = entry["coeff"]
-                    await _run_minidsp_cli(
-                        "input", str(input_index), "peq", slot, "set", "--",
-                        str(c["b0"]), str(c["b1"]), str(c["b2"]),
-                        str(c["a1"]), str(c["a2"]),
-                    )
-                    await _run_minidsp_cli("input", str(input_index), "peq", slot, "bypass", "off")
-        finally:
-            if has_active:
-                await _run_minidsp_cli("mute", "off")
+        for entry in entries:
+            slot = str(entry["index"])
+            if entry.get("bypass", False):
+                await _run_minidsp_cli("input", str(input_index), "peq", slot, "bypass", "on")
+            else:
+                c = entry["coeff"]
+                await _run_minidsp_cli(
+                    "input", str(input_index), "peq", slot, "set", "--",
+                    str(c["b0"]), str(c["b1"]), str(c["b2"]),
+                    str(-c["a1"]), str(-c["a2"]),  # negate: scipy→miniDSP sign convention
+                )
+                await _run_minidsp_cli("input", str(input_index), "peq", slot, "bypass", "off")
 
     async def set_output_fir_from_file(self, output: int, path: str) -> None:
         """Load FIR coefficients from a WAV file and activate them via CLI.

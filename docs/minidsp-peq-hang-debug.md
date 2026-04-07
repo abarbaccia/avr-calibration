@@ -106,8 +106,9 @@ The DSP is always "active" at idle (~-94 dBFS noise floor from analog inputs). A
 | CLI | `peq bypass off` | HPF 18Hz | None | ❌ | Same hang (not HPF-specific) |
 | CLI | `peq bypass off` | Peaking 80Hz | Master mute | ❌ | Mute does NOT stop DSP internally |
 | CLI | `peq set` (to active slot) | Peaking 80Hz | None | ❌ | Active slot overwrite also hangs |
-| CLI | `peq bypass off` | Peaking 80Hz (NEGATED a1/a2) | None | ❓ | Pending — core theory test |
-| CLI | `peq set` (to active slot) | Peaking 80Hz (NEGATED a1/a2) | None | ❓ | Pending |
+| CLI | `peq bypass off` | Peaking 80Hz (NEGATED a1/a2) | None | ✅ | No hang — stable poles at \|z\|≈0.99 |
+| CLI | `peq bypass off` | HPF 18Hz (NEGATED a1/a2) | None | ✅ | No hang — same fix works for HPF |
+| CLI | `peq set` + `bypass off` | Peaking 80Hz (NEGATED a1/a2) | Input 0 | ✅ | Input channel also works with negated a1/a2 |
 
 ## Verbose Debug Procedure
 
@@ -238,14 +239,42 @@ Evidence:
 - Negated a1 (+1.9912, -0.9912) would give poles at |z|≈0.99 → stable ✓
 - Why mute doesn't help: DSP still runs internally, still overflows
 
-**Next test (after reset): send real peaking with NEGATED a1/a2:**
+**Tests (after reset — Session 3 continued / Session 4):**
+
+All three tests with negated a1/a2 passed — no hang:
+
 ```bash
-# Scipy: a1=-1.9912, a2=+0.9912  →  Negated: a1=+1.9912, a2=-0.9912
-ssh pi@192.168.1.117 "sudo docker exec avr-calibration minidsp -v output 1 peq 2 set -- 0.9987203134966584 -1.9912093556606645 0.9925163375433332 1.9912093556606645 -0.9912366510399917 2>&1"
-ssh pi@192.168.1.117 "sudo docker exec avr-calibration minidsp -v output 1 peq 2 bypass off 2>&1"
-ssh pi@192.168.1.117 "sudo docker exec avr-calibration minidsp status 2>&1"
+# Input 0: negated a1/a2 peaking
+minidsp -v input 0 peq 2 set -- 0.9987203 -1.9912094 0.9925163 1.9912094 -0.9912366
+minidsp -v input 0 peq 2 bypass off
+# → output levels unchanged ✅
+
+# Output 0: negated a1/a2 peaking
+minidsp -v output 0 peq 2 set -- 0.9987203 -1.9912094 0.9925163 1.9912094 -0.9912366
+minidsp -v output 0 peq 2 bypass off
+# → output levels unchanged ✅
+
+# Output 0: negated a1/a2 HPF 18Hz
+minidsp -v output 0 peq 3 set -- 0.9984619 -1.9969238 0.9984619 1.9978241 -0.9978255
+minidsp -v output 0 peq 3 bypass off
+# → output 0 stays at -94.6 dBFS ✅
 ```
-Expected: output 1 stays at ~-94 dBFS (stable) → confirms sign convention fix.
+
+## Fix Applied
+
+**Root cause confirmed: scipy/standard sign convention uses negative a1/a2; miniDSP firmware uses positive.**
+
+Code fix in `calibrate/adapters/minidsp.py`, both `set_output_peq_cli` and `set_input_peq_cli`:
+```python
+# Before (wrong — causes DSP hang):
+str(c["a1"]), str(c["a2"]),
+
+# After (correct — negated for hardware):
+str(-c["a1"]), str(-c["a2"]),  # negate: scipy→miniDSP sign convention
+```
+
+The mute guard (`mute on/off`) was also removed — it was ineffective because `SetMute` only
+gates the analog output stage; the DSP pipeline continues running internally.
 
 ---
 

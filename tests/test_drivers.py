@@ -314,22 +314,29 @@ async def test_minidsp_apply_eq_per_output() -> None:
 
 
 @pytest.mark.asyncio
-async def test_minidsp_apply_eq_mutes_before_active_biquad_write() -> None:
-    """Master-mute must be called before writing any active (bypass=False) biquad slot."""
+async def test_minidsp_apply_eq_negates_a1_a2_for_hardware() -> None:
+    """CLI peq set must send negated a1/a2 (scipy→miniDSP positive sign convention)."""
+    from calibrate.dsp import freq_gain_q_to_biquad
     driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1])
     filters = [
         {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
+        {"freq": 80.0, "gain_db": -3.0, "q": 1.0, "type": "peaking"},
     ]
+    biquad = freq_gain_q_to_biquad(freq=80.0, gain_db=-3.0, q=1.0, filter_type="peaking")
     with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
         await driver.apply_eq(0, filters, output_index=1)
+        # Find the peq set call for the peaking filter (slot 3, the second filter)
+        set_calls = [c for c in mock_cli.call_args_list if "set" in c.args]
+        set_call = set_calls[1]  # second set call is the peaking filter
+        args = set_call.args
+        # args: ("output", "1", "peq", slot, "set", "--", b0, b1, b2, a1_hw, a2_hw)
+        a1_hw = float(args[9])
+        a2_hw = float(args[10])
+        assert abs(a1_hw - (-biquad["a1"])) < 1e-9, f"a1_hw {a1_hw} != -a1_scipy {-biquad['a1']}"
+        assert abs(a2_hw - (-biquad["a2"])) < 1e-9, f"a2_hw {a2_hw} != -a2_scipy {-biquad['a2']}"
+        # No mute calls — mute guard was removed (it doesn't stop the DSP pipeline)
         all_args = [c.args for c in mock_cli.call_args_list]
-        # mute on must appear before any peq set call
-        mute_on_idx = next(i for i, a in enumerate(all_args) if a == ("mute", "on"))
-        peq_set_idx = next(i for i, a in enumerate(all_args) if "set" in a)
-        assert mute_on_idx < peq_set_idx, "mute on must precede peq set"
-        # mute off must appear after all peq writes
-        mute_off_idx = next(i for i, a in enumerate(all_args) if a == ("mute", "off"))
-        assert mute_off_idx > peq_set_idx, "mute off must follow peq set"
+        assert ("mute", "on") not in all_args, "unexpected mute on — mute guard was removed"
 
 
 @respx.mock
