@@ -83,17 +83,31 @@ a2=0.9968933451585252
 
 Status legend: ✅ = confirmed OK, ❌ = confirmed HANG, ❓ = untested
 
+### Key Finding — Session 2
+
+**`peq set` is safe. `bypass off` is the trigger.**
+
+The verbose log shows two distinct commands:
+- `WriteBiquad` (from `peq set`) — writes coefficients to slot memory. Safe. Output levels unchanged.
+- `WriteBiquadBypass { value: false }` (from `bypass off`) — ACTIVATES the filter. **This triggers the hang.**
+
+The DSP is always "active" at idle (~-94 dBFS noise floor from analog inputs). Activating any real IIR biquad slot on a running DSP causes the freeze. The "no signal" assumption was incorrect.
+
+**Implication:** Only the `bypass off` call needs protection. `peq set` can be called freely.
+
 ### Transport × Filter Type × Mute State
 
-| Transport | Filter | Mute? | Output 0 | Output 1 | Output 2 |
-|-----------|--------|-------|----------|----------|----------|
-| HTTP batch | Identity | None | ✅ | — | — |
-| HTTP batch | Peaking 80Hz | None | ❌ | — | — |
-| CLI | Identity | None | — | ✅ | — |
-| CLI | HPF 18Hz (sec 0) | None | — | ❌ | ❌ |
-| CLI | Peaking 80Hz | None | — | ❓ | ❓ |
-| CLI | HPF 18Hz (sec 0) | Master mute | — | ❓ | ❓ |
-| CLI | Peaking 80Hz | Master mute | — | ❓ | ❓ |
+| Transport | Command | Filter | Mute? | Output 1 | Notes |
+|-----------|---------|--------|-------|----------|-------|
+| HTTP batch | batch | Identity | None | ✅ | |
+| HTTP batch | batch | Peaking 80Hz | None | ❌ | |
+| CLI | `peq set` | Peaking 80Hz | None | ✅ | **Set alone is safe** |
+| CLI | `peq bypass off` | Peaking 80Hz | None | ❌ | **Bypass off triggers hang** |
+| CLI | `peq bypass off` | HPF 18Hz | None | ❌ | Same hang (not HPF-specific) |
+| CLI | `peq bypass off` | Peaking 80Hz | Master mute | ❌ | Mute does NOT stop DSP internally |
+| CLI | `peq set` (to active slot) | Peaking 80Hz | None | ❌ | Active slot overwrite also hangs |
+| CLI | `peq bypass off` | Peaking 80Hz (NEGATED a1/a2) | None | ❓ | Pending — core theory test |
+| CLI | `peq set` (to active slot) | Peaking 80Hz (NEGATED a1/a2) | None | ❓ | Pending |
 
 ## Verbose Debug Procedure
 
@@ -158,6 +172,80 @@ Expected: ✅ output levels NOT frozen (validates the fix).
 **Fix applied:** `929f9cd` — master-mute before active biquad writes + post-write hang detection.
 
 **Status:** Pending validation (device needs physical reset).
+
+---
+
+### Session 2 — 2026-04-07
+
+**Setup:** Physical reset completed. Device at idle (~-94 dBFS output levels from analog noise floor).
+
+**Test: Peaking 80Hz -3dB Q=0.707 on output 1, no mute**
+
+```
+minidsp -v output 1 peq 2 set -- 0.9987... -1.9912... 0.9925... -1.9912... 0.9912...
+```
+Verbose output showed: `WriteBiquad { addr: PEQ_4_8, data: [0.9987203, -1.9912094, 0.99251634, -1.9912094, 0.9912366] }` → Ack
+Output levels **unchanged** after `peq set`. ✅ **Set is safe.**
+
+```
+minidsp -v output 1 peq 2 bypass off
+```
+Verbose output showed: `WriteBiquadBypass { addr: PEQ_4_8, value: false }` → Ack
+Output levels: `-94.1, **0.0**, -94.1, -94.1` → **HANG on output 1.** ❌
+
+**Key finding:** The hang is triggered by `WriteBiquadBypass { value: false }` (activating the filter), NOT by `WriteBiquad` (writing coefficients). Any real IIR filter causes this — not just HPF.
+
+The miniDSP is always running (~-94 dBFS idle noise from analog inputs). Activating a real IIR biquad slot on a live DSP triggers the freeze. "No audio playing" does not mean "DSP is idle."
+
+**Status:** Device needs physical reset. Next: test with master mute before `bypass off`.
+
+---
+
+### Session 3 — 2026-04-07
+
+**Setup:** Device recovered (output 1 hung from session 2, outputs 2/3 clean).
+
+**Test A: Peaking 80Hz with master mute before bypass off — output 2**
+
+Sequence: `mute on` → `peq set` (real peaking) → `bypass off` → `mute off` → check status
+
+Result: output 2 froze at 0.0 dBFS despite master mute. ❌
+
+Finding: `SetMute { value: true }` only gates the analog output stage. The DSP filter pipeline continues running internally. Muting does NOT prevent the hang.
+
+**Test B: Write to already-active slot (no bypass change) — output 3**
+
+Sequence: `peq 2 clear` (writes identity + activates slot, `WriteBiquadBypass false`) → confirm output 3 at -94 dBFS ✅ → `peq 2 set` with real peaking coefficients → check status
+
+Result: output 3 froze at 0.0 dBFS after `WriteBiquad` to an already-active slot. ❌
+
+Finding: The firmware applies new coefficients IMMEDIATELY when `WriteBiquad` is called on an active slot. This means the hang isn't just about `bypass off` — any mechanism that makes real IIR coefficients active in the running DSP causes immediate overflow.
+
+**Status:** All outputs hung (0: defective, 1-3: hung). Device needs physical reset.
+
+**Root cause hypothesis — sign convention mismatch:**
+
+The miniDSP 2x4 HD firmware almost certainly uses a POSITIVE-sign recurrence:
+```
+y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] + a1_stored*y[n-1] + a2_stored*y[n-2]
+```
+
+This requires `a1_stored = -a1_scipy` (negated). With scipy's negative a1, the effective poles are at `|z|≈2.4` (explosive), causing immediate saturation → 0.0 dBFS.
+
+Evidence:
+- Identity filter (a1=0): unaffected by sign → always works ✓
+- Any real IIR (a1≈-2): immediately hangs when active → consistent with unstable poles ✓
+- Negated a1 (+1.9912, -0.9912) would give poles at |z|≈0.99 → stable ✓
+- Why mute doesn't help: DSP still runs internally, still overflows
+
+**Next test (after reset): send real peaking with NEGATED a1/a2:**
+```bash
+# Scipy: a1=-1.9912, a2=+0.9912  →  Negated: a1=+1.9912, a2=-0.9912
+ssh pi@192.168.1.117 "sudo docker exec avr-calibration minidsp -v output 1 peq 2 set -- 0.9987203134966584 -1.9912093556606645 0.9925163375433332 1.9912093556606645 -0.9912366510399917 2>&1"
+ssh pi@192.168.1.117 "sudo docker exec avr-calibration minidsp -v output 1 peq 2 bypass off 2>&1"
+ssh pi@192.168.1.117 "sudo docker exec avr-calibration minidsp status 2>&1"
+```
+Expected: output 1 stays at ~-94 dBFS (stable) → confirms sign convention fix.
 
 ---
 
