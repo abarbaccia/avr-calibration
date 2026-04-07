@@ -21,6 +21,13 @@ Tools:
   unmute_output          — unmute DSP outputs (gain → 0 dB)
   set_delay              — set output delay in ms
   set_polarity           — set output polarity (normal/inverted)
+  get_output_state       — per-output gain, delay, polarity, fir_taps (in-memory tracking)
+  set_output_gain        — set gain for a single DSP output (dB)
+  apply_fir              — write FIR coefficients to a DSP output (via CLI, WAV temp file)
+  clear_fir              — clear FIR and reset to passthrough
+  analyze_ir             — IR peak time, polarity, SPL from stored session (sub alignment)
+  analyze_decay          — T60 decay analysis on stored IR; returns ringing modes with priority
+  configure_matrix       — configure miniDSP routing matrix (active input → all outputs)
   check_system           — pre-flight hardware checks
   fetch_recipe           — serve recipe markdown from recipes/ directory
 
@@ -384,6 +391,10 @@ async def _tool_get_config() -> dict:
                 "tool": "apply_input_eq",
             },
             "output_peq": [],
+            "fir_capable": True,
+            "fir_max_taps_per_output": 2048,
+            "fir_shared_tap_pool": 4096,
+            "fir_sample_rate_hz": 96000,
         }
 
         for slot_cfg in cfg.minidsp.get("output_slots", []):
@@ -477,6 +488,184 @@ async def _tool_set_polarity(output_index: int, inverted: bool) -> dict:
         return _err(str(exc))
     except Exception as exc:
         return _err(f"set_polarity error: {exc}")
+
+
+async def _tool_get_output_state() -> dict:
+    """Return per-output gain, delay, and polarity from in-memory driver tracking."""
+    try:
+        state = _dsp.get_output_state()  # type: ignore[union-attr]
+        return _ok(outputs=state)
+    except Exception as exc:
+        return _err(f"get_output_state error: {exc}")
+
+
+async def _tool_analyze_ir(
+    session_id: int | None = None,
+    search_window_ms: float = 50.0,
+) -> dict:
+    """Extract IR peak time, polarity sign, and SPL from a stored session.
+
+    Used for sub alignment: measure each sub solo, call this on each session,
+    compute delay offsets from peak_time_s differences, apply via set_delay.
+    """
+    from .storage import SessionStore
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        if not sessions:
+            return _err("no measurements found — run measure first")
+
+        if session_id is not None:
+            session = next((s for s in sessions if s.id == session_id), None)
+            if session is None:
+                return _err(f"session {session_id} not found")
+        else:
+            session = sessions[0]
+
+        ir = session.impulse_response
+        if not ir:
+            return _err(
+                f"session {session.id} has no impulse response stored — "
+                "re-run measure to capture IR"
+            )
+
+        import numpy as np
+
+        sample_rate = session.start_fr.sample_rate if session.start_fr else 48000
+        ir_arr = np.array(ir, dtype=np.float64)
+
+        search_samples = max(1, int(search_window_ms / 1000.0 * sample_rate))
+        search_samples = min(search_samples, len(ir_arr))
+        search_window = ir_arr[:search_samples]
+
+        peak_idx = int(np.argmax(np.abs(search_window)))
+        peak_sign = 1 if ir_arr[peak_idx] >= 0.0 else -1
+        peak_time_s = peak_idx / sample_rate
+        spl_db = float(20.0 * np.log10(abs(float(ir_arr[peak_idx])) + 1e-12))
+
+        return _ok(
+            session_id=session.id,
+            peak_time_s=round(peak_time_s, 6),
+            peak_time_ms=round(peak_time_s * 1000.0, 3),
+            peak_sign=peak_sign,
+            spl_db=round(spl_db, 1),
+            sample_rate=sample_rate,
+        )
+    except Exception as exc:
+        return _err(f"analyze_ir failed: {exc}")
+
+
+async def _tool_apply_fir(output_index: int, coefficients: list[float]) -> dict:
+    """Write FIR coefficients to a single DSP output."""
+    try:
+        await _dsp.apply_fir(output_index, coefficients)  # type: ignore[union-attr]
+        return _ok(output_index=output_index, taps=len(coefficients))
+    except DriverError as exc:
+        return _err(str(exc))
+    except Exception as exc:
+        return _err(f"apply_fir error: {exc}")
+
+
+async def _tool_clear_fir(output_index: int) -> dict:
+    """Clear FIR coefficients and reset output to passthrough."""
+    try:
+        await _dsp.clear_fir(output_index)  # type: ignore[union-attr]
+        return _ok(output_index=output_index, message="FIR cleared")
+    except DriverError as exc:
+        return _err(str(exc))
+    except Exception as exc:
+        return _err(f"clear_fir error: {exc}")
+
+
+async def _tool_set_output_gain(output_index: int, gain_db: float) -> dict:
+    """Set gain for a single DSP output in dB."""
+    try:
+        await _dsp.set_output_gain(output_index, gain_db)  # type: ignore[union-attr]
+        return _ok(output_index=output_index, gain_db=gain_db)
+    except DriverError as exc:
+        return _err(str(exc))
+    except Exception as exc:
+        return _err(f"set_output_gain error: {exc}")
+
+
+async def _tool_configure_matrix(active_input: int | None = None) -> dict:
+    """Route the active DSP input to enabled outputs, skipping defective/unused ones."""
+    try:
+        cfg = _config()
+        input_idx = active_input if active_input is not None else cfg.minidsp.get("active_input", 0)
+        # Only route to outputs that are not marked unused in config.
+        slots = cfg.minidsp.get("output_slots", [])
+        enabled_indices = {s["index"] for s in slots if s.get("type") != "unused"}
+        all_indices = set(range(4))
+        output_enabled = {i: (i in enabled_indices) for i in all_indices}
+        other_input = 1 - input_idx
+        await _dsp.set_routing({input_idx: output_enabled, other_input: {i: False for i in all_indices}})  # type: ignore[union-attr]
+        return _ok(active_input=input_idx, routed_outputs=sorted(enabled_indices),
+                   message=f"Input {input_idx} routed to outputs {sorted(enabled_indices)}")
+    except DriverError as exc:
+        return _err(str(exc))
+    except Exception as exc:
+        return _err(f"configure_matrix error: {exc}")
+
+
+async def _tool_analyze_decay(
+    session_id: int | None = None,
+    t60_threshold_ms: float = 300.0,
+    freq_min: float = 20.0,
+    freq_max: float = 200.0,
+) -> dict:
+    """Run T60 decay analysis on the impulse response from a stored session."""
+    from .storage import SessionStore
+    from .decay import analyze_decay as _analyze_decay
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        if not sessions:
+            return _err("no measurements found — run measure first")
+
+        if session_id is not None:
+            session = next((s for s in sessions if s.id == session_id), None)
+            if session is None:
+                return _err(f"session {session_id} not found")
+        else:
+            session = sessions[0]
+
+        ir = session.impulse_response
+        if not ir:
+            return _err(
+                f"session {session.id} has no impulse response stored — "
+                "re-run measure to capture IR"
+            )
+
+        sample_rate = session.start_fr.sample_rate if session.start_fr else 48000
+        modes = _analyze_decay(
+            ir,
+            sample_rate=sample_rate,
+            t60_threshold_ms=t60_threshold_ms,
+            freq_min=freq_min,
+            freq_max=freq_max,
+        )
+
+        return _ok(
+            session_id=session.id,
+            mode_count=len(modes),
+            modes=[
+                {
+                    "freq_hz": m.freq_hz,
+                    "t60_ms": m.t60_ms,
+                    "peak_db": m.peak_db,
+                    "suggested_q": m.suggested_q,
+                    "priority": m.priority,
+                }
+                for m in modes
+            ],
+        )
+    except ValueError as exc:
+        return _err(f"decay analysis error: {exc}")
+    except Exception as exc:
+        return _err(f"analyze_decay failed: {exc}")
 
 
 async def _tool_check_system() -> dict:
@@ -861,6 +1050,179 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="get_output_state",
+        description=(
+            "Return per-output gain_db, delay_ms, and polarity_inverted from "
+            "in-memory driver tracking. Reflects values set via set_output_gain, "
+            "set_delay, set_polarity during this session. "
+            "Note: hardware state from before this server started is not readable "
+            "from minidspd — only changes made in this session are tracked."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {},
+        },
+    ),
+    Tool(
+        name="analyze_ir",
+        description=(
+            "Extract IR peak time, polarity sign, and SPL from a stored measurement session. "
+            "Use this after measuring each sub solo to get the data needed for alignment: "
+            "peak_time_s is the travel-time from sub to mic; "
+            "subtract the earliest arrival from the latest to get the delay offset to apply; "
+            "peak_sign tells you polarity (if it differs from the reference sub, flip it); "
+            "spl_db is the relative level for gain matching. "
+            "Workflow: mute_output → measure → analyze_ir → unmute_output → repeat per sub → "
+            "compute offsets → set_delay / set_polarity / set_output_gain."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "integer",
+                    "description": "Session ID to analyse. Omit to analyse the most recent session.",
+                },
+                "search_window_ms": {
+                    "type": "number",
+                    "description": (
+                        "Time window to search for IR peak (default: 50ms = 17.5m at 343m/s). "
+                        "Increase if sub is more than ~5m from mic."
+                    ),
+                    "default": 50.0,
+                },
+            },
+        },
+    ),
+    Tool(
+        name="apply_fir",
+        description=(
+            "Write FIR filter coefficients to a single DSP output on the miniDSP 2x4 HD. "
+            "Coefficients are floats normalized so the peak is <= 1.0. "
+            "The miniDSP FIR engine runs at 96000 Hz; max 2048 taps per output "
+            "(4096 shared across all 4 outputs). "
+            "Use after analyze_decay to shorten room-mode ringing that PEQ cannot fix — "
+            "FIR corrects the time-domain decay; PEQ only reduces the peak magnitude. "
+            "After writing, get_output_state will show fir_taps = len(coefficients)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "output_index": {
+                    "type": "integer",
+                    "description": "DSP output index (0-3)",
+                },
+                "coefficients": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": (
+                        "FIR filter coefficients as floats. "
+                        "Max 2048 taps. Must be at 96000 Hz. "
+                        "Normalize so peak abs value <= 1.0."
+                    ),
+                },
+            },
+            "required": ["output_index", "coefficients"],
+        },
+    ),
+    Tool(
+        name="clear_fir",
+        description=(
+            "Clear FIR coefficients on a DSP output, resetting it to passthrough. "
+            "Use before loading new coefficients or to undo a FIR pass."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "output_index": {
+                    "type": "integer",
+                    "description": "DSP output index (0-3)",
+                },
+            },
+            "required": ["output_index"],
+        },
+    ),
+    Tool(
+        name="set_output_gain",
+        description=(
+            "Set gain for a single DSP output in dB. Range: -127 to +6 dB. "
+            "Use this for per-sub level trimming during calibration — after measuring "
+            "each sub solo, trim quieter subs up so all subs match the loudest. "
+            "Avoid gains above 0 dB (risks clipping). "
+            "mute_output / unmute_output are preferred for temporary silencing."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "output_index": {
+                    "type": "integer",
+                    "description": "DSP output index (0-3)",
+                },
+                "gain_db": {
+                    "type": "number",
+                    "description": "Gain in dB. Range: -127 to +6.",
+                },
+            },
+            "required": ["output_index", "gain_db"],
+        },
+    ),
+    Tool(
+        name="configure_matrix",
+        description=(
+            "Configure the miniDSP routing matrix: route the active analog input "
+            "to enabled outputs (skipping defective/unused ones) and mute the other input. "
+            "Call this if subs are silent during calibration (no signal reaching DSP). "
+            "Uses active_input from config by default, or pass active_input to override."
+            + _SIGNAL_PATH_WRITE_WARNING
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "active_input": {
+                    "type": "integer",
+                    "description": "Input index to route to all outputs (0 or 1). Defaults to config value.",
+                },
+            },
+        },
+    ),
+    Tool(
+        name="analyze_decay",
+        description=(
+            "Analyze room-mode T60 decay in the impulse response from a stored measurement. "
+            "Returns a list of ringing modes sorted by priority (T60 × peak_amplitude), "
+            "each with freq_hz, t60_ms, peak_db, and suggested_q for EQ targeting. "
+            "Modes with T60 > 300ms are flagged. "
+            "Correction options depend on eq_capabilities from get_config: "
+            "if fir_capable=true, use apply_fir to shorten the decay duration; "
+            "if fir_capable=false (miniDSP 2x4 HD), use apply_eq with suggested_q to "
+            "reduce peak energy — the mode will still ring at reduced level. "
+            "Call after measure() to identify problem frequencies before designing EQ filters."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "integer",
+                    "description": "Session ID to analyse. Omit to analyse the most recent session.",
+                },
+                "t60_threshold_ms": {
+                    "type": "number",
+                    "description": "Minimum T60 in ms to flag as a ringing mode (default: 300).",
+                    "default": 300.0,
+                },
+                "freq_min": {
+                    "type": "number",
+                    "description": "Lower frequency bound in Hz (default: 20).",
+                    "default": 20.0,
+                },
+                "freq_max": {
+                    "type": "number",
+                    "description": "Upper frequency bound in Hz (default: 200).",
+                    "default": 200.0,
+                },
+            },
+        },
+    ),
+    Tool(
         name="check_system",
         description=(
             "Run pre-flight hardware checks: config, miniDSP (USB + daemon), "
@@ -936,6 +1298,36 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_set_polarity(
             output_index=int(arguments["output_index"]),
             inverted=arguments["inverted"] is True,
+        )
+    elif name == "get_output_state":
+        result = await _tool_get_output_state()
+    elif name == "analyze_ir":
+        result = await _tool_analyze_ir(
+            session_id=int(arguments["session_id"]) if "session_id" in arguments else None,
+            search_window_ms=float(arguments.get("search_window_ms", 50.0)),
+        )
+    elif name == "apply_fir":
+        result = await _tool_apply_fir(
+            output_index=int(arguments["output_index"]),
+            coefficients=[float(c) for c in arguments["coefficients"]],
+        )
+    elif name == "clear_fir":
+        result = await _tool_clear_fir(output_index=int(arguments["output_index"]))
+    elif name == "set_output_gain":
+        result = await _tool_set_output_gain(
+            output_index=int(arguments["output_index"]),
+            gain_db=float(arguments["gain_db"]),
+        )
+    elif name == "configure_matrix":
+        result = await _tool_configure_matrix(
+            active_input=int(arguments["active_input"]) if "active_input" in arguments else None
+        )
+    elif name == "analyze_decay":
+        result = await _tool_analyze_decay(
+            session_id=int(arguments["session_id"]) if "session_id" in arguments else None,
+            t60_threshold_ms=float(arguments.get("t60_threshold_ms", 300.0)),
+            freq_min=float(arguments.get("freq_min", 20.0)),
+            freq_max=float(arguments.get("freq_max", 200.0)),
         )
     elif name == "check_system":
         result = await _tool_check_system()
