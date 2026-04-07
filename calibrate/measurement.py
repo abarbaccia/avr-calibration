@@ -58,6 +58,7 @@ class FrequencyResponse:
     timestamp: str            # ISO-8601 UTC
     warnings: list[dict] = field(default_factory=list)  # non-fatal quality warnings
     impulse_response: Optional[list[float]] = None  # time-domain IR, first 24 000 samples
+    phase: Optional[list[float]] = None  # radians, same grid as frequencies/spl
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
@@ -67,6 +68,7 @@ class FrequencyResponse:
         data = json.loads(s)
         data.setdefault("warnings", [])     # backward compat
         data.setdefault("impulse_response", None)  # backward compat
+        data.setdefault("phase", None)  # backward compat
         return cls(**data)
 
     @property
@@ -300,7 +302,7 @@ class MeasurementEngine:
         min_snr = float(cfg.get("min_snr_db", 20.0))
         self.validate_recording(np, sweep_1d, rec_1d, sample_rate, min_snr_db=min_snr)
 
-        frequencies, spl, ir_samples = self._compute_fr_arrays(
+        frequencies, spl, ir_samples, phase = self._compute_fr_arrays(
             np, sweep_1d, rec_1d, freq_min, freq_max, sample_rate
         )
 
@@ -311,6 +313,7 @@ class MeasurementEngine:
             sweep_duration=duration,
             timestamp=datetime.now(timezone.utc).isoformat(),
             impulse_response=ir_samples,
+            phase=phase,
         )
 
     # ── Internals ─────────────────────────────────────────────────────────
@@ -323,12 +326,13 @@ class MeasurementEngine:
         freq_min: int,
         freq_max: int,
         sample_rate: int,
-    ) -> tuple[list[float], list[float]]:
+    ) -> tuple[list[float], list[float], list[float], list[float]]:
         """
         Core deconvolution on raw numpy arrays.
 
         H(f) = FFT(recording) / FFT(sweep)
 
+        Returns (frequencies, magnitude_db, ir_samples, phase_radians).
         Arrays are zero-padded / truncated to the shorter length so they
         share the same FFT grid.
         """
@@ -345,9 +349,10 @@ class MeasurementEngine:
 
         freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
         mag_db = 20.0 * np.log10(np.abs(H) + 1e-12)
+        phase_rad = np.angle(H)
 
         mask = (freqs >= freq_min) & (freqs <= freq_max)
-        return freqs[mask].tolist(), mag_db[mask].tolist(), ir_samples
+        return freqs[mask].tolist(), mag_db[mask].tolist(), ir_samples, phase_rad[mask].tolist()
 
     def _compute_fr(
         self,
@@ -357,8 +362,91 @@ class MeasurementEngine:
         freq_min: int,
         freq_max: int,
         sample_rate: int,
-    ) -> tuple[list[float], list[float], list[float]]:
+    ) -> tuple[list[float], list[float], list[float], list[float]]:
         """Wrapper that extracts numpy arrays from PyTTa SignalObj inputs."""
         x = sweep.timeSignal[:, 0]
         y = recording.timeSignal[:, 0]
         return self._compute_fr_arrays(np, x, y, freq_min, freq_max, sample_rate)
+
+
+def compute_session_metadata(
+    fr: FrequencyResponse,
+    search_window_ms: float = 50.0,
+    decay_freq_min: float = 20.0,
+    decay_freq_max: float = 200.0,
+    t60_threshold_ms: float = 300.0,
+) -> dict:
+    """Compute IR-derived metadata from a FrequencyResponse at capture time.
+
+    Returns a dict with:
+      ir:           {peak_time_ms, peak_sign, spl_db}
+      decay_modes:  [{freq_hz, t60_ms, peak_db, suggested_q, priority}, ...]
+      group_delay:  {freq_hz: [...], delay_ms: [...]}
+    """
+    import numpy as np
+
+    metadata: dict = {}
+    sample_rate = fr.sample_rate or 48000
+
+    # ── IR peak analysis (replaces analyze_ir) ────────────────────────────
+    if fr.impulse_response:
+        ir_arr = np.array(fr.impulse_response, dtype=np.float64)
+        search_samples = max(1, int(search_window_ms / 1000.0 * sample_rate))
+        search_samples = min(search_samples, len(ir_arr))
+        search_window = ir_arr[:search_samples]
+
+        peak_idx = int(np.argmax(np.abs(search_window)))
+        peak_sign = 1 if ir_arr[peak_idx] >= 0.0 else -1
+        peak_time_s = peak_idx / sample_rate
+        spl_db = float(20.0 * np.log10(abs(float(ir_arr[peak_idx])) + 1e-12))
+
+        metadata["ir"] = {
+            "peak_time_ms": round(peak_time_s * 1000.0, 3),
+            "peak_sign": peak_sign,
+            "spl_db": round(spl_db, 1),
+            "sample_rate": sample_rate,
+        }
+
+    # ── Decay analysis (replaces analyze_decay) ──────────────────────────
+    if fr.impulse_response:
+        try:
+            from .decay import analyze_decay as _analyze_decay
+
+            modes = _analyze_decay(
+                fr.impulse_response,
+                sample_rate=sample_rate,
+                t60_threshold_ms=t60_threshold_ms,
+                freq_min=decay_freq_min,
+                freq_max=decay_freq_max,
+            )
+            metadata["decay_modes"] = [
+                {
+                    "freq_hz": m.freq_hz,
+                    "t60_ms": m.t60_ms,
+                    "peak_db": m.peak_db,
+                    "suggested_q": m.suggested_q,
+                    "priority": m.priority,
+                }
+                for m in modes
+            ]
+        except (ValueError, ImportError):
+            metadata["decay_modes"] = []
+
+    # ── Group delay from phase ────────────────────────────────────────────
+    if fr.phase and fr.frequencies and len(fr.phase) >= 2:
+        freqs = np.array(fr.frequencies, dtype=np.float64)
+        phase = np.unwrap(np.array(fr.phase, dtype=np.float64))
+        # group_delay = -d(phase)/d(omega) = -d(phase)/d(freq) / (2*pi)
+        d_freq = np.diff(freqs)
+        d_phase = np.diff(phase)
+        # Avoid division by zero
+        with np.errstate(divide="ignore", invalid="ignore"):
+            gd = np.where(d_freq > 0, -d_phase / (2.0 * np.pi * d_freq), 0.0)
+        # Convert to ms; use midpoint frequencies
+        mid_freqs = (freqs[:-1] + freqs[1:]) / 2.0
+        metadata["group_delay"] = {
+            "freq_hz": [round(f, 2) for f in mid_freqs.tolist()],
+            "delay_ms": [round(d * 1000.0, 3) for d in gd.tolist()],
+        }
+
+    return metadata

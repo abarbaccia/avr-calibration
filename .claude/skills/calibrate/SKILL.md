@@ -29,11 +29,29 @@ Run a calibration recipe by reading it and executing each step via MCP tools.
 ### Step 1 — List recipes and recommend based on hardware
 
 ```
-1. Call `get_config` to read the user's hardware setup (number of subs, shakers, etc.)
+1. Call `get_config` to read the user's hardware setup.
 2. List all .md files in recipes/core/ using Glob.
-3. Read the first few lines of each recipe to get the Goal/Overview.
+3. Read the first few lines of each recipe to get the Goal/Filter Strategy/Overview.
 4. Display them as a numbered list with a brief description.
-5. Recommend a recipe based on the hardware config:
+5. Before the recipe list, show a hardware summary derived from get_config:
+
+   Hardware summary format:
+   ┌─ Hardware Chain ──────────────────────────────────────────────┐
+   │ Subs:    [label] (output N) — [N] PEQ slots                   │
+   │          [label] (output N) — [N] PEQ slots                   │
+   │ Shakers: [label] (output N) — muted during calibration        │
+   │ Input PEQ: [N] slots (shared across all outputs)              │
+   │ FIR:     [N] taps/output ([N] shared pool @ [rate]kHz)        │
+   └───────────────────────────────────────────────────────────────┘
+
+   Read this from:
+   - config.minidsp.output_slots → sub/shaker labels and output indices
+   - config.eq_capabilities.output_peq → PEQ slots per sub output
+   - config.eq_capabilities.input_peq → shared input PEQ slots
+   - config.eq_capabilities.fir_capable, fir_max_taps_per_output,
+     fir_shared_tap_pool, fir_sample_rate_hz → FIR capability
+
+6. Recommend a recipe based on the hardware config:
 
    Recommendation logic:
    - Count sub outputs (type: "sub") in config.minidsp.output_slots
@@ -45,8 +63,11 @@ Run a calibration recipe by reading it and executing each step via MCP tools.
    "Recommended: **harman-bass-persub** — you have 2 subs, per-sub EQ will flatten each
     sub's room response independently before applying the shared Harman target."
 
-6. If $ARGUMENTS names a valid recipe, pre-select it but still confirm.
-7. Let the user pick or accept the recommendation.
+   Also note whether the selected recipe uses FIR or PEQ only (from the recipe's
+   ## Filter Strategy section), so the user knows what hardware will be touched.
+
+7. If $ARGUMENTS names a valid recipe, pre-select it but still confirm.
+8. Let the user pick or accept the recommendation.
 ```
 
 ### Step 2 — Pre-flight check

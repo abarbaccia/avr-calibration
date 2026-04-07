@@ -470,3 +470,11 @@ measurement:
 **Why:** The "AI-first configuration" design goal requires Claude to be able to read/write config without SSH or YAML editing.
 **Effort:** S — thin wrappers over `Config.load()` and `update_config()` already in config.py.
 **Priority:** P2 — completes the AI-first config vision.
+
+### TODO-FIR1: FIR inverse pre-filtering recipe for T60 ringing reduction
+**What:** A new recipe `recipes/core/harman-bass-fir.md` that implements minimum-phase inverse filtering via FIR to reduce room mode T60 (decay time), not just amplitude. Workflow: measure full IR per sub → compute regularized inverse filter (avoid boosting nulls) → load FIR coefficients per output via `apply_fir` → compensate AVR sub delay for FIR latency (~10ms at 96kHz/2048 taps).
+**Why:** PEQ cuts reduce ringing amplitude but not T60 — the mode decays for the same duration, just quieter. True T60 reduction requires inverse pre-filtering (what Dirac Live Bass Control does). The miniDSP 2x4 HD has the FIR capability (2048 taps/output, 4096 shared @ 96kHz) to implement this.
+**Constraints:** Regularized inversion required to avoid dangerous boosts at null frequencies. Latency (~10.7ms) must be compensated in AVR delay settings. FIR writes via CLI only (not HTTP). Sequential, never parallel.
+**Deferred because:** Current PEQ workflow (analyze_decay → narrow-Q cuts) is the practical equivalent for amplitude reduction. FIR inverse pre-filtering is Dirac-level complexity and warrants its own tooling before a recipe can be written.
+**Effort:** L — requires IR inversion tooling (likely scipy), regularization logic, FIR coefficient pipeline, and latency compensation in config/MCP.
+**Priority:** P3 — nice-to-have; only meaningfully better than PEQ for T60 reduction, not amplitude reduction.

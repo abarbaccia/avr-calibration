@@ -221,7 +221,7 @@ class TestComputeFr:
         n = 4800
         sweep = make_signal(n)
         recording = make_signal(n)
-        freqs, spl, _ir = engine._compute_fr(np, sweep, recording, 20, 200, 48000)
+        freqs, spl, _ir, _phase = engine._compute_fr(np, sweep, recording, 20, 200, 48000)
         assert all(isinstance(f, float) for f in freqs)
         assert all(isinstance(s, float) for s in spl)
         assert all(np.isfinite(s) for s in spl)
@@ -234,13 +234,13 @@ class TestComputeFr:
         sweep = MagicMock()
         sweep.timeSignal = np.zeros((n, 1))
         recording = make_signal(n)
-        freqs, spl, _ir = engine._compute_fr(np, sweep, recording, 20, 200, 48000)
+        freqs, spl, _ir, _phase = engine._compute_fr(np, sweep, recording, 20, 200, 48000)
         assert all(np.isfinite(s) for s in spl)
 
     def test_output_frequencies_in_requested_band(self):
         engine = self._engine()
         n = 4800
-        freqs, spl, _ir = engine._compute_fr(np, make_signal(n), make_signal(n), 50, 120, 48000)
+        freqs, spl, _ir, _phase = engine._compute_fr(np, make_signal(n), make_signal(n), 50, 120, 48000)
         assert all(50 <= f <= 120 for f in freqs)
 
     def test_no_frequencies_in_band_returns_empty(self):
@@ -248,7 +248,7 @@ class TestComputeFr:
         engine = self._engine()
         n = 100
         # With sample_rate=1000 and n=100, max freq=500Hz; band [600,700] is empty
-        freqs, spl, _ir = engine._compute_fr(np, make_signal(n), make_signal(n), 600, 700, 1000)
+        freqs, spl, _ir, _phase = engine._compute_fr(np, make_signal(n), make_signal(n), 600, 700, 1000)
         assert freqs == []
         assert spl == []
 
@@ -435,3 +435,102 @@ class TestMeasurementQuality:
                                             noise_floor_window_ms=3,
                                             min_snr_db=0.0)
         assert isinstance(result, list)
+
+
+# ── compute_session_metadata ────────────────────────────────────────────────
+
+class TestComputeSessionMetadata:
+    """Tests for compute_session_metadata — enriching measurements at capture time."""
+
+    def _make_fr(self, n=4800, sample_rate=48000) -> FrequencyResponse:
+        """Create a realistic FrequencyResponse with IR and phase data."""
+        engine = MeasurementEngine(make_config(sample_rate=sample_rate))
+        sweep = np.random.default_rng(42).standard_normal(n)
+        rec = np.random.default_rng(99).standard_normal(n)
+        freqs, spl, ir, phase = engine._compute_fr_arrays(
+            np, sweep, rec, 20, 200, sample_rate
+        )
+        return FrequencyResponse(
+            frequencies=freqs, spl=spl, sample_rate=sample_rate,
+            sweep_duration=3.0, timestamp="2026-04-07T00:00:00+00:00",
+            impulse_response=ir, phase=phase,
+        )
+
+    def test_ir_metadata_present(self):
+        from calibrate.measurement import compute_session_metadata
+        fr = self._make_fr()
+        meta = compute_session_metadata(fr)
+        assert "ir" in meta
+        ir = meta["ir"]
+        assert "peak_time_ms" in ir
+        assert "peak_sign" in ir
+        assert ir["peak_sign"] in (1, -1)
+        assert "spl_db" in ir
+        assert isinstance(ir["spl_db"], float)
+        assert "sample_rate" in ir
+
+    def test_decay_modes_present(self):
+        from calibrate.measurement import compute_session_metadata
+        fr = self._make_fr()
+        meta = compute_session_metadata(fr)
+        assert "decay_modes" in meta
+        assert isinstance(meta["decay_modes"], list)
+
+    def test_group_delay_present(self):
+        from calibrate.measurement import compute_session_metadata
+        fr = self._make_fr()
+        meta = compute_session_metadata(fr)
+        assert "group_delay" in meta
+        gd = meta["group_delay"]
+        assert "freq_hz" in gd
+        assert "delay_ms" in gd
+        assert len(gd["freq_hz"]) == len(gd["delay_ms"])
+        # Midpoint frequencies → one fewer than input frequencies
+        assert len(gd["freq_hz"]) == len(fr.frequencies) - 1
+
+    def test_no_ir_no_crash(self):
+        """FrequencyResponse without IR should still return metadata (empty)."""
+        from calibrate.measurement import compute_session_metadata
+        fr = FrequencyResponse(
+            frequencies=[20.0, 40.0], spl=[-10.0, -12.0],
+            sample_rate=48000, sweep_duration=3.0,
+            timestamp="2026-04-07T00:00:00+00:00",
+        )
+        meta = compute_session_metadata(fr)
+        assert "ir" not in meta
+        assert "decay_modes" not in meta
+
+    def test_no_phase_no_group_delay(self):
+        """FrequencyResponse without phase should skip group delay."""
+        from calibrate.measurement import compute_session_metadata
+        fr = FrequencyResponse(
+            frequencies=[20.0, 40.0], spl=[-10.0, -12.0],
+            sample_rate=48000, sweep_duration=3.0,
+            timestamp="2026-04-07T00:00:00+00:00",
+            impulse_response=[0.0] * 100,
+        )
+        meta = compute_session_metadata(fr)
+        assert "group_delay" not in meta
+
+    def test_phase_in_fr_json_round_trip(self):
+        """Phase field survives JSON serialization."""
+        fr = FrequencyResponse(
+            frequencies=[20.0, 40.0, 80.0],
+            spl=[-20.0, -15.0, -12.0],
+            phase=[0.1, -0.5, 1.2],
+            sample_rate=48000, sweep_duration=3.0,
+            timestamp="2026-04-07T00:00:00+00:00",
+        )
+        restored = FrequencyResponse.from_json(fr.to_json())
+        assert restored.phase == fr.phase
+
+    def test_phase_extracted_by_compute_fr(self):
+        """_compute_fr_arrays now returns phase alongside magnitude."""
+        engine = MeasurementEngine(make_config())
+        n = 4800
+        sweep = np.random.default_rng(42).standard_normal(n)
+        rec = np.random.default_rng(99).standard_normal(n)
+        freqs, spl, ir, phase = engine._compute_fr_arrays(np, sweep, rec, 20, 200, 48000)
+        assert len(phase) == len(freqs)
+        assert all(isinstance(p, float) for p in phase)
+        assert all(np.isfinite(p) for p in phase)

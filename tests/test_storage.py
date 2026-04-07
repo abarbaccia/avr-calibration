@@ -654,3 +654,57 @@ class TestRowToSessionCorruption:
         rows = store.list_equipment()
         assert len(rows) == 1
         assert rows[0]["data"] == {}
+
+
+# ── Metadata enrichment ─────────────────────────────────────────────────────
+
+class TestSessionMetadata:
+    """Tests for session metadata storage and retrieval."""
+
+    def test_save_and_retrieve_metadata(self, store: SessionStore):
+        meta = {"ir": {"peak_time_ms": 16.4, "peak_sign": 1, "spl_db": 66.9}}
+        sid = store.save_measurement(make_fr(), label="test", metadata=meta)
+        session = store.get_session(sid)
+        assert session.metadata == meta
+
+    def test_metadata_none_by_default(self, store: SessionStore):
+        sid = store.save_measurement(make_fr())
+        session = store.get_session(sid)
+        assert session.metadata is None
+
+    def test_metadata_with_decay_modes(self, store: SessionStore):
+        meta = {
+            "ir": {"peak_time_ms": 12.0, "peak_sign": -1, "spl_db": 68.0},
+            "decay_modes": [
+                {"freq_hz": 23.4, "t60_ms": 1080.0, "peak_db": 10.0, "suggested_q": 6.0, "priority": 1}
+            ],
+            "group_delay": {"freq_hz": [30.0, 50.0], "delay_ms": [5.2, 3.1]},
+        }
+        sid = store.save_measurement(make_fr(), metadata=meta)
+        session = store.get_session(sid)
+        assert session.metadata["decay_modes"][0]["freq_hz"] == 23.4
+        assert session.metadata["group_delay"]["delay_ms"] == [5.2, 3.1]
+
+    def test_metadata_survives_list_sessions(self, store: SessionStore):
+        meta = {"ir": {"peak_time_ms": 10.0, "peak_sign": 1, "spl_db": 60.0}}
+        store.save_measurement(make_fr(), metadata=meta)
+        sessions = store.list_sessions()
+        assert sessions[0].metadata == meta
+
+    def test_migrate_adds_metadata_column(self, tmp_path: Path):
+        """Existing DB without metadata column gets it added on next open."""
+        import sqlite3
+        db_path = tmp_path / "legacy.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE sessions ("
+            "id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, label TEXT, "
+            "start_fr TEXT NOT NULL, end_fr TEXT, filters_applied TEXT, "
+            "notes TEXT, impulse_response TEXT)"
+        )
+        conn.commit()
+        conn.close()
+        s = SessionStore(db_path=db_path)
+        meta = {"ir": {"peak_time_ms": 5.0}}
+        sid = s.save_measurement(make_fr(), metadata=meta)
+        assert s.get_session(sid).metadata == meta

@@ -150,13 +150,18 @@ async def _tool_get_measurement_history(limit: int = 10) -> dict:
         result = []
         for s in sessions:
             fr = s.start_fr
-            result.append({
+            entry: dict = {
                 "id": s.id,
                 "timestamp": s.timestamp,
                 "label": s.label,
                 "freq_hz": fr.frequencies if fr else [],
                 "spl_db": fr.spl if fr else [],
-            })
+            }
+            if fr and fr.phase:
+                entry["phase_rad"] = fr.phase
+            if s.metadata:
+                entry["metadata"] = s.metadata
+            result.append(entry)
         return _ok(sessions=result, count=len(result))
     except Exception as exc:
         return _err(f"storage error: {exc}")
@@ -239,7 +244,7 @@ async def _tool_trigger_measurement() -> dict:
         )
 
     try:
-        from .measurement import MeasurementEngine
+        from .measurement import MeasurementEngine, compute_session_metadata
         from .storage import SessionStore
 
         cfg = _config()
@@ -252,10 +257,14 @@ async def _tool_trigger_measurement() -> dict:
         else:
             fr = await engine.measure()
 
+        # Compute IR-derived metadata at capture time
+        metadata = compute_session_metadata(fr)
+
         store = SessionStore()
-        session_id = store.save_measurement(fr, label="mcp-triggered")
+        session_id = store.save_measurement(fr, label="mcp-triggered", metadata=metadata)
         return _ok(
             session_id=session_id,
+            metadata=metadata,
             message="Measurement complete — use get_measurement_history() to retrieve results.",
         )
     except Exception as exc:

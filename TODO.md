@@ -176,6 +176,7 @@ Max 5 EQ iterations. Prefer cuts over boosts.
 ### New MCP Tools Needed
 - [ ] `measure_sub_solo(sub_index)` — mute others, measure, unmute (atomic operation)
 - [ ] `get_alignment_state()` — current delay/polarity/level for each sub
+- [x] Enrich measurement sessions with full IR-derived metadata at capture time (peak time, polarity, SPL, phase, T60, group delay) to avoid redundant sweeps
 - [x] `set_delay(output_index, delay_ms)` — set delay for one output (was apply_sub_delay)
 - [x] `set_polarity(output_index, inverted)` — set polarity for one output (was apply_sub_polarity)
 - [x] `measure` — trigger a sweep and return session ID (was run_sweep/trigger_measurement)

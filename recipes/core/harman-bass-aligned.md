@@ -6,6 +6,19 @@ Calibrate multiple subwoofers to the Harman bass target curve (20-80Hz).
 Level-match and align the subs so they reinforce rather than cancel,
 then EQ the combined response to match the target.
 
+## Filter Strategy
+
+**This recipe uses PEQ only. FIR filters are not used.**
+
+| Layer | Tool | Purpose |
+|-------|------|---------|
+| Output PEQ (shared across subs) | `apply_eq` | Harman target curve + room correction |
+| Input PEQ | — | Not used in this recipe |
+| FIR | — | **Not used in this recipe** |
+
+If you want per-sub room correction before applying the Harman target, use `harman-bass-persub`.
+If you want FIR-based correction, use a FIR-capable recipe.
+
 ## Pre-flight
 
 Verify all hardware is connected and reachable before starting.
