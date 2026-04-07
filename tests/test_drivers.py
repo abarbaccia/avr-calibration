@@ -306,10 +306,45 @@ async def test_minidsp_apply_eq_per_output() -> None:
     ]
     with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
         await driver.apply_eq(0, filters, output_index=1)
-        # All CLI calls must target output 1
-        for call in mock_cli.call_args_list:
+        # Output-targeted CLI calls must reference output 1; mute calls are excluded
+        output_calls = [c for c in mock_cli.call_args_list if c.args[0] == "output"]
+        for call in output_calls:
             args = call.args
             assert args[1] == "1", f"unexpected output index in CLI call: {args}"
+
+
+@pytest.mark.asyncio
+async def test_minidsp_apply_eq_mutes_before_active_biquad_write() -> None:
+    """Master-mute must be called before writing any active (bypass=False) biquad slot."""
+    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1])
+    filters = [
+        {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
+    ]
+    with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
+        await driver.apply_eq(0, filters, output_index=1)
+        all_args = [c.args for c in mock_cli.call_args_list]
+        # mute on must appear before any peq set call
+        mute_on_idx = next(i for i, a in enumerate(all_args) if a == ("mute", "on"))
+        peq_set_idx = next(i for i, a in enumerate(all_args) if "set" in a)
+        assert mute_on_idx < peq_set_idx, "mute on must precede peq set"
+        # mute off must appear after all peq writes
+        mute_off_idx = next(i for i, a in enumerate(all_args) if a == ("mute", "off"))
+        assert mute_off_idx > peq_set_idx, "mute off must follow peq set"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_minidsp_apply_eq_detects_dsp_hang() -> None:
+    """apply_eq must raise DriverError if output level is frozen at 0.0 dBFS post-write."""
+    respx.get(DEVICE_URL).mock(return_value=httpx.Response(200, json={
+        "master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False},
+        "output_levels": [-120.0, 0.0, 0.0, -120.0],  # outputs 1,2 frozen → hang
+    }))
+    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1, 2])
+    filters = [{"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"}]
+    with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock):
+        with pytest.raises(DriverError, match="DSP hang detected"):
+            await driver.apply_eq(0, filters)
 
 
 @pytest.mark.asyncio
@@ -322,8 +357,9 @@ async def test_minidsp_apply_input_eq_writes_via_cli() -> None:
     ]
     with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
         await driver.apply_input_eq(0, filters)
-        # All CLI calls must use "input" subcommand targeting input 1
-        for call in mock_cli.call_args_list:
+        # Input-targeted CLI calls must use "input" subcommand targeting input 1
+        input_calls = [c for c in mock_cli.call_args_list if c.args[0] == "input"]
+        for call in input_calls:
             args = call.args
             assert args[0] == "input", f"unexpected subcommand in CLI call: {args}"
             assert args[1] == "1", f"unexpected input index in CLI call: {args}"

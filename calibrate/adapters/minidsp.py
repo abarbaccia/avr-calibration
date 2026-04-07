@@ -81,8 +81,8 @@ class MinidspApiError(RuntimeError):
 async def _run_minidsp_cli(*args: str, ignore_exit_codes: tuple[int, ...] = ()) -> None:
     """Run a minidsp CLI command, raising MinidspApiError on non-zero exit.
 
-    The CLI connects to minidspd's WebSocket transport, which correctly handles
-    PEQ biquad writes without the DSP hang caused by the HTTP batch-write path.
+    The CLI connects to minidspd's WebSocket transport (not HTTP batch writes).
+    Call this sequentially — concurrent CLI sessions corrupt device state.
 
     *ignore_exit_codes*: exit codes that are treated as success. Used for FIR
     commands (import, clear) which return exit code 1 due to an unrecognised
@@ -353,28 +353,65 @@ class MinidspClient:
     ) -> None:
         """Write PEQ entries to *output* via the minidsp CLI (not HTTP).
 
-        The minidsp HTTP batch-write endpoint causes the device DSP to hang when
-        writing real biquad coefficients (output level meter freezes at 0.0, audio
-        stops). The CLI uses the WebSocket transport path inside minidspd, which
-        does not exhibit this bug.
+        Writing real IIR biquad coefficients (a1≈-2, a2≈+1) to an active DSP output
+        causes the output level meter to freeze at 0.0 dBFS and audio to stop — a
+        hardware-level hang that requires a physical power-cycle to recover.
+
+        Fix: master-mute the DSP before writing any active (bypass=False) biquad
+        slot, then unmute after all writes complete.  The mute stops DSP processing
+        so coefficients can be safely loaded.  Bypassed slots are safe to write
+        without muting (they don't alter the signal path).
 
         Each entry: {"index": slot, "coeff": {b0,b1,b2,a1,a2}, "bypass": bool}
         Active slots (bypass=False): write coefficients then un-bypass.
         Bypassed slots (bypass=True): set bypass on (no coefficient write needed).
         """
         self._validate_output(output)
-        for entry in entries:
-            slot = str(entry["index"])
-            if entry.get("bypass", False):
-                await _run_minidsp_cli("output", str(output), "peq", slot, "bypass", "on")
-            else:
-                c = entry["coeff"]
-                await _run_minidsp_cli(
-                    "output", str(output), "peq", slot, "set", "--",
-                    str(c["b0"]), str(c["b1"]), str(c["b2"]),
-                    str(c["a1"]), str(c["a2"]),
+
+        has_active = any(not e.get("bypass", False) for e in entries)
+        if has_active:
+            await _run_minidsp_cli("mute", "on")
+        try:
+            for entry in entries:
+                slot = str(entry["index"])
+                if entry.get("bypass", False):
+                    await _run_minidsp_cli("output", str(output), "peq", slot, "bypass", "on")
+                else:
+                    c = entry["coeff"]
+                    await _run_minidsp_cli(
+                        "output", str(output), "peq", slot, "set", "--",
+                        str(c["b0"]), str(c["b1"]), str(c["b2"]),
+                        str(c["a1"]), str(c["a2"]),
+                    )
+                    await _run_minidsp_cli("output", str(output), "peq", slot, "bypass", "off")
+        finally:
+            if has_active:
+                await _run_minidsp_cli("mute", "off")
+
+    async def check_for_dsp_hang(self, suspect_outputs: list[int]) -> None:
+        """Poll output levels and raise MinidspApiError if any output is frozen.
+
+        A DSP hang manifests as an output level meter stuck at 0.0 dBFS when no
+        audio is playing.  Normal idle levels are -100 to -120 dBFS.  If detected,
+        the miniDSP must be physically power-cycled to recover — bypassing slots or
+        switching presets will not clear it.
+
+        Call this after PEQ writes to detect hangs early with a clear error.
+        """
+        try:
+            status = await self.get_device_status()
+            output_levels = status.get("output_levels", [])
+        except Exception:
+            return  # Best-effort: don't fail if status read is unavailable
+
+        for out in suspect_outputs:
+            if out < len(output_levels) and output_levels[out] == 0.0:
+                raise MinidspApiError(
+                    -1,
+                    f"DSP hang detected after PEQ write — output {out} frozen at 0.0 dBFS. "
+                    f"Physically power-cycle the miniDSP to recover. "
+                    f"(All output levels: {output_levels})"
                 )
-                await _run_minidsp_cli("output", str(output), "peq", slot, "bypass", "off")
 
     async def set_input_peq_cli(
         self,
@@ -383,20 +420,28 @@ class MinidspClient:
     ) -> None:
         """Write PEQ entries to input *input_index* via the minidsp CLI (not HTTP).
 
-        Same rationale as set_output_peq_cli — HTTP batch writes cause DSP hangs.
+        Same rationale as set_output_peq_cli — master-mutes before writing active
+        biquad slots to prevent DSP hang.
         """
-        for entry in entries:
-            slot = str(entry["index"])
-            if entry.get("bypass", False):
-                await _run_minidsp_cli("input", str(input_index), "peq", slot, "bypass", "on")
-            else:
-                c = entry["coeff"]
-                await _run_minidsp_cli(
-                    "input", str(input_index), "peq", slot, "set", "--",
-                    str(c["b0"]), str(c["b1"]), str(c["b2"]),
-                    str(c["a1"]), str(c["a2"]),
-                )
-                await _run_minidsp_cli("input", str(input_index), "peq", slot, "bypass", "off")
+        has_active = any(not e.get("bypass", False) for e in entries)
+        if has_active:
+            await _run_minidsp_cli("mute", "on")
+        try:
+            for entry in entries:
+                slot = str(entry["index"])
+                if entry.get("bypass", False):
+                    await _run_minidsp_cli("input", str(input_index), "peq", slot, "bypass", "on")
+                else:
+                    c = entry["coeff"]
+                    await _run_minidsp_cli(
+                        "input", str(input_index), "peq", slot, "set", "--",
+                        str(c["b0"]), str(c["b1"]), str(c["b2"]),
+                        str(c["a1"]), str(c["a2"]),
+                    )
+                    await _run_minidsp_cli("input", str(input_index), "peq", slot, "bypass", "off")
+        finally:
+            if has_active:
+                await _run_minidsp_cli("mute", "off")
 
     async def set_output_fir_from_file(self, output: int, path: str) -> None:
         """Load FIR coefficients from a WAV file and activate them via CLI.

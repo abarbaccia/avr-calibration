@@ -186,8 +186,10 @@ class MinidspDriver(DSPDriver):
             peq_entries = self._build_peq_entries(filter_specs)
             try:
                 for output in targets:
-                    log.info("apply_eq: writing PEQ to output %d via CLI", output)
+                    log.info("apply_eq: writing PEQ to output %d via CLI (master-muted)", output)
                     await self._client.set_output_peq_cli(output, peq_entries)
+                # Health check: verify no output is frozen at 0.0 dBFS (DSP hang indicator)
+                await self._client.check_for_dsp_hang(targets)
             except MinidspApiError as exc:
                 raise DriverError(f"minidsp write failed: {exc}")
             except Exception as exc:
@@ -237,8 +239,10 @@ class MinidspDriver(DSPDriver):
 
             peq_entries = self._build_peq_entries(filter_specs)
             try:
-                log.info("apply_input_eq: writing PEQ to input %d via CLI", target_input)
+                log.info("apply_input_eq: writing PEQ to input %d via CLI (master-muted)", target_input)
                 await self._client.set_input_peq_cli(target_input, peq_entries)
+                # Health check: verify sub outputs aren't frozen after input EQ write
+                await self._client.check_for_dsp_hang(self._sub_outputs)
             except MinidspApiError as exc:
                 raise DriverError(f"minidsp write failed: {exc}")
             except Exception as exc:
