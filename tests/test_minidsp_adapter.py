@@ -273,7 +273,7 @@ async def test_switch_source_invalid(client: MinidspClient) -> None:
 
 @respx.mock
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["Analog", "Toslink", "USB"])
+@pytest.mark.parametrize("source", ["Analog", "Toslink", "Usb"])
 async def test_switch_source_happy_path(client: MinidspClient, source: str) -> None:
     route = respx.post(DEVICE_URL).mock(return_value=httpx.Response(200))
     await client.switch_source(source)
@@ -353,7 +353,7 @@ async def test_cli_exception_propagates(client: MinidspClient) -> None:
 def test_valid_sources_contains_expected() -> None:
     assert "Analog" in VALID_SOURCES
     assert "Toslink" in VALID_SOURCES
-    assert "USB" in VALID_SOURCES
+    assert "Usb" in VALID_SOURCES
 
 
 def test_max_preset_index_is_three() -> None:

@@ -394,20 +394,56 @@ async def _tool_calibrate_level(
     target_snr_db: float = 20.0,
     step_db: float = 3.0,
 ) -> dict:
-    """Auto-ramp AVR volume until measurement SNR meets threshold.
+    """Auto-calibrate sweep level.
 
-    Starts at start_db, takes a test sweep, checks SNR. If too low, bumps
-    volume by step_db and retries. Stops when SNR >= target or ceiling hit.
-    Saves calibrated volume to config for subsequent measure calls.
+    For HDMI/AVR mode: ramps AVR volume from start_db toward max_volume_db
+    until measurement SNR >= target_snr_db.
+
+    For USB mode: AVR volume does not affect the sweep (signal goes Pi→USB→miniDSP,
+    bypassing the Denon entirely). A single measurement is taken with the miniDSP
+    source switched to USB via MinidspSweepContext. If SNR is insufficient, the
+    user should turn up the sub's physical gain knob.
     """
-    if _avr is None:
-        return _err("AVR driver not loaded")
-
     from .measurement import MeasurementEngine, MeasurementQualityError
     from .config import update_config
+    from .drivers.minidsp import MinidspSweepContext
 
     cfg = _config()
     engine = MeasurementEngine(cfg)
+    route = cfg.measurement.get("playback_route", "usb")
+
+    if route == "usb":
+        # USB mode: level is set by PyTTa sweep amplitude, not AVR volume.
+        # Switch miniDSP source to USB, take one measurement, report SNR.
+        minidsp_ctx = MinidspSweepContext.from_config(cfg)
+
+        async def _usb_check() -> dict:
+            try:
+                await engine.measure()
+                return _ok(
+                    calibrated_volume_db=None,
+                    message=(
+                        "USB mode: sweep level is controlled by Pi audio output. "
+                        "SNR is good — proceed with calibration."
+                    ),
+                )
+            except MeasurementQualityError as exc:
+                return _err(
+                    f"USB sweep SNR too low ({exc.detail}). "
+                    "Turn up the sub's physical gain knob, then retry."
+                )
+            except Exception as exc:
+                return _err(f"calibrate_level failed: {exc}")
+
+        if minidsp_ctx:
+            async with minidsp_ctx:
+                return await _usb_check()
+        return await _usb_check()
+
+    # HDMI/AVR mode: ramp AVR volume until SNR passes.
+    if _avr is None:
+        return _err("AVR driver not loaded")
+
     volume = start_db
 
     # Use DenonSweepContext with manage_volume=False — it handles input switching,
@@ -421,7 +457,7 @@ async def _tool_calibrate_level(
                 await _avr.set_volume(volume)  # type: ignore[union-attr]
                 await asyncio.sleep(0.5)
 
-                fr = await engine.measure()
+                await engine.measure()
 
                 # SNR passed — save calibrated volume
                 update_config({"measurement": {"denon_sweep_volume": volume}})

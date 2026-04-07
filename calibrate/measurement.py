@@ -271,6 +271,22 @@ class MeasurementEngine:
                     log.info("Output device (HDMI): %s (index %d)", dev["name"], idx)
             except ImportError:
                 pass
+        elif route == "usb":
+            try:
+                import sounddevice as sd
+                devices = sd.query_devices()
+                usb_name = cfg.get("playback_device") or "miniDSP"
+                candidates = [
+                    (idx, dev) for idx, dev in enumerate(devices)
+                    if dev.get("max_output_channels", 0) > 0 and usb_name.lower() in dev["name"].lower()
+                ]
+                if candidates:
+                    idx, dev = candidates[0]
+                    in_idx = int(sd.default.device[0])
+                    sd.default.device = (in_idx, idx)
+                    log.info("Output device (USB): %s (index %d)", dev["name"], idx)
+            except ImportError:
+                pass
 
         # pytta 0.1.1 uses camelCase params and fftDegree instead of duration.
         # Also patches traceback.walk_stack to handle shallow stacks (Python 3.11 bug).
