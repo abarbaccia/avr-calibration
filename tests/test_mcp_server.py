@@ -401,6 +401,7 @@ async def test_trigger_measurement_success() -> None:
     with (
         patch.dict(sys.modules, {"sounddevice": mock_sd}),
         patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
     ):
@@ -453,6 +454,7 @@ async def test_trigger_measurement_with_denon_context() -> None:
     with (
         patch.dict(sys.modules, {"sounddevice": mock_sd}),
         patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
     ):

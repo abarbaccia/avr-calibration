@@ -3,6 +3,18 @@ version: 1.0
 target: harman_bass
 hardware: ported sub, tuning_freq ~22Hz (SVS PB12-NSD)
 
+## Filter Strategy
+
+**This recipe uses PEQ only. FIR filters are not used.**
+
+| Layer | Tool | Purpose |
+|-------|------|---------|
+| Output PEQ | `apply_eq` | Harman target curve + room correction |
+| FIR | — | **Not used in this recipe** |
+
+If you have multiple subs, use `harman-bass-persub` or `harman-bass-aligned` instead.
+If you want FIR-based correction, use a FIR-capable recipe.
+
 ## Overview
 
 Calibrate a ported subwoofer to the Harman bass target curve. The Harman target

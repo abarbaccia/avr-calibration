@@ -9,6 +9,18 @@ Calibrate multiple subwoofers using a two-layer EQ strategy:
 This separation gives the combined Harman pass a much smoother starting point
 and keeps per-sub corrections independent from the target curve.
 
+## Filter Strategy
+
+**This recipe uses PEQ only. FIR filters are not used.**
+
+| Layer | Tool | Slots | Purpose |
+|-------|------|-------|---------|
+| Output PEQ (per sub) | `apply_eq` with `output_index` | 8 slots each | Room correction — flatten each sub independently |
+| Input PEQ (shared) | `apply_input_eq` | 8 slots | Harman target curve + mandatory 18Hz HPF |
+| FIR | — | 2048 taps/output (4096 shared @ 96kHz) | **Not used in this recipe** |
+
+If you want FIR-based correction (e.g. linear phase room EQ), use a FIR-capable recipe.
+
 ## EQ Architecture
 
 Call `get_config` to discover `eq_capabilities`. This tells you:

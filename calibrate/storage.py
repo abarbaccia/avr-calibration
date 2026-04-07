@@ -123,6 +123,7 @@ class Session:
     filters_applied: Optional[list[dict]]
     notes: Optional[str]
     impulse_response: Optional[list[float]] = None  # time-domain IR (first 24 000 samples)
+    metadata: Optional[dict] = None  # IR-derived: ir peak, decay modes, group delay
 
 
 class SessionStore:
@@ -165,6 +166,10 @@ class SessionStore:
                 conn.execute(
                     "ALTER TABLE sessions ADD COLUMN impulse_response TEXT DEFAULT NULL"
                 )
+            if "metadata" not in existing:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN metadata TEXT DEFAULT NULL"
+                )
 
     # ── Sessions ─────────────────────────────────────────────────────────────
 
@@ -172,14 +177,16 @@ class SessionStore:
         self,
         fr: FrequencyResponse,
         label: Optional[str] = None,
+        metadata: Optional[dict] = None,
     ) -> int:
         """Persist a measurement as a new session. Returns the new session id."""
         ir_blob = _encode_ir(fr.impulse_response) if fr.impulse_response else None
+        meta_json = json.dumps(metadata) if metadata else None
         with self._connect() as conn:
             cur = conn.execute(
-                "INSERT INTO sessions (timestamp, label, start_fr, impulse_response)"
-                " VALUES (?, ?, ?, ?)",
-                (fr.timestamp, label, fr.to_json(), ir_blob),
+                "INSERT INTO sessions (timestamp, label, start_fr, impulse_response, metadata)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (fr.timestamp, label, fr.to_json(), ir_blob, meta_json),
             )
             return cur.lastrowid
 
@@ -472,6 +479,14 @@ class SessionStore:
         except Exception:
             logger.warning("session %d has corrupt impulse_response; ignoring", row["id"])
 
+        meta = None
+        try:
+            raw_meta = row["metadata"] if "metadata" in row.keys() else None
+            if raw_meta:
+                meta = json.loads(raw_meta)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning("session %d has corrupt metadata; ignoring", row["id"])
+
         return Session(
             id=row["id"],
             timestamp=row["timestamp"],
@@ -481,4 +496,5 @@ class SessionStore:
             filters_applied=filters_applied,
             notes=row["notes"],
             impulse_response=ir,
+            metadata=meta,
         )
