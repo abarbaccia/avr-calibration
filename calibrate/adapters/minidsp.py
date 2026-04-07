@@ -67,6 +67,27 @@ class MinidspApiError(RuntimeError):
         super().__init__(f"minidspd {status_code} on {path}")
 
 
+# ── CLI helper ─────────────────────────────────────────────────────────────────
+
+async def _run_minidsp_cli(*args: str) -> None:
+    """Run a minidsp CLI command, raising MinidspApiError on non-zero exit.
+
+    The CLI connects to minidspd's WebSocket transport, which correctly handles
+    PEQ biquad writes without the DSP hang caused by the HTTP batch-write path.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "minidsp", *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise MinidspApiError(
+            proc.returncode or 1,
+            f"minidsp {' '.join(args)}: {stderr.decode().strip()}",
+        )
+
+
 # ── Client ─────────────────────────────────────────────────────────────────────
 
 class MinidspClient:
@@ -318,6 +339,58 @@ class MinidspClient:
         await self._post_config({
             "inputs": [{"index": input_index, "peq": entries}]
         })
+
+    async def set_output_peq_cli(
+        self,
+        output: int,
+        entries: list[dict[str, Any]],
+    ) -> None:
+        """Write PEQ entries to *output* via the minidsp CLI (not HTTP).
+
+        The minidsp HTTP batch-write endpoint causes the device DSP to hang when
+        writing real biquad coefficients (output level meter freezes at 0.0, audio
+        stops). The CLI uses the WebSocket transport path inside minidspd, which
+        does not exhibit this bug.
+
+        Each entry: {"index": slot, "coeff": {b0,b1,b2,a1,a2}, "bypass": bool}
+        Active slots (bypass=False): write coefficients then un-bypass.
+        Bypassed slots (bypass=True): set bypass on (no coefficient write needed).
+        """
+        self._validate_output(output)
+        for entry in entries:
+            slot = str(entry["index"])
+            if entry.get("bypass", False):
+                await _run_minidsp_cli("output", str(output), "peq", slot, "bypass", "on")
+            else:
+                c = entry["coeff"]
+                await _run_minidsp_cli(
+                    "output", str(output), "peq", slot, "set", "--",
+                    str(c["b0"]), str(c["b1"]), str(c["b2"]),
+                    str(c["a1"]), str(c["a2"]),
+                )
+                await _run_minidsp_cli("output", str(output), "peq", slot, "bypass", "off")
+
+    async def set_input_peq_cli(
+        self,
+        input_index: int,
+        entries: list[dict[str, Any]],
+    ) -> None:
+        """Write PEQ entries to input *input_index* via the minidsp CLI (not HTTP).
+
+        Same rationale as set_output_peq_cli — HTTP batch writes cause DSP hangs.
+        """
+        for entry in entries:
+            slot = str(entry["index"])
+            if entry.get("bypass", False):
+                await _run_minidsp_cli("input", str(input_index), "peq", slot, "bypass", "on")
+            else:
+                c = entry["coeff"]
+                await _run_minidsp_cli(
+                    "input", str(input_index), "peq", slot, "set", "--",
+                    str(c["b0"]), str(c["b1"]), str(c["b2"]),
+                    str(c["a1"]), str(c["a2"]),
+                )
+                await _run_minidsp_cli("input", str(input_index), "peq", slot, "bypass", "off")
 
     async def set_input_routing(
         self,

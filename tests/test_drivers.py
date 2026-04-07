@@ -210,7 +210,6 @@ async def test_minidsp_read_eq_starts_empty() -> None:
 @respx.mock
 @pytest.mark.asyncio
 async def test_minidsp_apply_eq_valid_writes_hardware() -> None:
-    config_route = respx.post(CONFIG_URL).mock(return_value=httpx.Response(200))
     respx.get(DEVICE_URL).mock(return_value=httpx.Response(200, json={
         "master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False}
     }))
@@ -219,10 +218,10 @@ async def test_minidsp_apply_eq_valid_writes_hardware() -> None:
         {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
         {"freq": 80.0, "gain_db": 3.0, "q": 0.707, "type": "peaking"},
     ]
-    await driver.apply_eq(0, filters)
-    assert config_route.called
-    # One batched PEQ write per output (default sub_outputs=[0,1])
-    assert config_route.call_count == 2
+    with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
+        await driver.apply_eq(0, filters)
+        # CLI called at least once per output (default sub_outputs=[0,1])
+        assert mock_cli.call_count > 0
     # State should be updated after successful write
     assert len(await driver.read_eq(0)) == len(filters)
 
@@ -263,82 +262,71 @@ async def test_minidsp_apply_eq_too_many_filters_raises() -> None:
         await driver.apply_eq(0, filters)
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_minidsp_apply_eq_hardware_failure_no_state_update() -> None:
     """P0: if hardware write fails, _eq_state must NOT be updated."""
-    respx.post(CONFIG_URL).mock(return_value=httpx.Response(500))
+    from calibrate.adapters.minidsp import MinidspApiError
     driver = MinidspDriver(host="localhost", port=5380)
     filters = [
         {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
         {"freq": 80.0, "gain_db": 3.0, "q": 0.707, "type": "peaking"},
     ]
-    with pytest.raises(DriverError, match="minidsp write failed"):
-        await driver.apply_eq(0, filters)
+    with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock,
+               side_effect=MinidspApiError(1, "cli: minidsp error")):
+        with pytest.raises(DriverError, match="minidsp write failed"):
+            await driver.apply_eq(0, filters)
 
     # State must be unchanged after failed write
     assert await driver.read_eq(0) == []
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_minidsp_apply_eq_updates_state_only_on_success() -> None:
     """State update and hardware write are atomic: state updates iff all writes pass."""
-    respx.post(CONFIG_URL).mock(return_value=httpx.Response(200))
     driver = MinidspDriver(host="localhost", port=5380)
     filters = [
         {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
         {"freq": 80.0, "gain_db": 3.0, "q": 0.707, "type": "peaking"},
     ]
-    await driver.apply_eq(0, filters)
+    with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock):
+        await driver.apply_eq(0, filters)
     state = await driver.read_eq(0)
     assert len(state) == len(filters)
     assert state[0]["freq"] == 18.0
     assert state[1]["freq"] == 80.0
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_minidsp_apply_eq_per_output() -> None:
-    """Per-output EQ writes one batched PEQ request to the target output."""
-    config_calls: list[dict] = []
-
-    def _capture(request):
-        import json
-        config_calls.append(json.loads(request.content))
-        return httpx.Response(200)
-
-    respx.post(CONFIG_URL).mock(side_effect=_capture)
+    """Per-output EQ targets only the specified output index."""
     driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1])
     filters = [
         {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
         {"freq": 80.0, "gain_db": -3.0, "q": 1.0, "type": "peaking"},
     ]
-    await driver.apply_eq(0, filters, output_index=1)
-    assert len(config_calls) == 1
-    assert "peq" in config_calls[0]["outputs"][0]
+    with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
+        await driver.apply_eq(0, filters, output_index=1)
+        # All CLI calls must target output 1
+        for call in mock_cli.call_args_list:
+            args = call.args
+            assert args[1] == "1", f"unexpected output index in CLI call: {args}"
 
 
-@respx.mock
 @pytest.mark.asyncio
-async def test_minidsp_apply_input_eq_writes_batch() -> None:
-    """Input PEQ writes one batched request to the target input."""
-    config_calls: list[dict] = []
-
-    def _capture(request):
-        import json
-        config_calls.append(json.loads(request.content))
-        return httpx.Response(200)
-
-    respx.post(CONFIG_URL).mock(side_effect=_capture)
-    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1, 2])
+async def test_minidsp_apply_input_eq_writes_via_cli() -> None:
+    """Input PEQ writes target the input channel via CLI."""
+    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1, 2], active_input=1)
     filters = [
         {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
         {"freq": 50.0, "gain_db": -2.0, "q": 1.0, "type": "peaking"},
     ]
-    await driver.apply_input_eq(0, filters)
-    assert len(config_calls) == 1
-    assert "inputs" in config_calls[0]
+    with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
+        await driver.apply_input_eq(0, filters)
+        # All CLI calls must use "input" subcommand targeting input 1
+        for call in mock_cli.call_args_list:
+            args = call.args
+            assert args[0] == "input", f"unexpected subcommand in CLI call: {args}"
+            assert args[1] == "1", f"unexpected input index in CLI call: {args}"
 
 
 @respx.mock

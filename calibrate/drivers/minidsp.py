@@ -123,7 +123,7 @@ class MinidspDriver(DSPDriver):
                 q=fspec.q,
                 filter_type=fspec.type,
             )
-            peq_entries.append({"index": slot, "coeff": biquad})
+            peq_entries.append({"index": slot, "coeff": biquad, "bypass": False})
         for slot in _AVAILABLE_SLOTS[len(filter_specs):]:
             peq_entries.append({
                 "index": slot,
@@ -172,14 +172,15 @@ class MinidspDriver(DSPDriver):
             if not result.ok:
                 raise DriverError(f"SafetyValidator: {result.error}")
 
-            # Hardware write — batch all PEQ slots per output into one request.
-            # Note: output 0 on this miniDSP 2x4 HD unit is defective (PEQ
-            # writes hang it). Config should use sub_outputs=[1,2] to avoid it.
+            # Use CLI (WebSocket path) not HTTP batch — the HTTP batch endpoint
+            # causes the device DSP to hang on real biquad coefficients.
+            # Note: output 0 on this unit is physically defective; config
+            # should use sub_outputs=[1,2] to avoid it entirely.
             peq_entries = self._build_peq_entries(filter_specs)
             try:
                 for output in targets:
-                    log.info("apply_eq: writing PEQ to output %d", output)
-                    await self._client.set_output_peq_batch(output, peq_entries)
+                    log.info("apply_eq: writing PEQ to output %d via CLI", output)
+                    await self._client.set_output_peq_cli(output, peq_entries)
             except MinidspApiError as exc:
                 raise DriverError(f"minidsp write failed: {exc}")
             except Exception as exc:
@@ -229,8 +230,8 @@ class MinidspDriver(DSPDriver):
 
             peq_entries = self._build_peq_entries(filter_specs)
             try:
-                log.info("apply_input_eq: writing PEQ to input %d", target_input)
-                await self._client.set_input_peq_batch(target_input, peq_entries)
+                log.info("apply_input_eq: writing PEQ to input %d via CLI", target_input)
+                await self._client.set_input_peq_cli(target_input, peq_entries)
             except MinidspApiError as exc:
                 raise DriverError(f"minidsp write failed: {exc}")
             except Exception as exc:
