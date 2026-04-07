@@ -410,9 +410,33 @@ function onCurveChange() {
   refreshChart();
 }
 
+// Harman bass offsets (dB relative to 80Hz reference)
+const HARMAN_TABLE = {20:6, 25:5, 31.5:4, 40:3, 50:2, 63:1, 80:0, 100:0, 125:0, 160:-1, 200:-2};
+
+function harmanOffset(f) {
+  const keys = Object.keys(HARMAN_TABLE).map(Number).sort((a,b)=>a-b);
+  if (f <= keys[0]) return HARMAN_TABLE[keys[0]];
+  if (f >= keys[keys.length-1]) return HARMAN_TABLE[keys[keys.length-1]];
+  for (let i = 0; i < keys.length-1; i++) {
+    if (f >= keys[i] && f <= keys[i+1]) {
+      const t = (Math.log(f)-Math.log(keys[i]))/(Math.log(keys[i+1])-Math.log(keys[i]));
+      return HARMAN_TABLE[keys[i]] + t * (HARMAN_TABLE[keys[i+1]] - HARMAN_TABLE[keys[i]]);
+    }
+  }
+  return 0;
+}
+
+function optimalRef(freqs, spl) {
+  // 25th percentile of (measured - harman_offset) — places target below most of the curve,
+  // so corrections are mostly cuts. Matches backend optimal_reference_spl().
+  const adjusted = freqs.map((f, i) => spl[i] - harmanOffset(f));
+  const sorted = [...adjusted].sort((a, b) => a - b);
+  const idx = Math.floor(sorted.length * 0.25);
+  return sorted[Math.min(idx, sorted.length - 1)];
+}
+
 function getTargetCurve(freqs, spl) {
-  const sorted = [...spl].sort((a, b) => a - b);
-  const refSpl = sorted[Math.floor(sorted.length / 2)];
+  const refSpl = optimalRef(freqs, spl);
   if (targetCurveType === 'flat') return freqs.map(() => refSpl);
   if (targetCurveType === 'ht')
     return freqs.map(f => f >= 100 ? refSpl : refSpl + 4 * Math.log2(100 / f));
@@ -420,7 +444,8 @@ function getTargetCurve(freqs, spl) {
     const oct = Math.log2(f / 30);
     return refSpl + 4 * Math.exp(-(oct * oct) / (2 * 0.7 * 0.7));
   });
-  return freqs.map(f => f >= 80 ? refSpl : refSpl + 3 * Math.log2(80 / f));
+  // Harman: use the proper offset table
+  return freqs.map(f => refSpl + harmanOffset(f));
 }
 
 function curveLabel() {
@@ -682,7 +707,8 @@ async function loadHistory() {
     const ts = s.timestamp.slice(0,19).replace('T',' ');
     const info = classifyLabel(s.label);
     const typeColors = {combined:'#3b82f6', solo:'#a78bfa', crawl:'#fb923c', baseline:'#64748b', iteration:'#4ade80', other:'#94a3b8', unknown:'#94a3b8'};
-    const typeLabel = '<span style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:.7rem;background:'+typeColors[info.type]+'22;color:'+typeColors[info.type]+';border:1px solid '+typeColors[info.type]+'44">'+info.type+'</span>';
+    const typeLabel = '<span style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:.7rem;background:'+typeColors[info.type]+'22;color:'+typeColors[info.type]+';border:1px solid '+typeColors[info.type]+'44">'+info.type+'</span>'
+      + (info.position ? '<span style="font-size:.68rem;color:var(--dim);margin-left:4px">'+info.position+'</span>' : '');
     const peak = s.peak_spl.toFixed(1) + ' dBFS';
     let deltaStr = '\\u2014';
     let deltaCls = '';
@@ -714,25 +740,33 @@ function updateHistButtons() {
 
 // ── Hero score ──────────────────────────────────────────────────────────────
 function classifyLabel(label) {
-  if (!label) return { type: 'unknown', desc: 'Unknown measurement' };
+  if (!label) return { type: 'unknown', desc: 'Unknown measurement', position: null };
   const l = label.toLowerCase();
-  if (l.includes('combined') || l.includes('both'))
-    return { type: 'combined', desc: 'Combined sub response (all subs playing)' };
-  if (l.match(/sub\\s*1|sub1|solo.*1|output.*0/i))
-    return { type: 'solo', desc: 'Sub 1 solo measurement' };
-  if (l.match(/sub\\s*2|sub2|solo.*2|output.*1/i))
-    return { type: 'solo', desc: 'Sub 2 solo measurement' };
+
+  // Extract position from "label @ position" format
+  let position = null;
+  const atMatch = label.match(/@\\s*(.+)$/);
+  if (atMatch) position = atMatch[1].trim();
+
+  const pos = position ? ' at ' + position : '';
+
+  if (l.includes('sub1-solo') || l.match(/sub\\s*1.*solo/))
+    return { type: 'solo', desc: 'Sub 1 solo' + pos, position };
+  if (l.includes('sub2-solo') || l.match(/sub\\s*2.*solo/))
+    return { type: 'solo', desc: 'Sub 2 solo' + pos, position };
   if (l.includes('solo'))
-    return { type: 'solo', desc: 'Solo sub measurement' };
+    return { type: 'solo', desc: 'Solo sub' + pos, position };
   if (l.includes('subcrawl') || l.includes('crawl'))
-    return { type: 'crawl', desc: 'Sub crawl position test' };
+    return { type: 'crawl', desc: 'Sub crawl' + pos, position };
   if (l.includes('baseline'))
-    return { type: 'baseline', desc: 'Baseline measurement (before EQ)' };
-  if (l.includes('iter'))
-    return { type: 'iteration', desc: 'Calibration iteration' };
+    return { type: 'baseline', desc: 'Baseline (before EQ)' + pos, position };
+  if (l.match(/iter-?\\d|iteration/))
+    return { type: 'iteration', desc: 'Calibration iteration' + pos, position };
+  if (l.includes('combined'))
+    return { type: 'combined', desc: 'Combined response' + pos, position };
   if (l === 'mcp-triggered' || l === 'headless')
-    return { type: 'combined', desc: 'Combined response at listening position' };
-  return { type: 'other', desc: label };
+    return { type: 'combined', desc: 'Combined response' + pos, position };
+  return { type: 'other', desc: label, position };
 }
 
 function updateHero(session) {

@@ -221,7 +221,10 @@ async def _tool_avr_set_volume(level_db: float) -> dict:
         return _err(f"avr unreachable: {exc}")
 
 
-async def _tool_trigger_measurement() -> dict:
+async def _tool_trigger_measurement(
+    label: str | None = None,
+    position: str | None = None,
+) -> dict:
     """Trigger a measurement via UMIK-1 + PyTTa.
 
     Calls MeasurementEngine.measure() directly (no HTTP hop). Wraps with
@@ -259,11 +262,21 @@ async def _tool_trigger_measurement() -> dict:
 
         # Compute IR-derived metadata at capture time
         metadata = compute_session_metadata(fr)
+        if position:
+            metadata["position"] = position
+
+        # Build descriptive label: "combined @ MLP", "sub1-solo @ MLP"
+        parts = []
+        parts.append(label or "combined")
+        if position:
+            parts.append("@ " + position)
+        full_label = " ".join(parts)
 
         store = SessionStore()
-        session_id = store.save_measurement(fr, label="mcp-triggered", metadata=metadata)
+        session_id = store.save_measurement(fr, label=full_label, metadata=metadata)
         return _ok(
             session_id=session_id,
+            label=full_label,
             metadata=metadata,
             message="Measurement complete — use get_measurement_history() to retrieve results.",
         )
@@ -884,11 +897,29 @@ _TOOLS: list[Tool] = [
         description=(
             "Trigger a frequency response measurement using the UMIK microphone. "
             "Takes a sweep measurement via PyTTa, saves to the session store, "
-            "and returns the session ID. Use get_measurement_history() to retrieve FR data."
+            "and returns the session ID. Use get_measurement_history() to retrieve FR data. "
+            "IMPORTANT: Always pass label and position so measurements are identifiable in the dashboard."
         ),
         inputSchema={
             "type": "object",
-            "properties": {},
+            "properties": {
+                "label": {
+                    "type": "string",
+                    "description": (
+                        "Descriptive label for this measurement. Use a consistent format: "
+                        "'combined' (all subs), 'sub1-solo', 'sub2-solo', 'subcrawl-pos1', "
+                        "'baseline', 'iter-1', 'iter-2', etc."
+                    ),
+                },
+                "position": {
+                    "type": "string",
+                    "description": (
+                        "Listening/mic position description. Examples: "
+                        "'MLP' (main listening position), 'front-left', 'nearfield', "
+                        "'subcrawl-candidate-1', 'seat-2'."
+                    ),
+                },
+            },
         },
     ),
     Tool(
@@ -1273,7 +1304,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     elif name in ("set_volume", "avr_set_volume", "set_denon_volume"):
         result = await _tool_avr_set_volume(float(arguments["level_db"]))
     elif name in ("measure", "trigger_measurement"):
-        result = await _tool_trigger_measurement()
+        result = await _tool_trigger_measurement(
+            label=arguments.get("label"),
+            position=arguments.get("position"),
+        )
     elif name == "calibrate_level":
         result = await _tool_calibrate_level(
             start_db=float(arguments.get("start_db", -10.0)),

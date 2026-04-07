@@ -38,6 +38,53 @@ def _median_spl(fr: FrequencyResponse) -> float:
     return sorted_spl[n // 2]
 
 
+def optimal_reference_spl(
+    fr: FrequencyResponse,
+    band: tuple[float, float] = (20.0, 200.0),
+) -> float:
+    """Find the reference SPL that minimizes boost needed to reach the Harman target.
+
+    Instead of anchoring to the median (which often places the target above the
+    room's low-frequency capability, requiring large boosts), this finds the
+    reference level where the target curve sits at or below the measured response
+    as much as possible — so corrections are mostly cuts.
+
+    Strategy: sweep candidate reference levels and pick the one that minimizes
+    total positive (boost) deviation while keeping total RMS reasonable.
+    """
+    if not fr.frequencies or not fr.spl:
+        return 0.0
+
+    freqs = np.array(fr.frequencies)
+    spl = np.array(fr.spl)
+    mask = (freqs >= band[0]) & (freqs <= band[1])
+    freqs_band = freqs[mask]
+    spl_band = spl[mask]
+
+    if len(spl_band) == 0:
+        return _median_spl(fr)
+
+    # Build the Harman offset array for the band frequencies
+    offsets = np.array([
+        HarmanTarget(reference_spl=0.0, band=band).target_at(f)
+        for f in freqs_band
+    ])
+
+    # The target at each freq = ref + offset.
+    # Deviation = measured - target = spl_band - (ref + offsets)
+    # Boost needed where deviation < 0: boost = max(0, target - measured)
+    #
+    # We want ref such that sum of boosts is minimized.
+    # Optimal: ref = min(spl_band - offsets), which places the target at/below
+    # the lowest point of the measured curve. But that may leave too much to cut.
+    #
+    # Compromise: use the 25th percentile of (spl - offsets). This keeps the
+    # target mostly below the measured curve, with only small boosts needed
+    # at the weakest frequencies.
+    adjusted = spl_band - offsets
+    return float(np.percentile(adjusted, 25))
+
+
 # ── Harman target curve ───────────────────────────────────────────────────────
 
 # Harman bass target: relative dB offsets at 1/3-octave centres.
@@ -173,14 +220,22 @@ def per_band_deviation(
 def harman_rms(
     fr: FrequencyResponse,
     band: tuple[float, float] = (20.0, 200.0),
+    anchor: str = "optimal",
 ) -> float:
     """Compute RMS deviation from Harman target for a measurement.
 
-    Standalone helper — creates a HarmanTarget anchored to the FR's median SPL
-    and returns the RMS deviation within *band*. Useful for computing a single
-    "how close to Harman" number for any stored measurement.
+    Standalone helper — creates a HarmanTarget and returns the RMS deviation
+    within *band*. Useful for computing a single "how close to Harman" number
+    for any stored measurement.
+
+    anchor:
+        "optimal" — minimize boost needed (prefer cuts). Best for dashboard scoring.
+        "median"  — anchor to median SPL. Legacy behavior.
     """
-    ref = _median_spl(fr)
+    if anchor == "optimal":
+        ref = optimal_reference_spl(fr, band)
+    else:
+        ref = _median_spl(fr)
     target = HarmanTarget(reference_spl=ref, band=band)
     return rms_deviation(fr, target, band)
 
