@@ -99,14 +99,31 @@ Claude should call `get_current_eq` and describe the filter state. If it doesn't
 
 | Tool | Description |
 |------|-------------|
-| `trigger_measurement` | Run a headless sweep via UMIK, returns session ID |
-| `get_frequency_response` | Fetch FR data for a session |
-| `get_current_eq` | Read current miniDSP EQ settings |
-| `apply_eq_corrections` | Write EQ band changes (SafetyValidator enforced) |
-| `get_sessions` | List measurement history |
-| `check_hardware` | Verify Denon, miniDSP, and mic are reachable |
-| `get_device_state` | Current Denon + miniDSP status |
-| `set_denon_volume` | Set Denon AVR master volume |
+| `measure` | Trigger a sweep via UMIK, saves session |
+| `get_measurement_history` | Fetch FR data for recent sessions |
+| `read_eq` | Read current miniDSP EQ filter state |
+| `apply_eq` | Write EQ filters to DSP output(s) (SafetyValidator enforced) |
+| `apply_input_eq` | Write EQ filters to the shared DSP input channel |
+| `get_calibration_runs` | List calibration run history |
+| `check_system` | Pre-flight: verify Denon, miniDSP, and mic are reachable |
+| `get_device_state` | Current AVR + DSP hardware state |
+| `set_volume` | Set AVR master volume |
+| `calibrate_level` | Auto-calibrate sweep volume by SNR |
+| `mute_output` | Mute DSP outputs (for solo sub measurement) |
+| `unmute_output` | Unmute DSP outputs |
+| `set_delay` | Set per-output delay in ms (sub time alignment) |
+| `set_polarity` | Set per-output polarity inversion |
+| `set_output_gain` | Set per-output gain trim in dB |
+| `get_output_state` | Per-output gain, delay, polarity, and FIR tap count |
+| `analyze_ir` | Extract IR peak time, polarity, and SPL for alignment |
+| `analyze_decay` | Analyze room-mode T60 decay; identify ringing frequencies |
+| `apply_fir` | Write FIR coefficients to a DSP output |
+| `clear_fir` | Clear FIR on a DSP output (reset to passthrough) |
+| `configure_matrix` | Configure DSP routing matrix |
+| `fetch_recipe` | Load a calibration recipe by name |
+| `get_config` | Return current config.yaml |
+| `set_config` | Deep-merge updates into config.yaml |
+| `discover_avr` | SSDP scan to find Denon/Marantz AVRs on the network |
 
 ## Security note
 
