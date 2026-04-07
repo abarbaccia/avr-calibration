@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0.0] - 2026-04-07
+
+### Added
+- **FIR filter support:** `apply_fir` and `clear_fir` MCP tools write FIR coefficients to the miniDSP 2x4 HD (2048 taps/output, 96kHz). Claude can now design time-domain filters that shorten room mode decay, not just cut peak magnitude.
+- **Decay analysis:** `analyze_decay` MCP tool runs Schroeder integration on stored impulse responses to identify ringing room modes (T60 > threshold), prioritize them, and recommend EQ Q values. Exposes `freq_hz`, `t60_ms`, `peak_db`, `suggested_q`, and `priority` per mode.
+- **IR analysis:** `analyze_ir` extracts `peak_time_s`, `peak_sign`, and `peak_spl_db` from stored sessions so Claude can compute inter-sub delay offsets and polarity inversions without custom Python.
+- **Output state:** `get_output_state` returns in-memory per-output tracking (gain, delay, polarity, fir_taps) accumulated since server startup — necessary because minidspd has no GET endpoint for these parameters.
+- **Output gain:** `set_output_gain` sets per-output gain in dB directly from Claude, completing the sub level-match workflow.
+- **`get_config` FIR capabilities:** `eq_capabilities` now includes `fir_capable`, `fir_max_taps_per_output`, `fir_shared_tap_pool`, and `fir_sample_rate_hz` so Claude can gate FIR vs PEQ recommendations on device capability.
+
+### Changed
+- **`configure_matrix` safety label:** Tool descriptor now carries the signal-path write warning, consistent with other routing tools.
+- **Per-sub recipe phase 1 and 2:** `harman-bass-persub.md` updated to call `analyze_ir` after each solo measurement for delay/polarity computation and `analyze_decay` after per-sub EQ for ringing mode detection.
+- **`/calibrate` skill:** Recipe picker now recommends hardware-aware recipes and lists all new MCP tools (`get_output_state`, `analyze_ir`, `analyze_decay`).
+
+### Fixed
+- **FIR exit code:** `minidsp fir import` and `fir clear` return exit code 1 even on success (minidsp-rs#766). CLI wrapper now ignores exit code 1 for these commands — previously every `apply_fir` call raised a `DriverError` even when the hardware loaded the coefficients correctly.
+- **FIR lock:** `apply_fir` and `clear_fir` now acquire `self._lock`, consistent with `apply_eq`. Concurrent `apply_eq + apply_fir` calls would otherwise interleave CLI writes and corrupt device state.
+- **FIR state rollback:** `_fir_state` is now updated only after all hardware writes succeed, matching the P0 rollback pattern in `apply_eq`.
+- **`clear_fir` passthrough:** `clear_output_fir` now explicitly sets `fir bypass off` after clearing, ensuring deterministic passthrough state regardless of firmware behaviour post-clear.
+- **Decay analysis broadband reference:** `broadband_energy` in `analyze_decay` now excludes near-zero bins. Previously, measurements with sparse energy could produce reference levels near zero, generating spurious +300 dB peak values that would misdirect EQ decisions.
+- **Python orchestrators removed:** `run_alignment_phases()` and `run_full_alignment()` — incomplete Python orchestrators with hardcoded placeholder values — deleted from `alignment.py`. Claude drives the calibration loop via MCP tools + recipes.
+
 ## [0.5.1.0] - 2026-04-05
 
 ### Added
