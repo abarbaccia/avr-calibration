@@ -427,12 +427,12 @@ function harmanOffset(f) {
 }
 
 function optimalRef(freqs, spl) {
-  // 25th percentile of (measured - harman_offset) — places target below most of the curve,
-  // so corrections are mostly cuts. Matches backend optimal_reference_spl().
-  const adjusted = freqs.map((f, i) => spl[i] - harmanOffset(f));
-  const sorted = [...adjusted].sort((a, b) => a - b);
-  const idx = Math.floor(sorted.length * 0.25);
-  return sorted[Math.min(idx, sorted.length - 1)];
+  // Max safe extension: highest reference where no band needs more than 6 dB boost.
+  // ref = min(measured(f) - harman_offset(f) + 6) across all frequencies.
+  // This maximizes bass output while staying within safety limits.
+  const MAX_BOOST = 6;
+  const adjusted = freqs.map((f, i) => spl[i] - harmanOffset(f) + MAX_BOOST);
+  return Math.min(...adjusted);
 }
 
 function getTargetCurve(freqs, spl) {

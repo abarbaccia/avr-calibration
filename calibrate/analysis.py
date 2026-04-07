@@ -217,6 +217,41 @@ def per_band_deviation(
     return result
 
 
+def max_safe_reference_spl(
+    fr: FrequencyResponse,
+    band: tuple[float, float] = (20.0, 200.0),
+    max_boost_db: float = 6.0,
+) -> float:
+    """Find the highest Harman reference level where no band needs more than max_boost_db.
+
+    This maximizes bass extension while staying within the safety limit.
+    For each frequency: boost_needed = (ref + harman_offset) - measured.
+    Constraint: boost_needed <= max_boost_db for all frequencies.
+    So: ref <= measured(f) - harman_offset(f) + max_boost_db for all f.
+    Take the minimum across all frequencies.
+    """
+    if not fr.frequencies or not fr.spl:
+        return 0.0
+
+    freqs = np.array(fr.frequencies)
+    spl = np.array(fr.spl)
+    mask = (freqs >= band[0]) & (freqs <= band[1])
+    freqs_band = freqs[mask]
+    spl_band = spl[mask]
+
+    if len(spl_band) == 0:
+        return _median_spl(fr)
+
+    offsets = np.array([
+        HarmanTarget(reference_spl=0.0, band=band).target_at(f)
+        for f in freqs_band
+    ])
+
+    # ref <= spl(f) - offset(f) + max_boost for all f
+    # So ref = min(spl - offset + max_boost)
+    return float(np.min(spl_band - offsets + max_boost_db))
+
+
 def harman_rms(
     fr: FrequencyResponse,
     band: tuple[float, float] = (20.0, 200.0),
@@ -229,11 +264,11 @@ def harman_rms(
     for any stored measurement.
 
     anchor:
-        "optimal" — minimize boost needed (prefer cuts). Best for dashboard scoring.
+        "optimal" — max safe extension (highest ref where no band needs >6dB boost).
         "median"  — anchor to median SPL. Legacy behavior.
     """
     if anchor == "optimal":
-        ref = optimal_reference_spl(fr, band)
+        ref = max_safe_reference_spl(fr, band)
     else:
         ref = _median_spl(fr)
     target = HarmanTarget(reference_spl=ref, band=band)

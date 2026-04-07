@@ -165,24 +165,49 @@ curve to the DSP input using `eq_capabilities.input_peq` from `get_config`.
 ### 3.1 Baseline
 
 Measure the combined sub response (all subs unmuted, per-sub EQ active).
-Calculate RMS deviation from the Harman target.
+Use label "combined" and position "MLP" when calling `measure`.
 
-### 3.2 Apply Harman EQ to input
+### 3.2 Anchor the target curve
 
-Design filters to match the Harman target:
+Compute the optimal reference level for the Harman target curve. The reference
+determines where the target sits relative to the measured response.
+
+**Strategy: max safe extension.** Find the highest reference level where no
+frequency band requires more than +6 dB of boost (the safety limit). This gets
+the most bass performance the subs can deliver within safety constraints.
+
+Algorithm:
+1. For each frequency in the baseline measurement (20-200 Hz band):
+   - required_boost = harman_offset(freq) + ref - measured_spl(freq)
+   - If required_boost > 0, that's how much boost this band needs
+2. The constraint is: max(required_boost across all bands) <= 6 dB
+3. So: ref <= min(measured_spl(freq) - harman_offset(freq)) + 6
+   across all frequencies in the band
+4. Use that as the reference SPL for the Harman target
+
+This places the target as high as possible while keeping all boosts within the
++6 dB per-band safety limit. Most corrections will be cuts (peaks above target).
+A few bands may need small boosts where the room is weakest.
+
+Report the chosen reference level and the resulting max boost needed.
+
+### 3.3 Apply Harman EQ to input
+
+Design filters to match the Harman target (anchored in 3.2):
 - Above target: cut (always safe)
-- Below target: boost (limited by safety)
+- Below target: boost (limited by safety, max +6 dB per band)
 
 Call `apply_input_eq` with the target curve filters. This writes to the
 input PEQ so all subs receive the same correction.
 
 Always include the mandatory 18Hz HPF.
 
-### 3.3 Re-measure and iterate
+### 3.4 Re-measure and iterate
 
-After applying input EQ, re-measure combined response:
-- RMS deviation < 2.0 dB: done
+After applying input EQ, re-measure combined response (label "iter-N @ MLP"):
+- RMS deviation < 2.0 dB from the anchored target: done
 - Otherwise: adjust input PEQ and re-measure
+- Do NOT re-anchor the target between iterations (it was set in 3.2)
 - Maximum 5 EQ iterations
 
 ## Convergence

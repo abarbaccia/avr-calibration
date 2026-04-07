@@ -30,10 +30,20 @@ Call `get_measurement_history(limit=1)` to retrieve the most recent measurement.
 If no measurement exists, instruct the user to take one in the browser
 (https://avr-cal.local:8000) and return once done.
 
-### Step 2 — Analyse the current response
+### Step 2 — Anchor the target curve
+
+Compute the optimal reference level for the Harman target. Find the highest
+reference SPL where no frequency band requires more than +6 dB of boost:
+
+  ref = min(measured(f) - harman_offset(f) + 6) across all frequencies in 20-200Hz
+
+This maximizes bass extension while staying within the +6 dB safety limit.
+Most corrections will be cuts. Report the chosen reference level.
+
+### Step 3 — Analyse the current response
 
 Compare the measured SPL at each 1/3-octave band (20–200 Hz) against the Harman
-bass target. The target relative to 80 Hz is approximately:
+bass target anchored at the reference from Step 2. The target relative to 80 Hz is:
 
 | Frequency (Hz) | Target relative to 80 Hz |
 |---------------|--------------------------|
@@ -52,7 +62,7 @@ Note: the Harman target is a preference model, not a physical law. Adjust
 interpretation based on room acoustics — a room with significant bass buildup
 below 50 Hz should target less bass lift than a flat room.
 
-### Step 3 — Calculate corrections
+### Step 4 — Calculate corrections
 
 For each 1/3-octave band, calculate the correction needed:
   correction_db = target_db - measured_db
@@ -70,7 +80,7 @@ Safety constraints (enforced automatically by apply_eq):
 If a correction exceeds a limit, clip it to the maximum safe value and note
 it as a partial correction. Do not attempt to apply the over-limit value.
 
-### Step 4 — Apply corrections
+### Step 5 — Apply corrections
 
 Call `apply_eq(filters)` with the calculated filter list. Always include the
 mandatory 18 Hz HPF:
@@ -88,12 +98,13 @@ If `apply_eq` returns `{ok: false, error: "SafetyValidator: ..."}`:
 2. Adjust the offending filter (reduce the gain or move the frequency)
 3. Retry with the adjusted filter set
 
-### Step 5 — Re-measure and iterate
+### Step 6 — Re-measure and iterate
 
 After applying filters, ask the user to take a new measurement in the browser.
 Retrieve it with `get_measurement_history(limit=1)` and compare to the target.
 
-Repeat from Step 2 until convergence or the maximum iteration count is reached.
+Repeat from Step 3 until convergence or the maximum iteration count is reached.
+Do NOT re-anchor the target between iterations (it was set in Step 2).
 
 ## Convergence
 
