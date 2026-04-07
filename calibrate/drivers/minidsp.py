@@ -373,3 +373,63 @@ class MinidspDriver(DSPDriver):
         other_input = 1 - active_input
         await self._client.set_input_routing(active_input, all_outputs)
         await self._client.set_input_routing(other_input, all_muted)
+
+
+class MinidspSweepContext:
+    """Async context manager for USB sweep lifecycle on the miniDSP.
+
+    Switches the miniDSP source to USB before a sweep, then restores the
+    original source on exit (best-effort).  Mirrors DenonSweepContext so the
+    measure tool can use both interchangeably.
+
+    Usage:
+        async with MinidspSweepContext.from_config(cfg) as ctx:
+            fr = await engine.measure()
+
+    Returns None from from_config() when playback_route is not "usb", so the
+    caller can always do::
+
+        ctx = MinidspSweepContext.from_config(cfg)
+        if ctx:
+            async with ctx:
+                fr = await engine.measure()
+        else:
+            fr = await engine.measure()
+    """
+
+    @classmethod
+    def from_config(cls, config) -> "MinidspSweepContext | None":
+        """Build from a Config object, or return None if USB sweep not configured."""
+        route = config.measurement.get("playback_route", "usb")
+        if route != "usb":
+            return None
+        host = config.minidsp.get("host", "localhost")
+        port = int(config.minidsp.get("port", 5380))
+        return cls(host=host, port=port)
+
+    def __init__(self, host: str, port: int) -> None:
+        self._client = MinidspClient(host=host, port=port)
+        self._original_source: str | None = None
+
+    async def __aenter__(self) -> "MinidspSweepContext":
+        try:
+            status = await self._client.get_status()
+            self._original_source = status.get("master", {}).get("source", "Analog")
+            await self._client.switch_source("USB")
+            log.info("MinidspSweepContext: switched source Analog→USB for sweep")
+        except Exception as exc:
+            log.warning("MinidspSweepContext: failed to switch to USB source: %s", exc)
+        return self
+
+    async def __aexit__(self, *_) -> None:
+        if self._original_source:
+            try:
+                await self._client.switch_source(self._original_source)
+                log.info(
+                    "MinidspSweepContext: restored source USB→%s", self._original_source
+                )
+            except Exception as exc:
+                log.warning(
+                    "MinidspSweepContext: failed to restore source to %s: %s",
+                    self._original_source, exc
+                )
