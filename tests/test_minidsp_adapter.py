@@ -1,7 +1,9 @@
 """Unit tests for MinidspClient — HTTP adapter for minidspd.
 
-All HTTP calls are intercepted with respx (same pattern as test_preflight.py).
-No hardware or real network access is required.
+HTTP-based methods use respx mocking. CLI-based methods (set_output_gain,
+set_output_delay, set_output_polarity, set_input_routing, restore_all_gains,
+mute_outputs, unmute_outputs) mock _run_minidsp_cli with AsyncMock since they
+no longer touch the HTTP transport.
 
 The minidspd REST API uses POST /devices/{idx}/config for EQ/routing mutations
 and POST /devices/{idx} with a MasterStatus body for preset/source switching.
@@ -11,6 +13,7 @@ The /preset/:n and /source/:s path endpoints do not exist in minidspd 0.1.x.
 import pytest
 import httpx
 import respx
+from unittest.mock import AsyncMock, patch
 
 from calibrate.adapters.minidsp import (
     MinidspClient,
@@ -22,6 +25,8 @@ from calibrate.adapters.minidsp import (
     APF_RESERVED_SLOTS,
     ALIGNMENT_PEQ_SLOTS,
 )
+
+_CLI_PATH = "calibrate.adapters.minidsp._run_minidsp_cli"
 
 BASE = "http://localhost:5380"
 CONFIG_URL = f"{BASE}/devices/0/config"
@@ -37,51 +42,35 @@ def client() -> MinidspClient:
 
 # ── set_output_gain ────────────────────────────────────────────────────────────
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_set_output_gain_happy_path(client: MinidspClient) -> None:
-    route = respx.post(CONFIG_URL).mock(return_value=httpx.Response(200))
-    await client.set_output_gain(0, -6.0)
-    assert route.called
-    body = route.calls[0].request.content
-    assert b'"outputs"' in body
-    assert b'"gain"' in body
-    assert b'-6.0' in body
+    with patch(_CLI_PATH, new_callable=AsyncMock) as mock_cli:
+        await client.set_output_gain(0, -6.0)
+    mock_cli.assert_called_once_with("output", "0", "gain", "--", "-6.0")
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_set_output_gain_sends_correct_index(client: MinidspClient) -> None:
-    route = respx.post(CONFIG_URL).mock(return_value=httpx.Response(200))
-    await client.set_output_gain(2, -3.0)
-    import json
-    payload = json.loads(route.calls[0].request.content)
-    assert payload["outputs"][0]["index"] == 2
-    assert payload["outputs"][0]["gain"] == -3.0
+    with patch(_CLI_PATH, new_callable=AsyncMock) as mock_cli:
+        await client.set_output_gain(2, -3.0)
+    mock_cli.assert_called_once_with("output", "2", "gain", "--", "-3.0")
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_set_output_gain_error(client: MinidspClient) -> None:
-    respx.post(CONFIG_URL).mock(return_value=httpx.Response(500))
-    with pytest.raises(MinidspApiError) as exc_info:
-        await client.set_output_gain(0, -6.0)
-    assert exc_info.value.status_code == 500
+    with patch(_CLI_PATH, new_callable=AsyncMock) as mock_cli:
+        mock_cli.side_effect = MinidspApiError(1, "minidsp output 0 gain -- -6.0: error")
+        with pytest.raises(MinidspApiError):
+            await client.set_output_gain(0, -6.0)
 
 
 # ── set_output_delay ──────────────────────────────────────────────────────────
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_set_output_delay_happy_path(client: MinidspClient) -> None:
-    route = respx.post(CONFIG_URL).mock(return_value=httpx.Response(200))
-    await client.set_output_delay(0, 4.5)
-    import json
-    payload = json.loads(route.calls[0].request.content)
-    delay = payload["outputs"][0]["delay"]
-    # 4.5ms = 4_500_000 nanos
-    assert delay["secs"] == 0
-    assert delay["nanos"] == 4_500_000
+    with patch(_CLI_PATH, new_callable=AsyncMock) as mock_cli:
+        await client.set_output_delay(0, 4.5)
+    mock_cli.assert_called_once_with("output", "0", "delay", "4.5")
 
 
 @pytest.mark.asyncio
@@ -93,34 +82,25 @@ async def test_set_output_delay_out_of_range(client: MinidspClient) -> None:
 @pytest.mark.asyncio
 async def test_set_output_delay_at_max_boundary(client: MinidspClient) -> None:
     """delay_ms == MAX_DELAY_MS is allowed (boundary value)."""
-    with respx.mock:
-        respx.post(CONFIG_URL).mock(return_value=httpx.Response(200))
+    with patch(_CLI_PATH, new_callable=AsyncMock):
         await client.set_output_delay(1, MAX_DELAY_MS)  # no error
 
 
 # ── set_output_polarity ───────────────────────────────────────────────────────
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_set_output_polarity_happy_path(client: MinidspClient) -> None:
-    route = respx.post(CONFIG_URL).mock(return_value=httpx.Response(200))
-    await client.set_output_polarity(0, inverted=True)
-    import json
-    payload = json.loads(route.calls[0].request.content)
-    assert payload["outputs"][0]["invert"] is True
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_set_output_polarity_not_supported(client: MinidspClient) -> None:
-    """A 4xx from minidspd → MinidspApiError."""
-    respx.post(CONFIG_URL).mock(return_value=httpx.Response(422))
-
-    with pytest.raises(MinidspApiError) as exc_info:
+    with patch(_CLI_PATH, new_callable=AsyncMock) as mock_cli:
         await client.set_output_polarity(0, inverted=True)
+    mock_cli.assert_called_once_with("output", "0", "invert", "on")
 
-    assert exc_info.value.status_code == 422
-    assert "/devices/0/config" in exc_info.value.path
+
+@pytest.mark.asyncio
+async def test_set_output_polarity_not_inverted(client: MinidspClient) -> None:
+    """inverted=False sends 'off'."""
+    with patch(_CLI_PATH, new_callable=AsyncMock) as mock_cli:
+        await client.set_output_polarity(0, inverted=False)
+    mock_cli.assert_called_once_with("output", "0", "invert", "off")
 
 
 # ── set_output_peq ────────────────────────────────────────────────────────────
@@ -174,98 +154,80 @@ async def test_set_output_peq_with_bypass(client: MinidspClient) -> None:
 
 # ── set_input_routing ─────────────────────────────────────────────────────────
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_set_input_routing_enabled(client: MinidspClient) -> None:
-    """Route input 1 to outputs 0, 2, 3; disable output 1."""
-    route = respx.post(CONFIG_URL).mock(return_value=httpx.Response(200))
-    await client.set_input_routing(1, {0: True, 1: False, 2: True, 3: True})
-    import json
-    payload = json.loads(route.calls[0].request.content)
-    inp = payload["inputs"][0]
-    assert inp["index"] == 1
-    routing = {r["index"]: r["mute"] for r in inp["routing"]}
-    assert routing[0] is False  # enabled → mute=False
-    assert routing[1] is True   # disabled → mute=True
-    assert routing[2] is False
-    assert routing[3] is False
+    """Route input 1 to outputs 0, 2, 3; disable output 1 via CLI."""
+    with patch(_CLI_PATH, new_callable=AsyncMock) as mock_cli:
+        await client.set_input_routing(1, {0: True, 1: False, 2: True, 3: True})
+    calls = [c.args for c in mock_cli.call_args_list]
+    assert ("input", "1", "routing", "0", "enable", "true") in calls
+    assert ("input", "1", "routing", "1", "enable", "false") in calls
+    assert ("input", "1", "routing", "2", "enable", "true") in calls
+    assert ("input", "1", "routing", "3", "enable", "true") in calls
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_set_input_routing_mute_semantics(client: MinidspClient) -> None:
-    import json
-    route = respx.post(CONFIG_URL).mock(return_value=httpx.Response(200))
-    await client.set_input_routing(0, {0: False, 1: True})
-    payload = json.loads(route.calls[0].request.content)
-    routing = payload["inputs"][0]["routing"]
-    by_index = {r["index"]: r["mute"] for r in routing}
-    assert by_index[0] is True
-    assert by_index[1] is False
+    """enabled=False → 'enable false'; enabled=True → 'enable true'."""
+    with patch(_CLI_PATH, new_callable=AsyncMock) as mock_cli:
+        await client.set_input_routing(0, {0: False, 1: True})
+    calls = {c.args[3]: c.args[5] for c in mock_cli.call_args_list}
+    assert calls["0"] == "false"
+    assert calls["1"] == "true"
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_set_input_routing_partial(client: MinidspClient) -> None:
-    """Partial routing only sends the specified outputs."""
-    route = respx.post(CONFIG_URL).mock(return_value=httpx.Response(200))
-    await client.set_input_routing(0, {0: True})
-    import json
-    payload = json.loads(route.calls[0].request.content)
-    assert len(payload["inputs"][0]["routing"]) == 1
+    """Partial routing only calls CLI for the specified outputs."""
+    with patch(_CLI_PATH, new_callable=AsyncMock) as mock_cli:
+        await client.set_input_routing(0, {0: True})
+    assert mock_cli.call_count == 1
 
 
 # ── restore_all_gains ─────────────────────────────────────────────────────────
 
-@respx.mock
 @pytest.mark.asyncio
-async def test_restore_all_gains_writes_zero(client: MinidspClient) -> None:
-    """restore_all_gains must POST gain=0.0 for each output index."""
-    route = respx.post(CONFIG_URL).mock(return_value=httpx.Response(200))
-
-    await client.restore_all_gains([0, 1])
-
-    assert route.call_count == 2
-    import json
-    gains = [json.loads(c.request.content)["outputs"][0]["gain"] for c in route.calls]
-    assert gains == [0.0, 0.0]
+async def test_restore_all_gains_unmutes_outputs(client: MinidspClient) -> None:
+    """restore_all_gains sends 'mute off' for each output index via CLI."""
+    with patch(_CLI_PATH, new_callable=AsyncMock) as mock_cli:
+        await client.restore_all_gains([0, 1])
+    assert mock_cli.call_count == 2
+    calls = [c.args for c in mock_cli.call_args_list]
+    assert ("output", "0", "mute", "off") in calls
+    assert ("output", "1", "mute", "off") in calls
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_restore_all_gains_continues_on_partial_failure(client: MinidspClient) -> None:
-    """If one gain restore fails, the rest still run."""
+    """If one unmute fails, the rest still run (errors are swallowed)."""
     call_count = 0
 
-    def side_effect(req):
+    async def side_effect(*args):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            raise httpx.ConnectError("refused")
-        return httpx.Response(200)
+            raise MinidspApiError(1, "minidsp output 0 mute off: error")
 
-    respx.post(CONFIG_URL).mock(side_effect=side_effect)
-
-    # Should not raise even though output 0 fails
-    await client.restore_all_gains([0, 1])
+    with patch(_CLI_PATH, side_effect=side_effect):
+        # Should not raise even though output 0 fails
+        await client.restore_all_gains([0, 1])
     assert call_count == 2
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_restore_all_gains_partial_failure(client: MinidspClient) -> None:
-    call_count = 0
+    """Errors from individual outputs are swallowed; all outputs attempted."""
+    attempted = []
 
-    def side_effect(request):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return httpx.Response(502)
-        return httpx.Response(200)
+    async def side_effect(*args):
+        attempted.append(args[1])  # output index
+        if args[1] == "0":
+            raise MinidspApiError(1, "minidsp output 0 mute off: error")
 
-    respx.post(CONFIG_URL).mock(side_effect=side_effect)
-    await client.restore_all_gains([0, 1])
-    assert call_count == 2
+    with patch(_CLI_PATH, side_effect=side_effect):
+        await client.restore_all_gains([0, 1])
+    assert "0" in attempted
+    assert "1" in attempted
 
 
 # ── switch_preset ──────────────────────────────────────────────────────────────
@@ -367,26 +329,23 @@ async def test_get_devices_happy_path(client: MinidspClient) -> None:
 
 # ── Error handling ────────────────────────────────────────────────────────────
 
-@respx.mock
 @pytest.mark.asyncio
-async def test_api_error_on_5xx(client: MinidspClient) -> None:
-    """5xx from minidspd → MinidspApiError."""
-    respx.post(CONFIG_URL).mock(return_value=httpx.Response(500))
+async def test_api_error_on_cli_failure(client: MinidspClient) -> None:
+    """Non-zero CLI exit code → MinidspApiError."""
+    with patch(_CLI_PATH, new_callable=AsyncMock) as mock_cli:
+        mock_cli.side_effect = MinidspApiError(1, "minidsp output 0 gain -- -6.0: device error")
+        with pytest.raises(MinidspApiError) as exc_info:
+            await client.set_output_gain(0, -6.0)
+    assert exc_info.value.status_code == 1
 
-    with pytest.raises(MinidspApiError) as exc_info:
-        await client.set_output_gain(0, -6.0)
 
-    assert exc_info.value.status_code == 500
-
-
-@respx.mock
 @pytest.mark.asyncio
-async def test_connection_refused_propagates(client: MinidspClient) -> None:
-    """httpx.ConnectError propagates without wrapping."""
-    respx.post(CONFIG_URL).mock(side_effect=httpx.ConnectError("refused"))
-
-    with pytest.raises(httpx.ConnectError):
-        await client.set_output_gain(0, -6.0)
+async def test_cli_exception_propagates(client: MinidspClient) -> None:
+    """Unexpected CLI exceptions propagate without wrapping."""
+    with patch(_CLI_PATH, new_callable=AsyncMock) as mock_cli:
+        mock_cli.side_effect = RuntimeError("subprocess crash")
+        with pytest.raises(RuntimeError):
+            await client.set_output_gain(0, -6.0)
 
 
 # ── constants ──────────────────────────────────────────────────────────────────
@@ -443,20 +402,13 @@ async def test_peq_invalid_output_rejected(client: MinidspClient) -> None:
 # ── mute_outputs error propagation ──────────────────────────────────────────
 
 
-@respx.mock
 @pytest.mark.asyncio
-async def test_mute_outputs_raises_on_partial_failure(client: MinidspClient) -> None:
-    """If one output fails to mute, MinidspApiError is raised."""
-    call_count = 0
+async def test_mute_outputs_raises_on_cli_failure(client: MinidspClient) -> None:
+    """If the first mute CLI call fails, MinidspApiError propagates immediately."""
+    async def side_effect(*args):
+        if args[1] == "0":
+            raise MinidspApiError(1, "minidsp output 0 mute on: error")
 
-    def side_effect(req):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return httpx.Response(500)
-        return httpx.Response(200)
-
-    respx.post(CONFIG_URL).mock(side_effect=side_effect)
-
-    with pytest.raises(MinidspApiError, match="partial failure"):
-        await client.mute_outputs([0, 1])
+    with patch(_CLI_PATH, side_effect=side_effect):
+        with pytest.raises(MinidspApiError):
+            await client.mute_outputs([0, 1])
