@@ -105,6 +105,12 @@ CREATE TABLE IF NOT EXISTS saved_states (
     measurement_session_id INTEGER REFERENCES sessions(id),
     notes                 TEXT
 );
+
+CREATE TABLE IF NOT EXISTS active_dsp_state (
+    key         TEXT PRIMARY KEY,
+    timestamp   TEXT NOT NULL,
+    data        TEXT NOT NULL
+);
 """
 
 
@@ -183,6 +189,12 @@ class SessionStore:
             if "metadata" not in existing:
                 conn.execute(
                     "ALTER TABLE sessions ADD COLUMN metadata TEXT DEFAULT NULL"
+                )
+
+            run_cols = {row[1] for row in conn.execute("PRAGMA table_info(calibration_runs)")}
+            if "target_curve_data" not in run_cols:
+                conn.execute(
+                    "ALTER TABLE calibration_runs ADD COLUMN target_curve_data TEXT DEFAULT NULL"
                 )
 
     # ── Sessions ─────────────────────────────────────────────────────────────
@@ -381,14 +393,17 @@ class SessionStore:
         baseline_rms: float | None = None,
         final_rms: float | None = None,
         error: str = "",
+        target_curve_data: dict | None = None,
     ) -> None:
         """Update a calibration run with final results."""
         with self._connect() as conn:
             conn.execute(
                 "UPDATE calibration_runs"
-                " SET converged=?, iterations_run=?, baseline_rms=?, final_rms=?, error=?"
+                " SET converged=?, iterations_run=?, baseline_rms=?, final_rms=?, error=?,"
+                "     target_curve_data=?"
                 " WHERE id=?",
-                (int(converged), iterations_run, baseline_rms, final_rms, error or None, run_id),
+                (int(converged), iterations_run, baseline_rms, final_rms, error or None,
+                 json.dumps(target_curve_data) if target_curve_data else None, run_id),
             )
 
     def save_iteration(
@@ -458,6 +473,13 @@ class SessionStore:
                 else:
                     d[key] = []
             iterations.append(d)
+
+        # Parse JSON columns
+        if run.get("target_curve_data"):
+            try:
+                run["target_curve_data"] = json.loads(run["target_curve_data"])
+            except (json.JSONDecodeError, TypeError):
+                run["target_curve_data"] = None
 
         run["iterations"] = iterations
         return run
@@ -531,6 +553,40 @@ class SessionStore:
         with self._connect() as conn:
             cur = conn.execute("DELETE FROM saved_states WHERE id=?", (state_id,))
             return cur.rowcount > 0
+
+    # ── Active DSP state ────────────────────────────────────────────────────
+
+    def set_active_dsp(self, key: str, data: dict) -> None:
+        """Upsert an active DSP state entry (e.g. 'output_eq_1', 'input_eq', 'delay_1')."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO active_dsp_state (key, timestamp, data)"
+                " VALUES (?, ?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET timestamp=excluded.timestamp, data=excluded.data",
+                (key, now, json.dumps(data)),
+            )
+
+    def get_active_dsp(self) -> dict[str, dict]:
+        """Return all active DSP state entries as {key: {timestamp, ...data}}."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT key, timestamp, data FROM active_dsp_state ORDER BY key"
+            ).fetchall()
+        result = {}
+        for r in rows:
+            try:
+                d = json.loads(r["data"])
+            except (json.JSONDecodeError, TypeError):
+                d = {}
+            d["timestamp"] = r["timestamp"]
+            result[r["key"]] = d
+        return result
+
+    def clear_active_dsp(self) -> None:
+        """Clear all active DSP state (e.g. on factory reset)."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM active_dsp_state")
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 

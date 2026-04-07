@@ -252,10 +252,47 @@ def max_safe_reference_spl(
     return float(np.min(spl_band - offsets + max_boost_db))
 
 
+def min_rms_reference_spl(
+    fr: FrequencyResponse,
+    band: tuple[float, float] = (20.0, 200.0),
+    max_boost_db: float = 6.0,
+    step_db: float = 0.5,
+    max_drop_db: float = 10.0,
+) -> float:
+    """Find the reference SPL that minimizes RMS deviation from the Harman target.
+
+    Starts at max_safe_reference_spl and steps downward. Lowering the reference
+    trades absolute bass level for better curve shape tracking — bands that
+    were maxed out on boost become reachable, and the overall RMS drops.
+
+    Stops when RMS starts increasing again (diminishing returns — just cutting
+    everything more without improving shape) or max_drop_db is reached.
+    """
+    ceiling = max_safe_reference_spl(fr, band, max_boost_db)
+
+    best_ref = ceiling
+    best_rms = rms_deviation(fr, HarmanTarget(reference_spl=ceiling, band=band), band)
+
+    ref = ceiling - step_db
+    floor = ceiling - max_drop_db
+    while ref >= floor:
+        target = HarmanTarget(reference_spl=ref, band=band)
+        rms = rms_deviation(fr, target, band)
+        if rms < best_rms:
+            best_rms = rms
+            best_ref = ref
+        elif rms > best_rms + 0.5:
+            # RMS rising — past the sweet spot
+            break
+        ref -= step_db
+
+    return float(best_ref)
+
+
 def harman_rms(
     fr: FrequencyResponse,
     band: tuple[float, float] = (20.0, 200.0),
-    anchor: str = "optimal",
+    anchor: str = "min_rms",
 ) -> float:
     """Compute RMS deviation from Harman target for a measurement.
 
@@ -264,10 +301,13 @@ def harman_rms(
     for any stored measurement.
 
     anchor:
-        "optimal" — max safe extension (highest ref where no band needs >6dB boost).
-        "median"  — anchor to median SPL. Legacy behavior.
+        "min_rms"  — minimize RMS deviation (best curve fit). Default.
+        "max_safe" — max safe extension (highest ref where no band needs >6dB boost).
+        "median"   — anchor to median SPL. Legacy behavior.
     """
-    if anchor == "optimal":
+    if anchor == "min_rms":
+        ref = min_rms_reference_spl(fr, band)
+    elif anchor == "max_safe":
         ref = max_safe_reference_spl(fr, band)
     else:
         ref = _median_spl(fr)

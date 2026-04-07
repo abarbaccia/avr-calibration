@@ -861,3 +861,47 @@ class TestOverlayAPI:
             resp = client.get("/api/sessions/overlay?ids=1,2,1,2,1,2,1,2")
         data = resp.json()
         assert len(data) <= 6
+
+
+# ── GET /api/dsp-state ─────────────────────────────────────────────────────
+
+
+class TestDspState:
+    def test_empty_state(self, client: TestClient, db_store: SessionStore) -> None:
+        cfg = _make_config()
+        with patch("calibrate.web.SessionStore", return_value=db_store), \
+             patch("calibrate.web._load_config", return_value=cfg):
+            resp = client.get("/api/dsp-state")
+        data = resp.json()
+        assert data["active"] is False
+
+    def test_with_persisted_state(self, client: TestClient, db_store: SessionStore) -> None:
+        db_store.set_active_dsp("output_eq_1", {"filters": [{"freq": 47, "gain_db": -3, "q": 3.4, "type": "peaking"}]})
+        db_store.set_active_dsp("delay_1", {"delay_ms": 12.2})
+        db_store.set_active_dsp("polarity_2", {"inverted": True})
+        db_store.set_active_dsp("gain_1", {"gain_db": 3.2})
+        db_store.set_active_dsp("input_eq", {"filters": [{"freq": 18, "gain_db": 0, "q": 0.707, "type": "hpf"}]})
+
+        cfg = Config({
+            "denon": {"host": "192.168.1.100"},
+            "minidsp": {
+                "host": "localhost", "port": 5380,
+                "output_slots": [
+                    {"index": 1, "label": "Sub 1", "type": "sub"},
+                    {"index": 2, "label": "Sub 2", "type": "sub"},
+                    {"index": 3, "label": "Shaker", "type": "shaker"},
+                ],
+            },
+            "mic": {"name": "UMIK"},
+            "measurement": {"denon_sweep_input": "CD", "denon_sweep_volume": -25.0},
+        })
+        with patch("calibrate.web.SessionStore", return_value=db_store), \
+             patch("calibrate.web._load_config", return_value=cfg):
+            resp = client.get("/api/dsp-state")
+        data = resp.json()
+        assert data["active"] is True
+        assert data["outputs"]["1"]["delay_ms"] == 12.2
+        assert data["outputs"]["1"]["gain_db"] == 3.2
+        assert data["outputs"]["1"]["eq"][0]["freq"] == 47
+        assert data["outputs"]["2"]["polarity_inverted"] is True
+        assert data["input_eq"]["filters"][0]["type"] == "hpf"

@@ -779,3 +779,38 @@ class TestSavedStates:
         assert state["eq_filters"] is None
         assert state["delays"] is None
         assert state["target_curve"] is None
+
+
+# ── Active DSP state ─────────────────────────────────────────────────────────
+
+
+class TestActiveDspState:
+    def test_set_and_get(self, store):
+        store.set_active_dsp("output_eq_1", {"filters": [{"freq": 80, "gain_db": -3}]})
+        result = store.get_active_dsp()
+        assert "output_eq_1" in result
+        assert result["output_eq_1"]["filters"] == [{"freq": 80, "gain_db": -3}]
+        assert "timestamp" in result["output_eq_1"]
+
+    def test_upsert_overwrites(self, store):
+        store.set_active_dsp("delay_1", {"delay_ms": 5.0})
+        store.set_active_dsp("delay_1", {"delay_ms": 12.2})
+        result = store.get_active_dsp()
+        assert result["delay_1"]["delay_ms"] == 12.2
+
+    def test_multiple_keys(self, store):
+        store.set_active_dsp("output_eq_1", {"filters": []})
+        store.set_active_dsp("output_eq_2", {"filters": []})
+        store.set_active_dsp("input_eq", {"filters": []})
+        store.set_active_dsp("delay_1", {"delay_ms": 0})
+        result = store.get_active_dsp()
+        assert len(result) == 4
+
+    def test_empty_returns_empty(self, store):
+        assert store.get_active_dsp() == {}
+
+    def test_clear(self, store):
+        store.set_active_dsp("output_eq_1", {"filters": []})
+        store.set_active_dsp("delay_1", {"delay_ms": 0})
+        store.clear_active_dsp()
+        assert store.get_active_dsp() == {}

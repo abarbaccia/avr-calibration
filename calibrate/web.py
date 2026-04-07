@@ -237,6 +237,22 @@ _HTML = """<!DOCTYPE html>
     }
     #toast.show { opacity: 1; }
 
+    /* ── DSP state ── */
+    .dsp-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: .75rem; margin-top: .5rem; }
+    .dsp-output {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+      padding: .6rem .75rem;
+    }
+    .dsp-output-header { display: flex; align-items: center; gap: .4rem; margin-bottom: .4rem; }
+    .dsp-output-label { font-weight: 600; font-size: .85rem; }
+    .dsp-output-type { font-size: .68rem; color: var(--dim); }
+    .dsp-param { font-size: .75rem; color: var(--muted); margin-bottom: .15rem; }
+    .dsp-param span { color: var(--text); }
+    .dsp-filter-list { font-size: .72rem; color: var(--muted); margin-top: .3rem; }
+    .dsp-filter-list .f-row { display: flex; gap: .5rem; padding: .1rem 0; border-bottom: 1px solid #1a2030; }
+    .dsp-filter-list .f-row:last-child { border-bottom: none; }
+    .dsp-section-label { font-size: .75rem; font-weight: 600; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; margin-bottom: .4rem; }
+
     /* ── Version footer ── */
     #versionFooter {
       width: 100%; max-width: 900px; margin-top: .5rem; padding: .4rem 1rem;
@@ -270,16 +286,29 @@ _HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Active DSP State -->
+  <div class="card" id="dspCard" style="display:none">
+    <div class="collapse-header" onclick="toggleSection('dsp')">
+      <h2>Active DSP State</h2>
+      <span class="arrow">&#9654;</span>
+    </div>
+    <div id="dspBody" class="collapse-body">
+      <div id="dspContent" style="font-size:.82rem;"></div>
+    </div>
+  </div>
+
   <!-- FR Plot (always visible when data exists) -->
   <div class="card" id="plotCard" style="display:none">
     <div class="chart-controls">
-      <label for="curveSelect">Target:</label>
-      <select id="curveSelect" onchange="onCurveChange()">
+      <label for="curveSelect">Compare:</label>
+      <select id="curveSelect">
+        <option value="">Add curve...</option>
         <option value="harman">Harman</option>
         <option value="ht">HT-Aggressive</option>
         <option value="music">Musicality</option>
         <option value="flat">Flat</option>
       </select>
+      <button class="btn-secondary btn-sm" onclick="onAddComparison()">Add</button>
       <div style="flex:1"></div>
       <button class="btn-save btn-sm" onclick="showSaveModal()">Save State</button>
       <button class="btn-secondary btn-sm" onclick="exportChart()">Export PNG</button>
@@ -402,15 +431,12 @@ let allSessions = [];
 const OVERLAY_COLORS = ['#3b82f6','#f472b6','#a78bfa','#fb923c','#34d399','#f87171'];
 
 // ── Target curves ───────────────────────────────────────────────────────────
-let targetCurveType = localStorage.getItem('targetCurve') || 'harman';
+// ── Target curve — stored from calibration, comparison curves as overlays ──
 
-function onCurveChange() {
-  targetCurveType = document.getElementById('curveSelect').value;
-  localStorage.setItem('targetCurve', targetCurveType);
-  refreshChart();
-}
+// Stored target from last calibration run (loaded from /api/dsp-state)
+let storedTarget = null;  // {type, reference_spl, points: [{freq, spl}]}
 
-// Harman bass offsets (dB relative to 80Hz reference)
+// Harman bass offsets for comparison curve generation
 const HARMAN_TABLE = {20:6, 25:5, 31.5:4, 40:3, 50:2, 63:1, 80:0, 100:0, 125:0, 160:-1, 200:-2};
 
 function harmanOffset(f) {
@@ -426,31 +452,35 @@ function harmanOffset(f) {
   return 0;
 }
 
-function optimalRef(freqs, spl) {
-  // Max safe extension: highest reference where no band needs more than 6 dB boost.
-  // ref = min(measured(f) - harman_offset(f) + 6) across all frequencies.
-  // This maximizes bass output while staying within safety limits.
-  const MAX_BOOST = 6;
-  const adjusted = freqs.map((f, i) => spl[i] - harmanOffset(f) + MAX_BOOST);
-  return Math.min(...adjusted);
+// Comparison curves: use the stored target's reference_spl so they're at the same level
+let comparisonCurves = [];  // ['harman', 'flat', 'ht', 'music']
+
+function onAddComparison() {
+  const sel = document.getElementById('curveSelect');
+  const type = sel.value;
+  if (!type || comparisonCurves.includes(type)) return;
+  comparisonCurves.push(type);
+  refreshChart();
 }
 
-function getTargetCurve(freqs, spl) {
-  const refSpl = optimalRef(freqs, spl);
-  if (targetCurveType === 'flat') return freqs.map(() => refSpl);
-  if (targetCurveType === 'ht')
-    return freqs.map(f => f >= 100 ? refSpl : refSpl + 4 * Math.log2(100 / f));
-  if (targetCurveType === 'music') return freqs.map(f => {
+function removeComparison(type) {
+  comparisonCurves = comparisonCurves.filter(c => c !== type);
+  refreshChart();
+}
+
+function buildComparisonCurve(type, freqs, refSpl) {
+  if (type === 'flat') return freqs.map(f => ({x: f, y: refSpl}));
+  if (type === 'ht') return freqs.map(f => ({x: f, y: f >= 100 ? refSpl : refSpl + 4 * Math.log2(100 / f)}));
+  if (type === 'music') return freqs.map(f => {
     const oct = Math.log2(f / 30);
-    return refSpl + 4 * Math.exp(-(oct * oct) / (2 * 0.7 * 0.7));
+    return {x: f, y: refSpl + 4 * Math.exp(-(oct * oct) / (2 * 0.7 * 0.7))};
   });
-  // Harman: use the proper offset table
-  return freqs.map(f => refSpl + harmanOffset(f));
+  // harman
+  return freqs.map(f => ({x: f, y: refSpl + harmanOffset(f)}));
 }
 
-function curveLabel() {
-  return {harman:'Harman', ht:'HT-Aggressive', music:'Musicality', flat:'Flat'}[targetCurveType] + ' Target';
-}
+const COMPARISON_COLORS = {harman:'#94a3b8', flat:'#64748b', ht:'#fb923c', music:'#a78bfa'};
+const COMPARISON_LABELS = {harman:'Harman', flat:'Flat', ht:'HT-Aggressive', music:'Musicality'};
 
 // ── Toast ───────────────────────────────────────────────────────────────────
 function toast(msg) {
@@ -472,14 +502,22 @@ function toggleSection(name) {
 const THIRD_OCT = [25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200];
 
 function renderDeltaTable(freqs, spl) {
-  const target = getTargetCurve(freqs, spl);
   const tbody = document.getElementById('deltaBody');
-  if (!tbody) return;
+  if (!tbody || !storedTarget || !storedTarget.points || storedTarget.points.length === 0) {
+    document.getElementById('deltaCard').style.display = 'none';
+    return;
+  }
+  // Build lookup from stored target points
+  const tPts = storedTarget.points;
   const rows = THIRD_OCT.map(fc => {
+    // Closest measurement bin
     let bi = 0, bd = Infinity;
     freqs.forEach((f, i) => { const d = Math.abs(f - fc); if (d < bd) { bd = d; bi = i; } });
+    // Closest target point
+    let ti = 0, td = Infinity;
+    tPts.forEach((pt, i) => { const d = Math.abs(pt.freq - fc); if (d < td) { td = d; ti = i; } });
     const measSpl = spl[bi];
-    const targSpl = target[bi];
+    const targSpl = tPts[ti].spl;
     const delta = measSpl - targSpl;
     const cls = Math.abs(delta) <= 3 ? 'ok' : Math.abs(delta) <= 6 ? 'warn' : 'bad';
     const sign = delta >= 0 ? '+' : '';
@@ -493,6 +531,10 @@ function renderDeltaTable(freqs, spl) {
 let portTuneHz = null;
 let chartData = {};  // {primary: {freqs, spl, label}, overlays: [{id, freqs, spl, label}]}
 
+function toXY(freqs, spl) {
+  return freqs.map((f, i) => ({x: f, y: spl[i]}));
+}
+
 function renderChart() {
   const p = chartData.primary;
   if (!p || !p.freqs || !p.freqs.length) return;
@@ -502,17 +544,13 @@ function renderChart() {
   document.getElementById('plotStatus').textContent = info.desc + (p.label && p.label !== info.desc ? ' (' + p.label + ')' : '');
 
   const sel = document.getElementById('curveSelect');
-  if (sel) sel.value = targetCurveType;
-
   const ctx = document.getElementById('frPlot').getContext('2d');
   if (frChart) frChart.destroy();
-
-  const targetLine = getTargetCurve(p.freqs, p.spl);
 
   const datasets = [
     {
       label: classifyLabel(p.label).desc,
-      data: p.spl,
+      data: toXY(p.freqs, p.spl),
       borderColor: OVERLAY_COLORS[0],
       backgroundColor: 'rgba(59,130,246,.08)',
       borderWidth: 2,
@@ -520,23 +558,44 @@ function renderChart() {
       tension: 0.3,
       fill: chartData.overlays.length === 0,
     },
-    {
-      label: curveLabel(),
-      data: targetLine,
-      borderColor: '#94a3b8',
-      borderDash: [5, 5],
-      borderWidth: 1,
+  ];
+
+  // Stored target curve from calibration (primary target line)
+  if (storedTarget && storedTarget.points && storedTarget.points.length > 0) {
+    datasets.push({
+      label: (storedTarget.type || 'Target').charAt(0).toUpperCase() + (storedTarget.type || 'target').slice(1) + ' Target',
+      data: storedTarget.points.map(pt => ({x: pt.freq, y: pt.spl})),
+      borderColor: '#4ade80',
+      borderDash: [6, 3],
+      borderWidth: 2,
       pointRadius: 0,
       tension: 0,
       fill: false,
-    },
-  ];
+    });
+  }
+
+  // Comparison curves (user-added overlays, same reference level as stored target)
+  const compRef = storedTarget ? storedTarget.reference_spl : null;
+  if (compRef != null) {
+    comparisonCurves.forEach(type => {
+      datasets.push({
+        label: COMPARISON_LABELS[type] || type,
+        data: buildComparisonCurve(type, p.freqs, compRef),
+        borderColor: COMPARISON_COLORS[type] || '#64748b',
+        borderDash: [3, 3],
+        borderWidth: 1,
+        pointRadius: 0,
+        tension: 0,
+        fill: false,
+      });
+    });
+  }
 
   // Overlays
   chartData.overlays.forEach((ov, i) => {
     datasets.push({
       label: ov.label,
-      data: ov.spl,
+      data: toXY(ov.freqs, ov.spl),
       borderColor: OVERLAY_COLORS[(i + 1) % OVERLAY_COLORS.length],
       borderWidth: 1.5,
       pointRadius: 0,
@@ -556,16 +615,16 @@ function renderChart() {
       borderWidth: 1.5,
       pointRadius: 0,
       fill: false,
-      parsing: false,
     });
   }
 
   frChart = new Chart(ctx, {
     type: 'line',
-    data: { labels: p.freqs.map(f => f.toFixed(1)), datasets },
+    data: { datasets },
     options: {
       animation: false,
       responsive: true,
+      parsing: { xAxisKey: 'x', yAxisKey: 'y' },
       scales: {
         x: {
           type: 'logarithmic',
@@ -792,10 +851,73 @@ function updateHero(session) {
   const ts = session.timestamp.slice(0,19).replace('T',' ');
   const info = classifyLabel(session.label);
   detail.textContent = 'Session #' + session.id + ' \\u2014 ' + ts;
-  ctx.textContent = info.desc + (rms != null ? ' \\u2014 vs ' + curveLabel() : '');
+  ctx.textContent = info.desc + (rms != null && storedTarget ? ' \\u2014 vs ' + (storedTarget.type || 'Target') : '');
 }
 
 // ── System status (hardware bar) ────────────────────────────────────────────
+// ── Active DSP state ────────────────────────────────────────────────────────
+async function loadDspState() {
+  try {
+    const r = await fetch('/api/dsp-state');
+    if (!r.ok) return;
+    const data = await r.json();
+
+    // Store the target curve for chart display
+    if (data.target_curve) {
+      storedTarget = data.target_curve;
+      refreshChart();
+    }
+
+    const card = document.getElementById('dspCard');
+    if (!data.active) { card.style.display = 'none'; return; }
+
+    card.style.display = '';
+    const el = document.getElementById('dspContent');
+    let html = '<div class="dsp-grid">';
+
+    // Per-output cards
+    const outputs = Object.entries(data.outputs || {}).sort((a,b) => a[0]-b[0]);
+    for (const [idx, out] of outputs) {
+      const typeColor = out.type === 'sub' ? 'var(--accent)' : out.type === 'shaker' ? 'var(--yellow)' : 'var(--dim)';
+      html += '<div class="dsp-output">';
+      html += '<div class="dsp-output-header"><span class="dsp-output-label">' + out.label + '</span>';
+      html += '<span class="dsp-output-type" style="color:'+typeColor+'">' + out.type + '</span></div>';
+
+      if (out.gain_db != null) html += '<div class="dsp-param">Gain: <span>' + (out.gain_db >= 0 ? '+' : '') + out.gain_db.toFixed(1) + ' dB</span></div>';
+      if (out.delay_ms != null) html += '<div class="dsp-param">Delay: <span>' + out.delay_ms.toFixed(1) + ' ms</span></div>';
+      if (out.polarity_inverted != null) html += '<div class="dsp-param">Polarity: <span>' + (out.polarity_inverted ? 'Inverted' : 'Normal') + '</span></div>';
+
+      if (out.eq && out.eq.length > 0) {
+        html += '<div class="dsp-filter-list">';
+        for (const f of out.eq) {
+          const gain = f.gain_db != null ? (f.gain_db >= 0 ? '+' : '') + f.gain_db.toFixed(1) + 'dB' : '';
+          const q = f.q ? 'Q=' + f.q.toFixed(2) : '';
+          html += '<div class="f-row"><span>' + f.type + '</span><span>' + f.freq.toFixed(0) + 'Hz</span><span>' + gain + '</span><span>' + q + '</span></div>';
+        }
+        html += '</div>';
+      } else {
+        html += '<div class="dsp-param" style="color:var(--dim)">No EQ applied</div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+
+    // Input EQ (shared)
+    if (data.input_eq && data.input_eq.filters && data.input_eq.filters.length > 0) {
+      html += '<div style="margin-top:.75rem"><div class="dsp-section-label">Shared Input EQ</div>';
+      html += '<div class="dsp-filter-list">';
+      for (const f of data.input_eq.filters) {
+        const gain = f.gain_db != null ? (f.gain_db >= 0 ? '+' : '') + f.gain_db.toFixed(1) + 'dB' : '';
+        const q = f.q ? 'Q=' + f.q.toFixed(2) : '';
+        html += '<div class="f-row"><span>' + f.type + '</span><span>' + f.freq.toFixed(0) + 'Hz</span><span>' + gain + '</span><span>' + q + '</span></div>';
+      }
+      html += '</div></div>';
+    }
+
+    el.innerHTML = html;
+  } catch(e) { console.warn('dsp state load failed:', e); }
+}
+
 async function loadStatus() {
   try {
     const r = await fetch('/api/status');
@@ -937,7 +1059,7 @@ async function doSaveState() {
   const body = {
     name,
     notes,
-    target_curve: targetCurveType,
+    target_curve: storedTarget ? storedTarget.type : null,
     measurement_session_id: selectedSessionId,
     rms_deviation: latestSession?.harman_delta_db || null,
   };
@@ -1065,6 +1187,7 @@ chartData = { primary: null, overlays: [] };
 
 loadHistory();
 loadStatus();
+loadDspState();
 loadRuns();
 loadStates();
 loadVersion();
@@ -1588,6 +1711,73 @@ async def delete_state(state_id: int) -> dict:
     if not store.delete_state(state_id):
         raise HTTPException(status_code=404, detail=f"State #{state_id} not found")
     return {"status": "deleted"}
+
+
+# ── Active DSP state ──────────────────────────────────────────────────────────
+
+
+@app.get("/api/dsp-state")
+async def dsp_state() -> dict:
+    """Return the active DSP state persisted by the MCP server.
+
+    Returns a structured view: per-output EQ/delay/polarity/gain + shared input EQ.
+    This data survives restarts because it's written to SQLite on every apply_eq,
+    set_delay, set_polarity, and set_output_gain call.
+    """
+    store = SessionStore()
+    raw = store.get_active_dsp()
+
+    if not raw:
+        return {"active": False, "outputs": {}, "input_eq": None}
+
+    cfg = _load_config()
+    slots = cfg.minidsp.get("output_slots", [])
+
+    outputs = {}
+    for slot in slots:
+        idx = slot["index"]
+        label = slot.get("label", f"Output {idx}")
+        slot_type = slot.get("type", "unknown")
+        out = {
+            "label": label,
+            "type": slot_type,
+            "eq": None,
+            "delay_ms": None,
+            "polarity_inverted": None,
+            "gain_db": None,
+        }
+        eq_entry = raw.get(f"output_eq_{idx}")
+        if eq_entry:
+            out["eq"] = eq_entry.get("filters")
+            out["eq_timestamp"] = eq_entry.get("timestamp")
+        delay_entry = raw.get(f"delay_{idx}")
+        if delay_entry:
+            out["delay_ms"] = delay_entry.get("delay_ms")
+        pol_entry = raw.get(f"polarity_{idx}")
+        if pol_entry:
+            out["polarity_inverted"] = pol_entry.get("inverted")
+        gain_entry = raw.get(f"gain_{idx}")
+        if gain_entry:
+            out["gain_db"] = gain_entry.get("gain_db")
+        outputs[str(idx)] = out
+
+    input_eq = None
+    ie = raw.get("input_eq")
+    if ie:
+        input_eq = {"filters": ie.get("filters"), "timestamp": ie.get("timestamp")}
+
+    target_curve = None
+    tc = raw.get("target_curve")
+    if tc:
+        target_curve = {
+            "type": tc.get("type"),
+            "reference_spl": tc.get("reference_spl"),
+            "band": tc.get("band"),
+            "points": tc.get("points"),
+            "timestamp": tc.get("timestamp"),
+        }
+
+    return {"active": True, "outputs": outputs, "input_eq": input_eq, "target_curve": target_curve}
 
 
 # ── Config helper ─────────────────────────────────────────────────────────────
