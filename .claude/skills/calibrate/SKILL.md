@@ -75,13 +75,13 @@ Run a calibration recipe by reading it and executing each step via MCP tools.
 
    Recommendation logic:
    - Count sub outputs (type: "sub") in config.minidsp.output_slots
-   - If 2+ subs → recommend "harman-bass-persub" (per-sub EQ gives best multi-sub results)
+   - If 2+ subs → recommend "harman-bass-persub" (time alignment + per-sub EQ + shared Harman target)
    - If 1 sub → recommend "harman-bass" (simpler, no alignment needed)
    - If user has alignment issues (subs at different distances) → mention "harman-bass-aligned"
 
    Show the recommendation with a brief reason, e.g.:
-   "Recommended: **harman-bass-persub** — you have 2 subs, per-sub EQ will flatten each
-    sub's room response independently before applying the shared Harman target."
+   "Recommended: **harman-bass-persub** — you have 2 subs; aligns them in time, flattens each
+    sub's room response independently, then applies the shared Harman target."
 
    Also note whether the selected recipe uses FIR or PEQ only (from the recipe's
    ## Filter Strategy section), so the user knows what hardware will be touched.
