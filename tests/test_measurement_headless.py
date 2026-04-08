@@ -118,19 +118,28 @@ class TestMeasureHeadless:
         mock_sd.reset_mock()
         mock_sd.default.device = (0, 0)
 
-        return engine, mock_pytta, mock_sd, sweep, recording
+        # Build a mock playback strategy that returns real arrays.
+        # USBPlayback now uses sd.InputStream/OutputStream directly — measure() tests
+        # should patch playback_for_route to avoid needing real audio hardware.
+        sweep_1d = sweep.timeSignal[:, 0]
+        rec_1d = recording.timeSignal[:, 0]
+        mock_strategy = MagicMock()
+        mock_strategy.play_and_record.return_value = (sweep_1d, rec_1d)
+
+        return engine, mock_pytta, mock_sd, sweep, recording, mock_strategy
 
     @pytest.mark.asyncio
     async def test_sets_sd_default_device_when_umik_found(self):
         """measure(input_device_name='UMIK') sets sd.default.device to UMIK index."""
-        engine, _, mock_sd, _, _ = self._setup_mocks()
+        engine, _, mock_sd, _, _, mock_strategy = self._setup_mocks()
         mock_sd.query_devices.return_value = [
             {"name": "Built-in Mic", "max_input_channels": 1},
             {"name": "UMIK-1", "max_input_channels": 1},
         ]
         mock_sd.default.device = (0, 2)
 
-        await engine.measure(input_device_name="UMIK")
+        with patch("calibrate.drivers.playback.playback_for_route", return_value=mock_strategy):
+            await engine.measure(input_device_name="UMIK")
 
         # UMIK-1 is at index 1; output stays at 2
         assert mock_sd.default.device == (1, 2)
@@ -138,14 +147,15 @@ class TestMeasureHeadless:
     @pytest.mark.asyncio
     async def test_no_input_device_name_uses_config_mic_name(self):
         """measure() with no input_device_name uses config.mic.name for UMIK selection."""
-        engine, _, mock_sd, _, _ = self._setup_mocks()
+        engine, _, mock_sd, _, _, mock_strategy = self._setup_mocks()
         mock_sd.query_devices.return_value = [
             {"name": "Built-in Mic", "max_input_channels": 1},
             {"name": "UMIK-1", "max_input_channels": 1},
         ]
         mock_sd.default.device = (0, 2)
 
-        await engine.measure()
+        with patch("calibrate.drivers.playback.playback_for_route", return_value=mock_strategy):
+            await engine.measure()
 
         # Config has mic.name="UMIK", so UMIK-1 at index 1 should be selected
         assert mock_sd.default.device == (1, 2)
@@ -153,30 +163,33 @@ class TestMeasureHeadless:
     @pytest.mark.asyncio
     async def test_sounddevice_unavailable_silently_ignored(self):
         """If sounddevice is not installed, measure() proceeds without setting device."""
-        engine, _, _, _, _ = self._setup_mocks()
+        engine, _, _, _, _, mock_strategy = self._setup_mocks()
         with patch.dict(sys.modules, {"sounddevice": None}):
-            fr = await engine.measure(input_device_name="UMIK", )
+            with patch("calibrate.drivers.playback.playback_for_route", return_value=mock_strategy):
+                fr = await engine.measure(input_device_name="UMIK")
         assert isinstance(fr, FrequencyResponse)
 
     @pytest.mark.asyncio
     async def test_portaudio_error_raises_runtime_error(self):
-        """PortAudioError from meas.run() is re-raised as RuntimeError."""
-        engine, mock_pytta, _, _, _ = self._setup_mocks()
+        """PortAudioError from play_and_record() is re-raised as RuntimeError."""
+        engine, _, _, _, _, _ = self._setup_mocks()
 
         class PortAudioError(Exception):
             pass
 
-        mock_pytta.PlayRecMeasure.return_value.run.side_effect = PortAudioError(
-            "No default output device"
+        error_strategy = MagicMock()
+        error_strategy.play_and_record.side_effect = RuntimeError(
+            "Audio device error: No default output device"
         )
 
-        with pytest.raises(RuntimeError, match="Audio device error"):
-            await engine.measure()
+        with patch("calibrate.drivers.playback.playback_for_route", return_value=error_strategy):
+            with pytest.raises(RuntimeError, match="Audio device error"):
+                await engine.measure()
 
     @pytest.mark.asyncio
     async def test_validate_recording_called(self):
         """validate_recording() is called before _compute_fr_arrays()."""
-        engine, mock_pytta, _, sweep, recording = self._setup_mocks()
+        engine, mock_pytta, _, sweep, recording, mock_strategy = self._setup_mocks()
 
         call_order: list[str] = []
 
@@ -194,6 +207,7 @@ class TestMeasureHeadless:
         engine.validate_recording = spy_validate
         engine._compute_fr_arrays = spy_compute
 
-        await engine.measure()
+        with patch("calibrate.drivers.playback.playback_for_route", return_value=mock_strategy):
+            await engine.measure()
 
         assert call_order.index("validate") < call_order.index("compute")

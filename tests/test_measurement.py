@@ -150,10 +150,25 @@ class TestMeasure:
 
         return engine, mock_pytta, mock_sweep, mock_recording
 
+    def _make_playback_mock(self, mock_sweep, mock_recording):
+        """Return a mock playback strategy that returns the given sweep/rec arrays.
+
+        USBPlayback now uses sd.InputStream/OutputStream directly instead of
+        pytta.PlayRecMeasure. Patching playback_for_route lets measure() tests
+        stay focused on the orchestration logic rather than stream mechanics.
+        """
+        sweep_1d = mock_sweep.timeSignal[:, 0]
+        rec_1d = mock_recording.timeSignal[:, 0]
+        mock_strategy = MagicMock()
+        mock_strategy.play_and_record.return_value = (sweep_1d, rec_1d)
+        return mock_strategy
+
     @pytest.mark.asyncio
     async def test_happy_path_returns_frequency_response(self):
-        engine, _, _, _ = self._make_engine_with_mocks()
-        fr = await engine.measure()
+        engine, _, mock_sweep, mock_recording = self._make_engine_with_mocks()
+        mock_strategy = self._make_playback_mock(mock_sweep, mock_recording)
+        with patch("calibrate.drivers.playback.playback_for_route", return_value=mock_strategy):
+            fr = await engine.measure()
         assert isinstance(fr, FrequencyResponse)
         assert len(fr.frequencies) > 0
         assert len(fr.spl) == len(fr.frequencies)
@@ -164,9 +179,11 @@ class TestMeasure:
     @pytest.mark.asyncio
     async def test_sweep_called_with_config_values(self):
         cfg = make_config(freq_min=30, freq_max=150, sweep_duration=5.0, sample_rate=44100)
-        engine, mock_pytta, _, _ = self._make_engine_with_mocks(cfg)
-        await engine.measure()
+        engine, mock_pytta, mock_sweep, mock_recording = self._make_engine_with_mocks(cfg)
+        mock_strategy = self._make_playback_mock(mock_sweep, mock_recording)
         import math
+        with patch("calibrate.drivers.playback.playback_for_route", return_value=mock_strategy):
+            await engine.measure()
         mock_pytta.generate.sweep.assert_called_once_with(
             freqMin=30,
             freqMax=150,
@@ -176,21 +193,25 @@ class TestMeasure:
         )
 
     @pytest.mark.asyncio
-    async def test_playrecmeasure_called_with_channel_config(self):
+    async def test_playback_called_with_channel_config(self):
+        """play_and_record is called with the correct in/out channels from config."""
         cfg = make_config(input_channel=2, output_channel=3)
-        engine, mock_pytta, _, _ = self._make_engine_with_mocks(cfg)
-        await engine.measure()
-        mock_pytta.PlayRecMeasure.assert_called_once_with(
-            excitation=mock_pytta.generate.sweep.return_value,
-            inChannels=[2],
-            outChannels=[3],
-        )
+        engine, _, mock_sweep, mock_recording = self._make_engine_with_mocks(cfg)
+        mock_strategy = self._make_playback_mock(mock_sweep, mock_recording)
+        with patch("calibrate.drivers.playback.playback_for_route", return_value=mock_strategy):
+            await engine.measure()
+        mock_strategy.play_and_record.assert_called_once()
+        call_args = mock_strategy.play_and_record.call_args
+        assert call_args[0][2] == 2  # in_channel
+        assert call_args[0][3] == 3  # out_channel
 
     @pytest.mark.asyncio
     async def test_frequencies_trimmed_to_config_band(self):
         cfg = make_config(freq_min=40, freq_max=100)
-        engine, _, _, _ = self._make_engine_with_mocks(cfg)
-        fr = await engine.measure()
+        engine, _, mock_sweep, mock_recording = self._make_engine_with_mocks(cfg)
+        mock_strategy = self._make_playback_mock(mock_sweep, mock_recording)
+        with patch("calibrate.drivers.playback.playback_for_route", return_value=mock_strategy):
+            fr = await engine.measure()
         assert all(40 <= f <= 100 for f in fr.frequencies)
 
     @pytest.mark.asyncio

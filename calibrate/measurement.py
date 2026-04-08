@@ -172,11 +172,16 @@ class MeasurementEngine:
             )
 
         # ── Check 3: SNR ───────────────────────────────────────────────────
-        peak_idx = int(np.argmax(np.abs(rec_array)))
-        half = floor_n // 2
-        start = max(0, peak_idx - half)
-        end = min(len(rec_array), peak_idx + half)
-        peak_window = rec_array[start:end]
+        # Use cross-correlation lag (from Check 2) to locate the sweep in the
+        # recording. Do NOT use np.argmax(abs(rec_array)) — that returns the
+        # first sample at maximum amplitude, which is fragile when the UMIK
+        # clips (multiple samples hit 1.0) or when there are room transients:
+        # the first clipping sample may be in the floor window, collapsing
+        # signal_rms ≈ floor_rms and giving SNR ≈ 0 dB despite a valid sweep.
+        lag_idx = int(np.argmax(np.abs(corr[:n])))  # circular lag in [0, n)
+        sig_start = max(0, lag_idx)
+        sig_end = min(len(rec_array), lag_idx + n)
+        peak_window = rec_array[sig_start:sig_end]
         signal_rms = np.sqrt(np.mean(peak_window ** 2)) if len(peak_window) > 0 else 0.0
         snr_db = 20.0 * np.log10(float(signal_rms) / (float(floor_rms) + 1e-12))
 
