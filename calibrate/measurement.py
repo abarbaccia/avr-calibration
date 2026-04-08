@@ -5,8 +5,8 @@ Single entry point: MeasurementEngine.measure()
     generate log sweep (PyTTa) → play+record → deconvolve (numpy FFT) → FR
 
 Playback is delegated to PlaybackStrategy (calibrate.drivers.playback):
-    USBPlayback  → PyTTa PlayRecMeasure (float32 duplex)
-    HDMIPlayback → split sd.rec() + sd.play() (HDMI requires int16 output)
+    USBPlayback  → explicit sd.InputStream + sd.OutputStream (recording-first, pre-delay)
+    HDMIPlayback → explicit sd.InputStream + sd.OutputStream (HDMI requires int16 output)
 
 This module has ZERO knowledge of AVR hardware or output format quirks.
 Callers that need AVR input/volume switching should use DenonSweepContext
@@ -102,8 +102,9 @@ def _find_umik_device(devices, name_substring: str = "UMIK") -> int | None:
 class MeasurementEngine:
     """Run a log-sweep measurement via PyTTa and return a FrequencyResponse.
 
-    Single entry point: measure(). Route-aware for USB (PyTTa duplex)
-    and HDMI (split play+record with int16 output conversion).
+    Single entry point: measure(). Route-aware: USB uses explicit sd.InputStream +
+    sd.OutputStream (recording-first, 1s pre-delay); HDMI uses the same with int16
+    output conversion.
     """
 
     def __init__(self, config: Config) -> None:
@@ -207,8 +208,8 @@ class MeasurementEngine:
         playback route, validates the recording, and deconvolves to FR.
 
         Route-aware playback:
-          "usb"  — PyTTa PlayRecMeasure (float32 duplex, both devices support it)
-          "hdmi" — split sd.rec() + sd.play() (HDMI only supports int16 output)
+          "usb"  — explicit sd.InputStream + sd.OutputStream (recording-first, 1s pre-delay)
+          "hdmi" — explicit sd.InputStream + sd.OutputStream (int16 output conversion)
 
         The caller is responsible for any AVR lifecycle management (input switching,
         volume, power) before/after calling measure(). Use DenonSweepContext for that.
