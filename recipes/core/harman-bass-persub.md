@@ -2,9 +2,10 @@
 
 ## Goal
 
-Calibrate multiple subwoofers using a two-layer EQ strategy:
-- **Output PEQ** (per-sub): flatten each sub's individual room response
-- **Input PEQ** (shared): apply the Harman bass target curve to all subs equally
+Calibrate multiple subwoofers using a three-phase approach:
+1. **Time alignment** (Phase 1): measure each sub solo, compute delay and polarity corrections so all subs arrive at the mic in phase
+2. **Output PEQ** (Phase 2, per-sub): flatten each sub's individual room response
+3. **Input PEQ** (Phase 3, shared): apply the Harman bass target curve to all subs equally
 
 This separation gives the combined Harman pass a much smoother starting point
 and keeps per-sub corrections independent from the target curve.

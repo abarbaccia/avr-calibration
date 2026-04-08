@@ -30,25 +30,139 @@ class PlaybackStrategy(Protocol):
 
 
 class USBPlayback:
-    """PyTTa PlayRecMeasure — float32 duplex via USB audio device."""
+    """Explicit InputStream + OutputStream for USB sweep play + mic record.
+
+    Uses separate streams (same pattern as HDMIPlayback) to guarantee that
+    recording starts BEFORE playback. This ensures the first 500 ms of the
+    recording captures the pre-sweep noise floor rather than mid-sweep signal
+    — critical for the SNR validation gate.
+
+    sd.playrec() with two different USB devices (UMIK on hw:3, miniDSP on
+    hw:2) uses non-synchronized streams; if recording starts late, the floor
+    window captures mid-sweep energy and SNR collapses to ~0 dB.
+    """
+
+    # Pre-delay: recording starts this many seconds before playback.
+    # Must exceed the floor window (500ms) by a comfortable margin so no
+    # sweep energy contaminates the noise floor estimate.
+    # 1.0s > 500ms floor window, with 500ms headroom for USB latency variance.
+    PRE_DELAY_S: float = 1.0
+
+    # Post-silence appended to the output buffer so the full sweep response
+    # (including room reverb tail) is captured before the input stream stops.
+    POST_DELAY_S: float = 0.5
 
     def play_and_record(self, sweep, sample_rate, in_channel, out_channel):
-        import pytta
+        import time as _time
 
-        measurement = pytta.PlayRecMeasure(
-            excitation=sweep,
-            inChannels=[in_channel],
-            outChannels=[out_channel],
+        import numpy as np
+        import sounddevice as sd
+
+        sweep_array = sweep.timeSignal[:, 0].astype(np.float32)
+        n_samples = len(sweep_array)
+
+        in_dev = int(sd.default.device[0])
+        out_dev = int(sd.default.device[1])
+
+        pre_samples = int(self.PRE_DELAY_S * sample_rate)
+        post_samples = int(self.POST_DELAY_S * sample_rate)
+
+        # Output buffer: sweep only (pre-delay handled by sleeping before start).
+        # Append post-silence so the output stream stays open long enough for
+        # the full room response to be captured by the input stream.
+        n_out_ch = max(2, out_channel)
+        sweep_buf = np.zeros((n_samples, n_out_ch), dtype=np.float32)
+        sweep_buf[:, out_channel - 1] = sweep_array  # 1-based → 0-based
+        post_silence = np.zeros((post_samples, n_out_ch), dtype=np.float32)
+        out_buf = np.vstack([sweep_buf, post_silence])
+
+        # Recording buffer: pre_delay + sweep + post_delay
+        # CRITICAL: must be larger than n_samples. With a 1s pre-delay, the
+        # sweep starts 48000 samples into the recording. A buffer sized to only
+        # n_samples would fill up before the sweep finishes, truncating the
+        # recording and corrupting the cross-correlation / SNR calculation.
+        rec_n = pre_samples + n_samples + post_samples
+        rec_buf = np.zeros((rec_n, 1), dtype=np.float32)
+        rec_pos = [0]
+
+        def _rec_callback(indata, frames, time_info, status):
+            end = min(rec_pos[0] + frames, rec_n)
+            count = end - rec_pos[0]
+            if count > 0:
+                rec_buf[rec_pos[0]:end] = indata[:count, in_channel - 1 : in_channel]
+            rec_pos[0] = end
+
+        in_stream = sd.InputStream(
+            device=in_dev,
+            samplerate=sample_rate,
+            channels=in_channel,
+            dtype="float32",
+            callback=_rec_callback,
         )
-        try:
-            recording = measurement.run()
-        except Exception as exc:
-            if "PortAudioError" in type(exc).__name__ or "PortAudio" in str(exc):
-                raise RuntimeError(f"Audio device error during measurement: {exc}") from exc
-            raise
+        out_stream = sd.OutputStream(
+            device=out_dev,
+            samplerate=sample_rate,
+            channels=n_out_ch,
+            dtype="float32",
+        )
 
+        # Sequence: recording FIRST, then sleep PRE_DELAY_S, then play.
+        # The sleep guarantees the first 500ms of recording (the noise floor
+        # window) contains only pre-sweep silence regardless of USB playback
+        # buffer start latency (~50-200ms). out_stream.write() is blocking and
+        # returns when all samples have been consumed by the OS audio buffer.
+        try:
+            in_stream.start()
+            _time.sleep(self.PRE_DELAY_S)
+            out_stream.start()
+            out_stream.write(out_buf)   # sweep + post_silence — blocking
+            out_stream.stop()
+            out_stream.close()
+
+            # Give the OS and PortAudio a moment to flush the last mic callback
+            # frames before stopping the input stream.
+            _time.sleep(0.1)
+            in_stream.stop()
+            in_stream.close()
+        except Exception as exc:
+            # Clean up streams on any audio device error, then surface as
+            # RuntimeError so callers get a consistent exception type.
+            for s in (in_stream, out_stream):
+                try:
+                    s.stop()
+                except Exception:
+                    pass
+                try:
+                    s.close()
+                except Exception:
+                    pass
+            raise RuntimeError(f"Audio device error: {exc}") from exc
+
+        n_recorded = rec_pos[0]
         sweep_1d = sweep.timeSignal[:, 0]
-        rec_1d = recording.timeSignal[:, 0]
+        rec_1d = rec_buf[:n_recorded, 0].astype(np.float64)
+
+        # Debug: log recording stats to diagnose SNR failures.
+        # floor = first 500ms; sig = everything after (includes pre-delay gap).
+        if len(rec_1d) > 0:
+            peak = float(np.max(np.abs(rec_1d)))
+            floor_n = min(int(0.5 * sample_rate), len(rec_1d) // 2)
+            floor_rms = float(np.sqrt(np.mean(rec_1d[:floor_n] ** 2)))
+            sig_rms = float(np.sqrt(np.mean(rec_1d[floor_n:] ** 2)))
+            log.info(
+                "USBPlayback: pre=%.0fms n_sweep=%d rec_n=%d n_recorded=%d "
+                "in_dev=%d out_dev=%d peak=%.1f dBFS floor=%.1f dBFS "
+                "sig=%.1f dBFS SNR=%.1f dB",
+                self.PRE_DELAY_S * 1000, n_samples, rec_n, n_recorded,
+                in_dev, out_dev,
+                20 * np.log10(peak + 1e-12),
+                20 * np.log10(floor_rms + 1e-12),
+                20 * np.log10(sig_rms + 1e-12),
+                20 * np.log10(sig_rms / (floor_rms + 1e-12)),
+            )
+        else:
+            log.warning("USBPlayback: recording is empty (0 samples captured)")
+
         return sweep_1d, rec_1d
 
 

@@ -42,40 +42,69 @@ class TestPlaybackForRoute:
 
 class TestUSBPlayback:
     def test_happy_path(self):
-        mock_pytta = sys.modules["pytta"]
-        mock_pytta.reset_mock()
+        """USBPlayback records via sd.InputStream callback, plays via sd.OutputStream."""
+        mock_sd = sys.modules["sounddevice"]
+        mock_sd.reset_mock()
 
+        n_samples = 4800
         sweep = MagicMock()
-        sweep.timeSignal = np.random.default_rng(42).standard_normal((4800, 1))
+        sweep.timeSignal = np.random.default_rng(42).standard_normal((n_samples, 1))
+        mock_sd.default.device = [0, 1]
 
-        recording = MagicMock()
-        recording.timeSignal = np.random.default_rng(99).standard_normal((4800, 1))
+        in_stream = MagicMock()
+        out_stream = MagicMock()
+        captured_callback = [None]
 
-        mock_pytta.PlayRecMeasure.return_value.run.return_value = recording
+        def fake_input_stream(**kwargs):
+            captured_callback[0] = kwargs.get("callback")
+            return in_stream
+
+        mock_sd.InputStream = MagicMock(side_effect=fake_input_stream)
+        mock_sd.OutputStream = MagicMock(return_value=out_stream)
+
+        # Simulate mic data arriving when out_stream.write() plays the sweep.
+        pre_s = int(USBPlayback.PRE_DELAY_S * 48000)
+        post_s = int(USBPlayback.POST_DELAY_S * 48000)
+        rec_n = pre_s + n_samples + post_s
+        fake_mic = np.random.default_rng(99).standard_normal((rec_n, 1)).astype(np.float32)
+
+        def fake_write(buf):
+            if captured_callback[0]:
+                captured_callback[0](fake_mic, rec_n, None, None)
+
+        out_stream.write = MagicMock(side_effect=fake_write)
 
         strategy = USBPlayback()
-        sweep_1d, rec_1d = strategy.play_and_record(sweep, 48000, 1, 1)
+        with patch("time.sleep"):
+            sweep_1d, rec_1d = strategy.play_and_record(sweep, 48000, 1, 1)
 
-        mock_pytta.PlayRecMeasure.assert_called_once()
-        assert sweep_1d.shape == (4800,)
-        assert rec_1d.shape == (4800,)
+        mock_sd.InputStream.assert_called_once()
+        mock_sd.OutputStream.assert_called_once()
+        in_stream.start.assert_called_once()
+        out_stream.start.assert_called_once()
+        out_stream.write.assert_called_once()
+
+        assert sweep_1d.shape == (n_samples,)
+        assert len(rec_1d) > 0
+        assert rec_1d.dtype == np.float64
         np.testing.assert_array_equal(sweep_1d, sweep.timeSignal[:, 0])
-        np.testing.assert_array_equal(rec_1d, recording.timeSignal[:, 0])
 
     def test_portaudio_error_raises_runtime_error(self):
-        mock_pytta = sys.modules["pytta"]
-        mock_pytta.reset_mock()
+        """Any audio device error from stream operations is re-raised as RuntimeError."""
+        mock_sd = sys.modules["sounddevice"]
+        mock_sd.reset_mock()
 
         sweep = MagicMock()
         sweep.timeSignal = np.zeros((4800, 1))
+        mock_sd.default.device = [0, 1]
 
-        class PortAudioError(Exception):
-            pass
-
-        mock_pytta.PlayRecMeasure.return_value.run.side_effect = PortAudioError("no device")
+        in_stream = MagicMock()
+        in_stream.start.side_effect = Exception("no device")
+        mock_sd.InputStream = MagicMock(return_value=in_stream)
+        mock_sd.OutputStream = MagicMock(return_value=MagicMock())
 
         strategy = USBPlayback()
-        with pytest.raises(RuntimeError, match="Audio device error"):
+        with patch("time.sleep"), pytest.raises(RuntimeError, match="Audio device error"):
             strategy.play_and_record(sweep, 48000, 1, 1)
 
 

@@ -5,8 +5,8 @@ Single entry point: MeasurementEngine.measure()
     generate log sweep (PyTTa) → play+record → deconvolve (numpy FFT) → FR
 
 Playback is delegated to PlaybackStrategy (calibrate.drivers.playback):
-    USBPlayback  → PyTTa PlayRecMeasure (float32 duplex)
-    HDMIPlayback → split sd.rec() + sd.play() (HDMI requires int16 output)
+    USBPlayback  → explicit sd.InputStream + sd.OutputStream (recording-first, pre-delay)
+    HDMIPlayback → explicit sd.InputStream + sd.OutputStream (HDMI requires int16 output)
 
 This module has ZERO knowledge of AVR hardware or output format quirks.
 Callers that need AVR input/volume switching should use DenonSweepContext
@@ -102,8 +102,9 @@ def _find_umik_device(devices, name_substring: str = "UMIK") -> int | None:
 class MeasurementEngine:
     """Run a log-sweep measurement via PyTTa and return a FrequencyResponse.
 
-    Single entry point: measure(). Route-aware for USB (PyTTa duplex)
-    and HDMI (split play+record with int16 output conversion).
+    Single entry point: measure(). Route-aware: USB uses explicit sd.InputStream +
+    sd.OutputStream (recording-first, 1s pre-delay); HDMI uses the same with int16
+    output conversion.
     """
 
     def __init__(self, config: Config) -> None:
@@ -172,11 +173,16 @@ class MeasurementEngine:
             )
 
         # ── Check 3: SNR ───────────────────────────────────────────────────
-        peak_idx = int(np.argmax(np.abs(rec_array)))
-        half = floor_n // 2
-        start = max(0, peak_idx - half)
-        end = min(len(rec_array), peak_idx + half)
-        peak_window = rec_array[start:end]
+        # Use cross-correlation lag (from Check 2) to locate the sweep in the
+        # recording. Do NOT use np.argmax(abs(rec_array)) — that returns the
+        # first sample at maximum amplitude, which is fragile when the UMIK
+        # clips (multiple samples hit 1.0) or when there are room transients:
+        # the first clipping sample may be in the floor window, collapsing
+        # signal_rms ≈ floor_rms and giving SNR ≈ 0 dB despite a valid sweep.
+        lag_idx = int(np.argmax(np.abs(corr[:n])))  # circular lag in [0, n)
+        sig_start = max(0, lag_idx)
+        sig_end = min(len(rec_array), lag_idx + n)
+        peak_window = rec_array[sig_start:sig_end]
         signal_rms = np.sqrt(np.mean(peak_window ** 2)) if len(peak_window) > 0 else 0.0
         snr_db = 20.0 * np.log10(float(signal_rms) / (float(floor_rms) + 1e-12))
 
@@ -202,8 +208,8 @@ class MeasurementEngine:
         playback route, validates the recording, and deconvolves to FR.
 
         Route-aware playback:
-          "usb"  — PyTTa PlayRecMeasure (float32 duplex, both devices support it)
-          "hdmi" — split sd.rec() + sd.play() (HDMI only supports int16 output)
+          "usb"  — explicit sd.InputStream + sd.OutputStream (recording-first, 1s pre-delay)
+          "hdmi" — explicit sd.InputStream + sd.OutputStream (int16 output conversion)
 
         The caller is responsible for any AVR lifecycle management (input switching,
         volume, power) before/after calling measure(). Use DenonSweepContext for that.

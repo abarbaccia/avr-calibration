@@ -353,7 +353,7 @@ async def _tool_trigger_measurement(
         engine = MeasurementEngine(cfg)
         denon_ctx = DenonSweepContext.from_config(cfg)
         from .drivers.minidsp import MinidspSweepContext
-        minidsp_ctx = MinidspSweepContext.from_config(cfg)
+        minidsp_ctx = MinidspSweepContext.from_config(cfg, driver=_dsp)
 
         if denon_ctx:
             async with denon_ctx:
