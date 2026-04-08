@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.1.0] - 2026-04-07
+
+### Fixed
+- **USB sweep buffer truncation:** Recording buffer was sized to `n_sweep_samples` only. With a 1-second pre-delay, the buffer filled before the sweep finished, truncating the cross-correlation and collapsing SNR. Buffer is now sized to `pre_samples + n_sweep_samples + post_samples`.
+- **SNR check argmax bug:** `validate_recording` used `np.argmax(abs(recording))` to locate the sweep, which breaks when the UMIK clips or a room transient occurs at recording start. The first max-value sample lands in the floor window, making `signal_rms ≈ floor_rms → SNR ≈ 0 dB`. Fix: use the cross-correlation lag already computed in the sweep-capture check.
+- **MinidspSweepContext silent failures:** `__aenter__` wrapped setup in a try/except that swallowed CLI errors (routing, source switch, mute restore). Failed setup silently passed a garbage signal path to `measure()`. Fix: remove try/except — setup failures now propagate loudly.
+- **USBPlayback error handling:** Stream operations now catch any audio device error and re-raise as `RuntimeError("Audio device error: ...")` for consistent caller interface.
+- **mcp_server MinidspSweepContext wiring:** Pass `driver=_dsp` so the context shares the driver's in-memory mute state.
+
+### Added
+- **`docs/audio-debugging-lessons.md`:** Hard-won USB measurement debugging lessons (10, 11, 12) covering buffer sizing, xcorr SNR, and context manager fail-loud rules.
+- **MinidspDriver mute tracking:** `mute_outputs`/`unmute_outputs` now update `_output_muted` dict; `get_mute_state()` exposes it.
+- **MinidspSweepContext:** Full USB sweep lifecycle — source switch, routing, mute restore — via `_get_source_via_cli`, `_configure_routing_via_cli`, and `_restore_driver_mutes`.
+
 ## [0.6.0.0] - 2026-04-07
 
 ### Added
