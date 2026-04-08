@@ -26,6 +26,7 @@ from ..adapters.minidsp import (
     FIR_SAMPLE_RATE,
     MinidspApiError,
     MinidspClient,
+    _run_minidsp_cli,
 )
 from ..dsp import freq_gain_q_to_biquad
 from ..safety import FilterSpec, SafetyValidator
@@ -68,6 +69,7 @@ class MinidspDriver(DSPDriver):
         self._output_delay: dict[int, float] = {}     # output_index → delay_ms (default 0.0)
         self._output_polarity: dict[int, bool] = {}   # output_index → inverted (default False)
         self._fir_state: dict[int, list[float]] = {}  # output_index → coefficients ([] = cleared)
+        self._output_muted: dict[int, bool] = {}      # output_index → muted (default False)
 
     async def get_state(self) -> dict:
         try:
@@ -263,13 +265,21 @@ class MinidspDriver(DSPDriver):
 
     @_driver_api
     async def mute_outputs(self, output_indices: list[int]) -> None:
-        """Mute outputs by setting gain to -127 dB."""
+        """Mute outputs and track state in memory."""
         await self._client.mute_outputs(output_indices)
+        for idx in output_indices:
+            self._output_muted[idx] = True
 
     @_driver_api
     async def unmute_outputs(self, output_indices: list[int]) -> None:
-        """Unmute outputs by restoring gain to 0 dB."""
+        """Unmute outputs and track state in memory."""
         await self._client.unmute_outputs(output_indices)
+        for idx in output_indices:
+            self._output_muted[idx] = False
+
+    def get_mute_state(self) -> dict[int, bool]:
+        """Return tracked per-output mute state (only includes explicitly set outputs)."""
+        return dict(self._output_muted)
 
     @_driver_api
     async def set_output_gain(self, output_index: int, gain_db: float) -> None:
@@ -375,12 +385,71 @@ class MinidspDriver(DSPDriver):
         await self._client.set_input_routing(other_input, all_muted)
 
 
+async def _get_source_via_cli() -> str:
+    """Read the current miniDSP input source via CLI. Returns e.g. 'Usb', 'Analog'."""
+    import json as _json
+    proc = await asyncio.create_subprocess_exec(
+        "minidsp", "-o", "json", "status",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    if proc.returncode != 0 or not stdout:
+        return "Analog"
+    try:
+        data = _json.loads(stdout)
+        return data.get("master", {}).get("source", "Analog")
+    except Exception:
+        return "Analog"
+
+
+async def _run_minidsp_batch(*commands: str) -> None:
+    """Run multiple minidsp commands in a single CLI session via ``-f -``.
+
+    A single WebSocket connection is used for all commands, which avoids the
+    routing-state resets that occur when opening multiple CLI sessions.
+    """
+    input_data = "\n".join(commands).encode()
+    proc = await asyncio.create_subprocess_exec(
+        "minidsp", "-f", "-",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate(input_data)
+    if proc.returncode != 0:
+        raise MinidspApiError(
+            proc.returncode or 1,
+            f"minidsp batch: {stderr.decode().strip()}",
+        )
+
+
+async def _configure_routing_via_cli(
+    active_input: int, enabled_outputs: set[int]
+) -> None:
+    """Route *active_input* to *enabled_outputs* and mute the other input via CLI.
+
+    Uses batch mode (single CLI session) so all routing changes are applied
+    atomically. Called after every source switch because the miniDSP resets its
+    routing matrix when the source changes.
+    """
+    other_input = 1 - active_input
+    commands: list[str] = []
+    for out in range(4):
+        en = "true" if out in enabled_outputs else "false"
+        commands.append(f"input {active_input} routing {out} enable {en}")
+    for out in range(4):
+        commands.append(f"input {other_input} routing {out} enable false")
+    await _run_minidsp_batch(*commands)
+
+
 class MinidspSweepContext:
     """Async context manager for USB sweep lifecycle on the miniDSP.
 
-    Switches the miniDSP source to USB before a sweep, then restores the
-    original source on exit (best-effort).  Mirrors DenonSweepContext so the
-    measure tool can use both interchangeably.
+    Switches the miniDSP source to USB before a sweep via CLI, then restores
+    the original source on exit (best-effort). Reconfigures the routing matrix
+    after every source switch because the miniDSP resets routing on source change.
+    Uses CLI only — no HTTP writes.
 
     Usage:
         async with MinidspSweepContext.from_config(cfg) as ctx:
@@ -398,38 +467,91 @@ class MinidspSweepContext:
     """
 
     @classmethod
-    def from_config(cls, config) -> "MinidspSweepContext | None":
-        """Build from a Config object, or return None if USB sweep not configured."""
+    def from_config(cls, config, driver: "MinidspDriver | None" = None) -> "MinidspSweepContext | None":
+        """Build from a Config object, or return None if USB sweep not configured.
+
+        Pass *driver* so the context can read and restore per-output mute state
+        across source switches (source switch resets hardware mutes).
+        """
         route = config.measurement.get("playback_route", "usb")
         if route != "usb":
             return None
-        host = config.minidsp.get("host", "localhost")
-        port = int(config.minidsp.get("port", 5380))
-        return cls(host=host, port=port)
+        # USB sweep: PyTTa output channel (1-indexed) → miniDSP matrix input (0-indexed)
+        usb_input = config.measurement.get("output_channel", 1) - 1
+        normal_input = config.minidsp.get("active_input", 0)
+        # Determine which outputs are enabled (skip unused/defective)
+        slots = config.minidsp.get("output_slots", [])
+        enabled = {s["index"] for s in slots if s.get("type") != "unused"}
+        return cls(
+            usb_input=usb_input,
+            normal_input=normal_input,
+            enabled_outputs=enabled,
+            driver=driver,
+        )
 
-    def __init__(self, host: str, port: int) -> None:
-        self._client = MinidspClient(host=host, port=port)
+    def __init__(
+        self,
+        usb_input: int = 0,
+        normal_input: int = 0,
+        enabled_outputs: set[int] | None = None,
+        driver: "MinidspDriver | None" = None,
+    ) -> None:
+        self._usb_input = usb_input
+        self._normal_input = normal_input
+        self._enabled_outputs = enabled_outputs or {0, 1, 2, 3}
+        self._driver = driver
         self._original_source: str | None = None
 
+    async def _restore_driver_mutes(self) -> None:
+        """Re-apply per-output mute state for ALL outputs via sequential CLI calls.
+
+        Called after a source switch that resets ALL hardware output mutes.
+        Iterates all 4 outputs explicitly — untracked outputs default to unmuted.
+        Uses individual CLI calls — batch mode does not reliably apply output
+        mute commands on the miniDSP 2x4 HD.
+        """
+        if self._driver is None:
+            return
+        mute_state = self._driver.get_mute_state()
+        # Source switch resets ALL 4 output mutes. Set each explicitly using
+        # driver-tracked state, defaulting untracked outputs to unmuted.
+        for idx in range(4):
+            muted = mute_state.get(idx, False)
+            await _run_minidsp_cli("output", str(idx), "mute", "on" if muted else "off")
+        log.info(
+            "MinidspSweepContext: set all output mutes: %s",
+            {i: mute_state.get(i, False) for i in range(4)},
+        )
+
     async def __aenter__(self) -> "MinidspSweepContext":
-        try:
-            status = await self._client.get_device_status()
-            self._original_source = status.get("master", {}).get("source", "Analog")
-            await self._client.switch_source("Usb")
-            log.info("MinidspSweepContext: switched source Analog→Usb for sweep")
-        except Exception as exc:
-            log.warning("MinidspSweepContext: failed to switch to USB source: %s", exc)
+        self._original_source = await _get_source_via_cli()
+        await _run_minidsp_cli("source", "usb")
+        await asyncio.sleep(1.0)  # settle after source switch
+        await _configure_routing_via_cli(self._usb_input, self._enabled_outputs)
+        # Source switch resets hardware output mutes — restore from driver tracking.
+        await self._restore_driver_mutes()
+        log.info(
+            "MinidspSweepContext: source %s→usb, routed input %d to outputs %s",
+            self._original_source, self._usb_input,
+            sorted(self._enabled_outputs),
+        )
         return self
 
     async def __aexit__(self, *_) -> None:
         if self._original_source:
             try:
-                await self._client.switch_source(self._original_source)
+                await _run_minidsp_cli("source", self._original_source.lower())
+                await asyncio.sleep(1.0)  # settle after source switch
+                await _configure_routing_via_cli(
+                    self._normal_input, self._enabled_outputs,
+                )
+                # Source switch resets hardware output mutes — restore from driver tracking.
+                await self._restore_driver_mutes()
                 log.info(
-                    "MinidspSweepContext: restored source USB→%s", self._original_source
+                    "MinidspSweepContext: restored source→%s, routed input %d",
+                    self._original_source.lower(), self._normal_input,
                 )
             except Exception as exc:
                 log.warning(
-                    "MinidspSweepContext: failed to restore source to %s: %s",
-                    self._original_source, exc
+                    "MinidspSweepContext: restore failed: %s", exc
                 )
