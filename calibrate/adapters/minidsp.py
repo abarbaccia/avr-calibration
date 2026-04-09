@@ -29,6 +29,7 @@ Safety:
 from __future__ import annotations
 
 import asyncio
+import json as _json
 from typing import Any
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -98,7 +99,11 @@ async def _run_minidsp_cli(*args: str, ignore_exit_codes: tuple[int, ...] = ()) 
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, stderr = await proc.communicate()
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise MinidspApiError(1, f"minidsp {' '.join(args)}: timed out after 10s")
     if proc.returncode != 0 and proc.returncode not in ignore_exit_codes:
         raise MinidspApiError(
             proc.returncode or 1,
@@ -118,13 +123,16 @@ async def _get_status_via_cli() -> dict:
 
     Raises MinidspApiError on CLI failure (daemon not running, device not connected, etc.).
     """
-    import json as _json
     proc = await asyncio.create_subprocess_exec(
         "minidsp", "-o", "json", "status",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise MinidspApiError(1, "minidsp status: timed out after 5s")
     if proc.returncode != 0:
         raise MinidspApiError(
             proc.returncode or 1,

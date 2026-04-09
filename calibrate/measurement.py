@@ -31,6 +31,10 @@ from .config import Config
 
 log = logging.getLogger(__name__)
 
+_MEASUREMENT_TIMEOUT_S: float = 60.0
+"""Timeout for a single play-and-record cycle. Prevents a hung audio device from
+blocking the calibration loop indefinitely."""
+
 
 class MeasurementQualityError(RuntimeError):
     """Raised when a recording fails quality validation before deconvolution.
@@ -332,12 +336,12 @@ class MeasurementEngine:
                     loop.run_in_executor(
                         None, strategy.play_and_record, sweep, sample_rate, in_channel, out_channel
                     ),
-                    timeout=60.0,
+                    timeout=_MEASUREMENT_TIMEOUT_S,
                 )
             except asyncio.TimeoutError:
                 raise RuntimeError(
-                    "Measurement timed out after 60s — audio device may be hung. "
-                    "Reconnect the USB cable and retry."
+                    f"Measurement timed out after {_MEASUREMENT_TIMEOUT_S:.0f}s — "
+                    "audio device may be hung. Reconnect the USB cable and retry."
                 )
 
         min_snr = float(cfg.get("min_snr_db", 20.0))
