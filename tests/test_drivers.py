@@ -434,12 +434,12 @@ async def test_reapply_volatile_output_state_skips_zero_gain() -> None:
         assert not gain_calls, f"gain=0.0 should be skipped but got: {gain_calls}"
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_minidsp_set_preset() -> None:
-    respx.post(DEVICE_URL).mock(return_value=httpx.Response(200))
     driver = MinidspDriver(host="localhost", port=5380)
-    await driver.set_preset(1)  # should not raise
+    with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
+        await driver.set_preset(1)
+    mock_cli.assert_called_once_with("preset", "1")
 
 
 @pytest.mark.asyncio

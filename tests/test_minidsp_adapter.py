@@ -1,13 +1,7 @@
-"""Unit tests for MinidspClient — HTTP adapter for minidspd.
+"""Unit tests for MinidspClient — adapter for minidspd.
 
-HTTP-based methods use respx mocking. CLI-based methods (set_output_gain,
-set_output_delay, set_output_polarity, set_input_routing, restore_all_gains,
-mute_outputs, unmute_outputs) mock _run_minidsp_cli with AsyncMock since they
-no longer touch the HTTP transport.
-
-The minidspd REST API uses POST /devices/{idx}/config for EQ/routing mutations
-and POST /devices/{idx} with a MasterStatus body for preset/source switching.
-The /preset/:n and /source/:s path endpoints do not exist in minidspd 0.1.x.
+All writes go through the minidsp CLI (WebSocket transport via AsyncMock on
+_run_minidsp_cli). HTTP is reads-only: get_devices() and get_device_status().
 """
 
 import pytest
@@ -22,14 +16,11 @@ from calibrate.adapters.minidsp import (
     MAX_OUTPUT_INDEX,
     MAX_PRESET_INDEX,
     VALID_SOURCES,
-    APF_RESERVED_SLOTS,
-    ALIGNMENT_PEQ_SLOTS,
 )
 
 _CLI_PATH = "calibrate.adapters.minidsp._run_minidsp_cli"
 
 BASE = "http://localhost:5380"
-CONFIG_URL = f"{BASE}/devices/0/config"
 DEVICE_URL = f"{BASE}/devices/0"
 
 
@@ -101,55 +92,6 @@ async def test_set_output_polarity_not_inverted(client: MinidspClient) -> None:
     with patch(_CLI_PATH, new_callable=AsyncMock) as mock_cli:
         await client.set_output_polarity(0, inverted=False)
     mock_cli.assert_called_once_with("output", "0", "invert", "off")
-
-
-# ── set_output_peq ────────────────────────────────────────────────────────────
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_set_output_peq_happy_path(client: MinidspClient) -> None:
-    route = respx.post(CONFIG_URL).mock(return_value=httpx.Response(200))
-    biquad = {"b0": 1.0, "b1": 0.0, "b2": 0.0, "a1": 0.0, "a2": 0.0}
-    await client.set_output_peq(0, 2, biquad)
-    import json
-    payload = json.loads(route.calls[0].request.content)
-    peq = payload["outputs"][0]["peq"][0]
-    assert peq["index"] == 2
-    assert peq["coeff"]["b0"] == 1.0
-
-
-@pytest.mark.asyncio
-async def test_set_output_peq_invalid_slot(client: MinidspClient) -> None:
-    """Slot 0 is reserved for APF → ValueError before any HTTP call."""
-    reserved_slot = next(iter(APF_RESERVED_SLOTS))  # 0
-    with pytest.raises(ValueError, match="reserved for APF"):
-        await client.set_output_peq(0, reserved_slot, {"b0": 1.0})
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_set_output_peq_valid_slot(client: MinidspClient) -> None:
-    import json
-    route = respx.post(CONFIG_URL).mock(return_value=httpx.Response(200))
-    slot = next(iter(ALIGNMENT_PEQ_SLOTS))
-    biquad = {"b0": 1.0, "b1": 0.0, "b2": 0.0, "a1": 0.0, "a2": 0.0}
-    await client.set_output_peq(0, slot, biquad)
-    payload = json.loads(route.calls[0].request.content)
-    assert payload["outputs"][0]["peq"][0]["index"] == slot
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_set_output_peq_with_bypass(client: MinidspClient) -> None:
-    """bypass field is included in PEQ entry, not in coeff."""
-    route = respx.post(CONFIG_URL).mock(return_value=httpx.Response(200))
-    biquad = {"b0": 1.0, "b1": 0.0, "b2": 0.0, "a1": 0.0, "a2": 0.0, "bypass": True}
-    await client.set_output_peq(0, 3, biquad)
-    import json
-    payload = json.loads(route.calls[0].request.content)
-    peq = payload["outputs"][0]["peq"][0]
-    assert peq["bypass"] is True
-    assert "bypass" not in peq["coeff"]
 
 
 # ── set_input_routing ─────────────────────────────────────────────────────────
@@ -244,23 +186,18 @@ async def test_switch_preset_negative(client: MinidspClient) -> None:
         await client.switch_preset(-1)
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_switch_preset_happy_path(client: MinidspClient) -> None:
-    route = respx.post(DEVICE_URL).mock(return_value=httpx.Response(200))
-    await client.switch_preset(2)
-    assert route.called
-    import json
-    assert json.loads(route.calls[0].request.content) == {"preset": 2}
+    with patch(_CLI_PATH, new_callable=AsyncMock) as mock_cli:
+        await client.switch_preset(2)
+    mock_cli.assert_called_once_with("preset", "2")
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_switch_preset_api_error(client: MinidspClient) -> None:
-    respx.post(DEVICE_URL).mock(return_value=httpx.Response(500))
-    with pytest.raises(MinidspApiError) as exc_info:
-        await client.switch_preset(1)
-    assert exc_info.value.status_code == 500
+    with patch(_CLI_PATH, new_callable=AsyncMock, side_effect=MinidspApiError(1, "preset 1")):
+        with pytest.raises(MinidspApiError):
+            await client.switch_preset(1)
 
 
 # ── switch_source ──────────────────────────────────────────────────────────────
@@ -271,24 +208,19 @@ async def test_switch_source_invalid(client: MinidspClient) -> None:
         await client.switch_source("HDMI")
 
 
-@respx.mock
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["Analog", "Toslink", "Usb"])
 async def test_switch_source_happy_path(client: MinidspClient, source: str) -> None:
-    route = respx.post(DEVICE_URL).mock(return_value=httpx.Response(200))
-    await client.switch_source(source)
-    assert route.called
-    import json
-    assert json.loads(route.calls[0].request.content) == {"source": source}
+    with patch(_CLI_PATH, new_callable=AsyncMock) as mock_cli:
+        await client.switch_source(source)
+    mock_cli.assert_called_once_with("source", source.lower())
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_switch_source_api_error(client: MinidspClient) -> None:
-    respx.post(DEVICE_URL).mock(return_value=httpx.Response(502))
-    with pytest.raises(MinidspApiError) as exc_info:
-        await client.switch_source("Toslink")
-    assert exc_info.value.status_code == 502
+    with patch(_CLI_PATH, new_callable=AsyncMock, side_effect=MinidspApiError(1, "source toslink")):
+        with pytest.raises(MinidspApiError):
+            await client.switch_source("Toslink")
 
 
 # ── get_device_status ──────────────────────────────────────────────────────────
@@ -394,9 +326,10 @@ async def test_delay_invalid_output_rejected(client: MinidspClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_peq_invalid_output_rejected(client: MinidspClient) -> None:
+async def test_peq_cli_invalid_output_rejected(client: MinidspClient) -> None:
+    """set_output_peq_cli rejects output index out of range."""
     with pytest.raises(ValueError, match="out of range"):
-        await client.set_output_peq(5, 2, {"b0": 1.0})
+        await client.set_output_peq_cli(5, [])
 
 
 # ── mute_outputs error propagation ──────────────────────────────────────────

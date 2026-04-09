@@ -1,19 +1,24 @@
-"""HTTP client for minidspd — per-output gain, delay, polarity, PEQ, and routing.
+"""Adapter for minidspd — status reads via HTTP, all writes via CLI.
 
-minidspd exposes a local REST API.  MinidspClient wraps the config endpoint
-used by the sub-alignment algorithm and signal routing setup.
+minidspd exposes a local REST API for reads.  ALL writes go through the
+minidsp CLI (WebSocket transport) because HTTP config writes reset routing
+and PEQ state, and the HTTP config API has a sign bug in the a1/a2 biquad
+coefficients that causes DSP hangs requiring physical power-cycle to recover.
 
-API (relative to http://{host}:{port}):
+HTTP (reads only):
   GET  /devices                         → list connected devices
   GET  /devices/{idx}                   → master status (preset, source, volume, mute)
-  POST /devices/{idx}                   → patch master status
-  POST /devices/{idx}/config            → apply partial Config (outputs/inputs/master_status)
 
-Config payload shape (all fields optional, only include what you want to change):
-  {
-    "outputs": [{"index": 0, "gain": -6.0}],
-    "inputs":  [{"index": 1, "routing": [{"index": 0, "mute": false}]}]
-  }
+CLI (all writes):
+  minidsp source <name>                 → switch source (Analog/Toslink/Usb)
+  minidsp preset <N>                    → switch preset (0-3)
+  minidsp output <N> gain -- <dB>       → set output gain
+  minidsp output <N> mute on|off        → set output mute
+  minidsp output <N> delay <ms>         → set output delay
+  minidsp output <N> invert on|off      → set output polarity
+  minidsp output <N> peq <slot> set ... → write biquad coefficients
+  minidsp output <N> fir import <path>  → write FIR coefficients
+  minidsp input  <N> routing <out> ...  → configure routing matrix
 
 Safety:
   - delay_ms > MAX_DELAY_MS  → ValueError (hardware limit is 30 ms)
@@ -130,31 +135,6 @@ class MinidspClient:
         self._base = f"http://{host}:{port}"
         self._device_index = device_index
 
-    # ── Internal helpers ───────────────────────────────────────────────────────
-
-    async def _post_config(self, config: dict[str, Any]) -> None:
-        """POST a partial Config to the device, raising MinidspApiError on 4xx/5xx."""
-        path = f"/devices/{self._device_index}/config"
-        url = f"{self._base}{path}"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(url, json=config)
-        if response.status_code >= 400:
-            raise MinidspApiError(response.status_code, path)
-
-    async def _patch_master(self, fields: dict[str, Any]) -> None:
-        """POST master-status fields to /devices/{idx}.
-
-        minidspd 0.1.x uses POST /devices/{idx} with a MasterStatus body
-        to mutate preset, source, volume, or mute.  Only the supplied fields
-        are changed; omitted fields are ignored by the daemon.
-        """
-        path = f"/devices/{self._device_index}"
-        url = f"{self._base}{path}"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(url, json=fields)
-        if response.status_code >= 400:
-            raise MinidspApiError(response.status_code, path)
-
     # ── Public API ─────────────────────────────────────────────────────────────
 
     async def get_devices(self) -> list[dict]:
@@ -186,40 +166,37 @@ class MinidspClient:
         return response.json()  # type: ignore[no-any-return]
 
     async def switch_preset(self, preset: int) -> None:
-        """Switch the active preset slot to *preset* (0-3).
+        """Switch the active preset slot to *preset* (0-3) via CLI.
 
-        Uses POST /devices/{idx} with {"preset": N} — the correct API for
-        minidspd 0.1.x (the /preset/:n path endpoint does not exist).
+        Uses CLI (not HTTP) — HTTP master-status writes reset routing and PEQ
+        state via the WebSocket transport. CLI is the safe write path.
 
         Raises ValueError if preset is out of range.
-        Raises MinidspApiError on HTTP error.
+        Raises MinidspApiError on CLI error.
         """
         if not (0 <= preset <= MAX_PRESET_INDEX):
             raise ValueError(
                 f"preset={preset} out of range; must be 0-{MAX_PRESET_INDEX}"
             )
-        await self._patch_master({"preset": preset})
+        await _run_minidsp_cli("preset", str(preset))
 
     async def switch_source(self, source: str) -> None:
-        """Switch the input source to *source* (Analog/Toslink/USB).
+        """Switch the input source to *source* (Analog/Toslink/Usb) via CLI.
 
-        Uses POST /devices/{idx} with {"source": name} — same pattern as
-        switch_preset.
+        Uses CLI (not HTTP) — HTTP writes reset routing and PEQ biquads.
+        Source switch also resets routing and mutes; callers must reconfigure
+        routing and restore mute/gain/PEQ state after calling this.
 
         Raises ValueError if source is not in VALID_SOURCES.
-        Raises MinidspApiError on HTTP error.
+        Raises MinidspApiError on CLI error.
         """
         if source not in VALID_SOURCES:
             raise ValueError(
                 f"source={source!r} invalid; must be one of {sorted(VALID_SOURCES)}"
             )
-        await self._patch_master({"source": source})
+        await _run_minidsp_cli("source", source.lower())
 
     MUTE_GAIN_DB: float = -127.0
-
-    async def set_master_mute(self, muted: bool) -> None:
-        """Set master mute on/off. Stops all DSP processing when muted."""
-        await self._patch_master({"mute": muted})
 
     @staticmethod
     def _validate_output(output: int) -> None:
@@ -275,76 +252,6 @@ class MinidspClient:
         self._validate_output(output)
         await _run_minidsp_cli("output", str(output), "invert", "on" if inverted else "off")
 
-    async def set_output_peq(
-        self,
-        output: int,
-        slot: int,
-        biquad: dict[str, Any],
-    ) -> None:
-        """Write a biquad filter to output *output* PEQ slot *slot*.
-
-        *biquad* must contain at least the biquad coefficients (b0, b1, b2, a1, a2).
-        Optionally include "bypass": bool to set the bypass state.
-
-        Raises ValueError if *slot* is in APF_RESERVED_SLOTS (0 or 1).
-        """
-        self._validate_output(output)
-        if slot in APF_RESERVED_SLOTS:
-            raise ValueError(
-                f"PEQ slot {slot} is reserved for APF filters; "
-                f"use slots {list(ALIGNMENT_PEQ_SLOTS)}"
-            )
-        bypass = biquad.pop("bypass", None)
-        peq_entry: dict[str, Any] = {"index": slot, "coeff": biquad}
-        if bypass is not None:
-            peq_entry["bypass"] = bypass
-        await self._post_config({
-            "outputs": [{"index": output, "peq": [peq_entry]}]
-        })
-
-    async def set_output_peq_batch(
-        self,
-        output: int,
-        entries: list[dict[str, Any]],
-    ) -> None:
-        """Write multiple PEQ slots to *output* in a single HTTP request.
-
-        Each entry in *entries* must have: {"index": slot, "coeff": {b0,b1,b2,a1,a2}}
-        and optionally "bypass": bool.
-
-        This is much safer than individual set_output_peq calls — one atomic POST
-        instead of N sequential ones, reducing the chance of partial writes that
-        can leave the miniDSP in a stuck state.
-
-        Raises ValueError if any slot is in APF_RESERVED_SLOTS.
-        """
-        self._validate_output(output)
-        for entry in entries:
-            if entry["index"] in APF_RESERVED_SLOTS:
-                raise ValueError(
-                    f"PEQ slot {entry['index']} is reserved for APF filters; "
-                    f"use slots {list(ALIGNMENT_PEQ_SLOTS)}"
-                )
-        await self._post_config({
-            "outputs": [{"index": output, "peq": entries}]
-        })
-
-    async def set_input_peq_batch(
-        self,
-        input_index: int,
-        entries: list[dict[str, Any]],
-    ) -> None:
-        """Write multiple PEQ slots to input *input_index* in a single HTTP request.
-
-        Each entry in *entries* must have: {"index": slot, "coeff": {b0,b1,b2,a1,a2}}
-        and optionally "bypass": bool.
-
-        Used to apply shared EQ (e.g. Harman target curve) to the input channel,
-        affecting all outputs equally.
-        """
-        await self._post_config({
-            "inputs": [{"index": input_index, "peq": entries}]
-        })
 
     async def set_output_peq_cli(
         self,
