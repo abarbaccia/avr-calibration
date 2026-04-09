@@ -366,6 +366,71 @@ class MinidspDriver(DSPDriver):
             for idx in range(4)
         }
 
+    async def reapply_volatile_output_state(self) -> None:
+        """Re-apply output gains and PEQ after a source switch resets volatile state.
+
+        The miniDSP 2x4 HD resets output mutes, gains, and PEQ biquads when the
+        input source is switched (Analog ↔ USB ↔ Toslink). Delays and polarity
+        are stored per-preset in flash and survive source switches.
+
+        This method re-applies all state tracked by this driver instance:
+        - Per-output gains (from _output_gain)
+        - Per-output PEQ filters for the current preset (from _eq_state)
+
+        Called by MinidspSweepContext after each source switch, after mutes are restored.
+        Best-effort: logs warnings on failure rather than raising.
+        """
+        # Restore per-output gains (skip 0.0 — that's the hardware default)
+        for output_idx, gain_db in self._output_gain.items():
+            if gain_db != 0.0:
+                try:
+                    await self._client.set_output_gain(output_idx, gain_db)
+                    log.info(
+                        "reapply_volatile_output_state: restored gain %+.1f dB on output %d",
+                        gain_db, output_idx,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "reapply_volatile_output_state: gain restore failed for output %d: %s",
+                        output_idx, exc,
+                    )
+
+        # Restore per-output PEQ for the current preset
+        try:
+            current_preset = await self.current_preset()
+        except Exception as exc:
+            log.warning("reapply_volatile_output_state: failed to read current preset: %s", exc)
+            return
+
+        for key, filter_list in list(self._eq_state.items()):
+            # Per-output EQ keys are (preset, output_index); broadcast keys are int
+            if not isinstance(key, tuple) or len(key) != 2:
+                continue
+            preset, output_index = key
+            if preset != current_preset or not filter_list:
+                continue
+            try:
+                filter_specs = [
+                    FilterSpec(
+                        freq=float(f["freq"]),
+                        gain_db=float(f["gain_db"]),
+                        q=float(f.get("q", 0.707)),
+                        type=f["type"],
+                    )
+                    for f in filter_list
+                ]
+                peq_entries = self._build_peq_entries(filter_specs)
+                await self._client.set_output_peq_cli(output_index, peq_entries)
+                log.info(
+                    "reapply_volatile_output_state: restored %d PEQ filters to output %d",
+                    len(filter_specs), output_index,
+                )
+            except Exception as exc:
+                log.warning(
+                    "reapply_volatile_output_state: PEQ restore failed for output %d: %s",
+                    output_index, exc,
+                )
+
     @_driver_api
     async def set_routing(self, routing: dict) -> None:
         for input_index, output_enabled in routing.items():
@@ -523,13 +588,25 @@ class MinidspSweepContext:
             {i: mute_state.get(i, False) for i in range(4)},
         )
 
+    async def _restore_driver_volatile_state(self) -> None:
+        """Re-apply volatile output state (gains + PEQ) after a source switch.
+
+        Source switch resets mutes, gains, and PEQ biquads on the miniDSP 2x4 HD.
+        Delays and polarity persist in flash. This restores gains and PEQ so that
+        calibration EQ is active during sweep measurements.
+        """
+        if self._driver is None:
+            return
+        await self._driver.reapply_volatile_output_state()
+
     async def __aenter__(self) -> "MinidspSweepContext":
         self._original_source = await _get_source_via_cli()
         await _run_minidsp_cli("source", "usb")
         await asyncio.sleep(1.0)  # settle after source switch
         await _configure_routing_via_cli(self._usb_input, self._enabled_outputs)
-        # Source switch resets hardware output mutes — restore from driver tracking.
+        # Source switch resets hardware output mutes, gains, and PEQ — restore all.
         await self._restore_driver_mutes()
+        await self._restore_driver_volatile_state()
         log.info(
             "MinidspSweepContext: source %s→usb, routed input %d to outputs %s",
             self._original_source, self._usb_input,
@@ -545,8 +622,9 @@ class MinidspSweepContext:
                 await _configure_routing_via_cli(
                     self._normal_input, self._enabled_outputs,
                 )
-                # Source switch resets hardware output mutes — restore from driver tracking.
+                # Source switch resets hardware output mutes, gains, and PEQ — restore all.
                 await self._restore_driver_mutes()
+                await self._restore_driver_volatile_state()
                 log.info(
                     "MinidspSweepContext: restored source→%s, routed input %d",
                     self._original_source.lower(), self._normal_input,
