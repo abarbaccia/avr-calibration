@@ -509,8 +509,10 @@ async def test_trigger_measurement_success() -> None:
         patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
+        patch("calibrate.drivers.minidsp.MinidspSweepContext") as MockMinidspCtx,
     ):
-        MockCtx.from_config.return_value = None  # USB route
+        MockCtx.from_config.return_value = None  # no HDMI context
+        MockMinidspCtx.from_config.return_value = None  # no miniDSP context → direct call
         result = await _tool_trigger_measurement()
 
     assert result["ok"]
@@ -531,8 +533,10 @@ async def test_trigger_measurement_engine_error() -> None:
         patch.dict(sys.modules, {"sounddevice": mock_sd}),
         patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
         patch.object(sut, "DenonSweepContext") as MockCtx,
+        patch("calibrate.drivers.minidsp.MinidspSweepContext") as MockMinidspCtx,
     ):
         MockCtx.from_config.return_value = None
+        MockMinidspCtx.from_config.return_value = None
         result = await _tool_trigger_measurement()
 
     assert not result["ok"]
