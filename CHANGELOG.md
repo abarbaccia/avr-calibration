@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.2.0] - 2026-04-09
+
+### Fixed
+- **miniDSP HTTP writes removed:** All writes to the miniDSP 2x4 HD now go through the `minidsp` CLI instead of the HTTP REST API. The HTTP API resets routing and PEQ biquad state when a CLI session opens, and has a sign bug in `a1`/`a2` coefficients that causes DSP hangs requiring a physical power-cycle. CLI is the only safe write path.
+- **Three USB measurement fragility bugs in MinidspSweepContext:** (1) Source switch is now skipped when the device is already on USB, saving ~2 s per measurement. (2) Source-switch restores (mutes, gains, PEQ) now only run when the source actually changed — prevents unnecessary state churn. (3) `__aenter__`/`__aexit__` log messages now distinguish "source skipped" from "source switched" for clearer debugging.
+- **Volatile output state lost after USB source switch:** The miniDSP 2x4 HD resets output mutes, gains, and PEQ biquads when the source is switched. `MinidspSweepContext` now calls `reapply_volatile_output_state()` after each source switch, restoring all calibration EQ so sweeps include the correct filter state.
+- **Measurement event-loop blocking:** `play_and_record()` (blocking PortAudio I/O) now runs in a thread-pool executor via `loop.run_in_executor()` so the asyncio event loop stays responsive during sweeps. A 60-second `asyncio.wait_for` timeout raises `RuntimeError` if the audio device hangs.
+- **Concurrent measurement race:** `MeasurementEngine.measure()` is now serialized by an `asyncio.Lock` to prevent concurrent calls from clobbering `sd.default.device` (a sounddevice global state).
+
 ## [0.6.1.0] - 2026-04-07
 
 ### Fixed

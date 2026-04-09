@@ -382,10 +382,10 @@ class MinidspDriver(DSPDriver):
 
         Acquires self._lock for the full write sequence so concurrent apply_eq() or
         apply_fir() calls cannot interleave CLI commands with the restore sequence.
-        current_preset() is a read (HTTP GET) and does not use the lock, so it is
+        current_preset() is a CLI read and does not acquire self._lock, so it is
         called before acquiring the lock to avoid any deadlock risk.
         """
-        # Read current preset before acquiring the lock (HTTP GET, no CLI, no lock)
+        # Read current preset before acquiring the lock (CLI read, no lock needed)
         try:
             current_preset = await self.current_preset()
         except Exception as exc:
