@@ -18,6 +18,7 @@ environments without PortAudio.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -29,6 +30,18 @@ from typing import Optional
 from .config import Config
 
 log = logging.getLogger(__name__)
+
+_MEASUREMENT_TIMEOUT_S: float = 60.0
+"""Timeout for a single play-and-record cycle. Prevents a hung audio device from
+blocking the calibration loop indefinitely."""
+
+_MEASURE_LOCK: asyncio.Lock = asyncio.Lock()
+"""Module-level lock serializing all measure() calls across all MeasurementEngine instances.
+
+MeasurementEngine is instantiated fresh per MCP tool call, so an instance-level lock
+would not serialize concurrent callers. This lock is shared across all instances so
+that sd.default.device (a sounddevice module-level global) is never overwritten by a
+concurrent caller mid-measurement."""
 
 
 class MeasurementQualityError(RuntimeError):
@@ -109,6 +122,9 @@ class MeasurementEngine:
 
     def __init__(self, config: Config) -> None:
         self.config = config
+        # Use the module-level _MEASURE_LOCK, not an instance lock — MeasurementEngine
+        # is created fresh per MCP tool call, so an instance lock would not serialize
+        # concurrent callers. The module lock is shared across all instances.
 
     def validate_recording(
         self,
@@ -195,9 +211,6 @@ class MeasurementEngine:
 
         return warnings_out
 
-    # TODO: Wrap measure() with asyncio.wait_for(timeout=30s) so a hung
-    #       audio device doesn't block the calibration loop forever.
-
     async def measure(
         self,
         input_device_name: str | None = None,
@@ -213,6 +226,12 @@ class MeasurementEngine:
 
         The caller is responsible for any AVR lifecycle management (input switching,
         volume, power) before/after calling measure(). Use DenonSweepContext for that.
+
+        Concurrent measure() calls are serialized by an asyncio.Lock to prevent
+        sd.default.device (global state) from being overwritten mid-measurement.
+        play_and_record() runs in a thread executor so the event loop stays responsive
+        during the blocking PortAudio I/O. Raises RuntimeError if the audio device
+        hangs for more than 60 seconds.
 
         Args:
             input_device_name: optional substring to select the recording device by name
@@ -241,59 +260,7 @@ class MeasurementEngine:
         out_channel: int = cfg.get("output_channel", 1)
         route = cfg.get("playback_route", "usb")
 
-        # Always select UMIK for recording input
-        mic_name = input_device_name or self.config._data.get("mic", {}).get("name", "UMIK")
-        try:
-            import sounddevice as sd
-            devices = sd.query_devices()
-            # TODO: sd.default.device is global state — concurrent measure() calls
-            #       can collide. Add an asyncio.Lock to serialize access.
-            umik_idx = _find_umik_device(devices, name_substring=mic_name)
-            if umik_idx is not None:
-                out_idx = int(sd.default.device[1])
-                sd.default.device = (umik_idx, out_idx)
-                log.info("Input device: %s (index %d)", devices[umik_idx]["name"], umik_idx)
-        except ImportError:
-            pass
-
-        # Select output device based on route
-        if route == "hdmi":
-            try:
-                import sounddevice as sd
-                devices = sd.query_devices()
-                hdmi_name = cfg.get("hdmi_playback_device") or "hdmi"
-                # Prefer ALSA plugin devices (e.g. "hdmi") over hardware devices
-                # (e.g. "vc4-hdmi-0: MAI PCM ...") — plugins handle resampling.
-                candidates = [
-                    (idx, dev) for idx, dev in enumerate(devices)
-                    if dev["max_output_channels"] > 0 and hdmi_name.lower() in dev["name"].lower()
-                ]
-                # Sort: exact name match first, then shorter names (plugins) before hardware
-                candidates.sort(key=lambda x: (x[1]["name"].lower() != hdmi_name.lower(), len(x[1]["name"])))
-                if candidates:
-                    idx, dev = candidates[0]
-                    in_idx = int(sd.default.device[0])
-                    sd.default.device = (in_idx, idx)
-                    log.info("Output device (HDMI): %s (index %d)", dev["name"], idx)
-            except ImportError:
-                pass
-        elif route == "usb":
-            try:
-                import sounddevice as sd
-                devices = sd.query_devices()
-                usb_name = cfg.get("playback_device") or "miniDSP"
-                candidates = [
-                    (idx, dev) for idx, dev in enumerate(devices)
-                    if dev.get("max_output_channels", 0) > 0 and usb_name.lower() in dev["name"].lower()
-                ]
-                if candidates:
-                    idx, dev = candidates[0]
-                    in_idx = int(sd.default.device[0])
-                    sd.default.device = (in_idx, idx)
-                    log.info("Output device (USB): %s (index %d)", dev["name"], idx)
-            except ImportError:
-                pass
-
+        # Generate sweep before acquiring the lock — pure computation, no global state.
         # pytta 0.1.1 uses camelCase params and fftDegree instead of duration.
         # Also patches traceback.walk_stack to handle shallow stacks (Python 3.11 bug).
         _orig_walk_stack = _traceback.walk_stack
@@ -317,9 +284,76 @@ class MeasurementEngine:
             _traceback.walk_stack = _orig_walk_stack
 
         from .drivers.playback import playback_for_route
-
         strategy = playback_for_route(route)
-        sweep_1d, rec_1d = strategy.play_and_record(sweep, sample_rate, in_channel, out_channel)
+
+        # Lock: protects sd.default.device (module-level global) and serializes
+        # play_and_record() so concurrent measure() calls don't clobber each other.
+        # Uses the module-level lock (not self._lock) so all instances share it.
+        async with _MEASURE_LOCK:
+            mic_name = input_device_name or self.config._data.get("mic", {}).get("name", "UMIK")
+            try:
+                import sounddevice as sd
+                devices = sd.query_devices()
+                umik_idx = _find_umik_device(devices, name_substring=mic_name)
+                if umik_idx is not None:
+                    out_idx = int(sd.default.device[1])
+                    sd.default.device = (umik_idx, out_idx)
+                    log.info("Input device: %s (index %d)", devices[umik_idx]["name"], umik_idx)
+            except ImportError:
+                pass
+
+            # Select output device based on route
+            if route == "hdmi":
+                try:
+                    import sounddevice as sd
+                    devices = sd.query_devices()
+                    hdmi_name = cfg.get("hdmi_playback_device") or "hdmi"
+                    candidates = [
+                        (idx, dev) for idx, dev in enumerate(devices)
+                        if dev["max_output_channels"] > 0 and hdmi_name.lower() in dev["name"].lower()
+                    ]
+                    # Sort: exact name match first, then shorter names (plugins) before hardware
+                    candidates.sort(key=lambda x: (x[1]["name"].lower() != hdmi_name.lower(), len(x[1]["name"])))
+                    if candidates:
+                        idx, dev = candidates[0]
+                        in_idx = int(sd.default.device[0])
+                        sd.default.device = (in_idx, idx)
+                        log.info("Output device (HDMI): %s (index %d)", dev["name"], idx)
+                except ImportError:
+                    pass
+            elif route == "usb":
+                try:
+                    import sounddevice as sd
+                    devices = sd.query_devices()
+                    usb_name = cfg.get("playback_device") or "miniDSP"
+                    candidates = [
+                        (idx, dev) for idx, dev in enumerate(devices)
+                        if dev.get("max_output_channels", 0) > 0 and usb_name.lower() in dev["name"].lower()
+                    ]
+                    if candidates:
+                        idx, dev = candidates[0]
+                        in_idx = int(sd.default.device[0])
+                        sd.default.device = (in_idx, idx)
+                        log.info("Output device (USB): %s (index %d)", dev["name"], idx)
+                except ImportError:
+                    pass
+
+            # Run blocking play_and_record() in a thread executor so the asyncio event
+            # loop stays responsive during PortAudio I/O. Times out after 60s to prevent
+            # a hung audio device from blocking the calibration loop indefinitely.
+            loop = asyncio.get_running_loop()
+            try:
+                sweep_1d, rec_1d = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, strategy.play_and_record, sweep, sample_rate, in_channel, out_channel
+                    ),
+                    timeout=_MEASUREMENT_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"Measurement timed out after {_MEASUREMENT_TIMEOUT_S:.0f}s — "
+                    "audio device may be hung. Reconnect the USB cable and retry."
+                )
 
         min_snr = float(cfg.get("min_snr_db", 20.0))
         self.validate_recording(np, sweep_1d, rec_1d, sample_rate, min_snr_db=min_snr)

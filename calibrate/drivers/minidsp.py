@@ -366,6 +366,89 @@ class MinidspDriver(DSPDriver):
             for idx in range(4)
         }
 
+    async def reapply_volatile_output_state(self) -> None:
+        """Re-apply output gains and PEQ after a source switch resets volatile state.
+
+        The miniDSP 2x4 HD resets output mutes, gains, and PEQ biquads when the
+        input source is switched (Analog ↔ USB ↔ Toslink). Delays and polarity
+        are stored per-preset in flash and survive source switches.
+
+        This method re-applies all state tracked by this driver instance:
+        - Per-output gains (from _output_gain)
+        - Per-output PEQ filters for the current preset (from _eq_state)
+
+        Called by MinidspSweepContext after each source switch, after mutes are restored.
+        Best-effort: logs warnings on failure rather than raising.
+
+        Acquires self._lock for the full write sequence so concurrent apply_eq() or
+        apply_fir() calls cannot interleave CLI commands with the restore sequence.
+        current_preset() is a CLI read and does not acquire self._lock, so it is
+        called before acquiring the lock to avoid any deadlock risk.
+        """
+        # Read current preset before acquiring the lock (CLI read, no lock needed)
+        try:
+            current_preset = await self.current_preset()
+        except Exception as exc:
+            log.warning("reapply_volatile_output_state: failed to read current preset: %s", exc)
+            return
+
+        async with self._lock:
+            await self._reapply_volatile_output_state_locked(current_preset)
+
+    async def _reapply_volatile_output_state_locked(self, current_preset: int) -> None:
+        """Inner implementation — caller must hold self._lock."""
+        # Restore per-output gains (skip 0.0 — that's the hardware default)
+        for output_idx, gain_db in self._output_gain.items():
+            if gain_db != 0.0:
+                try:
+                    await self._client.set_output_gain(output_idx, gain_db)
+                    log.info(
+                        "reapply_volatile_output_state: restored gain %+.1f dB on output %d",
+                        gain_db, output_idx,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "reapply_volatile_output_state: gain restore failed for output %d: %s",
+                        output_idx, exc,
+                    )
+
+        # Restore per-output PEQ for the current preset.
+        # _eq_state key shapes:
+        #   int (preset)           → broadcast EQ (applied to all _sub_outputs)
+        #   (preset, output_index) → per-output EQ
+        #   ("input", input, prs)  → input PEQ — skip, not volatile
+        for key, filter_list in list(self._eq_state.items()):
+            if not filter_list:
+                continue
+            if isinstance(key, int):
+                # Broadcast key: applies to all sub outputs for this preset
+                if key != current_preset:
+                    continue
+                target_outputs = list(self._sub_outputs)
+            elif isinstance(key, tuple) and len(key) == 2:
+                preset, output_index = key
+                if preset != current_preset:
+                    continue
+                target_outputs = [output_index]
+            else:
+                # ("input", ...) or unknown shape — skip
+                continue
+
+            try:
+                filter_specs = self._parse_filter_specs(filter_list)
+                peq_entries = self._build_peq_entries(filter_specs)
+                for output_index in target_outputs:
+                    await self._client.set_output_peq_cli(output_index, peq_entries)
+                log.info(
+                    "reapply_volatile_output_state: restored %d PEQ filters to outputs %s",
+                    len(filter_specs), target_outputs,
+                )
+            except Exception as exc:
+                log.warning(
+                    "reapply_volatile_output_state: PEQ restore failed for key %s: %s",
+                    key, exc,
+                )
+
     @_driver_api
     async def set_routing(self, routing: dict) -> None:
         for input_index, output_enabled in routing.items():
@@ -393,7 +476,13 @@ async def _get_source_via_cli() -> str:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, _ = await proc.communicate()
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        log.warning("_get_source_via_cli: timed out after 5s, assuming Analog")
+        return "Analog"
     if proc.returncode != 0 or not stdout:
         return "Analog"
     try:
@@ -416,7 +505,12 @@ async def _run_minidsp_batch(*commands: str) -> None:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, stderr = await proc.communicate(input_data)
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(input_data), timeout=10.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise MinidspApiError(1, "minidsp batch: timed out after 10s")
     if proc.returncode != 0:
         raise MinidspApiError(
             proc.returncode or 1,
@@ -523,33 +617,66 @@ class MinidspSweepContext:
             {i: mute_state.get(i, False) for i in range(4)},
         )
 
+    async def _restore_driver_volatile_state(self) -> None:
+        """Re-apply volatile output state (gains + PEQ) after a source switch.
+
+        Source switch resets mutes, gains, and PEQ biquads on the miniDSP 2x4 HD.
+        Delays and polarity persist in flash. This restores gains and PEQ so that
+        calibration EQ is active during sweep measurements.
+        """
+        if self._driver is None:
+            return
+        await self._driver.reapply_volatile_output_state()
+
     async def __aenter__(self) -> "MinidspSweepContext":
         self._original_source = await _get_source_via_cli()
-        await _run_minidsp_cli("source", "usb")
-        await asyncio.sleep(1.0)  # settle after source switch
+        source_switched = self._original_source.lower() != "usb"
+
+        if source_switched:
+            await _run_minidsp_cli("source", "usb")
+            await asyncio.sleep(1.0)  # settle after source switch
+
+        # Always reconfigure routing (may have been changed externally, or routing
+        # maps differently for USB input vs. normal analog input).
         await _configure_routing_via_cli(self._usb_input, self._enabled_outputs)
-        # Source switch resets hardware output mutes — restore from driver tracking.
-        await self._restore_driver_mutes()
+
+        if source_switched:
+            # Source switch resets hardware output mutes, gains, and PEQ — restore all.
+            await self._restore_driver_mutes()
+            await self._restore_driver_volatile_state()
+
         log.info(
-            "MinidspSweepContext: source %s→usb, routed input %d to outputs %s",
-            self._original_source, self._usb_input,
+            "MinidspSweepContext: source %s→usb%s, routed input %d to outputs %s",
+            self._original_source,
+            " (switched)" if source_switched else " (already usb, skip switch)",
+            self._usb_input,
             sorted(self._enabled_outputs),
         )
         return self
 
     async def __aexit__(self, *_) -> None:
         if self._original_source:
+            source_switched = self._original_source.lower() != "usb"
             try:
-                await _run_minidsp_cli("source", self._original_source.lower())
-                await asyncio.sleep(1.0)  # settle after source switch
+                if source_switched:
+                    await _run_minidsp_cli("source", self._original_source.lower())
+                    await asyncio.sleep(1.0)  # settle after source switch
+
+                # Always restore routing to normal input mapping.
                 await _configure_routing_via_cli(
                     self._normal_input, self._enabled_outputs,
                 )
-                # Source switch resets hardware output mutes — restore from driver tracking.
-                await self._restore_driver_mutes()
+
+                if source_switched:
+                    # Source switch resets hardware output mutes, gains, and PEQ.
+                    await self._restore_driver_mutes()
+                    await self._restore_driver_volatile_state()
+
                 log.info(
-                    "MinidspSweepContext: restored source→%s, routed input %d",
-                    self._original_source.lower(), self._normal_input,
+                    "MinidspSweepContext: restored source→%s%s, routed input %d",
+                    self._original_source.lower(),
+                    " (switched back)" if source_switched else " (was already usb)",
+                    self._normal_input,
                 )
             except Exception as exc:
                 log.warning(

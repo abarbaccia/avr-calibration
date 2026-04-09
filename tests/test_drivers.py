@@ -2,27 +2,32 @@
 
 All network calls are mocked:
   - DenonDriver: denonavr module patched in sys.modules
-  - MinidspDriver: respx mocks for minidspd HTTP API
+  - MinidspDriver: CLI subprocess mocked via _run_minidsp_cli and _get_status_via_cli
   - Registry: Config mock
 """
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import pytest
-import respx
 
+from calibrate.adapters.minidsp import MinidspApiError
 from calibrate.drivers.base import DriverError
 from calibrate.drivers.denon import DenonDriver
-from calibrate.drivers.minidsp import MinidspDriver
+from calibrate.drivers.minidsp import MinidspDriver, MinidspSweepContext
 from calibrate.drivers.registry import load_avr_driver, load_dsp_driver
 
-MINIDSP_BASE = "http://localhost:5380"
-DEVICE_URL = f"{MINIDSP_BASE}/devices/0"
-CONFIG_URL = f"{MINIDSP_BASE}/devices/0/config"
+# Patch target for CLI status reads (used by get_state, current_preset, check_for_dsp_hang)
+_ADAPTER_STATUS_CLI = "calibrate.adapters.minidsp._get_status_via_cli"
+
+_GOOD_STATUS = {
+    "master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False},
+    "input_levels": [-120.0, -120.0],
+    "output_levels": [-120.0, -120.0, -120.0, -120.0],
+}
 
 # ── denonavr mock helpers ──────────────────────────────────────────────────────
 
@@ -161,44 +166,38 @@ async def test_denon_discover_timeout() -> None:
 
 # ── MinidspDriver ──────────────────────────────────────────────────────────────
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_minidsp_get_state_connected() -> None:
-    respx.get(DEVICE_URL).mock(return_value=httpx.Response(200, json={
-        "master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False}
-    }))
-    driver = MinidspDriver(host="localhost", port=5380)
-    state = await driver.get_state()
+    with patch(_ADAPTER_STATUS_CLI, new_callable=AsyncMock, return_value=_GOOD_STATUS):
+        driver = MinidspDriver(host="localhost", port=5380)
+        state = await driver.get_state()
     assert state["connected"]
     assert state["preset"] == 0
     assert state["source"] == "Analog"
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_minidsp_get_state_timeout() -> None:
-    respx.get(DEVICE_URL).mock(side_effect=httpx.ConnectTimeout("timeout"))
-    driver = MinidspDriver(host="localhost", port=5380)
-    with pytest.raises(DriverError):
-        await driver.get_state()
+    with patch(_ADAPTER_STATUS_CLI, new_callable=AsyncMock, side_effect=asyncio.TimeoutError()):
+        driver = MinidspDriver(host="localhost", port=5380)
+        with pytest.raises(DriverError):
+            await driver.get_state()
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_minidsp_current_preset_returns_preset() -> None:
-    respx.get(DEVICE_URL).mock(return_value=httpx.Response(200, json={
-        "master": {"preset": 2, "source": "Analog", "volume": -30.0, "mute": False}
-    }))
-    driver = MinidspDriver(host="localhost", port=5380)
-    assert await driver.current_preset() == 2
+    status = {"master": {"preset": 2, "source": "Analog", "volume": -30.0, "mute": False}}
+    with patch(_ADAPTER_STATUS_CLI, new_callable=AsyncMock, return_value=status):
+        driver = MinidspDriver(host="localhost", port=5380)
+        assert await driver.current_preset() == 2
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_minidsp_current_preset_defaults_to_zero_on_failure() -> None:
-    respx.get(DEVICE_URL).mock(side_effect=Exception("connection refused"))
-    driver = MinidspDriver(host="localhost", port=5380)
-    assert await driver.current_preset() == 0
+    with patch(_ADAPTER_STATUS_CLI, new_callable=AsyncMock,
+               side_effect=MinidspApiError(1, "connection refused")):
+        driver = MinidspDriver(host="localhost", port=5380)
+        assert await driver.current_preset() == 0
 
 
 @pytest.mark.asyncio
@@ -207,21 +206,18 @@ async def test_minidsp_read_eq_starts_empty() -> None:
     assert await driver.read_eq(0) == []
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_minidsp_apply_eq_valid_writes_hardware() -> None:
-    respx.get(DEVICE_URL).mock(return_value=httpx.Response(200, json={
-        "master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False}
-    }))
     driver = MinidspDriver(host="localhost", port=5380)
     filters = [
         {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
         {"freq": 80.0, "gain_db": 3.0, "q": 0.707, "type": "peaking"},
     ]
-    with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
-        await driver.apply_eq(0, filters)
-        # CLI called at least once per output (default sub_outputs=[0,1])
-        assert mock_cli.call_count > 0
+    with patch(_ADAPTER_STATUS_CLI, new_callable=AsyncMock, return_value=_GOOD_STATUS):
+        with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
+            await driver.apply_eq(0, filters)
+            # CLI called at least once per output (default sub_outputs=[0,1])
+            assert mock_cli.call_count > 0
     # State should be updated after successful write
     assert len(await driver.read_eq(0)) == len(filters)
 
@@ -339,19 +335,19 @@ async def test_minidsp_apply_eq_negates_a1_a2_for_hardware() -> None:
         assert ("mute", "on") not in all_args, "unexpected mute on — mute guard was removed"
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_minidsp_apply_eq_detects_dsp_hang() -> None:
     """apply_eq must raise DriverError if output level is frozen at 0.0 dBFS post-write."""
-    respx.get(DEVICE_URL).mock(return_value=httpx.Response(200, json={
+    hang_status = {
         "master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False},
         "output_levels": [-120.0, 0.0, 0.0, -120.0],  # outputs 1,2 frozen → hang
-    }))
+    }
     driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1, 2])
     filters = [{"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"}]
-    with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock):
-        with pytest.raises(DriverError, match="DSP hang detected"):
-            await driver.apply_eq(0, filters)
+    with patch(_ADAPTER_STATUS_CLI, new_callable=AsyncMock, return_value=hang_status):
+        with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock):
+            with pytest.raises(DriverError, match="DSP hang detected"):
+                await driver.apply_eq(0, filters)
 
 
 @pytest.mark.asyncio
@@ -372,12 +368,63 @@ async def test_minidsp_apply_input_eq_writes_via_cli() -> None:
             assert args[1] == "1", f"unexpected input index in CLI call: {args}"
 
 
-@respx.mock
+@pytest.mark.asyncio
+async def test_reapply_volatile_output_state_restores_gain_and_peq() -> None:
+    """reapply_volatile_output_state() must re-send non-zero gains and per-output PEQ via CLI."""
+    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1, 2])
+    filters = [
+        {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
+        {"freq": 63.0, "gain_db": -6.0, "q": 4.0, "type": "peaking"},
+    ]
+
+    with patch(_ADAPTER_STATUS_CLI, new_callable=AsyncMock, return_value=_GOOD_STATUS):
+        with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
+            # Simulate apply_eq for output 1 (stores state) and a gain trim on output 2
+            await driver.apply_eq(0, filters, output_index=1)
+            mock_cli.reset_mock()
+
+            # Simulate gain set on output 2 (-4.3 dB trim)
+            await driver.set_output_gain(2, -4.3)
+            mock_cli.reset_mock()
+
+            # Now simulate source-switch restore
+            await driver.reapply_volatile_output_state()
+
+            all_args = [c.args for c in mock_cli.call_args_list]
+            # Gain restore: output 2 gain must be re-sent (-4.3 dB)
+            gain_calls = [a for a in all_args if a[:2] == ("output", "2") and "gain" in a]
+            assert gain_calls, "expected gain restore call for output 2"
+            assert "--" in gain_calls[0] and str(-4.3) in gain_calls[0], \
+                f"gain call args wrong: {gain_calls[0]}"
+
+            # PEQ restore: output 1 peq set calls must be re-sent
+            peq_set_calls = [a for a in all_args if a[:2] == ("output", "1") and "set" in a]
+            assert peq_set_calls, "expected PEQ set restore calls for output 1"
+
+
+@pytest.mark.asyncio
+async def test_reapply_volatile_output_state_skips_zero_gain() -> None:
+    """reapply_volatile_output_state() must skip gain restore if gain is 0.0 (hardware default)."""
+    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1])
+
+    with patch(_ADAPTER_STATUS_CLI, new_callable=AsyncMock, return_value=_GOOD_STATUS):
+        with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
+            await driver.set_output_gain(1, 0.0)  # explicitly set to 0 — should be skipped
+            mock_cli.reset_mock()
+
+            await driver.reapply_volatile_output_state()
+
+            gain_calls = [a for a in [c.args for c in mock_cli.call_args_list]
+                          if "gain" in a]
+            assert not gain_calls, f"gain=0.0 should be skipped but got: {gain_calls}"
+
+
 @pytest.mark.asyncio
 async def test_minidsp_set_preset() -> None:
-    respx.post(DEVICE_URL).mock(return_value=httpx.Response(200))
     driver = MinidspDriver(host="localhost", port=5380)
-    await driver.set_preset(1)  # should not raise
+    with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
+        await driver.set_preset(1)
+    mock_cli.assert_called_once_with("preset", "1")
 
 
 @pytest.mark.asyncio
@@ -385,6 +432,239 @@ async def test_minidsp_setup_and_close_are_noop() -> None:
     driver = MinidspDriver(host="localhost", port=5380)
     await driver.setup()
     await driver.close()
+
+
+# ── MinidspSweepContext ─────────────────────────────────────────────────────────
+
+# MinidspSweepContext calls _run_minidsp_cli, _get_source_via_cli, and
+# _configure_routing_via_cli — all module-level in calibrate.drivers.minidsp.
+# Patch there (not in the adapter) since the name was imported at load time.
+_CTX_CLI  = "calibrate.drivers.minidsp._run_minidsp_cli"
+_GET_SRC  = "calibrate.drivers.minidsp._get_source_via_cli"
+_CFG_RT   = "calibrate.drivers.minidsp._configure_routing_via_cli"
+
+# MinidspDriver methods (apply_eq, set_output_gain, etc.) call _run_minidsp_cli
+# through MinidspClient, which lives in the adapter module — patch there.
+_ADAPTER_CLI = "calibrate.adapters.minidsp._run_minidsp_cli"
+
+
+def _usb_sweep_config(
+    route: str = "usb",
+    output_channel: int = 1,
+    active_input: int = 0,
+    slots: list | None = None,
+):
+    cfg = MagicMock()
+    cfg.measurement = {
+        "playback_route": route,
+        "output_channel": output_channel,
+    }
+    cfg.minidsp = {
+        "active_input": active_input,
+        "output_slots": slots or [
+            {"index": 0, "type": "sub"},
+            {"index": 1, "type": "sub"},
+            {"index": 2, "type": "unused"},
+            {"index": 3, "type": "unused"},
+        ],
+    }
+    return cfg
+
+
+def test_sweep_context_from_config_returns_none_for_hdmi():
+    """from_config() returns None when playback_route != 'usb'."""
+    cfg = _usb_sweep_config(route="hdmi")
+    assert MinidspSweepContext.from_config(cfg) is None
+
+
+def test_sweep_context_from_config_returns_context_for_usb():
+    """from_config() returns a MinidspSweepContext when route == 'usb'."""
+    cfg = _usb_sweep_config(route="usb")
+    ctx = MinidspSweepContext.from_config(cfg)
+    assert isinstance(ctx, MinidspSweepContext)
+
+
+def test_sweep_context_from_config_maps_output_channel_to_usb_input():
+    """output_channel=1 → usb_input=0 (USB left), output_channel=2 → usb_input=1."""
+    cfg = _usb_sweep_config(output_channel=2)
+    ctx = MinidspSweepContext.from_config(cfg)
+    assert ctx._usb_input == 1  # 2 - 1 = 1
+
+
+def test_sweep_context_from_config_excludes_unused_outputs():
+    """Outputs marked 'unused' in config are excluded from enabled_outputs."""
+    cfg = _usb_sweep_config()
+    ctx = MinidspSweepContext.from_config(cfg)
+    assert ctx._enabled_outputs == {0, 1}
+
+
+@pytest.mark.asyncio
+async def test_sweep_context_enter_switches_source_and_configures_routing():
+    """__aenter__: if source != usb, switch source, sleep 1s, configure routing."""
+    with (
+        patch(_GET_SRC, new_callable=AsyncMock, return_value="Analog") as mock_src,
+        patch(_CTX_CLI, new_callable=AsyncMock) as mock_cli,
+        patch(_CFG_RT, new_callable=AsyncMock) as mock_rt,
+        patch("calibrate.drivers.minidsp.asyncio.sleep", new_callable=AsyncMock),
+    ):
+        ctx = MinidspSweepContext(usb_input=0, normal_input=0, enabled_outputs={0, 1})
+        await ctx.__aenter__()
+
+    # source switch must be sent
+    cli_sources = [c.args for c in mock_cli.call_args_list if c.args[:2] == ("source", "usb")]
+    assert cli_sources, "expected 'source usb' CLI call"
+
+    # routing must be configured
+    mock_rt.assert_called_once_with(0, {0, 1})
+
+
+@pytest.mark.asyncio
+async def test_sweep_context_enter_skips_switch_when_already_usb():
+    """__aenter__: if source == usb, skip switch+sleep but still configure routing."""
+    with (
+        patch(_GET_SRC, new_callable=AsyncMock, return_value="Usb"),
+        patch(_CTX_CLI, new_callable=AsyncMock) as mock_cli,
+        patch(_CFG_RT, new_callable=AsyncMock) as mock_rt,
+        patch("calibrate.drivers.minidsp.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+    ):
+        ctx = MinidspSweepContext(usb_input=0, normal_input=0, enabled_outputs={0, 1})
+        await ctx.__aenter__()
+
+    # no source switch CLI call
+    cli_sources = [c.args for c in mock_cli.call_args_list if "source" in c.args]
+    assert not cli_sources, f"source switch should be skipped but got: {cli_sources}"
+
+    # no sleep
+    mock_sleep.assert_not_called()
+
+    # routing still configured
+    mock_rt.assert_called_once_with(0, {0, 1})
+
+
+@pytest.mark.asyncio
+async def test_sweep_context_enter_restores_mutes_after_source_switch():
+    """__aenter__ restores all 4 output mutes via CLI after switching source."""
+    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[0, 1])
+    driver._output_muted = {1: True}  # output 1 was muted
+
+    with (
+        patch(_GET_SRC, new_callable=AsyncMock, return_value="Analog"),
+        patch(_CTX_CLI, new_callable=AsyncMock) as mock_cli,
+        patch(_CFG_RT, new_callable=AsyncMock),
+        patch("calibrate.drivers.minidsp.asyncio.sleep", new_callable=AsyncMock),
+    ):
+        ctx = MinidspSweepContext(usb_input=0, normal_input=0, enabled_outputs={0, 1, 2, 3}, driver=driver)
+        await ctx.__aenter__()
+
+    all_args = [c.args for c in mock_cli.call_args_list]
+    mute_calls = {(a[1], a[3]) for a in all_args if len(a) == 4 and a[0] == "output" and a[2] == "mute"}
+    assert ("1", "on") in mute_calls, "output 1 should be muted (was tracked as muted)"
+    assert ("0", "off") in mute_calls, "output 0 should be unmuted (not tracked)"
+
+
+@pytest.mark.asyncio
+async def test_sweep_context_enter_does_not_restore_mutes_when_already_usb():
+    """__aenter__: no mute restore when source was already USB (no reset happened)."""
+    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[0, 1])
+    driver._output_muted = {1: True}
+
+    with (
+        patch(_GET_SRC, new_callable=AsyncMock, return_value="Usb"),
+        patch(_CTX_CLI, new_callable=AsyncMock) as mock_cli,
+        patch(_CFG_RT, new_callable=AsyncMock),
+        patch("calibrate.drivers.minidsp.asyncio.sleep", new_callable=AsyncMock),
+    ):
+        ctx = MinidspSweepContext(usb_input=0, normal_input=0, enabled_outputs={0, 1}, driver=driver)
+        await ctx.__aenter__()
+
+    all_args = [c.args for c in mock_cli.call_args_list]
+    mute_calls = [a for a in all_args if len(a) >= 3 and a[0] == "output" and a[2] == "mute"]
+    assert not mute_calls, f"mute restore should be skipped when already USB, got: {mute_calls}"
+
+
+@pytest.mark.asyncio
+async def test_sweep_context_exit_restores_original_source():
+    """__aexit__: restores original non-USB source, reconfigures routing."""
+    with (
+        patch(_GET_SRC, new_callable=AsyncMock, return_value="Analog"),
+        patch(_CTX_CLI, new_callable=AsyncMock) as mock_cli,
+        patch(_CFG_RT, new_callable=AsyncMock) as mock_rt,
+        patch("calibrate.drivers.minidsp.asyncio.sleep", new_callable=AsyncMock),
+    ):
+        ctx = MinidspSweepContext(usb_input=0, normal_input=0, enabled_outputs={0, 1})
+        await ctx.__aenter__()
+        mock_cli.reset_mock()
+        mock_rt.reset_mock()
+        await ctx.__aexit__(None, None, None)
+
+    # must restore original source
+    restore_src_calls = [c.args for c in mock_cli.call_args_list if c.args[:1] == ("source",)]
+    assert restore_src_calls, "expected source restore CLI call"
+    assert restore_src_calls[0][1] == "analog"
+
+    # routing must be reconfigured to normal_input
+    mock_rt.assert_called_once_with(0, {0, 1})
+
+
+@pytest.mark.asyncio
+async def test_sweep_context_exit_skips_source_restore_when_already_usb():
+    """__aexit__: no source restore when original was already USB."""
+    with (
+        patch(_GET_SRC, new_callable=AsyncMock, return_value="Usb"),
+        patch(_CTX_CLI, new_callable=AsyncMock) as mock_cli,
+        patch(_CFG_RT, new_callable=AsyncMock) as mock_rt,
+        patch("calibrate.drivers.minidsp.asyncio.sleep", new_callable=AsyncMock),
+    ):
+        ctx = MinidspSweepContext(usb_input=0, normal_input=0, enabled_outputs={0, 1})
+        await ctx.__aenter__()
+        mock_cli.reset_mock()
+        mock_rt.reset_mock()
+        await ctx.__aexit__(None, None, None)
+
+    # no source switch
+    restore_src_calls = [c.args for c in mock_cli.call_args_list if c.args[:1] == ("source",)]
+    assert not restore_src_calls, f"source restore should be skipped, got: {restore_src_calls}"
+
+    # routing still reconfigured
+    mock_rt.assert_called_once_with(0, {0, 1})
+
+
+@pytest.mark.asyncio
+async def test_sweep_context_exit_swallows_exceptions():
+    """__aexit__ catches exceptions and logs a warning — does not raise."""
+    with (
+        patch(_GET_SRC, new_callable=AsyncMock, return_value="Analog"),
+        patch(_CTX_CLI, new_callable=AsyncMock, side_effect=Exception("CLI error")),
+        patch(_CFG_RT, new_callable=AsyncMock),
+        patch("calibrate.drivers.minidsp.asyncio.sleep", new_callable=AsyncMock),
+    ):
+        ctx = MinidspSweepContext(usb_input=0, normal_input=0, enabled_outputs={0, 1})
+        ctx._original_source = "Analog"  # bypass __aenter__
+        # must not raise
+        await ctx.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_reapply_volatile_output_state_holds_lock():
+    """reapply_volatile_output_state() acquires self._lock before any CLI write."""
+    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1])
+    lock_was_held = []
+
+    with patch(_ADAPTER_STATUS_CLI, new_callable=AsyncMock, return_value=_GOOD_STATUS):
+        with patch(_ADAPTER_CLI, new_callable=AsyncMock) as mock_cli:
+            # Pre-populate gain state without the lock-check side effect
+            await driver.set_output_gain(1, -5.0)
+
+            # Now install the lock-check side effect and observe only reapply calls
+            async def check_lock(*args, **kwargs):
+                lock_was_held.append(driver._lock.locked())
+
+            mock_cli.side_effect = check_lock
+
+            await driver.reapply_volatile_output_state()
+
+    assert lock_was_held, "reapply must make at least one CLI call"
+    assert all(lock_was_held), "lock must be held during every CLI call in reapply"
 
 
 # ── Registry ───────────────────────────────────────────────────────────────────

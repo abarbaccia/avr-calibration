@@ -16,7 +16,7 @@ Claude Code (your laptop)
 Pi 5 — avr-calibration service (Docker)
     ├── UMIK-1 (USB) — headless log sweep via sounddevice + PyTTa
     ├── Denon X3800H — auto power on/off, input switch, volume control
-    ├── miniDSP 2x4 HD — EQ reads and writes via minidspd HTTP
+    ├── miniDSP 2x4 HD — EQ reads and writes via minidsp CLI (WebSocket)
     └── SQLite — measurement history
 ```
 

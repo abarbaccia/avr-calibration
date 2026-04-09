@@ -4,7 +4,7 @@
 
 ## Framework
 
-**pytest** + **pytest-asyncio** + **respx** (httpx mocking)
+**pytest** + **pytest-asyncio** + **unittest.mock** (AsyncMock for CLI/driver mocking)
 
 Version: pytest 9.x, pytest-asyncio 1.x
 
@@ -39,7 +39,7 @@ Run against real hardware after `calibrate check` passes. Not automated — run 
 - **Async tests:** All async test methods are automatically handled by `pytest-asyncio` (mode=auto in `pyproject.toml`)
 - **sounddevice mocking:** `sounddevice` is injected into `sys.modules` via a session-scoped fixture in `conftest.py` (avoids PortAudio dependency in CI)
 - **pytta mocking:** `pytta` is injected into `sys.modules` the same way — `fake_pytta_module` fixture; individual tests set return values and call `reset_mock()` to clear cross-test call history
-- **HTTP mocking:** Use `respx` for mocking httpx calls to minidspd
+- **miniDSP CLI mocking:** Patch `calibrate.adapters.minidsp._run_minidsp_cli` (writes) and `calibrate.adapters.minidsp._get_status_via_cli` (status reads) with `AsyncMock`
 - **Denon mocking:** Use `unittest.mock.patch("denonavr.DenonAVR", ...)` with `AsyncMock` for `async_setup`
 - **numpy:** Used directly (not mocked) — real FFT computation in `_compute_fr` tests; mock signals via `numpy.random`
 
