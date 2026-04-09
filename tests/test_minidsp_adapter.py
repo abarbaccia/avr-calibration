@@ -1,12 +1,11 @@
 """Unit tests for MinidspClient — adapter for minidspd.
 
-All writes go through the minidsp CLI (WebSocket transport via AsyncMock on
-_run_minidsp_cli). HTTP is reads-only: get_devices() and get_device_status().
+All I/O goes through the minidsp CLI (WebSocket transport). No HTTP.
+CLI writes are mocked via AsyncMock on _run_minidsp_cli.
+CLI status reads are mocked via AsyncMock on _get_status_via_cli.
 """
 
 import pytest
-import httpx
-import respx
 from unittest.mock import AsyncMock, patch
 
 from calibrate.adapters.minidsp import (
@@ -19,9 +18,7 @@ from calibrate.adapters.minidsp import (
 )
 
 _CLI_PATH = "calibrate.adapters.minidsp._run_minidsp_cli"
-
-BASE = "http://localhost:5380"
-DEVICE_URL = f"{BASE}/devices/0"
+_STATUS_CLI = "calibrate.adapters.minidsp._get_status_via_cli"
 
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
@@ -225,7 +222,6 @@ async def test_switch_source_api_error(client: MinidspClient) -> None:
 
 # ── get_device_status ──────────────────────────────────────────────────────────
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_get_device_status_happy_path(client: MinidspClient) -> None:
     payload = {
@@ -233,30 +229,38 @@ async def test_get_device_status_happy_path(client: MinidspClient) -> None:
         "input_levels": [],
         "output_levels": [],
     }
-    respx.get(DEVICE_URL).mock(return_value=httpx.Response(200, json=payload))
-    status = await client.get_device_status()
+    with patch(_STATUS_CLI, new_callable=AsyncMock, return_value=payload):
+        status = await client.get_device_status()
     assert status["master"]["preset"] == 0
     assert status["master"]["source"] == "Analog"
 
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_get_device_status_api_error(client: MinidspClient) -> None:
-    respx.get(DEVICE_URL).mock(return_value=httpx.Response(503))
-    with pytest.raises(MinidspApiError) as exc_info:
-        await client.get_device_status()
-    assert exc_info.value.status_code == 503
+    with patch(_STATUS_CLI, new_callable=AsyncMock,
+               side_effect=MinidspApiError(1, "minidsp status: connection refused")):
+        with pytest.raises(MinidspApiError) as exc_info:
+            await client.get_device_status()
+    assert exc_info.value.status_code == 1
 
 
 # ── get_devices ────────────────────────────────────────────────────────────────
 
-@respx.mock
 @pytest.mark.asyncio
 async def test_get_devices_happy_path(client: MinidspClient) -> None:
-    devices = [{"product_name": "miniDSP 2x4 HD", "version": {"serial": "12345"}}]
-    respx.get(f"{BASE}/devices").mock(return_value=httpx.Response(200, json=devices))
-    result = await client.get_devices()
+    status = {"master": {}, "input_levels": [], "output_levels": []}
+    with patch(_STATUS_CLI, new_callable=AsyncMock, return_value=status):
+        result = await client.get_devices()
     assert result[0]["product_name"] == "miniDSP 2x4 HD"
+
+
+@pytest.mark.asyncio
+async def test_get_devices_raises_on_cli_failure(client: MinidspClient) -> None:
+    """CLI failure propagates as MinidspApiError (not silently returns [])."""
+    with patch(_STATUS_CLI, new_callable=AsyncMock,
+               side_effect=MinidspApiError(1, "minidsp status: no device")):
+        with pytest.raises(MinidspApiError):
+            await client.get_devices()
 
 
 # ── Error handling ────────────────────────────────────────────────────────────

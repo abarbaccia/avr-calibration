@@ -13,13 +13,12 @@ Coverage diagram:
   │   └── [TESTED] sounddevice raises → fails gracefully with error text
   │   └── [TESTED] Detail includes device index and sample rate
   ├── check_minidsp()
-  │   ├── [TESTED] Device found → passes with product name + serial
-  │   ├── [TESTED] Device found but no serial → passes, no serial in detail
-  │   ├── [TESTED] Daemon running but no USB device → fails, actionable hint
-  │   ├── [TESTED] ConnectError (daemon not running) → fails, start-daemon hint
-  │   ├── [TESTED] TimeoutException → fails, wait-and-retry hint
+  │   ├── [TESTED] Device found → passes with product name + host:port
+  │   ├── [TESTED] Device found — serial not shown (CLI doesn't expose it)
+  │   ├── [TESTED] CLI failure (daemon not running / no device) → fails, start-daemon hint
+  │   ├── [TESTED] TimeoutError → fails, wait-and-retry hint
   │   ├── [TESTED] Unexpected exception → fails gracefully
-  │   └── [TESTED] Custom host and port respected
+  │   └── [TESTED] Custom host and port in detail
   ├── check_minidsp_combined()
   │   ├── [TESTED] Both pass → single pass result with combined detail
   │   ├── [TESTED] Only hidraw fails → propagates hidraw error
@@ -47,12 +46,13 @@ Coverage diagram:
 import asyncio
 import sys
 import pytest
-import httpx
-import respx
 from unittest.mock import patch, MagicMock, AsyncMock
 
+from calibrate.adapters.minidsp import MinidspApiError
 from calibrate.preflight import PreflightChecker, CheckResult, HIDRAW_DEVICE
 from tests.conftest import make_input_device, make_output_device
+
+_STATUS_CLI = "calibrate.adapters.minidsp._get_status_via_cli"
 
 
 # ── HID device node checks ───────────────────────────────────────────────────
@@ -127,67 +127,60 @@ class TestMicCheck:
 
 # ── miniDSP checks ───────────────────────────────────────────────────────────
 
-class TestMinidspCheck:
-    @respx.mock
-    async def test_device_found_with_serial(self, config):
-        respx.get("http://localhost:5380/devices").mock(return_value=httpx.Response(
-            200, json=[{"product_name": "2x4HD", "version": {"serial": 965535}}]
-        ))
-        result = await PreflightChecker(config).check_minidsp()
-        assert result.passed
-        assert "2x4HD" in result.detail
-        assert "965535" in result.detail
+_GOOD_STATUS = {
+    "master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False},
+    "input_levels": [],
+    "output_levels": [],
+}
 
-    @respx.mock
-    async def test_device_found_without_serial(self, config):
-        respx.get("http://localhost:5380/devices").mock(return_value=httpx.Response(
-            200, json=[{"product_name": "2x4HD", "version": {}}]
-        ))
-        result = await PreflightChecker(config).check_minidsp()
+
+class TestMinidspCheck:
+    async def test_device_found(self, config):
+        """CLI status succeeds → passes with product name and host:port."""
+        with patch(_STATUS_CLI, new_callable=AsyncMock, return_value=_GOOD_STATUS):
+            result = await PreflightChecker(config).check_minidsp()
+        assert result.passed
+        assert "miniDSP 2x4 HD" in result.detail
+        assert "localhost:5380" in result.detail
+
+    async def test_device_found_no_serial_in_detail(self, config):
+        """Serial is empty in CLI response — detail should not contain 'serial'."""
+        with patch(_STATUS_CLI, new_callable=AsyncMock, return_value=_GOOD_STATUS):
+            result = await PreflightChecker(config).check_minidsp()
         assert result.passed
         assert "serial" not in result.detail
 
-    @respx.mock
-    async def test_daemon_running_no_usb_device(self, config):
-        respx.get("http://localhost:5380/devices").mock(return_value=httpx.Response(200, json=[]))
-        result = await PreflightChecker(config).check_minidsp()
-        assert not result.passed
-        assert "no devices found" in result.detail.lower()
-        assert "USB" in result.error
-
-    @respx.mock
-    async def test_connect_error_daemon_not_running(self, config):
-        respx.get("http://localhost:5380/devices").mock(side_effect=httpx.ConnectError("refused"))
-        result = await PreflightChecker(config).check_minidsp()
+    async def test_cli_failure_daemon_not_running(self, config):
+        """CLI failure (any) → fails with start-daemon hint."""
+        with patch(_STATUS_CLI, new_callable=AsyncMock,
+                   side_effect=MinidspApiError(1, "minidsp status: connection refused")):
+            result = await PreflightChecker(config).check_minidsp()
         assert not result.passed
         assert "minidspd" in result.error.lower()
 
-    @respx.mock
     async def test_timeout(self, config):
-        route = respx.get("http://localhost:5380/devices")
-        route.mock(side_effect=httpx.ConnectTimeout("timed out"))
-        result = await PreflightChecker(config).check_minidsp()
+        """asyncio.TimeoutError → fails with wait-and-retry hint."""
+        with patch(_STATUS_CLI, new_callable=AsyncMock, side_effect=asyncio.TimeoutError()):
+            result = await PreflightChecker(config).check_minidsp()
         assert not result.passed
-        assert "wait" in result.error.lower()  # "wait a moment and retry"
+        assert "wait" in result.error.lower()
 
-    @respx.mock
     async def test_unexpected_exception(self, config):
-        respx.get("http://localhost:5380/devices").mock(side_effect=ValueError("bad json"))
-        result = await PreflightChecker(config).check_minidsp()
+        """Unexpected exception → fails with error text."""
+        with patch(_STATUS_CLI, new_callable=AsyncMock, side_effect=RuntimeError("crash")):
+            result = await PreflightChecker(config).check_minidsp()
         assert not result.passed
         assert result.error is not None
 
     async def test_custom_host_and_port(self):
+        """Configured host:port appears in the result detail."""
         from calibrate.config import Config
         cfg = Config({
             "denon": {"host": None},
             "minidsp": {"host": "10.0.0.5", "port": 9999},
             "mic": {"name": "UMIK"},
         })
-        with respx.mock:
-            respx.get("http://10.0.0.5:9999/devices").mock(return_value=httpx.Response(
-                200, json=[{"product_name": "2x4HD", "version": {}}]
-            ))
+        with patch(_STATUS_CLI, new_callable=AsyncMock, return_value=_GOOD_STATUS):
             result = await PreflightChecker(cfg).check_minidsp()
         assert result.passed
         assert "10.0.0.5:9999" in result.detail

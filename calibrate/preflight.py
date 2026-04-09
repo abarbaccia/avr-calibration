@@ -5,8 +5,6 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-import httpx
-
 from .config import Config
 
 HIDRAW_DEVICE: str = "/dev/hidraw0"
@@ -137,26 +135,17 @@ class PreflightChecker:
             )
 
     async def check_minidsp(self) -> CheckResult:
-        """Check that minidspd is running and has a device connected."""
+        """Check that minidspd is running and has a device connected via CLI."""
+        from .adapters.minidsp import MinidspClient, MinidspApiError
+
         host, port = self.config.minidsp_host_port
-        url = f"http://{host}:{port}/devices"
+        client = MinidspClient(host, port)
 
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(url)
-                response.raise_for_status()
-                devices = response.json()
-
-            if not devices:
-                return CheckResult(
-                    name="miniDSP",
-                    passed=False,
-                    detail=f"minidspd reachable at {host}:{port} but no devices found",
-                    error="Connect the miniDSP 2x4 HD via USB and retry",
-                )
+            devices = await asyncio.wait_for(client.get_devices(), timeout=5.0)
 
             device = devices[0]
-            product = device.get("product_name") or "Unknown"
+            product = device.get("product_name") or "miniDSP"
             serial = (device.get("version") or {}).get("serial", "")
             serial_str = f" (serial {serial})" if serial else ""
 
@@ -166,19 +155,19 @@ class PreflightChecker:
                 detail=f"{product} at {host}:{port}{serial_str}",
             )
 
-        except httpx.ConnectError:
-            return CheckResult(
-                name="miniDSP",
-                passed=False,
-                detail=f"Cannot reach minidspd at {host}:{port}",
-                error="Start the daemon: run 'minidspd' in a separate terminal",
-            )
-        except httpx.TimeoutException:
+        except asyncio.TimeoutError:
             return CheckResult(
                 name="miniDSP",
                 passed=False,
                 detail=f"Timeout connecting to minidspd at {host}:{port}",
                 error="minidspd may be starting — wait a moment and retry",
+            )
+        except MinidspApiError:
+            return CheckResult(
+                name="miniDSP",
+                passed=False,
+                detail=f"Cannot reach minidspd at {host}:{port}",
+                error="Start the daemon: run 'minidspd' in a separate terminal",
             )
         except Exception as exc:
             return CheckResult(
