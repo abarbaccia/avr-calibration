@@ -103,6 +103,7 @@ async def _run_minidsp_cli(*args: str, ignore_exit_codes: tuple[int, ...] = ()) 
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
     except asyncio.TimeoutError:
         proc.kill()
+        await proc.wait()  # reap zombie
         raise MinidspApiError(1, f"minidsp {' '.join(args)}: timed out after 10s")
     if proc.returncode != 0 and proc.returncode not in ignore_exit_codes:
         raise MinidspApiError(
@@ -132,6 +133,7 @@ async def _get_status_via_cli() -> dict:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
     except asyncio.TimeoutError:
         proc.kill()
+        await proc.wait()  # reap zombie
         raise MinidspApiError(1, "minidsp status: timed out after 5s")
     if proc.returncode != 0:
         raise MinidspApiError(

@@ -35,6 +35,14 @@ _MEASUREMENT_TIMEOUT_S: float = 60.0
 """Timeout for a single play-and-record cycle. Prevents a hung audio device from
 blocking the calibration loop indefinitely."""
 
+_MEASURE_LOCK: asyncio.Lock = asyncio.Lock()
+"""Module-level lock serializing all measure() calls across all MeasurementEngine instances.
+
+MeasurementEngine is instantiated fresh per MCP tool call, so an instance-level lock
+would not serialize concurrent callers. This lock is shared across all instances so
+that sd.default.device (a sounddevice module-level global) is never overwritten by a
+concurrent caller mid-measurement."""
+
 
 class MeasurementQualityError(RuntimeError):
     """Raised when a recording fails quality validation before deconvolution.
@@ -114,7 +122,9 @@ class MeasurementEngine:
 
     def __init__(self, config: Config) -> None:
         self.config = config
-        self._lock = asyncio.Lock()  # serializes concurrent measure() calls (sd.default.device is global)
+        # Use the module-level _MEASURE_LOCK, not an instance lock — MeasurementEngine
+        # is created fresh per MCP tool call, so an instance lock would not serialize
+        # concurrent callers. The module lock is shared across all instances.
 
     def validate_recording(
         self,
@@ -278,7 +288,8 @@ class MeasurementEngine:
 
         # Lock: protects sd.default.device (module-level global) and serializes
         # play_and_record() so concurrent measure() calls don't clobber each other.
-        async with self._lock:
+        # Uses the module-level lock (not self._lock) so all instances share it.
+        async with _MEASURE_LOCK:
             mic_name = input_device_name or self.config._data.get("mic", {}).get("name", "UMIK")
             try:
                 import sounddevice as sd
