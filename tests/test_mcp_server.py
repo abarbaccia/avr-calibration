@@ -85,6 +85,17 @@ def mock_avr():
 
 
 @pytest.fixture
+def mock_hdmi_config():
+    """Patch _config to simulate HDMI playback route (Denon in signal chain)."""
+    mock_cfg = MagicMock()
+    mock_cfg.measurement.get.side_effect = lambda key, default=None: (
+        "hdmi" if key == "playback_route" else default
+    )
+    with patch.object(sut, "_config", return_value=mock_cfg):
+        yield mock_cfg
+
+
+@pytest.fixture
 def mock_dsp():
     """Patch _dsp with an AsyncMock DSPDriver.
 
@@ -430,7 +441,7 @@ async def test_apply_eq_updates_reflected_in_read_eq(mock_dsp, valid_filters) ->
 # ── avr_set_volume / set_denon_volume ──────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_avr_set_volume_success(mock_avr) -> None:
+async def test_avr_set_volume_success(mock_avr, mock_hdmi_config) -> None:
     mock_avr.set_volume.return_value = -25.0
     result = await _tool_avr_set_volume(-25.0)
     assert result["ok"]
@@ -439,7 +450,7 @@ async def test_avr_set_volume_success(mock_avr) -> None:
 
 
 @pytest.mark.asyncio
-async def test_avr_set_volume_no_host(mock_avr) -> None:
+async def test_avr_set_volume_no_host(mock_avr, mock_hdmi_config) -> None:
     mock_avr.set_volume.side_effect = DriverError("no host configured")
     result = await _tool_avr_set_volume(-30.0)
     assert not result["ok"]
@@ -447,7 +458,7 @@ async def test_avr_set_volume_no_host(mock_avr) -> None:
 
 
 @pytest.mark.asyncio
-async def test_avr_set_volume_connection_error(mock_avr) -> None:
+async def test_avr_set_volume_connection_error(mock_avr, mock_hdmi_config) -> None:
     mock_avr.set_volume.side_effect = DriverError("connection refused")
     result = await _tool_avr_set_volume(-30.0)
     assert not result["ok"]
@@ -455,7 +466,23 @@ async def test_avr_set_volume_connection_error(mock_avr) -> None:
 
 
 @pytest.mark.asyncio
-async def test_set_volume_legacy_alias_avr_set_volume(mock_avr) -> None:
+async def test_avr_set_volume_usb_mode_no_op() -> None:
+    """In USB mode, set_volume is a no-op — Denon is not in the signal chain."""
+    mock_avr = AsyncMock()
+    mock_cfg = MagicMock()
+    mock_cfg.measurement.get.side_effect = lambda key, default=None: (
+        "usb" if key == "playback_route" else default
+    )
+    with patch.object(sut, "_avr", mock_avr), patch.object(sut, "_config", return_value=mock_cfg):
+        result = await _tool_avr_set_volume(-25.0)
+    assert result["ok"]
+    assert result["level_db"] is None
+    assert "USB mode" in result["message"]
+    mock_avr.set_volume.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_set_volume_legacy_alias_avr_set_volume(mock_avr, mock_hdmi_config) -> None:
     """Legacy avr_set_volume alias still dispatches to set_volume."""
     mock_avr.set_volume.return_value = -25.0
     from calibrate.mcp_server import call_tool
@@ -466,7 +493,7 @@ async def test_set_volume_legacy_alias_avr_set_volume(mock_avr) -> None:
 
 
 @pytest.mark.asyncio
-async def test_set_volume_legacy_alias_set_denon_volume(mock_avr) -> None:
+async def test_set_volume_legacy_alias_set_denon_volume(mock_avr, mock_hdmi_config) -> None:
     """Legacy set_denon_volume alias still dispatches to set_volume."""
     mock_avr.set_volume.return_value = -25.0
     from calibrate.mcp_server import call_tool
@@ -578,8 +605,8 @@ async def test_trigger_measurement_with_denon_context() -> None:
 
 
 @pytest.mark.asyncio
-async def test_trigger_measurement_passes_active_target_curve() -> None:
-    """Active target_curve in DSP state is stored with the measurement (timestamp stripped)."""
+async def test_trigger_measurement_stores_explicit_target_curve() -> None:
+    """target_curve passed explicitly by calibration engine is stored with the session."""
     mock_sd = MagicMock()
     mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
 
@@ -587,12 +614,9 @@ async def test_trigger_measurement_passes_active_target_curve() -> None:
     mock_engine = MagicMock()
     mock_engine.measure = AsyncMock(return_value=mock_fr)
 
-    active_tc = {"type": "harman", "reference_spl": 72.5, "band": [20, 200]}
+    tc = {"type": "harman", "reference_spl": 72.5, "band": [20, 200]}
     mock_store = MagicMock()
     mock_store.save_measurement.return_value = 5
-    mock_store.get_active_dsp.return_value = {
-        "target_curve": {**active_tc, "timestamp": "2026-04-10T10:00:00Z"}
-    }
 
     with (
         patch.dict(sys.modules, {"sounddevice": mock_sd}),
@@ -604,16 +628,16 @@ async def test_trigger_measurement_passes_active_target_curve() -> None:
     ):
         MockCtx.from_config.return_value = None
         MockMinidspCtx.from_config.return_value = None
-        result = await _tool_trigger_measurement()
+        result = await _tool_trigger_measurement(target_curve=tc)
 
     assert result["ok"]
     call_kwargs = mock_store.save_measurement.call_args[1]
-    assert call_kwargs["target_curve"] == active_tc
+    assert call_kwargs["target_curve"] == tc
 
 
 @pytest.mark.asyncio
-async def test_trigger_measurement_no_target_when_none_active() -> None:
-    """When no active target_curve in DSP state, save_measurement called with target_curve=None."""
+async def test_trigger_measurement_no_target_for_raw_capture() -> None:
+    """Standalone/diagnostic measurement stores target_curve=None — no delta shown."""
     mock_sd = MagicMock()
     mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
 
@@ -623,7 +647,6 @@ async def test_trigger_measurement_no_target_when_none_active() -> None:
 
     mock_store = MagicMock()
     mock_store.save_measurement.return_value = 6
-    mock_store.get_active_dsp.return_value = {}  # no target_curve key
 
     with (
         patch.dict(sys.modules, {"sounddevice": mock_sd}),
@@ -635,7 +658,7 @@ async def test_trigger_measurement_no_target_when_none_active() -> None:
     ):
         MockCtx.from_config.return_value = None
         MockMinidspCtx.from_config.return_value = None
-        result = await _tool_trigger_measurement()
+        result = await _tool_trigger_measurement()  # no target_curve
 
     assert result["ok"]
     call_kwargs = mock_store.save_measurement.call_args[1]

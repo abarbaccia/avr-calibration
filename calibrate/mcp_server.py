@@ -379,7 +379,17 @@ async def _tool_apply_input_eq(
 
 
 async def _tool_avr_set_volume(level_db: float) -> dict:
-    """Set AVR volume to *level_db* dB."""
+    """Set AVR volume to *level_db* dB.
+
+    No-op when playback_route is 'usb' — the Denon is not in the signal
+    chain and its volume has no effect on sweep playback or SPL at the mic.
+    """
+    cfg = _config()
+    if cfg.measurement.get("playback_route", "usb") == "usb":
+        return _ok(
+            level_db=None,
+            message="USB mode: Denon is not in the signal chain — volume unchanged.",
+        )
     try:
         confirmed_db = await _avr.set_volume(level_db)  # type: ignore[union-attr]
         return _ok(level_db=confirmed_db)
@@ -390,11 +400,17 @@ async def _tool_avr_set_volume(level_db: float) -> dict:
 async def _tool_trigger_measurement(
     label: str | None = None,
     position: str | None = None,
+    target_curve: dict | None = None,
 ) -> dict:
     """Trigger a measurement via UMIK-1 + PyTTa.
 
     Calls MeasurementEngine.measure() directly (no HTTP hop). Wraps with
     DenonSweepContext when HDMI route is configured.
+
+    Pass *target_curve* only when this measurement is part of a calibration
+    loop — include the reference_spl and band used to compute the filters for
+    this iteration. Leave None for raw/diagnostic captures; those sessions will
+    not show a delta on the dashboard.
     """
     try:
         import sounddevice as sd
@@ -444,13 +460,7 @@ async def _tool_trigger_measurement(
         full_label = " ".join(parts)
 
         store = SessionStore()
-        active_dsp = store.get_active_dsp()
-        raw_tc = active_dsp.get("target_curve")
-        # Strip the injected "timestamp" key so only curve data is stored
-        active_tc: dict | None = None
-        if raw_tc:
-            active_tc = {k: v for k, v in raw_tc.items() if k != "timestamp"}
-        session_id = store.save_measurement(fr, label=full_label, metadata=metadata, target_curve=active_tc)
+        session_id = store.save_measurement(fr, label=full_label, metadata=metadata, target_curve=target_curve)
         return _ok(
             session_id=session_id,
             label=full_label,
@@ -1202,6 +1212,18 @@ _TOOLS: list[Tool] = [
                         "'subcrawl-candidate-1', 'seat-2'."
                     ),
                 },
+                "target_curve": {
+                    "type": "object",
+                    "description": (
+                        "The optimization target being pursued in this calibration iteration. "
+                        "Pass ONLY during a calibration loop — include the reference_spl and band "
+                        "that were used to compute the filters for this iteration. "
+                        "Omit (or pass null) for standalone/diagnostic measurements; those sessions "
+                        "will not show a dB delta on the dashboard. "
+                        "Shape: {type: 'harman'|'flat', reference_spl: float, band: [min_hz, max_hz], "
+                        "points: [{freq, spl}, ...]}"
+                    ),
+                },
             },
         },
     ),
@@ -1638,6 +1660,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_trigger_measurement(
             label=arguments.get("label"),
             position=arguments.get("position"),
+            target_curve=arguments.get("target_curve"),
         )
     elif name == "calibrate_level":
         result = await _tool_calibrate_level(
