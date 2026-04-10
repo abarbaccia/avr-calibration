@@ -116,6 +116,7 @@ Read the recipe step by step and execute each instruction by calling the appropr
 Key MCP tools available on the `avr-calibration` server:
 - `measure` — take a sweep measurement, returns frequency response data
 - `apply_eq` — write PEQ filters to miniDSP (SafetyValidator enforced)
+- `apply_input_eq` — write shared input PEQ filters (Harman target, affects all outputs)
 - `read_eq` — read current EQ state from miniDSP
 - `mute_output` — mute specific DSP outputs for solo measurement
 - `unmute_output` — unmute DSP outputs (always unmute when done)
@@ -127,8 +128,12 @@ Key MCP tools available on the `avr-calibration` server:
 - `fetch_recipe` — load a recipe by name
 - `get_config` / `set_config` — read/write config
 - `get_output_state` — per-output gain_db, delay_ms, polarity_inverted (in-memory tracking for this session)
+- `get_measurement_history` — raw FR data (983 pts, ~0.18Hz spacing): **use this for filter design and verification**
+- `get_fr_summary` — 11-band 1/3-octave summary: use only for quick coarse convergence checks
 - `analyze_ir` — IR peak time, polarity sign, SPL from a stored session (key input for computing alignment corrections)
 - `analyze_decay` — T60 decay analysis on the IR from a measurement; returns ringing modes with priority and suggested_q
+
+**FR data resolution rule:** Always use `get_measurement_history` when designing or verifying filters. `get_fr_summary` returns only 11 1/3-octave bands (~2.8Hz–17Hz wide each) — too coarse to resolve narrow peaks (Q > 2) or verify filter notch depth. `get_measurement_history` gives ~0.18Hz spacing across the full range, which is what you need to place center frequencies accurately and confirm attenuation at the notch.
 
 ### Step 5 — Report progress
 
@@ -157,3 +162,8 @@ If max iterations reached without convergence:
 4. **Mute bass shakers** before starting calibration if the config has shaker outputs.
 5. **Unmute everything** when done, even if calibration fails.
 6. **Do not hardcode frequencies or gains.** Read them from the measurement data and recipe.
+7. **Describe every hardware action explicitly.** Before each DSP write, say in plain language what you are doing and why — which inputs/outputs are involved, what values are being set, and what problem it solves. Do not just name the tool call. Examples:
+   - `configure_matrix`: "Routing input 1 (the Denon HDMI analog input) to outputs 1, 2, and 3. This ensures all subs receive signal — the 2x4 HD default matrix can split inputs across outputs unexpectedly."
+   - `set_delay`: "Sub 2 (Nearfield, output 2) arrives 16.8ms earlier than Sub 1 at the mic. Adding 16.8ms delay to output 2 so both subs arrive simultaneously."
+   - `set_polarity`: "Sub 2 IR peak sign is +1 while Sub 1 is −1. Inverting polarity on output 2 to match Sub 1's phase."
+   - `set_output_gain`: "Sub 1 measured 3.4 dB quieter than Sub 2. Applying +3.4 dB gain to output 1 to level-match."

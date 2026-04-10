@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.3.0] - 2026-04-10
+
+### Fixed
+- **Input PEQ had zero effect on sweep measurements:** Two bugs: (1) `apply_input_eq` was writing to `active_input=1` (the analog Denon LFE path) but calibration sweeps use USB source routed through `usb_input=0` — the PEQ was on the wrong input and never touched the sweep signal. (2) `reapply_volatile_output_state` explicitly skipped input PEQ with a "not volatile" comment, so even if the filter had been on the right input, any source switch (analog → USB at sweep start) would wipe it and it would never be restored.
+- **Fix:** `apply_input_eq` now writes to all active signal paths (union of `usb_input` and `active_input` — both inputs 0 and 1 in this setup). `reapply_volatile_output_state` now restores input PEQ alongside output PEQ after source switches. `MinidspDriver` constructor now accepts `usb_input` (populated from `output_channel` in config via `registry.py`).
+- **FR resolution guidance added to calibrate skill:** Added explicit rule that `get_measurement_history` (983 pts, ~0.18 Hz spacing) must be used for filter design and verification. `get_fr_summary` (11 1/3-octave bands) is too coarse to resolve narrow peaks (Q > 2) and is for quick convergence checks only.
+
 ## [0.6.2.0] - 2026-04-09
 
 ### Fixed

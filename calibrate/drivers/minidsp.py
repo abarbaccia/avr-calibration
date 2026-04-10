@@ -57,11 +57,13 @@ class MinidspDriver(DSPDriver):
 
     def __init__(self, host: str, port: int, device_index: int = 0,
                  sub_outputs: list[int] | None = None,
-                 active_input: int = 0) -> None:
+                 active_input: int = 0,
+                 usb_input: int = 0) -> None:
         self._client = MinidspClient(host=host, port=port, device_index=device_index)
         self._host = host
         self._sub_outputs = sub_outputs or [0, 1]
         self._active_input = active_input
+        self._usb_input = usb_input
         self._eq_state: dict = {}
         self._lock = asyncio.Lock()
         # In-memory tracking for write-only hardware params (no GET endpoint in minidspd)
@@ -208,8 +210,12 @@ class MinidspDriver(DSPDriver):
     ) -> None:
         """Apply EQ filters to the DSP input channel (shared across all outputs).
 
-        Uses the same SafetyValidator as output EQ. Writes to the active input
-        from config, or *input_index* if specified.
+        Uses the same SafetyValidator as output EQ. When no *input_index* is
+        given, writes to ALL active signal paths: the analog input (active_input)
+        AND the USB sweep input (usb_input). This ensures the EQ is effective
+        during both calibration sweeps (USB path) and normal listening (analog path).
+
+        If usb_input == active_input, only one write is performed.
 
         IMPORTANT: The miniDSP 2x4 HD default matrix routes each analog input
         to a subset of outputs. For input PEQ to affect ALL outputs, call
@@ -223,11 +229,17 @@ class MinidspDriver(DSPDriver):
                 f"{len(_AVAILABLE_SLOTS)} PEQ slots available (slots 2-9)"
             )
 
-        target_input = input_index if input_index is not None else self._active_input
+        # Determine which input channels to write to.
+        # Explicit input_index → single target. Otherwise write to all active paths.
+        if input_index is not None:
+            target_inputs = [input_index]
+        else:
+            target_inputs = sorted(set([self._active_input, self._usb_input]))
 
         async with self._lock:
-            state_key = ("input", target_input, preset)
-            prev_raw = self._eq_state.get(state_key, [])
+            # Validate against the canonical (active_input) state
+            canonical_key = ("input", self._active_input, preset)
+            prev_raw = self._eq_state.get(canonical_key, [])
             prev_specs = [
                 FilterSpec(
                     freq=float(f["freq"]),
@@ -245,8 +257,11 @@ class MinidspDriver(DSPDriver):
 
             peq_entries = self._build_peq_entries(filter_specs)
             try:
-                log.info("apply_input_eq: writing PEQ to input %d via CLI", target_input)
-                await self._client.set_input_peq_cli(target_input, peq_entries)
+                log.info(
+                    "apply_input_eq: writing PEQ to inputs %s via CLI", target_inputs
+                )
+                for inp in target_inputs:
+                    await self._client.set_input_peq_cli(inp, peq_entries)
                 # Health check: verify sub outputs aren't frozen after input EQ write
                 await self._client.check_for_dsp_hang(self._sub_outputs)
             except MinidspApiError as exc:
@@ -254,10 +269,12 @@ class MinidspDriver(DSPDriver):
             except Exception as exc:
                 raise DriverError(f"apply_input_eq error: {exc}")
 
-            self._eq_state[state_key] = [
+            filter_record = [
                 {"freq": f.freq, "gain_db": f.gain_db, "q": f.q, "type": f.type}
                 for f in filter_specs
             ]
+            for inp in target_inputs:
+                self._eq_state[("input", inp, preset)] = filter_record
 
     @_driver_api
     async def set_preset(self, preset: int) -> None:
@@ -430,8 +447,28 @@ class MinidspDriver(DSPDriver):
                 if preset != current_preset:
                     continue
                 target_outputs = [output_index]
+            elif isinstance(key, tuple) and len(key) == 3 and key[0] == "input":
+                _, input_idx, key_preset = key
+                if key_preset != current_preset:
+                    continue
+                # Input PEQ is volatile on the 2x4 HD (resets on source switch).
+                # Restore it the same way we restore output PEQ.
+                try:
+                    filter_specs = self._parse_filter_specs(filter_list)
+                    peq_entries = self._build_peq_entries(filter_specs)
+                    await self._client.set_input_peq_cli(input_idx, peq_entries)
+                    log.info(
+                        "reapply_volatile_output_state: restored %d PEQ filters to input %d",
+                        len(filter_specs), input_idx,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "reapply_volatile_output_state: input PEQ restore failed for input %d: %s",
+                        input_idx, exc,
+                    )
+                continue
             else:
-                # ("input", ...) or unknown shape — skip
+                # Unknown key shape — skip
                 continue
 
             try:

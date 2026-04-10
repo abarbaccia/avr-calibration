@@ -352,20 +352,58 @@ async def test_minidsp_apply_eq_detects_dsp_hang() -> None:
 
 @pytest.mark.asyncio
 async def test_minidsp_apply_input_eq_writes_via_cli() -> None:
-    """Input PEQ writes target the input channel via CLI."""
-    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1, 2], active_input=1)
+    """Input PEQ writes to ALL active signal paths (USB input + analog input)."""
+    # active_input=1 (Denon LFE on analog), usb_input=0 (USB sweep path)
+    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1, 2],
+                           active_input=1, usb_input=0)
     filters = [
         {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
         {"freq": 50.0, "gain_db": -2.0, "q": 1.0, "type": "peaking"},
     ]
     with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
         await driver.apply_input_eq(0, filters)
-        # Input-targeted CLI calls must use "input" subcommand targeting input 1
+        # Must write to BOTH input 0 (USB sweep path) AND input 1 (analog listening path)
         input_calls = [c for c in mock_cli.call_args_list if c.args[0] == "input"]
-        for call in input_calls:
-            args = call.args
-            assert args[0] == "input", f"unexpected subcommand in CLI call: {args}"
-            assert args[1] == "1", f"unexpected input index in CLI call: {args}"
+        written_inputs = {c.args[1] for c in input_calls}
+        assert "0" in written_inputs, "USB sweep input (0) must receive input PEQ"
+        assert "1" in written_inputs, "analog input (1) must receive input PEQ"
+
+@pytest.mark.asyncio
+async def test_minidsp_apply_input_eq_same_input_writes_once() -> None:
+    """When usb_input == active_input, input 1 is not written (no duplicate)."""
+    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1, 2],
+                           active_input=0, usb_input=0)
+    filters = [{"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"}]
+    with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
+        await driver.apply_input_eq(0, filters)
+        input_calls = [c for c in mock_cli.call_args_list if c.args[0] == "input"]
+        written_inputs = {c.args[1] for c in input_calls}
+        assert "0" in written_inputs, "input 0 must be written"
+        assert "1" not in written_inputs, "input 1 must not be written when usb_input==active_input"
+
+
+@pytest.mark.asyncio
+async def test_reapply_volatile_output_state_restores_input_peq() -> None:
+    """reapply_volatile_output_state() must re-send input PEQ after a source switch."""
+    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1, 2],
+                           active_input=1, usb_input=0)
+    filters = [
+        {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
+        {"freq": 40.0, "gain_db": 3.0, "q": 1.5, "type": "peaking"},
+    ]
+
+    with patch(_ADAPTER_STATUS_CLI, new_callable=AsyncMock, return_value=_GOOD_STATUS):
+        with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
+            await driver.apply_input_eq(0, filters)
+            mock_cli.reset_mock()
+
+            await driver.reapply_volatile_output_state()
+
+            all_args = [c.args for c in mock_cli.call_args_list]
+            input_set_calls = [a for a in all_args if a[0] == "input" and "set" in a]
+            written_inputs = {a[1] for a in input_set_calls}
+            assert "0" in written_inputs, "USB input (0) PEQ must be restored"
+            assert "1" in written_inputs, "analog input (1) PEQ must be restored"
 
 
 @pytest.mark.asyncio
