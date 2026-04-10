@@ -136,23 +136,17 @@ class PreflightChecker:
 
     async def check_minidsp(self) -> CheckResult:
         """Check that minidspd is running and has a device connected via CLI."""
-        from .adapters.minidsp import MinidspClient, MinidspApiError
+        from .adapters.minidsp import _get_status_via_cli, MinidspApiError
 
         host, port = self.config.minidsp_host_port
-        client = MinidspClient(host, port)
 
         try:
-            devices = await asyncio.wait_for(client.get_devices(), timeout=5.0)
-
-            device = devices[0]
-            product = device.get("product_name") or "miniDSP"
-            serial = (device.get("version") or {}).get("serial", "")
-            serial_str = f" (serial {serial})" if serial else ""
+            await asyncio.wait_for(_get_status_via_cli(), timeout=5.0)
 
             return CheckResult(
                 name="miniDSP",
                 passed=True,
-                detail=f"{product} at {host}:{port}{serial_str}",
+                detail=f"miniDSP 2x4 HD at {host}:{port}",
             )
 
         except asyncio.TimeoutError:
@@ -287,7 +281,7 @@ class PreflightChecker:
         Skipped (passes) if signal_path is not configured in config.yaml.
         Warns if the live device source or preset differs from config.
         """
-        from .adapters.minidsp import MinidspClient, MinidspApiError
+        from .adapters.minidsp import _get_status_via_cli, MinidspApiError
 
         sp = self.config.minidsp.get("signal_path")
         if not sp:
@@ -306,11 +300,8 @@ class PreflightChecker:
                 detail="no source/preset defined (skipped)",
             )
 
-        host, port = self.config.minidsp_host_port
-        client = MinidspClient(host, port)
-
         try:
-            status = await client.get_device_status()
+            status = await _get_status_via_cli()
         except MinidspApiError as exc:
             return CheckResult(
                 name="Signal Path",

@@ -390,11 +390,8 @@ class TestSignalPathSync:
     async def test_passes_when_device_matches_config(self, config):
         config._data["minidsp"]["signal_path"] = {"source": "Analog", "preset": 0}
         from unittest.mock import AsyncMock, patch
-        mock_client = AsyncMock()
-        mock_client.get_device_status.return_value = {
-            "master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False}
-        }
-        with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+        status = {"master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False}}
+        with patch("calibrate.adapters.minidsp._get_status_via_cli", new_callable=AsyncMock, return_value=status):
             result = await PreflightChecker(config).check_signal_path_sync()
         assert result.passed
         assert "source=Analog" in result.detail
@@ -403,11 +400,8 @@ class TestSignalPathSync:
     async def test_fails_on_source_mismatch(self, config):
         config._data["minidsp"]["signal_path"] = {"source": "Toslink"}
         from unittest.mock import AsyncMock, patch
-        mock_client = AsyncMock()
-        mock_client.get_device_status.return_value = {
-            "master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False}
-        }
-        with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+        status = {"master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False}}
+        with patch("calibrate.adapters.minidsp._get_status_via_cli", new_callable=AsyncMock, return_value=status):
             result = await PreflightChecker(config).check_signal_path_sync()
         assert not result.passed
         assert "source" in result.detail
@@ -416,11 +410,8 @@ class TestSignalPathSync:
     async def test_fails_on_preset_mismatch(self, config):
         config._data["minidsp"]["signal_path"] = {"preset": 2}
         from unittest.mock import AsyncMock, patch
-        mock_client = AsyncMock()
-        mock_client.get_device_status.return_value = {
-            "master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False}
-        }
-        with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+        status = {"master": {"preset": 0, "source": "Analog", "volume": -30.0, "mute": False}}
+        with patch("calibrate.adapters.minidsp._get_status_via_cli", new_callable=AsyncMock, return_value=status):
             result = await PreflightChecker(config).check_signal_path_sync()
         assert not result.passed
         assert "preset" in result.detail
@@ -429,9 +420,9 @@ class TestSignalPathSync:
         config._data["minidsp"]["signal_path"] = {"source": "Analog"}
         from unittest.mock import AsyncMock, patch
         from calibrate.adapters.minidsp import MinidspApiError
-        mock_client = AsyncMock()
-        mock_client.get_device_status.side_effect = MinidspApiError(503, "/devices/0")
-        with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+        with patch("calibrate.adapters.minidsp._get_status_via_cli",
+                   new_callable=AsyncMock,
+                   side_effect=MinidspApiError(503, "/devices/0")):
             result = await PreflightChecker(config).check_signal_path_sync()
         assert not result.passed
         assert result.error
@@ -627,12 +618,12 @@ class TestSignalPathSyncEdgeCases:
         assert "skipped" in result.detail
 
     async def test_generic_exception_returns_failed_result(self, config):
-        """Generic exception during miniDSP status fetch → failed CheckResult (lines 347-348)."""
+        """Generic exception during miniDSP status fetch → failed CheckResult."""
         from unittest.mock import AsyncMock, patch
         config._data["minidsp"]["signal_path"] = {"source": "Analog"}
-        mock_client = AsyncMock()
-        mock_client.get_device_status.side_effect = OSError("network unreachable")
-        with patch("calibrate.adapters.minidsp.MinidspClient", return_value=mock_client):
+        with patch("calibrate.adapters.minidsp._get_status_via_cli",
+                   new_callable=AsyncMock,
+                   side_effect=OSError("network unreachable")):
             result = await PreflightChecker(config).check_signal_path_sync()
         assert not result.passed
         assert "Cannot reach miniDSP daemon" in result.error

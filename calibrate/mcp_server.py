@@ -1838,7 +1838,7 @@ def create_app() -> Starlette:
 
         # Configure DSP input routing if active_input is set
         active_input = cfg.minidsp.get("active_input")
-        if active_input is not None and hasattr(_dsp, "configure_active_input"):
+        if active_input is not None and _dsp is not None:
             try:
                 await _dsp.configure_active_input(int(active_input))
                 log.info("DSP routing: active_input=%d → all outputs", active_input)

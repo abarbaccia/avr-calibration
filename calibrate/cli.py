@@ -7,6 +7,8 @@ from pathlib import Path
 import click
 
 from .config import Config, CONFIG_PATH
+from .drivers.base import DriverError
+from .drivers.registry import load_dsp_driver
 from .preflight import PreflightChecker
 
 PASS_ICON = "✓"
@@ -264,15 +266,12 @@ def signal_path() -> None:
 )
 def signal_path_show(config_path: Path | None) -> None:
     """Show the current device state and configured signal path."""
-    from .adapters.minidsp import MinidspClient, MinidspApiError
-
     path = config_path or CONFIG_PATH
     if not path.exists():
         click.echo(f"No config found at {path}. Run 'calibrate check' first.", err=True)
         sys.exit(1)
 
     cfg = Config.load(path)
-    host, port = cfg.minidsp_host_port
     sp = cfg.minidsp.get("signal_path") or {}
 
     click.echo()
@@ -291,19 +290,18 @@ def signal_path_show(config_path: Path | None) -> None:
 
     click.echo()
     click.echo("  Live device state:")
-    client = MinidspClient(host, port)
+    driver = load_dsp_driver(cfg)
     try:
-        status = asyncio.run(client.get_device_status())
-        master = status.get("master", {})
-        click.echo(f"    Source:  {master.get('source', '?')}")
-        click.echo(f"    Preset:  {master.get('preset', '?')}")
-        vol = master.get("volume", "?")
-        mute = "  (MUTED)" if master.get("mute") else ""
+        state = asyncio.run(driver.get_state())
+        click.echo(f"    Source:  {state.get('source', '?')}")
+        click.echo(f"    Preset:  {state.get('preset', '?')}")
+        vol = state.get("volume", "?")
+        mute = "  (MUTED)" if state.get("mute") else ""
         click.echo(f"    Volume:  {vol} dB{mute}")
-    except MinidspApiError as exc:
+    except DriverError as exc:
         click.echo(click.style(f"    Cannot read device state: {exc}", fg="yellow"))
     except Exception as exc:
-        click.echo(click.style(f"    Cannot reach miniDSP daemon: {exc}", fg="yellow"))
+        click.echo(click.style(f"    Cannot reach DSP: {exc}", fg="yellow"))
 
     click.echo()
 
@@ -319,12 +317,12 @@ def signal_path_show(config_path: Path | None) -> None:
 @click.option("--source", default=None, help="Input source: Analog, Toslink, or USB")
 @click.option("--preset", default=None, type=int, help="Preset slot 0-3")
 def signal_path_apply(config_path: Path | None, source: str | None, preset: int | None) -> None:
-    """Apply signal path config to the miniDSP (source, preset, routing matrix).
+    """Apply signal path config to the DSP (source, preset, routing matrix).
 
     Reads source/preset from config.yaml unless overridden by --source/--preset.
     Always applies the routing matrix from config if defined.
     """
-    from .adapters.minidsp import MinidspClient, MinidspApiError, VALID_SOURCES, MAX_PRESET_INDEX
+    from .adapters.minidsp import VALID_SOURCES, MAX_PRESET_INDEX
 
     path = config_path or CONFIG_PATH
     if not path.exists():
@@ -344,24 +342,25 @@ def signal_path_apply(config_path: Path | None, source: str | None, preset: int 
         click.echo(click.style(f"Error: preset must be 0-{MAX_PRESET_INDEX}", fg="red"), err=True)
         sys.exit(1)
 
-    host, port = cfg.minidsp_host_port
-    client = MinidspClient(host, port)
+    driver = load_dsp_driver(cfg)
 
     async def _apply() -> None:
         if effective_preset is not None:
             click.echo(f"  Switching to preset {effective_preset}…")
-            await client.switch_preset(effective_preset)
+            await driver.set_preset(effective_preset)
         if effective_source is not None:
             click.echo(f"  Switching source to {effective_source}…")
-            await client.switch_source(effective_source)
+            await driver.set_source(effective_source)
 
         routing = sp.get("routing") or []
-        for entry in routing:
-            input_idx = entry.get("input", 0)
-            enabled_outputs = set(entry.get("outputs", []))
-            output_enabled = {i: (i in enabled_outputs) for i in range(4)}
-            click.echo(f"  Setting routing: Input {input_idx} → Outputs {sorted(enabled_outputs)}…")
-            await client.set_input_routing(input_idx, output_enabled)
+        if routing:
+            routing_dict: dict = {}
+            for entry in routing:
+                input_idx = entry.get("input", 0)
+                enabled_outputs = set(entry.get("outputs", []))
+                routing_dict[input_idx] = {i: (i in enabled_outputs) for i in range(4)}
+                click.echo(f"  Setting routing: Input {input_idx} → Outputs {sorted(enabled_outputs)}…")
+            await driver.set_routing(routing_dict)
 
     click.echo()
     click.echo("AVR Calibration — Apply Signal Path")
@@ -374,8 +373,8 @@ def signal_path_apply(config_path: Path | None, source: str | None, preset: int 
 
     try:
         asyncio.run(_apply())
-    except MinidspApiError as exc:
-        click.echo(click.style(f"\n  miniDSP error: {exc}", fg="red"), err=True)
+    except DriverError as exc:
+        click.echo(click.style(f"\n  Error: {exc}", fg="red"), err=True)
         sys.exit(1)
     except Exception as exc:
         click.echo(click.style(f"\n  Error: {exc}", fg="red"), err=True)
