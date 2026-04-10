@@ -152,8 +152,44 @@ async def _tool_get_device_state() -> dict:
     return _ok(avr=avr_result, dsp=dsp_result)
 
 
-async def _tool_get_measurement_history(limit: int = 10) -> dict:
-    """Return last *limit* measurement sessions from SessionStore."""
+def _filter_and_decimate_fr(
+    freqs: list[float],
+    spl: list[float],
+    min_hz: float | None,
+    max_hz: float | None,
+    decimation: int,
+) -> tuple[list[float], list[float]]:
+    """Apply frequency range filter and decimation to a FR pair. Returns (freqs, spls)."""
+    pairs = list(zip(freqs, spl))
+    if min_hz is not None:
+        pairs = [(f, v) for f, v in pairs if f >= min_hz]
+    if max_hz is not None:
+        pairs = [(f, v) for f, v in pairs if f <= max_hz]
+    if decimation > 1:
+        pairs = pairs[::decimation]
+    return (
+        [round(f, 2) for f, _ in pairs],
+        [round(v, 2) for _, v in pairs],
+    )
+
+
+async def _tool_get_measurement_history(
+    limit: int = 10,
+    min_hz: float | None = None,
+    max_hz: float | None = None,
+    decimation: int = 1,
+    fmt: str = "full",
+) -> dict:
+    """Return last *limit* measurement sessions from SessionStore.
+
+    Args:
+        limit: Number of sessions to return.
+        min_hz: Low-frequency cutoff — only return data at or above this frequency.
+        max_hz: High-frequency cutoff — only return data at or below this frequency.
+        decimation: Keep every Nth point (1 = all points, 2 = every other, etc.).
+        fmt: Output format — "full" (separate freq_hz[]/spl_db[] arrays) or
+             "compact" (single "fr" string "freq1:spl1,freq2:spl2,...", much smaller).
+    """
     from .storage import SessionStore
     try:
         store = SessionStore()
@@ -161,17 +197,48 @@ async def _tool_get_measurement_history(limit: int = 10) -> dict:
         result = []
         for s in sessions:
             fr = s.start_fr
+            freqs: list[float]
+            spls: list[float]
+            if fr:
+                freqs, spls = _filter_and_decimate_fr(
+                    fr.frequencies, fr.spl, min_hz, max_hz, decimation
+                )
+                if fr.phase and fmt == "full":
+                    phase_freqs, phase_vals = _filter_and_decimate_fr(
+                        fr.frequencies, fr.phase, min_hz, max_hz, decimation
+                    )
+                else:
+                    phase_freqs, phase_vals = [], []
+            else:
+                freqs, spls, phase_freqs, phase_vals = [], [], [], []
+
             entry: dict = {
                 "id": s.id,
                 "timestamp": s.timestamp,
                 "label": s.label,
-                "freq_hz": fr.frequencies if fr else [],
-                "spl_db": fr.spl if fr else [],
             }
-            if fr and fr.phase:
-                entry["phase_rad"] = fr.phase
+            if fmt == "compact":
+                # Encode as compact "freq:spl,freq:spl,..." string — ~12 chars/point
+                # vs ~40 chars/point in full JSON array format (3x smaller)
+                entry["fr"] = ",".join(
+                    f"{f:.2f}:{v:.1f}" for f, v in zip(freqs, spls)
+                )
+                entry["point_count"] = len(freqs)
+            else:
+                entry["freq_hz"] = freqs
+                entry["spl_db"] = spls
+                if phase_vals:
+                    entry["phase_rad"] = [round(v, 4) for v in phase_vals]
             if s.metadata:
-                entry["metadata"] = s.metadata
+                if fmt == "compact":
+                    # In compact mode, strip large sub-fields (group_delay is ~17KB per session)
+                    _COMPACT_META_SKIP = {"group_delay"}
+                    entry["metadata"] = {
+                        k: v for k, v in s.metadata.items()
+                        if k not in _COMPACT_META_SKIP
+                    }
+                else:
+                    entry["metadata"] = s.metadata
             result.append(entry)
         return _ok(sessions=result, count=len(result))
     except Exception as exc:
@@ -754,6 +821,22 @@ async def _tool_set_output_gain(output_index: int, gain_db: float) -> dict:
         return _err(f"set_output_gain error: {exc}")
 
 
+async def _tool_set_master_gain(gain_db: float) -> dict:
+    """Set the miniDSP master output gain (-127 to 0 dB).
+
+    Global attenuation applied before all outputs. Use to control sweep
+    playback volume without touching per-output alignment gains.
+    Always restore to 0.0 after sweeps are done.
+    """
+    try:
+        await _dsp.set_master_gain(gain_db)  # type: ignore[union-attr]
+        return _ok(gain_db=max(-127.0, min(0.0, gain_db)))
+    except DriverError as exc:
+        return _err(str(exc))
+    except Exception as exc:
+        return _err(f"set_master_gain error: {exc}")
+
+
 async def _tool_configure_matrix(active_input: int | None = None) -> dict:
     """Route the active DSP input to enabled outputs, skipping defective/unused ones."""
     try:
@@ -877,8 +960,12 @@ _TOOLS: list[Tool] = [
         name="get_measurement_history",
         description=(
             "Return the last N calibration measurement sessions from the Pi's "
-            "local database. Each session includes frequency response data "
-            "(freq_hz[], spl_db[]), timestamp, and label."
+            "local database. Each session includes frequency response data, timestamp, and label.\n\n"
+            "ALWAYS use format='compact' for bass calibration filter design — it encodes FR as "
+            "'freq:spl,freq:spl,...' strings (~12 chars/point vs ~40 chars/point in full format). "
+            "Combined with min_hz=20, max_hz=120, a 2-session compact response fits comfortably "
+            "in context (~8KB vs 115KB full). "
+            "Parse compact fr string: split on ',' then ':' to get (freq_hz, spl_db) pairs."
         ),
         inputSchema={
             "type": "object",
@@ -887,7 +974,41 @@ _TOOLS: list[Tool] = [
                     "type": "integer",
                     "description": "Number of sessions to return (default: 10)",
                     "default": 10,
-                }
+                },
+                "min_hz": {
+                    "type": "number",
+                    "description": (
+                        "Low-frequency cutoff in Hz — only return data at or above this "
+                        "frequency. For sub bass calibration use 20."
+                    ),
+                },
+                "max_hz": {
+                    "type": "number",
+                    "description": (
+                        "High-frequency cutoff in Hz — only return data at or below this "
+                        "frequency. For sub bass calibration use 120."
+                    ),
+                },
+                "decimation": {
+                    "type": "integer",
+                    "description": (
+                        "Keep every Nth point (1 = all, 2 = every other, 4 = quarter). "
+                        "Default: 1 (no decimation). With format='compact' and min_hz/max_hz, "
+                        "decimation=1 already fits in context — only use higher values if you "
+                        "want coarser resolution."
+                    ),
+                    "default": 1,
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["full", "compact"],
+                    "description": (
+                        "Output format. 'compact': FR data as 'freq:spl,...' string (~12 chars/point, "
+                        "recommended for filter design). 'full': separate freq_hz[] and spl_db[] arrays "
+                        "(verbose, may exceed token limits). Default: 'full'."
+                    ),
+                    "default": "full",
+                },
             },
         },
     ),
@@ -1335,6 +1456,25 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="set_master_gain",
+        description=(
+            "Set the miniDSP master output gain in dB. Range: -127 to 0 dB. "
+            "This is a global attenuation applied before all outputs — use it to "
+            "control sweep playback volume without disturbing per-output alignment gains. "
+            "Set to e.g. -30 for quiet sweeps, restore to 0 when done."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "gain_db": {
+                    "type": "number",
+                    "description": "Master gain in dB. Range: -127 to 0.",
+                },
+            },
+            "required": ["gain_db"],
+        },
+    ),
+    Tool(
         name="set_output_gain",
         description=(
             "Set gain for a single DSP output in dB. Range: -127 to +6 dB. "
@@ -1465,8 +1605,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if name == "get_device_state":
         result = await _tool_get_device_state()
     elif name == "get_measurement_history":
+        min_hz = arguments.get("min_hz")
+        max_hz = arguments.get("max_hz")
         result = await _tool_get_measurement_history(
-            limit=int(arguments.get("limit", 10))
+            limit=int(arguments.get("limit", 10)),
+            min_hz=float(min_hz) if min_hz is not None else None,
+            max_hz=float(max_hz) if max_hz is not None else None,
+            decimation=int(arguments.get("decimation", 1)),
+            fmt=arguments.get("format", "full"),
         )
     elif name == "read_eq":
         result = await _tool_read_eq()
@@ -1535,6 +1681,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         )
     elif name == "clear_fir":
         result = await _tool_clear_fir(output_index=int(arguments["output_index"]))
+    elif name == "set_master_gain":
+        result = await _tool_set_master_gain(gain_db=float(arguments["gain_db"]))
     elif name == "set_output_gain":
         result = await _tool_set_output_gain(
             output_index=int(arguments["output_index"]),

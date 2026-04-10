@@ -739,3 +739,30 @@ def test_load_dsp_driver_unknown_raises() -> None:
     cfg = _mock_config(dsp_driver="camilla")
     with pytest.raises(ValueError, match="Unknown DSP driver"):
         load_dsp_driver(cfg)
+
+
+# ── set_master_gain ────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_minidsp_set_master_gain_calls_cli() -> None:
+    driver = MinidspDriver(host="localhost", port=5380)
+    with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
+        await driver.set_master_gain(-30.0)
+    mock_cli.assert_awaited_once_with("gain", "--", "-30.0")
+
+
+@pytest.mark.asyncio
+async def test_minidsp_set_master_gain_clamps_positive() -> None:
+    driver = MinidspDriver(host="localhost", port=5380)
+    with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
+        await driver.set_master_gain(5.0)
+    # Positive values must be clamped to 0
+    mock_cli.assert_awaited_once_with("gain", "--", "0.0")
+
+
+@pytest.mark.asyncio
+async def test_minidsp_set_master_gain_clamps_below_minus127() -> None:
+    driver = MinidspDriver(host="localhost", port=5380)
+    with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
+        await driver.set_master_gain(-200.0)
+    mock_cli.assert_awaited_once_with("gain", "--", "-127.0")

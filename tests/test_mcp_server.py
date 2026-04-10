@@ -57,6 +57,7 @@ from calibrate.mcp_server import (
     _tool_mute_output,
     _tool_read_eq,
     _tool_set_delay,
+    _tool_set_master_gain,
     _tool_set_output_gain,
     _tool_set_polarity,
     _tool_trigger_measurement,
@@ -1521,6 +1522,41 @@ async def test_call_tool_set_output_gain_dispatch(mock_dsp) -> None:
     assert data["gain_db"] == -3.0
 
 
+# ── set_master_gain ──────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_set_master_gain_success(mock_dsp) -> None:
+    result = await _tool_set_master_gain(gain_db=-30.0)
+    assert result["ok"]
+    assert result["gain_db"] == -30.0
+    mock_dsp.set_master_gain.assert_awaited_once_with(-30.0)
+
+
+@pytest.mark.asyncio
+async def test_set_master_gain_clamps_to_zero(mock_dsp) -> None:
+    """Positive values are clamped to 0 by the driver."""
+    result = await _tool_set_master_gain(gain_db=5.0)
+    assert result["ok"]
+    assert result["gain_db"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_set_master_gain_driver_error(mock_dsp) -> None:
+    mock_dsp.set_master_gain.side_effect = DriverError("usb error")
+    result = await _tool_set_master_gain(gain_db=-20.0)
+    assert not result["ok"]
+    assert "usb error" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_set_master_gain_dispatch(mock_dsp) -> None:
+    from calibrate.mcp_server import call_tool
+    texts = await call_tool("set_master_gain", {"gain_db": -30.0})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert data["gain_db"] == -30.0
+
+
 # ── apply_fir / clear_fir ────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -1775,3 +1811,153 @@ async def test_call_tool_analyze_decay_dispatch() -> None:
     assert "mode_count" in data
     assert "modes" in data
 
+
+# ── get_measurement_history — frequency filtering ─────────────────────────────
+
+def _make_fr_session(freqs: list[float], spls: list[float], session_id: int = 1) -> MagicMock:
+    mock_fr = MagicMock()
+    mock_fr.frequencies = freqs
+    mock_fr.spl = spls
+    mock_fr.phase = None
+    session = MagicMock()
+    session.id = session_id
+    session.timestamp = "2026-04-10T00:00:00Z"
+    session.label = f"session-{session_id}"
+    session.start_fr = mock_fr
+    session.metadata = None
+    return session
+
+
+@pytest.mark.asyncio
+async def test_get_measurement_history_min_hz_filters_low_freqs() -> None:
+    freqs = [10.0, 20.0, 50.0, 100.0, 200.0]
+    spls  = [ 1.0,  2.0,  3.0,   4.0,   5.0]
+    session = _make_fr_session(freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_get_measurement_history(limit=1, min_hz=20.0)
+    assert result["ok"]
+    data = result["sessions"][0]
+    assert data["freq_hz"] == [20.0, 50.0, 100.0, 200.0]
+    assert data["spl_db"] == [2.0, 3.0, 4.0, 5.0]
+
+
+@pytest.mark.asyncio
+async def test_get_measurement_history_max_hz_filters_high_freqs() -> None:
+    freqs = [10.0, 20.0, 50.0, 100.0, 200.0]
+    spls  = [ 1.0,  2.0,  3.0,   4.0,   5.0]
+    session = _make_fr_session(freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_get_measurement_history(limit=1, max_hz=100.0)
+    data = result["sessions"][0]
+    assert data["freq_hz"] == [10.0, 20.0, 50.0, 100.0]
+    assert data["spl_db"] == [1.0, 2.0, 3.0, 4.0]
+
+
+@pytest.mark.asyncio
+async def test_get_measurement_history_min_max_hz_combined() -> None:
+    freqs = [10.0, 20.0, 50.0, 100.0, 200.0]
+    spls  = [ 1.0,  2.0,  3.0,   4.0,   5.0]
+    session = _make_fr_session(freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_get_measurement_history(limit=1, min_hz=20.0, max_hz=100.0)
+    data = result["sessions"][0]
+    assert data["freq_hz"] == [20.0, 50.0, 100.0]
+    assert data["spl_db"] == [2.0, 3.0, 4.0]
+
+
+@pytest.mark.asyncio
+async def test_get_measurement_history_decimation() -> None:
+    freqs = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+    spls  = [ 1.0,  2.0,  3.0,  4.0,  5.0,  6.0]
+    session = _make_fr_session(freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_get_measurement_history(limit=1, decimation=2)
+    data = result["sessions"][0]
+    assert data["freq_hz"] == [10.0, 30.0, 50.0]
+    assert data["spl_db"] == [1.0, 3.0, 5.0]
+
+
+@pytest.mark.asyncio
+async def test_get_measurement_history_rounds_floats() -> None:
+    freqs = [20.1416015625, 40.2832031250]
+    spls  = [-5.12345678,   -3.98765432]
+    session = _make_fr_session(freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_get_measurement_history(limit=1)
+    data = result["sessions"][0]
+    assert data["freq_hz"] == [20.14, 40.28]
+    assert data["spl_db"] == [-5.12, -3.99]
+
+
+@pytest.mark.asyncio
+async def test_get_measurement_history_compact_format() -> None:
+    freqs = [20.0, 40.0, 80.0]
+    spls  = [-1.5,  2.3,  0.0]
+    session = _make_fr_session(freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_get_measurement_history(limit=1, fmt="compact")
+    data = result["sessions"][0]
+    assert "fr" in data
+    assert "freq_hz" not in data
+    assert "spl_db" not in data
+    assert data["fr"] == "20.00:-1.5,40.00:2.3,80.00:0.0"
+    assert data["point_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_get_measurement_history_compact_with_range() -> None:
+    """Compact format + range filter together — the primary bass calibration mode."""
+    freqs = [10.0, 20.0, 50.0, 100.0, 200.0]
+    spls  = [ 1.0,  2.0,  3.0,   4.0,   5.0]
+    session = _make_fr_session(freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_get_measurement_history(
+            limit=1, min_hz=20.0, max_hz=100.0, fmt="compact"
+        )
+    data = result["sessions"][0]
+    assert data["fr"] == "20.00:2.0,50.00:3.0,100.00:4.0"
+    assert data["point_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_get_measurement_history_compact_strips_group_delay() -> None:
+    """group_delay is ~17KB per session; compact mode must exclude it."""
+    freqs = [20.0, 40.0]
+    spls  = [1.0, 2.0]
+    session = _make_fr_session(freqs, spls)
+    session.metadata = {
+        "ir": {"peak_time_ms": 5.0, "spl_db": 80.0},
+        "group_delay": {"freq_hz": list(range(500)), "gd_ms": list(range(500))},
+        "position": "MLP",
+    }
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_get_measurement_history(limit=1, fmt="compact")
+    data = result["sessions"][0]
+    assert "metadata" in data
+    assert "group_delay" not in data["metadata"]
+    assert "ir" in data["metadata"]
+    assert "position" in data["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_get_measurement_history_full_keeps_group_delay() -> None:
+    """Full mode returns group_delay unchanged."""
+    freqs = [20.0, 40.0]
+    spls  = [1.0, 2.0]
+    session = _make_fr_session(freqs, spls)
+    session.metadata = {
+        "group_delay": {"freq_hz": [20.0], "gd_ms": [1.0]},
+    }
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_get_measurement_history(limit=1, fmt="full")
+    data = result["sessions"][0]
+    assert "group_delay" in data["metadata"]
