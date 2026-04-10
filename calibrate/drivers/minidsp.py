@@ -501,6 +501,11 @@ class MinidspDriver(DSPDriver):
             await self._client.set_input_routing(int(input_index), output_enabled)
 
     @_driver_api
+    async def set_source(self, source: str) -> None:
+        """Switch the miniDSP input source via CLI (Analog/Toslink/Usb)."""
+        await self._client.switch_source(source)
+
+    @_driver_api
     async def configure_active_input(self, active_input: int) -> None:
         """Route *active_input* to all outputs and mute the other input.
 

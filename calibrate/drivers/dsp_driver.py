@@ -105,3 +105,68 @@ class DSPDriver(ABC):
 
         Raises DriverError on hardware failure.
         """
+
+    @abstractmethod
+    async def mute_outputs(self, output_indices: list[int]) -> None:
+        """Mute the specified output channels.
+
+        Raises DriverError on hardware failure.
+        """
+
+    @abstractmethod
+    async def unmute_outputs(self, output_indices: list[int]) -> None:
+        """Unmute the specified output channels.
+
+        Raises DriverError on hardware failure.
+        """
+
+    @abstractmethod
+    async def set_output_gain(self, output_index: int, gain_db: float) -> None:
+        """Set gain for a single output in dB.
+
+        Raises DriverError on hardware failure.
+        """
+
+    @abstractmethod
+    async def set_output_delay(self, output_index: int, delay_ms: float) -> None:
+        """Set delay for a single output in milliseconds.
+
+        Raises DriverError on hardware failure.
+        """
+
+    @abstractmethod
+    async def set_output_polarity(self, output_index: int, inverted: bool) -> None:
+        """Set polarity for a single output (inverted=True flips phase 180°).
+
+        Raises DriverError on hardware failure.
+        """
+
+    @abstractmethod
+    async def set_master_gain(self, gain_db: float) -> None:
+        """Set master output gain (global attenuation) in dB.
+
+        Raises DriverError on hardware failure.
+        """
+
+    @abstractmethod
+    async def get_output_state(self) -> dict[int, dict]:
+        """Return per-output state dict.
+
+        Returns {output_index: {gain_db, delay_ms, polarity_inverted, fir_taps}}.
+        Only reflects state set via this driver instance since startup — hardware
+        state from before server start is not readable from minidspd.
+        """
+
+    async def configure_active_input(self, active_input: int) -> None:
+        """Route active_input to all outputs and mute the other input.
+
+        Default: no-op. Override for DSPs with configurable input routing
+        (e.g. miniDSP 2x4 HD where one analog input may be defective).
+        """
+
+    async def set_source(self, source: str) -> None:
+        """Switch the active DSP input source (e.g. 'Analog', 'Usb', 'Toslink').
+
+        Default: raises NotImplementedError. Override for DSPs with source switching.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support set_source")

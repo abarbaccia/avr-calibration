@@ -147,49 +147,45 @@ class TestSignalPathShow:
             },
             "mic": {"name": "UMIK"},
         })
-        status = {"master": {"source": "Analog", "preset": 0, "volume": -30.0, "mute": False}}
+        mock_driver = AsyncMock()
+        mock_driver.get_state.return_value = {"source": "Analog", "preset": 0, "volume": -30.0, "mute": False}
         with (
             patch("calibrate.cli.CONFIG_PATH", cfg_path),
-            patch("calibrate.adapters.minidsp.MinidspClient") as MockClient,
+            patch("calibrate.cli.load_dsp_driver", return_value=mock_driver),
         ):
-            mock = AsyncMock()
-            mock.get_device_status.return_value = status
-            MockClient.return_value = mock
             result = CliRunner().invoke(cli, ["signal-path", "show"])
         assert result.exit_code == 0
         assert "Analog" in result.output
 
-    def test_show_minidsp_api_error_shows_warning(self, tmp_path):
-        """MinidspApiError → yellow warning, no crash (line 294-295)."""
-        from calibrate.adapters.minidsp import MinidspApiError
+    def test_show_driver_error_shows_warning(self, tmp_path):
+        """DriverError → yellow warning, no crash."""
+        from calibrate.drivers.base import DriverError
         cfg_path = _make_config_file(tmp_path)
+        mock_driver = AsyncMock()
+        mock_driver.get_state.side_effect = DriverError("daemon not running")
         with (
             patch("calibrate.cli.CONFIG_PATH", cfg_path),
-            patch("calibrate.adapters.minidsp.MinidspClient") as MockClient,
+            patch("calibrate.cli.load_dsp_driver", return_value=mock_driver),
         ):
-            mock = AsyncMock()
-            mock.get_device_status.side_effect = MinidspApiError(503, "/devices/0")
-            MockClient.return_value = mock
             result = CliRunner().invoke(cli, ["signal-path", "show"])
         assert result.exit_code == 0
         assert "Cannot read device state" in result.output
 
     def test_show_generic_exception_shows_warning(self, tmp_path):
-        """Generic exception → cannot reach miniDSP warning (lines 296-297)."""
+        """Generic exception → cannot reach DSP warning."""
         cfg_path = _make_config_file(tmp_path)
+        mock_driver = AsyncMock()
+        mock_driver.get_state.side_effect = OSError("refused")
         with (
             patch("calibrate.cli.CONFIG_PATH", cfg_path),
-            patch("calibrate.adapters.minidsp.MinidspClient") as MockClient,
+            patch("calibrate.cli.load_dsp_driver", return_value=mock_driver),
         ):
-            mock = AsyncMock()
-            mock.get_device_status.side_effect = OSError("refused")
-            MockClient.return_value = mock
             result = CliRunner().invoke(cli, ["signal-path", "show"])
         assert result.exit_code == 0
         assert "Cannot reach" in result.output
 
     def test_show_routing_displayed(self, tmp_path):
-        """Routing config is displayed (lines 277-280)."""
+        """Routing config is displayed."""
         cfg_path = _make_config_file(tmp_path, {
             "denon": {"host": None},
             "minidsp": {
@@ -203,41 +199,37 @@ class TestSignalPathShow:
             },
             "mic": {"name": "UMIK"},
         })
+        mock_driver = AsyncMock()
+        mock_driver.get_state.return_value = {"source": "Analog", "preset": 0, "volume": -30.0, "mute": False}
         with (
             patch("calibrate.cli.CONFIG_PATH", cfg_path),
-            patch("calibrate.adapters.minidsp.MinidspClient") as MockClient,
+            patch("calibrate.cli.load_dsp_driver", return_value=mock_driver),
         ):
-            mock = AsyncMock()
-            mock.get_device_status.return_value = {"master": {}}
-            MockClient.return_value = mock
             result = CliRunner().invoke(cli, ["signal-path", "show"])
         assert "Routing" in result.output
         assert "Input 0" in result.output
 
     def test_show_no_routing_configured(self, tmp_path):
-        """No routing in config → '— not configured —' shown (line 281)."""
+        """No routing in config → '— not configured —' shown."""
         cfg_path = _make_config_file(tmp_path)
+        mock_driver = AsyncMock()
+        mock_driver.get_state.return_value = {"source": "Analog", "preset": 0, "volume": -30.0, "mute": False}
         with (
             patch("calibrate.cli.CONFIG_PATH", cfg_path),
-            patch("calibrate.adapters.minidsp.MinidspClient") as MockClient,
+            patch("calibrate.cli.load_dsp_driver", return_value=mock_driver),
         ):
-            mock = AsyncMock()
-            mock.get_device_status.return_value = {"master": {}}
-            MockClient.return_value = mock
             result = CliRunner().invoke(cli, ["signal-path", "show"])
         assert "not configured" in result.output
 
     def test_show_muted_volume(self, tmp_path):
-        """Muted device shows '(MUTED)' in output (line 292-293)."""
+        """Muted device shows '(MUTED)' in output."""
         cfg_path = _make_config_file(tmp_path)
-        status = {"master": {"source": "USB", "preset": 1, "volume": -20.0, "mute": True}}
+        mock_driver = AsyncMock()
+        mock_driver.get_state.return_value = {"source": "USB", "preset": 1, "volume": -20.0, "mute": True}
         with (
             patch("calibrate.cli.CONFIG_PATH", cfg_path),
-            patch("calibrate.adapters.minidsp.MinidspClient") as MockClient,
+            patch("calibrate.cli.load_dsp_driver", return_value=mock_driver),
         ):
-            mock = AsyncMock()
-            mock.get_device_status.return_value = status
-            MockClient.return_value = mock
             result = CliRunner().invoke(cli, ["signal-path", "show"])
         assert "MUTED" in result.output
 
@@ -279,34 +271,32 @@ class TestSignalPathApply:
         assert "preset must be" in result.output
 
     def test_apply_preset_success(self, tmp_path):
-        """Valid --preset → switch_preset called, 'Done.' printed (lines 343-376)."""
+        """Valid --preset → set_preset called, 'Done.' printed."""
         cfg_path = _make_config_file(tmp_path)
+        mock_driver = AsyncMock()
         with (
             patch("calibrate.cli.CONFIG_PATH", cfg_path),
-            patch("calibrate.adapters.minidsp.MinidspClient") as MockClient,
+            patch("calibrate.cli.load_dsp_driver", return_value=mock_driver),
         ):
-            mock = AsyncMock()
-            MockClient.return_value = mock
             result = CliRunner().invoke(cli, ["signal-path", "apply", "--preset", "1"])
         assert result.exit_code == 0
         assert "Done" in result.output
-        mock.switch_preset.assert_called_once_with(1)
+        mock_driver.set_preset.assert_called_once_with(1)
 
     def test_apply_source_success(self, tmp_path):
-        """Valid --source → switch_source called."""
+        """Valid --source → set_source called."""
         cfg_path = _make_config_file(tmp_path)
+        mock_driver = AsyncMock()
         with (
             patch("calibrate.cli.CONFIG_PATH", cfg_path),
-            patch("calibrate.adapters.minidsp.MinidspClient") as MockClient,
+            patch("calibrate.cli.load_dsp_driver", return_value=mock_driver),
         ):
-            mock = AsyncMock()
-            MockClient.return_value = mock
             result = CliRunner().invoke(cli, ["signal-path", "apply", "--source", "Analog"])
         assert result.exit_code == 0
-        mock.switch_source.assert_called_once_with("Analog")
+        mock_driver.set_source.assert_called_once_with("Analog")
 
     def test_apply_with_routing_from_config(self, tmp_path):
-        """Config with routing → set_input_routing called for each entry (lines 350-356)."""
+        """Config with routing → set_routing called once with full routing dict."""
         cfg_path = _make_config_file(tmp_path, {
             "denon": {"host": None},
             "minidsp": {
@@ -320,41 +310,38 @@ class TestSignalPathApply:
             },
             "mic": {"name": "UMIK"},
         })
+        mock_driver = AsyncMock()
         with (
             patch("calibrate.cli.CONFIG_PATH", cfg_path),
-            patch("calibrate.adapters.minidsp.MinidspClient") as MockClient,
+            patch("calibrate.cli.load_dsp_driver", return_value=mock_driver),
         ):
-            mock = AsyncMock()
-            MockClient.return_value = mock
             result = CliRunner().invoke(cli, ["signal-path", "apply"])
         assert result.exit_code == 0
-        mock.set_input_routing.assert_called_once()
+        mock_driver.set_routing.assert_called_once()
 
-    def test_apply_minidsp_api_error_exits_1(self, tmp_path):
-        """MinidspApiError → red error message, exit 1 (lines 369-371)."""
-        from calibrate.adapters.minidsp import MinidspApiError
+    def test_apply_driver_error_exits_1(self, tmp_path):
+        """DriverError → red error message, exit 1."""
+        from calibrate.drivers.base import DriverError
         cfg_path = _make_config_file(tmp_path)
+        mock_driver = AsyncMock()
+        mock_driver.set_preset.side_effect = DriverError("write failed")
         with (
             patch("calibrate.cli.CONFIG_PATH", cfg_path),
-            patch("calibrate.adapters.minidsp.MinidspClient") as MockClient,
+            patch("calibrate.cli.load_dsp_driver", return_value=mock_driver),
         ):
-            mock = AsyncMock()
-            mock.switch_preset.side_effect = MinidspApiError(500, "/devices/0/config")
-            MockClient.return_value = mock
             result = CliRunner().invoke(cli, ["signal-path", "apply", "--preset", "2"])
         assert result.exit_code == 1
-        assert "miniDSP error" in result.output
+        assert "Error" in result.output
 
     def test_apply_generic_exception_exits_1(self, tmp_path):
-        """Generic exception → red error message, exit 1 (lines 372-374)."""
+        """Generic exception → red error message, exit 1."""
         cfg_path = _make_config_file(tmp_path)
+        mock_driver = AsyncMock()
+        mock_driver.set_source.side_effect = OSError("network unreachable")
         with (
             patch("calibrate.cli.CONFIG_PATH", cfg_path),
-            patch("calibrate.adapters.minidsp.MinidspClient") as MockClient,
+            patch("calibrate.cli.load_dsp_driver", return_value=mock_driver),
         ):
-            mock = AsyncMock()
-            mock.switch_source.side_effect = OSError("network unreachable")
-            MockClient.return_value = mock
             result = CliRunner().invoke(cli, ["signal-path", "apply", "--source", "USB"])
         assert result.exit_code == 1
         assert "Error" in result.output

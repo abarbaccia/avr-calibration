@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .adapters.minidsp import MinidspClient
+    from .drivers.dsp_driver import DSPDriver
     from .measurement import MeasurementEngine
 
 log = logging.getLogger(__name__)
@@ -171,7 +171,7 @@ async def measure_sub_ir(
 async def detect_and_correct_polarity(
     ir_results: list[SubIRResult],
     sub_outputs: list[int],
-    client: "MinidspClient",
+    driver: "DSPDriver",
 ) -> list[SubIRResult]:
     """Phase 3 — correct polarity of any sub whose IR peak sign differs from sub 0.
 
@@ -192,7 +192,7 @@ async def detect_and_correct_polarity(
         needs_inversion = (result.peak_sign != ref_sign)
         if needs_inversion:
             try:
-                await client.set_output_polarity(output_idx, inverted=True)
+                await driver.set_output_polarity(output_idx, inverted=True)
                 log.info(
                     "Polarity corrected for output %d (sub_index=%d)",
                     output_idx,
@@ -223,7 +223,7 @@ async def detect_and_correct_polarity(
 async def level_match_subs(
     ir_results: list[SubIRResult],
     sub_outputs: list[int],
-    client: "MinidspClient",
+    driver: "DSPDriver",
 ) -> list[float]:
     """Phase 4 — write gain trims so all subs have equal SPL at the mic.
 
@@ -243,7 +243,7 @@ async def level_match_subs(
         trims.append(trim)
         output_idx = sub_outputs[result.sub_index]
         try:
-            await client.set_output_gain(output_idx, trim)
+            await driver.set_output_gain(output_idx, trim)
         except Exception as exc:
             log.warning(
                 "level_match: set_output_gain(%d, %.2f) failed: %s",
@@ -259,9 +259,9 @@ async def apply_delays(
     delay_offsets_ms: list[float],
     ir_results: list[SubIRResult],
     sub_outputs: list[int],
-    client: "MinidspClient",
+    driver: "DSPDriver",
 ) -> None:
-    """Phase 2 — write delay offsets to miniDSP outputs."""
+    """Phase 2 — write delay offsets to DSP outputs."""
     from .adapters.minidsp import MAX_DELAY_MS
 
     for i, (delay_ms, result) in enumerate(zip(delay_offsets_ms, ir_results)):
@@ -277,7 +277,7 @@ async def apply_delays(
         if delay_ms <= 0.0:
             continue  # reference sub — no delay needed
         try:
-            await client.set_output_delay(output_idx, delay_ms)
+            await driver.set_output_delay(output_idx, delay_ms)
         except Exception as exc:
             log.warning(
                 "apply_delays: set_output_delay(%d, %.2f) failed: %s",
