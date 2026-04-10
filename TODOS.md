@@ -95,6 +95,7 @@ alert when room response shifts significantly (furniture moved, season change, e
 **Why:** Without this, 10 sessions of data still can't answer "is my calibration improving?" The column makes the history table a progress dashboard.
 **Effort:** M — requires computing the Harman error metric against stored FR data. Needs the Harman target data from TODO-CV1 first.
 **Priority:** P2 — depends on TODO-CV1.
+**Completed:** v0.6.4.0 (2026-04-10) — target curve stored per measurement session at capture time; dB RMS computed against the actual calibration reference (null for sessions taken outside of a calibration run).
 
 ### TODO-CV3: URL deep linking for sessions
 **What:** `?session=3` query param on page load restores the selected session. `history.pushState()` when a session is loaded.
