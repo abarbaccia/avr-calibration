@@ -606,7 +606,8 @@ function renderChart() {
 
   // Port tune marker
   if (portTuneHz && p.freqs[0] <= portTuneHz && portTuneHz <= p.freqs[p.freqs.length-1]) {
-    const allSpl = [...p.spl, ...targetLine].filter(v => v != null && isFinite(v));
+    const targetSpl = (storedTarget && storedTarget.points) ? storedTarget.points.map(pt => pt.spl) : [];
+    const allSpl = [...p.spl, ...targetSpl].filter(v => v != null && isFinite(v));
     datasets.push({
       label: 'Port tune (' + portTuneHz + ' Hz)',
       data: [{x: portTuneHz, y: Math.min(...allSpl)-3}, {x: portTuneHz, y: Math.max(...allSpl)+3}],
