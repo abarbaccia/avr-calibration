@@ -574,9 +574,14 @@ function renderChart() {
     });
   }
 
-  // Comparison curves (user-added overlays, same reference level as stored target)
-  const compRef = storedTarget ? storedTarget.reference_spl : null;
-  if (compRef != null) {
+  // Comparison curves — anchor to the measurement's SPL at 80 Hz so the shape
+  // lines up with what you're actually hearing, regardless of absolute level.
+  const compRef = (() => {
+    let bi = 0, bd = Infinity;
+    p.freqs.forEach((f, i) => { const d = Math.abs(f - 80); if (d < bd) { bd = d; bi = i; } });
+    return p.spl[bi];
+  })();
+  if (comparisonCurves.length > 0) {
     comparisonCurves.forEach(type => {
       datasets.push({
         label: COMPARISON_LABELS[type] || type,
@@ -658,15 +663,17 @@ function refreshChart() {
 
 function renderOverlayChips() {
   const el = document.getElementById('overlayChips');
-  if (!chartData.overlays || chartData.overlays.length === 0) {
-    el.innerHTML = '';
-    return;
-  }
-  el.innerHTML = chartData.overlays.map((ov, i) => {
+  const compChips = comparisonCurves.map(type => {
+    const color = COMPARISON_COLORS[type] || '#64748b';
+    return '<span class="overlay-chip" style="background:' + color + '22;color:' + color + ';border:1px solid ' + color + '">'
+      + (COMPARISON_LABELS[type] || type) + ' <span class="remove" data-type="' + type + '" onclick="removeComparison(this.dataset.type)">&times;</span></span>';
+  });
+  const overlayChips = (chartData.overlays || []).map((ov, i) => {
     const color = OVERLAY_COLORS[(i + 1) % OVERLAY_COLORS.length];
     return '<span class="overlay-chip" style="background:' + color + '22;color:' + color + ';border:1px solid ' + color + '">'
       + ov.label + ' <span class="remove" onclick="removeOverlay(' + ov.id + ')">&times;</span></span>';
-  }).join('');
+  });
+  el.innerHTML = [...compChips, ...overlayChips].join('');
 }
 
 function removeOverlay(id) {
