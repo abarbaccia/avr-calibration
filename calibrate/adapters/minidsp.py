@@ -241,6 +241,15 @@ class MinidspClient:
                 f"output={output} out of range; must be 0-{MAX_OUTPUT_INDEX}"
             )
 
+    async def set_master_gain(self, gain_db: float) -> None:
+        """Set the miniDSP master output gain (-127 to 0 dB) via CLI.
+
+        This is a global attenuation applied before all outputs — useful for
+        controlling sweep volume without touching per-output alignment gains.
+        """
+        clamped = max(-127.0, min(0.0, gain_db))
+        await _run_minidsp_cli("gain", "--", str(clamped))
+
     async def set_output_gain(self, output: int, gain_db: float) -> None:
         """Set output *output* gain to *gain_db* dB via CLI.
 

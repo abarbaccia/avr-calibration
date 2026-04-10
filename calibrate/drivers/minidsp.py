@@ -299,6 +299,15 @@ class MinidspDriver(DSPDriver):
         return dict(self._output_muted)
 
     @_driver_api
+    async def set_master_gain(self, gain_db: float) -> None:
+        """Set miniDSP master output gain (-127 to 0 dB).
+
+        Global attenuation applied to all outputs. Use to control sweep volume
+        without touching per-output alignment gains. Set back to 0 after sweeps.
+        """
+        await self._client.set_master_gain(gain_db)
+
+    @_driver_api
     async def set_output_gain(self, output_index: int, gain_db: float) -> None:
         """Set gain for a single output in dB. Range: -127 to +6 dB."""
         await self._client.set_output_gain(output_index, gain_db)

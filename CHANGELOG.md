@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.4.0] - 2026-04-10
+
+### Added
+- **Target curve stored with each measurement session:** Measurements now capture the active optimization target (Harman, flat, etc.) at the time of the sweep. The dashboard shows dB RMS deviation against the actual calibration reference — not a post-hoc best-fit. Sessions taken outside of a calibration run show no delta.
+- **FR filtering/decimation for history and summary MCP tools:** `get_measurement_history` and `get_fr_summary` now accept `freq_min`/`freq_max` band limits and a `max_points` cap, reducing data volume in LLM context for bass-focused calibration workflows.
+
+### Fixed
+- **Dashboard charts never displayed after clicking a session:** `renderChart()` referenced an undeclared `targetLine` variable inside the port tune marker path. Since port tune is always set (22 Hz), every chart render threw a silent `ReferenceError` swallowed by `loadSession()`.
+- **Comparison curves aligned 14 dB below the measurement:** The comparison reference used `storedTarget.reference_spl` (the DSP calibration reference, around −7 dBFS) instead of the measurement's own SPL at 80 Hz. Now anchored to the session's actual level.
+- **No remove button for overlaid comparison curves:** Added × chips for comparison lines (Harman, flat) alongside the existing overlay chips.
+- **dB RMS context lost when switching sessions:** The dashboard now sets/clears the target reference from each session's stored data rather than the global DSP state, so each historical session shows the target it was actually measured against.
+
 ## [0.6.3.0] - 2026-04-10
 
 ### Fixed

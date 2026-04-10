@@ -445,46 +445,51 @@ class TestListSessions:
         assert resp.json() == []
 
     def test_sessions_with_data(self, seeded_store: SessionStore, client: TestClient) -> None:
-        with (
-            patch("calibrate.web.SessionStore", return_value=seeded_store),
-            patch("calibrate.analysis.harman_rms", return_value=3.5),
-        ):
+        with patch("calibrate.web.SessionStore", return_value=seeded_store):
             resp = client.get("/api/sessions")
 
         assert resp.status_code == 200
         data = resp.json()
         assert len(data) == 2
 
-    def test_harman_delta_present(self, seeded_store: SessionStore, client: TestClient) -> None:
-        with (
-            patch("calibrate.web.SessionStore", return_value=seeded_store),
-            patch("calibrate.analysis.harman_rms", return_value=4.2),
-        ):
+    def test_harman_delta_none_without_target_curve(self, seeded_store: SessionStore, client: TestClient) -> None:
+        """Sessions without a stored target_curve have harman_delta_db = None."""
+        with patch("calibrate.web.SessionStore", return_value=seeded_store):
             resp = client.get("/api/sessions")
 
         data = resp.json()
         for session in data:
             assert "harman_delta_db" in session
-            assert session["harman_delta_db"] == 4.2
+            assert session["harman_delta_db"] is None
 
-    def test_harman_delta_none_on_error(self, seeded_store: SessionStore, client: TestClient) -> None:
-        """If harman_rms raises, harman_delta_db is None (graceful degradation)."""
+    def test_harman_delta_computed_from_stored_target(self, db_store: SessionStore, client: TestClient) -> None:
+        """Session with stored target_curve returns a computed delta, not None."""
+        tc = {"type": "harman", "reference_spl": 78.0, "band": [20.0, 200.0]}
+        db_store.save_measurement(_make_fr(), label="calibrated", target_curve=tc)
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.get("/api/sessions")
+
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["harman_delta_db"] is not None
+        assert isinstance(data[0]["harman_delta_db"], float)
+
+    def test_harman_delta_graceful_on_analysis_error(self, db_store: SessionStore, client: TestClient) -> None:
+        """If rms_deviation raises for a stored target, harman_delta_db is None."""
+        tc = {"type": "harman", "reference_spl": 78.0, "band": [20.0, 200.0]}
+        db_store.save_measurement(_make_fr(), label="test", target_curve=tc)
         with (
-            patch("calibrate.web.SessionStore", return_value=seeded_store),
-            patch("calibrate.analysis.harman_rms", side_effect=ValueError("bad data")),
+            patch("calibrate.web.SessionStore", return_value=db_store),
+            patch("calibrate.analysis.rms_deviation", side_effect=ValueError("bad data")),
         ):
             resp = client.get("/api/sessions")
 
         data = resp.json()
-        for session in data:
-            assert session["harman_delta_db"] is None
+        assert data[0]["harman_delta_db"] is None
 
     def test_session_fields(self, seeded_store: SessionStore, client: TestClient) -> None:
         """Verify all expected fields are present in session list entries."""
-        with (
-            patch("calibrate.web.SessionStore", return_value=seeded_store),
-            patch("calibrate.analysis.harman_rms", return_value=2.0),
-        ):
+        with patch("calibrate.web.SessionStore", return_value=seeded_store):
             resp = client.get("/api/sessions")
 
         entry = resp.json()[0]
@@ -531,6 +536,26 @@ class TestGetSession:
         assert data["start_fr"] is not None
         assert data["end_fr"] is not None
         assert data["end_fr"]["spl"][0] == 65.0
+
+    def test_session_detail_has_target_curve_field(self, db_store: SessionStore, client: TestClient) -> None:
+        """Session detail includes target_curve field (null when not stored)."""
+        db_store.save_measurement(_make_fr(), label="raw")
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.get("/api/sessions/1")
+
+        data = resp.json()
+        assert "target_curve" in data
+        assert data["target_curve"] is None
+
+    def test_session_detail_target_curve_returned_when_stored(self, db_store: SessionStore, client: TestClient) -> None:
+        """Session detail returns stored target_curve when present."""
+        tc = {"type": "harman", "reference_spl": 72.5, "band": [20.0, 200.0]}
+        sid = db_store.save_measurement(_make_fr(), label="calibrated", target_curve=tc)
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.get(f"/api/sessions/{sid}")
+
+        data = resp.json()
+        assert data["target_curve"] == tc
 
 
 # ── GET /api/runs ───────────────────────────────────────────────────────────

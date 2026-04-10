@@ -144,6 +144,7 @@ class Session:
     notes: Optional[str]
     impulse_response: Optional[list[float]] = None  # time-domain IR (first 24 000 samples)
     metadata: Optional[dict] = None  # IR-derived: ir peak, decay modes, group delay
+    target_curve: Optional[dict] = None  # optimization target active at measurement time
 
 
 class SessionStore:
@@ -190,6 +191,10 @@ class SessionStore:
                 conn.execute(
                     "ALTER TABLE sessions ADD COLUMN metadata TEXT DEFAULT NULL"
                 )
+            if "target_curve" not in existing:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN target_curve TEXT DEFAULT NULL"
+                )
 
             run_cols = {row[1] for row in conn.execute("PRAGMA table_info(calibration_runs)")}
             if "target_curve_data" not in run_cols:
@@ -204,15 +209,17 @@ class SessionStore:
         fr: FrequencyResponse,
         label: Optional[str] = None,
         metadata: Optional[dict] = None,
+        target_curve: Optional[dict] = None,
     ) -> int:
         """Persist a measurement as a new session. Returns the new session id."""
         ir_blob = _encode_ir(fr.impulse_response) if fr.impulse_response else None
         meta_json = json.dumps(metadata) if metadata else None
+        tc_json = json.dumps(target_curve) if target_curve else None
         with self._connect() as conn:
             cur = conn.execute(
-                "INSERT INTO sessions (timestamp, label, start_fr, impulse_response, metadata)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (fr.timestamp, label, fr.to_json(), ir_blob, meta_json),
+                "INSERT INTO sessions (timestamp, label, start_fr, impulse_response, metadata, target_curve)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (fr.timestamp, label, fr.to_json(), ir_blob, meta_json, tc_json),
             )
             return cur.lastrowid
 
@@ -627,6 +634,14 @@ class SessionStore:
         except (json.JSONDecodeError, TypeError, ValueError):
             logger.warning("session %d has corrupt metadata; ignoring", row["id"])
 
+        tc = None
+        try:
+            raw_tc = row["target_curve"] if "target_curve" in row.keys() else None
+            if raw_tc:
+                tc = json.loads(raw_tc)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning("session %d has corrupt target_curve; ignoring", row["id"])
+
         return Session(
             id=row["id"],
             timestamp=row["timestamp"],
@@ -637,4 +652,5 @@ class SessionStore:
             notes=row["notes"],
             impulse_response=ir,
             metadata=meta,
+            target_curve=tc,
         )

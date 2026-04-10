@@ -574,9 +574,14 @@ function renderChart() {
     });
   }
 
-  // Comparison curves (user-added overlays, same reference level as stored target)
-  const compRef = storedTarget ? storedTarget.reference_spl : null;
-  if (compRef != null) {
+  // Comparison curves — anchor to the measurement's SPL at 80 Hz so the shape
+  // lines up with what you're actually hearing, regardless of absolute level.
+  const compRef = (() => {
+    let bi = 0, bd = Infinity;
+    p.freqs.forEach((f, i) => { const d = Math.abs(f - 80); if (d < bd) { bd = d; bi = i; } });
+    return p.spl[bi];
+  })();
+  if (comparisonCurves.length > 0) {
     comparisonCurves.forEach(type => {
       datasets.push({
         label: COMPARISON_LABELS[type] || type,
@@ -606,7 +611,8 @@ function renderChart() {
 
   // Port tune marker
   if (portTuneHz && p.freqs[0] <= portTuneHz && portTuneHz <= p.freqs[p.freqs.length-1]) {
-    const allSpl = [...p.spl, ...targetLine].filter(v => v != null && isFinite(v));
+    const targetSpl = (storedTarget && storedTarget.points) ? storedTarget.points.map(pt => pt.spl) : [];
+    const allSpl = [...p.spl, ...targetSpl].filter(v => v != null && isFinite(v));
     datasets.push({
       label: 'Port tune (' + portTuneHz + ' Hz)',
       data: [{x: portTuneHz, y: Math.min(...allSpl)-3}, {x: portTuneHz, y: Math.max(...allSpl)+3}],
@@ -657,15 +663,17 @@ function refreshChart() {
 
 function renderOverlayChips() {
   const el = document.getElementById('overlayChips');
-  if (!chartData.overlays || chartData.overlays.length === 0) {
-    el.innerHTML = '';
-    return;
-  }
-  el.innerHTML = chartData.overlays.map((ov, i) => {
+  const compChips = comparisonCurves.map(type => {
+    const color = COMPARISON_COLORS[type] || '#64748b';
+    return '<span class="overlay-chip" style="background:' + color + '22;color:' + color + ';border:1px solid ' + color + '">'
+      + (COMPARISON_LABELS[type] || type) + ' <span class="remove" data-type="' + type + '" onclick="removeComparison(this.dataset.type)">&times;</span></span>';
+  });
+  const overlayChips = (chartData.overlays || []).map((ov, i) => {
     const color = OVERLAY_COLORS[(i + 1) % OVERLAY_COLORS.length];
     return '<span class="overlay-chip" style="background:' + color + '22;color:' + color + ';border:1px solid ' + color + '">'
       + ov.label + ' <span class="remove" onclick="removeOverlay(' + ov.id + ')">&times;</span></span>';
-  }).join('');
+  });
+  el.innerHTML = [...compChips, ...overlayChips].join('');
 }
 
 function removeOverlay(id) {
@@ -693,6 +701,8 @@ async function loadSession(id) {
     const r = await fetch('/api/sessions/' + id);
     if (!r.ok) return;
     const s = await r.json();
+    // Set (or clear) the stored target from the session itself
+    storedTarget = s.target_curve || null;
     const startFr = s.start_fr;
     if (startFr && startFr.frequencies) {
       chartData.primary = { freqs: startFr.frequencies, spl: startFr.spl, label: s.label || 'Session #' + s.id };
@@ -1494,7 +1504,7 @@ async def average_sessions(body: AverageRequest) -> dict:
 @app.get("/api/sessions")
 async def list_sessions() -> list[dict]:
     """Return all sessions for the history table, with Harman delta."""
-    from .analysis import harman_rms
+    from .analysis import HarmanTarget, rms_deviation
 
     store = SessionStore()
     sessions = store.list_sessions()
@@ -1502,10 +1512,15 @@ async def list_sessions() -> list[dict]:
     for s in sessions:
         harman_delta: float | None = None
         try:
-            if s.start_fr and s.start_fr.frequencies:
-                harman_delta = round(harman_rms(s.start_fr), 1)
+            if s.target_curve and s.start_fr and s.start_fr.frequencies:
+                ref = s.target_curve.get("reference_spl")
+                band_raw = s.target_curve.get("band", [20.0, 200.0])
+                band: tuple[float, float] = (float(band_raw[0]), float(band_raw[1]))
+                if ref is not None:
+                    target = HarmanTarget(reference_spl=float(ref), band=band)
+                    harman_delta = round(rms_deviation(s.start_fr, target, band), 1)
         except Exception:
-            pass  # analysis import or computation failure — leave as None
+            pass  # analysis failure — leave as None
         result.append({
             "id": s.id,
             "timestamp": s.timestamp,
@@ -1569,6 +1584,7 @@ async def get_session_detail(session_id: int) -> dict:
         "timestamp": session.timestamp,
         "start_fr": _fr_dict(session.start_fr),
         "end_fr": _fr_dict(session.end_fr),
+        "target_curve": session.target_curve,
     }
 
 

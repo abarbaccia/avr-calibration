@@ -128,12 +128,12 @@ Key MCP tools available on the `avr-calibration` server:
 - `fetch_recipe` — load a recipe by name
 - `get_config` / `set_config` — read/write config
 - `get_output_state` — per-output gain_db, delay_ms, polarity_inverted (in-memory tracking for this session)
-- `get_measurement_history` — raw FR data (983 pts, ~0.18Hz spacing): **use this for filter design and verification**
+- `get_measurement_history` — raw FR data: **use this for filter design and verification**. **ALWAYS** pass `min_hz=20, max_hz=120, format="compact"` for sub bass work. Compact encodes FR as `"freq:spl,freq:spl,..."` strings (~8KB for 2 sessions vs 115KB full JSON) and fits in context. Parse: split on `,` then `:` to get (freq_hz, spl_db) pairs.
 - `get_fr_summary` — 11-band 1/3-octave summary: use only for quick coarse convergence checks
 - `analyze_ir` — IR peak time, polarity sign, SPL from a stored session (key input for computing alignment corrections)
 - `analyze_decay` — T60 decay analysis on the IR from a measurement; returns ringing modes with priority and suggested_q
 
-**FR data resolution rule:** Always use `get_measurement_history` when designing or verifying filters. `get_fr_summary` returns only 11 1/3-octave bands (~2.8Hz–17Hz wide each) — too coarse to resolve narrow peaks (Q > 2) or verify filter notch depth. `get_measurement_history` gives ~0.18Hz spacing across the full range, which is what you need to place center frequencies accurately and confirm attenuation at the notch.
+**FR data resolution rule:** Always use `get_measurement_history(min_hz=20, max_hz=120, format="compact")` when designing or verifying sub bass filters. `get_fr_summary` returns only 11 1/3-octave bands — too coarse to resolve narrow peaks (Q > 2). The compact format gives 0.18Hz resolution in the 20–120Hz range, ~550 points per session, ~8KB for 2 sessions. If the response still exceeds token limits (shouldn't happen with compact), fall back to bash/python to process the saved file.
 
 ### Step 5 — Report progress
 
