@@ -444,7 +444,13 @@ async def _tool_trigger_measurement(
         full_label = " ".join(parts)
 
         store = SessionStore()
-        session_id = store.save_measurement(fr, label=full_label, metadata=metadata)
+        active_dsp = store.get_active_dsp()
+        raw_tc = active_dsp.get("target_curve")
+        # Strip the injected "timestamp" key so only curve data is stored
+        active_tc: dict | None = None
+        if raw_tc:
+            active_tc = {k: v for k, v in raw_tc.items() if k != "timestamp"}
+        session_id = store.save_measurement(fr, label=full_label, metadata=metadata, target_curve=active_tc)
         return _ok(
             session_id=session_id,
             label=full_label,

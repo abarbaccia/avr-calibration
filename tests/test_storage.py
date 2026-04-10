@@ -710,6 +710,56 @@ class TestSessionMetadata:
         assert s.get_session(sid).metadata == meta
 
 
+# ── Session target curve ─────────────────────────────────────────────────────
+
+class TestSessionTargetCurve:
+    """Tests for target_curve storage and retrieval on Session."""
+
+    def test_target_curve_stored_and_retrieved(self, store: SessionStore):
+        tc = {"type": "harman", "reference_spl": 78.0, "band": [20.0, 200.0]}
+        sid = store.save_measurement(make_fr(), label="cal-run", target_curve=tc)
+        session = store.get_session(sid)
+        assert session.target_curve == tc
+
+    def test_target_curve_none_by_default(self, store: SessionStore):
+        sid = store.save_measurement(make_fr())
+        session = store.get_session(sid)
+        assert session.target_curve is None
+
+    def test_target_curve_survives_list_sessions(self, store: SessionStore):
+        tc = {"type": "harman", "reference_spl": 75.0, "band": [20.0, 200.0]}
+        store.save_measurement(make_fr(), target_curve=tc)
+        sessions = store.list_sessions()
+        assert sessions[0].target_curve == tc
+
+    def test_corrupt_target_curve_returns_none(self, tmp_path: Path):
+        """Corrupt target_curve JSON → None (graceful degradation)."""
+        import sqlite3
+        db_path = tmp_path / "tc_corrupt.db"
+        s = SessionStore(db_path=db_path)
+        s.save_measurement(make_fr())
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE sessions SET target_curve = '{bad:json}' WHERE id = 1")
+        conn.commit()
+        conn.close()
+        session = s.get_session(1)
+        assert session is not None
+        assert session.target_curve is None
+
+    def test_target_curve_with_points(self, store: SessionStore):
+        """Full target_curve dict including points list round-trips."""
+        tc = {
+            "type": "harman",
+            "reference_spl": 72.5,
+            "band": [20.0, 200.0],
+            "points": [{"freq": 20.0, "spl": 78.5}, {"freq": 80.0, "spl": 72.5}],
+        }
+        sid = store.save_measurement(make_fr(), target_curve=tc)
+        session = store.get_session(sid)
+        assert session.target_curve["points"][0]["freq"] == 20.0
+        assert session.target_curve["reference_spl"] == 72.5
+
+
 # ── Saved states ─────────────────────────────────────────────────────────────
 
 class TestSavedStates:

@@ -701,6 +701,8 @@ async function loadSession(id) {
     const r = await fetch('/api/sessions/' + id);
     if (!r.ok) return;
     const s = await r.json();
+    // Set (or clear) the stored target from the session itself
+    storedTarget = s.target_curve || null;
     const startFr = s.start_fr;
     if (startFr && startFr.frequencies) {
       chartData.primary = { freqs: startFr.frequencies, spl: startFr.spl, label: s.label || 'Session #' + s.id };
@@ -1502,7 +1504,7 @@ async def average_sessions(body: AverageRequest) -> dict:
 @app.get("/api/sessions")
 async def list_sessions() -> list[dict]:
     """Return all sessions for the history table, with Harman delta."""
-    from .analysis import harman_rms
+    from .analysis import HarmanTarget, rms_deviation
 
     store = SessionStore()
     sessions = store.list_sessions()
@@ -1510,10 +1512,15 @@ async def list_sessions() -> list[dict]:
     for s in sessions:
         harman_delta: float | None = None
         try:
-            if s.start_fr and s.start_fr.frequencies:
-                harman_delta = round(harman_rms(s.start_fr), 1)
+            if s.target_curve and s.start_fr and s.start_fr.frequencies:
+                ref = s.target_curve.get("reference_spl")
+                band_raw = s.target_curve.get("band", [20.0, 200.0])
+                band: tuple[float, float] = (float(band_raw[0]), float(band_raw[1]))
+                if ref is not None:
+                    target = HarmanTarget(reference_spl=float(ref), band=band)
+                    harman_delta = round(rms_deviation(s.start_fr, target, band), 1)
         except Exception:
-            pass  # analysis import or computation failure — leave as None
+            pass  # analysis failure — leave as None
         result.append({
             "id": s.id,
             "timestamp": s.timestamp,
@@ -1577,6 +1584,7 @@ async def get_session_detail(session_id: int) -> dict:
         "timestamp": session.timestamp,
         "start_fr": _fr_dict(session.start_fr),
         "end_fr": _fr_dict(session.end_fr),
+        "target_curve": session.target_curve,
     }
 
 

@@ -577,6 +577,71 @@ async def test_trigger_measurement_with_denon_context() -> None:
     mock_ctx_instance.__aexit__.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_trigger_measurement_passes_active_target_curve() -> None:
+    """Active target_curve in DSP state is stored with the measurement (timestamp stripped)."""
+    mock_sd = MagicMock()
+    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
+
+    mock_fr = MagicMock()
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(return_value=mock_fr)
+
+    active_tc = {"type": "harman", "reference_spl": 72.5, "band": [20, 200]}
+    mock_store = MagicMock()
+    mock_store.save_measurement.return_value = 5
+    mock_store.get_active_dsp.return_value = {
+        "target_curve": {**active_tc, "timestamp": "2026-04-10T10:00:00Z"}
+    }
+
+    with (
+        patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
+        patch("calibrate.storage.SessionStore", return_value=mock_store),
+        patch.object(sut, "DenonSweepContext") as MockCtx,
+        patch("calibrate.drivers.minidsp.MinidspSweepContext") as MockMinidspCtx,
+    ):
+        MockCtx.from_config.return_value = None
+        MockMinidspCtx.from_config.return_value = None
+        result = await _tool_trigger_measurement()
+
+    assert result["ok"]
+    call_kwargs = mock_store.save_measurement.call_args[1]
+    assert call_kwargs["target_curve"] == active_tc
+
+
+@pytest.mark.asyncio
+async def test_trigger_measurement_no_target_when_none_active() -> None:
+    """When no active target_curve in DSP state, save_measurement called with target_curve=None."""
+    mock_sd = MagicMock()
+    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
+
+    mock_fr = MagicMock()
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(return_value=mock_fr)
+
+    mock_store = MagicMock()
+    mock_store.save_measurement.return_value = 6
+    mock_store.get_active_dsp.return_value = {}  # no target_curve key
+
+    with (
+        patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
+        patch("calibrate.storage.SessionStore", return_value=mock_store),
+        patch.object(sut, "DenonSweepContext") as MockCtx,
+        patch("calibrate.drivers.minidsp.MinidspSweepContext") as MockMinidspCtx,
+    ):
+        MockCtx.from_config.return_value = None
+        MockMinidspCtx.from_config.return_value = None
+        result = await _tool_trigger_measurement()
+
+    assert result["ok"]
+    call_kwargs = mock_store.save_measurement.call_args[1]
+    assert call_kwargs["target_curve"] is None
+
+
 # ── calibrate_level ────────────────────────────────────────────────────────────
 
 
