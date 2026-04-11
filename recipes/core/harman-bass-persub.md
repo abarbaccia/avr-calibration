@@ -41,6 +41,17 @@ Mute any non-sub outputs (e.g. shakers) during calibration.
 
 ## Phase 0 — Level Setup
 
+### 0.0 Clear all sub output EQ
+
+Before any measurements, reset every sub output to a known zero state:
+call `apply_eq` with **only the mandatory 18Hz HPF** on each sub output.
+This ensures Phase 0 level comparisons, Phase 1 alignment, and Phase 2
+room correction measurements are all taken from a clean baseline — not
+through invisible prior EQ from a previous session.
+
+`read_eq` only tracks in-memory state since server start. Always clear
+explicitly rather than relying on it to tell you what's on the hardware.
+
 ### 0.1 Configure input routing
 
 Call `configure_matrix` with the `active_input` from config. This routes the active
@@ -151,7 +162,15 @@ the ringing frequency more surgically without over-cutting broadband energy.
 After applying per-sub EQ:
 1. Measure each sub solo again
 2. Check if its response is flatter (lower variance across 25-80Hz)
-3. If variance > 3 dB: adjust and re-measure
+3. If variance > 3 dB, design additional corrections:
+   - Call `read_eq(output_index)` to get the **currently applied** filter set
+   - Compute the residual deviation from the new measurement
+   - Design only the additional filters needed to correct the residual
+   - Merge the new filters into the existing set (add to existing gains at the
+     same frequency, or add new bands for new frequencies)
+   - Call `apply_eq` with the **full merged set** — existing corrections plus
+     the new ones. Never call `apply_eq` with only the delta: `apply_eq`
+     replaces all slots and a delta-only write discards all prior corrections.
 4. Maximum 3 iterations per sub
 
 ## Phase 3 — Harman Target (Input PEQ)
@@ -212,11 +231,17 @@ Always include the mandatory 18Hz HPF.
 
 ### 3.4 Re-measure and iterate
 
-After applying input EQ, re-measure combined response (label "iter-N @ MLP"):
+After applying EQ, re-measure combined response (label "iter-N @ MLP"):
 - RMS deviation < 2.0 dB from the anchored target: done
-- Otherwise: adjust input PEQ and re-measure
 - Do NOT re-anchor the target between iterations (it was set in 3.2)
 - Maximum 5 EQ iterations
+
+On each subsequent iteration:
+- Call `read_eq` (or `read_input_eq` if using input PEQ) to get the **currently applied** filter set
+- Compute the residual deviation from the anchored target
+- Design only the additional filters needed to correct the residual
+- Merge with existing filters (add gains at the same frequency, add new bands for new frequencies)
+- Call `apply_eq` / `apply_input_eq` with the **full merged set** — never with just the delta
 
 ## Convergence
 

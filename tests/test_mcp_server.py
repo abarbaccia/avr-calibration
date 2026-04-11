@@ -786,6 +786,108 @@ async def test_calibrate_level_ramps_on_sweep_not_detected() -> None:
     assert result["calibrated_volume_db"] == -7.0
 
 
+def _make_usb_cfg():
+    """Return a mock config that reports USB playback route."""
+    mock_cfg = MagicMock()
+    mock_cfg.measurement.get.side_effect = lambda key, default=None: (
+        "usb" if key == "playback_route" else default
+    )
+    return mock_cfg
+
+
+@pytest.mark.asyncio
+async def test_calibrate_level_usb_good_level() -> None:
+    """USB mode: sets master gain to start_db, peak_spl in range → success."""
+    mock_dsp = AsyncMock()
+    mock_fr = MagicMock()
+    mock_fr.peak_spl = -12.0  # within [-30, -6] window
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(return_value=mock_fr)
+
+    with (
+        patch.object(sut, "_dsp", mock_dsp),
+        patch.object(sut, "_config", return_value=_make_usb_cfg()),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.drivers.minidsp.MinidspSweepContext.from_config", return_value=None),
+        patch("calibrate.config.update_config") as mock_update,
+        patch("asyncio.sleep"),
+    ):
+        result = await _tool_calibrate_level(start_db=-10.0)
+
+    assert result["ok"]
+    assert result["calibrated_master_gain_db"] == -10.0
+    mock_dsp.set_master_gain.assert_called_once_with(-10.0)
+    mock_update.assert_called_once_with({"measurement": {"master_gain_db": -10.0}})
+
+
+@pytest.mark.asyncio
+async def test_calibrate_level_usb_steps_down_on_hot_signal() -> None:
+    """USB mode: peak_spl too hot → steps master gain down until in range."""
+    mock_dsp = AsyncMock()
+
+    hot_fr = MagicMock()
+    hot_fr.peak_spl = 1.5  # above 0 dBFS ceiling (clipping)
+
+    good_fr = MagicMock()
+    good_fr.peak_spl = -4.0  # within range
+
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(side_effect=[hot_fr, good_fr])
+
+    with (
+        patch.object(sut, "_dsp", mock_dsp),
+        patch.object(sut, "_config", return_value=_make_usb_cfg()),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.drivers.minidsp.MinidspSweepContext.from_config", return_value=None),
+        patch("calibrate.config.update_config") as mock_update,
+        patch("asyncio.sleep"),
+    ):
+        result = await _tool_calibrate_level(start_db=-10.0, step_db=3.0, max_spl_dbfs=0.0)
+
+    assert result["ok"]
+    assert result["calibrated_master_gain_db"] == -13.0  # -10 - 3
+    assert mock_dsp.set_master_gain.call_count == 2
+    mock_update.assert_called_once_with({"measurement": {"master_gain_db": -13.0}})
+
+
+@pytest.mark.asyncio
+async def test_calibrate_level_usb_snr_fail() -> None:
+    """USB mode: SNR too low → error directing user to physical knob."""
+    from calibrate.measurement import MeasurementQualityError
+
+    mock_dsp = AsyncMock()
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(
+        side_effect=MeasurementQualityError("snr", "SNR 8 dB < 20 dB", "increase level"),
+    )
+
+    with (
+        patch.object(sut, "_dsp", mock_dsp),
+        patch.object(sut, "_config", return_value=_make_usb_cfg()),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.drivers.minidsp.MinidspSweepContext.from_config", return_value=None),
+        patch("calibrate.config.update_config"),
+        patch("asyncio.sleep"),
+    ):
+        result = await _tool_calibrate_level(start_db=-10.0)
+
+    assert not result["ok"]
+    assert "physical gain knob" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_calibrate_level_usb_no_dsp() -> None:
+    """USB mode with no DSP driver loaded → error."""
+    with (
+        patch.object(sut, "_dsp", None),
+        patch.object(sut, "_config", return_value=_make_usb_cfg()),
+    ):
+        result = await _tool_calibrate_level()
+
+    assert not result["ok"]
+    assert "DSP driver not loaded" in result["error"]
+
+
 # ── fetch_recipe ───────────────────────────────────────────────────────────────
 
 @pytest.fixture

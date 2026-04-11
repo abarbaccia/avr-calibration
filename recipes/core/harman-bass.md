@@ -24,6 +24,15 @@ at Harman shows this preference across a wide range of listeners.
 
 ## Strategy
 
+### Step 0 — Clear existing EQ
+
+Before taking the baseline measurement, reset the sub output to a known zero state:
+call `apply_eq` with **only the mandatory 18Hz HPF** (no other filters).
+
+`read_eq` only tracks in-memory state since server start and returns [] after a
+restart even if old filters remain on the hardware. Always clear explicitly so the
+baseline measurement reflects the true room response, not the room plus prior EQ.
+
 ### Step 1 — Baseline measurement
 
 Call `get_measurement_history(limit=1)` to retrieve the most recent measurement.
@@ -101,10 +110,19 @@ If `apply_eq` returns `{ok: false, error: "SafetyValidator: ..."}`:
 ### Step 6 — Re-measure and iterate
 
 After applying filters, ask the user to take a new measurement in the browser.
-Retrieve it with `get_measurement_history(limit=1)` and compare to the target.
+Retrieve it with `get_measurement_history(limit=1)` and compare to the anchored target.
 
-Repeat from Step 3 until convergence or the maximum iteration count is reached.
 Do NOT re-anchor the target between iterations (it was set in Step 2).
+
+On each subsequent iteration:
+- Call `read_eq` to get the **currently applied** filter set
+- Compute the residual deviation from the anchored target based on the new measurement
+- Merge the additional correction into the existing filters (adjust gains at the
+  same frequency, add new bands for new frequencies)
+- Call `apply_eq` with the **full merged set** — never with just the delta.
+  `apply_eq` replaces all PEQ slots: a delta-only write discards all prior corrections.
+
+Repeat until convergence or the maximum iteration count is reached.
 
 ## Convergence
 

@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.5.0] - 2026-04-11
+
+### Added
+- **`calibrate_level` controls master gain in USB mode:** Previously the USB path only checked SNR and returned — it never touched the miniDSP master gain, so calibration could start at 0 dB (factory default) and measure at full blast. Now sets master gain to `start_db` (default −10 dB) before measuring, then steps it down if `peak_spl` exceeds `max_spl_dbfs` (default 0 dBFS). Saves the calibrated master gain to config on success. HDMI mode behavior unchanged.
+
+### Fixed
+- **Recipes measured through invisible prior EQ:** All three calibration recipes now start with an explicit EQ-clear step (HPF-only on each sub output) before any measurements begin. `read_eq` only tracks in-memory state since server start — after a restart it returns `[]` while old filters remain on the hardware. Clearing explicitly guarantees the baseline measurement reflects the true room response.
+- **Recipe EQ iterations discarded prior corrections:** The "re-measure and iterate" sections in all three recipes were ambiguous — an AI following them would compute a delta correction and call `apply_eq` with just the delta, silently overwriting previous iterations. All iteration sections now explicitly say: call `read_eq` to get the current filter set, merge the new correction in, and call `apply_eq` with the full merged set.
+
 ## [0.6.4.0] - 2026-04-10
 
 ### Added
