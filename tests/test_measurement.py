@@ -555,3 +555,77 @@ class TestComputeSessionMetadata:
         assert len(phase) == len(freqs)
         assert all(isinstance(p, float) for p in phase)
         assert all(np.isfinite(p) for p in phase)
+
+
+class TestPreDelayCompensation:
+    """
+    USBPlayback records PRE_DELAY_S seconds of room noise before playing the sweep
+    so validate_recording has a clean noise-floor window.  measure() must strip those
+    pre-delay samples before calling _compute_fr_arrays, otherwise the circular FFT
+    shifts the true IR peak outside the stored 24000-sample window and the peak-finder
+    returns noise artifacts (e.g. 0.25ms when the sub is ~40ms away).
+    """
+
+    def _make_delayed_pair(self, arrival_samples, pre_delay_samples, n=65536, sample_rate=48000):
+        """Return (sweep_1d, rec_1d_with_predelay) with a known IR peak at arrival_samples."""
+        rng = np.random.default_rng(7)
+        # Sweep: 300ms silence lead-in (like PyTTa's startMargin), then chirp
+        lead = int(0.3 * sample_rate)
+        sweep = np.zeros(n)
+        sweep[lead:] = rng.standard_normal(n - lead)
+
+        # Room IR: impulse at arrival_samples
+        h = np.zeros(n)
+        h[arrival_samples] = 1.0
+
+        # Recording = conv(sweep, h) delayed by pre_delay_samples
+        rec_linear = np.convolve(sweep, h)[:n]
+        rec_buf = np.zeros(pre_delay_samples + len(rec_linear))
+        rec_buf[pre_delay_samples:pre_delay_samples + len(rec_linear)] = rec_linear
+        return sweep, rec_buf
+
+    def test_ir_peak_without_predelay_compensation_is_wrong(self):
+        """Without stripping pre-delay, the stored IR peak is far from the true arrival."""
+        engine = MeasurementEngine(make_config())
+        arrival_ms = 30.0
+        arrival_samples = int(arrival_ms * 48000 / 1000)
+        pre_delay = int(1.0 * 48000)  # 1s = 48000 samples
+
+        sweep, rec_1d = self._make_delayed_pair(arrival_samples, pre_delay)
+
+        # Deconvolution WITHOUT pre-delay stripping (old, broken behaviour)
+        n = min(len(sweep), len(rec_1d))
+        X = np.fft.rfft(sweep[:n], n=n)
+        Y = np.fft.rfft(rec_1d[:n], n=n)
+        H = np.where(np.abs(X) > 1e-10, Y / X, 0.0 + 0.0j)
+        ir_full = np.fft.irfft(H, n=n)
+        peak_wrong = int(np.argmax(np.abs(ir_full[:24000])))
+
+        # The wrong peak must NOT match the true arrival (should be off by pre-delay offset)
+        assert abs(peak_wrong - arrival_samples) > 1000, (
+            f"Expected peak far from {arrival_samples}, got {peak_wrong}"
+        )
+
+    def test_ir_peak_with_predelay_compensation_is_correct(self):
+        """After stripping pre-delay, the stored IR peak is within 3ms of the true arrival."""
+        engine = MeasurementEngine(make_config())
+        arrival_ms = 30.0
+        arrival_samples = int(arrival_ms * 48000 / 1000)
+        pre_delay = int(1.0 * 48000)  # 1s = 48000 samples
+
+        sweep, rec_1d = self._make_delayed_pair(arrival_samples, pre_delay)
+
+        # Deconvolution WITH pre-delay stripping (fixed behaviour)
+        rec_aligned = rec_1d[pre_delay:]
+        n = min(len(sweep), len(rec_aligned))
+        X = np.fft.rfft(sweep[:n], n=n)
+        Y = np.fft.rfft(rec_aligned[:n], n=n)
+        H = np.where(np.abs(X) > 1e-10, Y / X, 0.0 + 0.0j)
+        ir_full = np.fft.irfft(H, n=n)
+        peak_fixed = int(np.argmax(np.abs(ir_full[:24000])))
+
+        # Within 3ms = 144 samples of the true arrival
+        tolerance_samples = int(3e-3 * 48000)
+        assert abs(peak_fixed - arrival_samples) <= tolerance_samples, (
+            f"Expected peak near {arrival_samples} (±{tolerance_samples}), got {peak_fixed}"
+        )

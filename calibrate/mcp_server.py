@@ -506,6 +506,16 @@ async def _tool_calibrate_level(
         if _dsp is None:
             return _err("DSP driver not loaded")
 
+        # Count active sub outputs so we can suggest a higher gain for solo sweeps.
+        # When all-but-one sub is muted, SPL drops by ~20*log10(N) dB relative to
+        # combined, meaning solo measurements can run at a proportionally higher gain.
+        import math as _math
+        sub_count = sum(
+            1 for slot in cfg.minidsp.output_slots
+            if getattr(slot, "type", "unused") == "sub"
+        )
+        _sub_count = max(1, sub_count)
+
         minidsp_ctx = MinidspSweepContext.from_config(cfg)
         current_gain = start_db
         # Safety floor: don't step below -40 dB (inaudible, pointless)
@@ -539,13 +549,21 @@ async def _tool_calibrate_level(
 
                 # In range (or below min_spl_dbfs — SNR passed so accept it)
                 update_config({"measurement": {"master_gain_db": current_gain}})
+                # For solo sweeps (one sub muted), SPL drops ~20*log10(N) dB so we can
+                # use a proportionally higher gain without clipping the recording.
+                _solo_offset = round(20.0 * _math.log10(_sub_count), 1) if _sub_count > 1 else 0.0
+                _solo_gain = round(min(0.0, current_gain + _solo_offset), 1)
                 return _ok(
                     calibrated_volume_db=None,
                     calibrated_master_gain_db=current_gain,
+                    suggested_solo_gain_db=_solo_gain,
                     message=(
-                        f"USB mode: master gain set to {current_gain:.1f} dB, "
-                        f"peak_spl={fr.peak_spl:.1f} dBFS. "
-                        "SNR good — proceed with calibration."
+                        f"USB mode: master gain set to {current_gain:.1f} dB "
+                        f"(peak_spl={fr.peak_spl:.1f} dBFS). "
+                        f"For solo single-sub sweeps use suggested_solo_gain_db "
+                        f"({_solo_gain:.1f} dB) — muting one of {_sub_count} subs "
+                        f"reduces SPL by ~{_solo_offset:.0f} dB, allowing higher gain "
+                        "without clipping."
                     ),
                 )
 

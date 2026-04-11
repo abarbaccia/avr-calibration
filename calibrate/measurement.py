@@ -356,10 +356,23 @@ class MeasurementEngine:
                 )
 
         min_snr = float(cfg.get("min_snr_db", 20.0))
+        # validate_recording uses the FULL recording (including pre-delay silence) for
+        # its noise-floor check — the first 500ms must be silence.
         self.validate_recording(np, sweep_1d, rec_1d, sample_rate, min_snr_db=min_snr)
 
+        # USBPlayback records PRE_DELAY_S (1s) of room noise BEFORE playing the sweep so
+        # validate_recording has silence for its noise-floor window.  But passing this
+        # pre-delayed recording directly to _compute_fr_arrays shifts the apparent IR
+        # peak by pre_delay_samples in the circular FFT — moving it outside the stored
+        # 24000-sample window and causing the peak-finder to return noise artifacts
+        # (e.g. 0.25ms instead of the true ~40ms arrival time).
+        # Strip the pre-delay so rec starts exactly when the sweep started playing.
+        # HDMIPlayback has no PRE_DELAY_S, so this is a no-op for HDMI.
+        pre_delay_samples = int(getattr(strategy, "PRE_DELAY_S", 0.0) * sample_rate)
+        rec_for_deconv = rec_1d[pre_delay_samples:] if pre_delay_samples > 0 else rec_1d
+
         frequencies, spl, ir_samples, phase = self._compute_fr_arrays(
-            np, sweep_1d, rec_1d, freq_min, freq_max, sample_rate
+            np, sweep_1d, rec_for_deconv, freq_min, freq_max, sample_rate
         )
 
         return FrequencyResponse(
