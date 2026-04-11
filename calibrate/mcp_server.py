@@ -841,10 +841,16 @@ async def _tool_analyze_ir(
         search_samples = min(search_samples, len(ir_arr))
         search_window = ir_arr[:search_samples]
 
-        peak_idx = int(np.argmax(np.abs(search_window)))
+        abs_window = np.abs(search_window)
+        max_idx = int(np.argmax(abs_window))
+        # Onset detection: first sample within 20 dB of the absolute peak.
+        # argmax finds the LOUDEST peak — in strong-mode rooms this can be a
+        # late resonance instead of the direct sound.  Onset finds first arrival.
+        onset_threshold = abs_window[max_idx] * 0.1  # -20 dB
+        peak_idx = int(np.argmax(abs_window > onset_threshold))
         peak_sign = 1 if ir_arr[peak_idx] >= 0.0 else -1
         peak_time_s = peak_idx / sample_rate
-        spl_db = float(20.0 * np.log10(abs(float(ir_arr[peak_idx])) + 1e-12))
+        spl_db = float(20.0 * np.log10(abs_window[max_idx] + 1e-12))
 
         return _ok(
             session_id=session.id,

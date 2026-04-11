@@ -37,7 +37,7 @@ from click.testing import CliRunner
 
 from calibrate.cli import cli
 from calibrate.config import Config
-from calibrate.measurement import FrequencyResponse, MeasurementEngine, MeasurementQualityError
+from calibrate.measurement import FrequencyResponse, MeasurementEngine, MeasurementQualityError, compute_session_metadata
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -628,4 +628,69 @@ class TestPreDelayCompensation:
         tolerance_samples = int(3e-3 * 48000)
         assert abs(peak_fixed - arrival_samples) <= tolerance_samples, (
             f"Expected peak near {arrival_samples} (±{tolerance_samples}), got {peak_fixed}"
+        )
+
+
+class TestOnsetDetection:
+    """
+    compute_session_metadata uses onset detection to find the first IR arrival
+    rather than the loudest peak.  In rooms with strong bass modes, a late
+    resonance can be louder than the direct sound, causing argmax(abs(ir)) to
+    report a bogus arrival time (e.g. 48ms instead of ~8ms).  Onset detection
+    finds the first sample within 20 dB of the peak — the direct sound.
+    """
+
+    def test_onset_finds_direct_sound_not_room_mode(self):
+        """IR with direct sound at 8ms (0.5 amplitude) and room mode at 40ms
+        (1.0 amplitude).  argmax would return 40ms; onset detection returns ~8ms."""
+        sr = 48000
+        direct_idx = int(0.008 * sr)    # 8ms = 384 samples
+        mode_idx = int(0.040 * sr)      # 40ms = 1920 samples
+
+        ir = np.zeros(24000)
+        ir[direct_idx] = 0.5            # direct sound (weaker)
+        ir[mode_idx] = 1.0              # room mode (louder)
+
+        fr = FrequencyResponse(
+            frequencies=[20.0, 100.0],
+            spl=[0.0, 0.0],
+            sample_rate=sr,
+            sweep_duration=1.0,
+            timestamp="2026-01-01T00:00:00Z",
+            impulse_response=ir.tolist(),
+        )
+
+        meta = compute_session_metadata(fr, search_window_ms=50.0)
+
+        # Onset should find the direct sound at ~8ms, not the mode at 40ms
+        peak_ms = meta["ir"]["peak_time_ms"]
+        assert abs(peak_ms - 8.0) < 1.0, (
+            f"Expected onset near 8ms (direct sound), got {peak_ms}ms"
+        )
+        # SPL should still reflect the loudest peak (room mode)
+        assert meta["ir"]["peak_sign"] == 1
+
+    def test_onset_matches_argmax_when_direct_is_loudest(self):
+        """When the direct sound IS the loudest peak, onset detection and
+        argmax should agree."""
+        sr = 48000
+        direct_idx = int(0.010 * sr)    # 10ms
+
+        ir = np.zeros(24000)
+        ir[direct_idx] = 1.0            # direct sound is the peak
+
+        fr = FrequencyResponse(
+            frequencies=[20.0, 100.0],
+            spl=[0.0, 0.0],
+            sample_rate=sr,
+            sweep_duration=1.0,
+            timestamp="2026-01-01T00:00:00Z",
+            impulse_response=ir.tolist(),
+        )
+
+        meta = compute_session_metadata(fr, search_window_ms=50.0)
+
+        peak_ms = meta["ir"]["peak_time_ms"]
+        assert abs(peak_ms - 10.0) < 1.0, (
+            f"Expected onset near 10ms, got {peak_ms}ms"
         )

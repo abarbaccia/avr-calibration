@@ -99,10 +99,15 @@ def extract_ir(
     H = Y / (X + 1e-12)
     ir = np.fft.irfft(H, n=n)
 
-    # Adaptive peak detection within the search window
+    # Onset detection within the search window: find the first sample within
+    # 20 dB of the absolute peak rather than the loudest peak itself.  In rooms
+    # with strong bass modes, a late resonance can exceed the direct sound.
     search_samples = max(1, int(ir_search_window_ms / 1000.0 * sample_rate))
     search_window = ir[:search_samples]
-    peak_idx = int(np.argmax(np.abs(search_window)))
+    abs_window = np.abs(search_window)
+    max_idx = int(np.argmax(abs_window))
+    onset_threshold = abs_window[max_idx] * 0.1  # -20 dB
+    peak_idx = int(np.argmax(abs_window > onset_threshold))
     peak_sign = 1 if ir[peak_idx] >= 0 else -1
 
     return ir, peak_idx, peak_sign
