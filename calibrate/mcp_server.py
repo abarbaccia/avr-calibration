@@ -476,6 +476,8 @@ async def _tool_calibrate_level(
     max_volume_db: float = 0.0,
     target_snr_db: float = 20.0,
     step_db: float = 3.0,
+    min_spl_dbfs: float = -30.0,
+    max_spl_dbfs: float = 0.0,
 ) -> dict:
     """Auto-calibrate sweep level.
 
@@ -483,9 +485,11 @@ async def _tool_calibrate_level(
     until measurement SNR >= target_snr_db.
 
     For USB mode: AVR volume does not affect the sweep (signal goes Pi→USB→miniDSP,
-    bypassing the Denon entirely). A single measurement is taken with the miniDSP
-    source switched to USB via MinidspSweepContext. If SNR is insufficient, the
-    user should turn up the sub's physical gain knob.
+    bypassing the Denon entirely). Sets miniDSP master gain to start_db, then steps
+    it down by step_db while peak_spl > max_spl_dbfs. Accepts the level once
+    peak_spl <= max_spl_dbfs and SNR is good. If SNR fails, the user must turn up
+    the sub's physical gain knob (master gain can only make things louder, not fix SNR).
+    Saves calibrated master gain to config on success.
     """
     from .measurement import MeasurementEngine, MeasurementQualityError
     from .config import update_config
@@ -496,32 +500,65 @@ async def _tool_calibrate_level(
     route = cfg.measurement.get("playback_route", "usb")
 
     if route == "usb":
-        # USB mode: level is set by PyTTa sweep amplitude, not AVR volume.
-        # Switch miniDSP source to USB, take one measurement, report SNR.
-        minidsp_ctx = MinidspSweepContext.from_config(cfg)
+        # USB mode: control SPL via miniDSP master gain.
+        # Always start at start_db so calibration begins from a known state,
+        # then step down if the signal is too hot.
+        if _dsp is None:
+            return _err("DSP driver not loaded")
 
-        async def _usb_check() -> dict:
-            try:
-                await engine.measure()
+        minidsp_ctx = MinidspSweepContext.from_config(cfg)
+        current_gain = start_db
+        # Safety floor: don't step below -40 dB (inaudible, pointless)
+        gain_floor = -40.0
+
+        async def _usb_level_loop() -> dict:
+            nonlocal current_gain
+            while current_gain >= gain_floor:
+                await _dsp.set_master_gain(current_gain)  # type: ignore[union-attr]
+                await asyncio.sleep(0.3)
+                try:
+                    fr = await engine.measure()
+                except MeasurementQualityError as exc:
+                    # SNR too low — master gain stepping can only make it louder,
+                    # not fix a signal that's already too quiet.
+                    return _err(
+                        f"USB sweep SNR too low ({exc.detail}). "
+                        "Turn up the sub's physical gain knob, then retry."
+                    )
+                except Exception as exc:
+                    return _err(f"calibrate_level failed: {exc}")
+
+                if fr.peak_spl > max_spl_dbfs:
+                    log.info(
+                        "calibrate_level: peak_spl=%.1f dBFS above max %.1f dBFS, "
+                        "stepping master gain down to %.1f dB",
+                        fr.peak_spl, max_spl_dbfs, current_gain - step_db,
+                    )
+                    current_gain -= step_db
+                    continue
+
+                # In range (or below min_spl_dbfs — SNR passed so accept it)
+                update_config({"measurement": {"master_gain_db": current_gain}})
                 return _ok(
                     calibrated_volume_db=None,
+                    calibrated_master_gain_db=current_gain,
                     message=(
-                        "USB mode: sweep level is controlled by Pi audio output. "
-                        "SNR is good — proceed with calibration."
+                        f"USB mode: master gain set to {current_gain:.1f} dB, "
+                        f"peak_spl={fr.peak_spl:.1f} dBFS. "
+                        "SNR good — proceed with calibration."
                     ),
                 )
-            except MeasurementQualityError as exc:
-                return _err(
-                    f"USB sweep SNR too low ({exc.detail}). "
-                    "Turn up the sub's physical gain knob, then retry."
-                )
-            except Exception as exc:
-                return _err(f"calibrate_level failed: {exc}")
+
+            return _err(
+                f"peak_spl still above {max_spl_dbfs} dBFS even at "
+                f"{current_gain + step_db:.1f} dB master gain. "
+                "Check that the sub's physical gain knob is not turned up too high."
+            )
 
         if minidsp_ctx:
             async with minidsp_ctx:
-                return await _usb_check()
-        return await _usb_check()
+                return await _usb_level_loop()
+        return await _usb_level_loop()
 
     # HDMI/AVR mode: ramp AVR volume until SNR passes.
     if _avr is None:
@@ -1138,21 +1175,24 @@ _TOOLS: list[Tool] = [
     Tool(
         name="calibrate_level",
         description=(
-            "Auto-calibrate sweep volume. Ramps AVR volume from start_db toward "
-            "max_volume_db in step_db increments until measurement SNR >= target_snr_db. "
-            "Saves calibrated volume to config. Call before calibration to find the "
-            "right sweep level. Returns {ok: true, calibrated_volume_db: N}."
+            "Auto-calibrate sweep level. "
+            "HDMI mode: ramps AVR volume from start_db toward max_volume_db until SNR >= target_snr_db. "
+            "USB mode: sets miniDSP master gain to start_db, steps it down by step_db while "
+            "peak_spl > max_spl_dbfs, accepts when peak_spl in range and SNR good. "
+            "Saves calibrated level to config. Call before calibration to find the right sweep level. "
+            "Returns {ok: true, calibrated_volume_db: N} (HDMI) or "
+            "{ok: true, calibrated_master_gain_db: N} (USB)."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "start_db": {
                     "type": "number",
-                    "description": "Starting volume in dB (default: -10)",
+                    "description": "Starting level in dB (default: -10). HDMI: AVR volume. USB: miniDSP master gain.",
                 },
                 "max_volume_db": {
                     "type": "number",
-                    "description": "Maximum volume ceiling in dB (default: 0 = reference)",
+                    "description": "HDMI only: maximum AVR volume ceiling in dB (default: 0 = reference)",
                 },
                 "target_snr_db": {
                     "type": "number",
@@ -1160,7 +1200,15 @@ _TOOLS: list[Tool] = [
                 },
                 "step_db": {
                     "type": "number",
-                    "description": "Volume increment per retry in dB (default: 3)",
+                    "description": "Level increment/decrement per retry in dB (default: 3)",
+                },
+                "min_spl_dbfs": {
+                    "type": "number",
+                    "description": "USB only: minimum acceptable peak SPL in dBFS (default: -30). Accepted if SNR passes.",
+                },
+                "max_spl_dbfs": {
+                    "type": "number",
+                    "description": "USB only: maximum acceptable peak SPL in dBFS (default: 0). Steps down master gain if exceeded.",
                 },
             },
         },
