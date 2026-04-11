@@ -26,6 +26,13 @@ Mute any non-sub outputs (e.g. bass shakers) during calibration.
 
 ## Phase 0 — Level Setup
 
+### 0.0 Clear all sub output EQ
+
+Before any measurements, reset every sub output to a known zero state:
+call `apply_eq` with **only the mandatory 18Hz HPF** on each sub output.
+This ensures level comparisons and alignment measurements are taken from
+a clean baseline, not through invisible prior EQ from a previous session.
+
 ### 0.1 Set initial volume
 
 Set AVR to -10 dB as a known-good starting point for measurements.
@@ -89,6 +96,17 @@ Maximum 3 alignment iterations.
 
 ## Phase 2 — EQ to Harman Target
 
+### 2.0 Clear all sub output EQ
+
+Before measuring, reset every sub output to a known zero state:
+for each sub output, call `apply_eq` with **only the mandatory 18Hz HPF**.
+This ensures Phase 2 measurements reflect the true room response, not the
+room plus whatever filters were left from a prior session.
+
+`read_eq` only tracks in-memory state since server start. If the server
+restarted between sessions it returns [] while old filters remain on the
+hardware. Always clear explicitly.
+
 ### Harman bass target (relative to 80Hz)
 
 | Hz  | Target |
@@ -116,8 +134,14 @@ Prefer cuts over boosts. Always include the mandatory infrasonic high-pass filte
 
 After applying EQ, re-measure and check convergence.
 - RMS deviation < 2.0 dB: done
-- Otherwise: adjust and re-measure
 - Maximum 5 EQ iterations
+
+On each subsequent iteration:
+- Call `read_eq` to get the **currently applied** filter set
+- Compute the residual deviation from the anchored target
+- Merge the additional correction into the existing filters (adjust gains at the
+  same frequency, add new bands for new frequencies)
+- Call `apply_eq` with the **full merged set** — never with just the delta
 
 ## Convergence
 
