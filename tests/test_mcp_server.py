@@ -1503,7 +1503,7 @@ async def test_call_tool_check_system_dispatch() -> None:
 # ── set_volume dispatch ─────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_call_tool_set_volume_dispatch(mock_avr) -> None:
+async def test_call_tool_set_volume_dispatch(mock_avr, mock_hdmi_config) -> None:
     from calibrate.mcp_server import call_tool
     mock_avr.set_volume.return_value = -30.0
     texts = await call_tool("set_volume", {"level_db": -30.0})
