@@ -65,7 +65,7 @@ class FrequencyResponse:
     """Frequency response from a single log-sweep measurement."""
 
     frequencies: list[float]  # Hz, trimmed to calibration band
-    spl: list[float]          # dBFS transfer-function magnitude
+    spl: list[float]          # dBFS transfer-function magnitude (mic-corrected if cal file available)
     sample_rate: int          # Hz
     sweep_duration: float     # seconds
     timestamp: str            # ISO-8601 UTC
@@ -73,6 +73,7 @@ class FrequencyResponse:
     impulse_response: Optional[list[float]] = None  # time-domain IR, first 24 000 samples
     phase: Optional[list[float]] = None  # radians, same grid as frequencies/spl
     recording_peak_dbfs: Optional[float] = None  # peak of raw recording before deconvolution
+    coherence: Optional[list[float]] = None  # 0-1 per frequency, measurement reliability
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
@@ -84,6 +85,7 @@ class FrequencyResponse:
         data.setdefault("impulse_response", None)  # backward compat
         data.setdefault("phase", None)  # backward compat
         data.setdefault("recording_peak_dbfs", None)  # backward compat
+        data.setdefault("coherence", None)  # backward compat
         return cls(**data)
 
     @property
@@ -132,6 +134,80 @@ def parse_umik_sensitivity(cal_path: str) -> float:
     # SPL = dBFS - effective_sens + 94
     offset = 94.0 - effective_sens_dbfs
     return offset
+
+
+def parse_umik_cal_curve(cal_path: str) -> list[tuple[float, float]]:
+    """Parse UMIK cal file per-frequency correction data.
+
+    The cal file has a header line (or two), then rows of:
+        frequency_hz   correction_db
+
+    Returns a list of (freq_hz, correction_db) pairs sorted by frequency.
+    The correction should be ADDED to measured SPL to get true SPL.
+    """
+    from pathlib import Path
+
+    path = Path(cal_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"UMIK cal file not found: {cal_path}")
+
+    points: list[tuple[float, float]] = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith('"'):
+            continue  # Skip header lines (quoted strings)
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                freq = float(parts[0])
+                correction = float(parts[1])
+                points.append((freq, correction))
+            except ValueError:
+                continue
+    if not points:
+        raise ValueError(f"No frequency correction data found in {cal_path}")
+    return sorted(points, key=lambda p: p[0])
+
+
+def apply_mic_correction(
+    frequencies: list[float],
+    spl: list[float],
+    cal_curve: list[tuple[float, float]],
+) -> list[float]:
+    """Apply mic calibration correction to measured SPL values.
+
+    Interpolates the cal curve (log-frequency, linear dB) to each measurement
+    frequency and adds the correction. Returns corrected SPL list.
+    """
+    import math
+
+    if not cal_curve:
+        return spl
+
+    cal_freqs = [p[0] for p in cal_curve]
+    cal_corrections = [p[1] for p in cal_curve]
+
+    corrected = []
+    for freq, measured in zip(frequencies, spl):
+        # Find surrounding cal points for log-frequency interpolation
+        if freq <= cal_freqs[0]:
+            correction = cal_corrections[0]
+        elif freq >= cal_freqs[-1]:
+            correction = cal_corrections[-1]
+        else:
+            # Binary search for surrounding points
+            for i in range(len(cal_freqs) - 1):
+                if cal_freqs[i] <= freq <= cal_freqs[i + 1]:
+                    f0, c0 = cal_freqs[i], cal_corrections[i]
+                    f1, c1 = cal_freqs[i + 1], cal_corrections[i + 1]
+                    # Log-frequency interpolation
+                    t = math.log(freq / f0) / math.log(f1 / f0)
+                    correction = c0 + t * (c1 - c0)
+                    break
+            else:
+                correction = 0.0
+        corrected.append(round(measured + correction, 2))
+    return corrected
 
 
 def _find_umik_device(devices, name_substring: str = "UMIK") -> int | None:
@@ -416,8 +492,19 @@ class MeasurementEngine:
         rec_peak_abs = float(np.max(np.abs(rec_for_deconv)))
         rec_peak_dbfs = round(20.0 * np.log10(rec_peak_abs + 1e-12), 1)
 
-        frequencies, spl, ir_samples, phase = self._compute_fr_arrays(
-            np, sweep_1d, rec_for_deconv, freq_min, freq_max, sample_rate
+        # Load mic calibration curve if configured
+        cal_curve = None
+        cal_path = self.config._data.get("mic", {}).get("cal_file")
+        if cal_path:
+            try:
+                cal_curve = parse_umik_cal_curve(cal_path)
+                log.info("Loaded mic cal curve from %s (%d points)", cal_path, len(cal_curve))
+            except Exception as exc:
+                log.warning("Failed to load mic cal file %s: %s", cal_path, exc)
+
+        frequencies, spl, ir_samples, phase, coherence = self._compute_fr_arrays(
+            np, sweep_1d, rec_for_deconv, freq_min, freq_max, sample_rate,
+            cal_curve=cal_curve,
         )
 
         return FrequencyResponse(
@@ -429,6 +516,7 @@ class MeasurementEngine:
             impulse_response=ir_samples,
             phase=phase,
             recording_peak_dbfs=rec_peak_dbfs,
+            coherence=coherence,
         )
 
     # ── Internals ─────────────────────────────────────────────────────────
@@ -441,13 +529,15 @@ class MeasurementEngine:
         freq_min: int,
         freq_max: int,
         sample_rate: int,
-    ) -> tuple[list[float], list[float], list[float], list[float]]:
+        cal_curve: list[tuple[float, float]] | None = None,
+    ) -> tuple[list[float], list[float], list[float], list[float], list[float] | None]:
         """
         Core deconvolution on raw numpy arrays.
 
         H(f) = FFT(recording) / FFT(sweep)
 
-        Returns (frequencies, magnitude_db, ir_samples, phase_radians).
+        Returns (frequencies, magnitude_db, ir_samples, phase_radians, coherence).
+        coherence is None if scipy is unavailable or computation fails.
         Arrays are zero-padded / truncated to the shorter length so they
         share the same FFT grid.
         """
@@ -467,7 +557,30 @@ class MeasurementEngine:
         phase_rad = np.angle(H)
 
         mask = (freqs >= freq_min) & (freqs <= freq_max)
-        return freqs[mask].tolist(), mag_db[mask].tolist(), ir_samples, phase_rad[mask].tolist()
+        freq_list = freqs[mask].tolist()
+        spl_list = mag_db[mask].tolist()
+
+        # Apply mic calibration correction if cal curve provided
+        if cal_curve:
+            spl_list = apply_mic_correction(freq_list, spl_list, cal_curve)
+
+        # Compute coherence using Welch's method
+        coh_list: list[float] | None = None
+        try:
+            from scipy.signal import coherence as _scipy_coherence
+            nperseg = min(n // 4, sample_rate)  # ~1s segments
+            if nperseg >= 256:
+                coh_freqs, coh_vals = _scipy_coherence(
+                    sweep_array[:n], rec_array[:n],
+                    fs=sample_rate, nperseg=nperseg,
+                )
+                # Interpolate coherence to our frequency grid
+                coh_interp = np.interp(freqs[mask], coh_freqs, coh_vals)
+                coh_list = [round(float(c), 3) for c in coh_interp]
+        except (ImportError, Exception) as exc:
+            log.warning("coherence computation failed: %s", exc)
+
+        return freq_list, spl_list, ir_samples, phase_rad[mask].tolist(), coh_list
 
     def _compute_fr(
         self,
@@ -477,11 +590,12 @@ class MeasurementEngine:
         freq_min: int,
         freq_max: int,
         sample_rate: int,
-    ) -> tuple[list[float], list[float], list[float], list[float]]:
+        cal_curve: list[tuple[float, float]] | None = None,
+    ) -> tuple[list[float], list[float], list[float], list[float], list[float] | None]:
         """Wrapper that extracts numpy arrays from PyTTa SignalObj inputs."""
         x = sweep.timeSignal[:, 0]
         y = recording.timeSignal[:, 0]
-        return self._compute_fr_arrays(np, x, y, freq_min, freq_max, sample_rate)
+        return self._compute_fr_arrays(np, x, y, freq_min, freq_max, sample_rate, cal_curve=cal_curve)
 
 
 def compute_session_metadata(
