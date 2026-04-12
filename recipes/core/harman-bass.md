@@ -20,14 +20,29 @@ If you want FIR-based correction, use a FIR-capable recipe.
 Call `check_system` to verify all hardware is connected and reachable.
 Call `get_config` to discover output slots, EQ capabilities, and mic configuration.
 
-## Step 0 — Clear existing EQ
+## Step 0 — Reset ALL DSP state
 
-Before taking the baseline measurement, reset the sub output to a known zero state:
-call `apply_eq` with **only the mandatory 18Hz HPF** (no other filters).
+Before taking the baseline measurement, reset the entire DSP to a known zero state.
+`read_eq` and `get_output_state` only track in-memory changes since the MCP server
+started — hardware flash retains settings from prior sessions. Always write explicitly.
 
-`read_eq` only tracks in-memory state since server start and returns [] after a
-restart even if old filters remain on the hardware. Always clear explicitly so the
-baseline measurement reflects the true room response, not the room plus prior EQ.
+For **every output** (0-3, including unused/shaker):
+1. `set_delay(output_index, 0)` — clear any leftover alignment delays
+2. `set_polarity(output_index, inverted=false)` — clear polarity flips
+3. `set_output_gain(output_index, 0)` — clear level trims
+
+For **each sub output** in the config:
+4. `apply_eq(output_index, [HPF only])` — bypasses all PEQ slots
+
+For **inputs**:
+5. `apply_input_eq([HPF only])` — clears input PEQ on both inputs
+6. `set_master_gain(0)` — reset master gain
+
+For **FIR** (if previously used):
+7. `clear_fir(output_index)` for each output
+
+This ensures the baseline measurement reflects the true room response,
+not the room plus prior EQ, delays, or gain trims.
 
 ## Step 1 — Set volume and calibrate level
 
