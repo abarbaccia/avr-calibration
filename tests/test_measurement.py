@@ -768,6 +768,35 @@ class TestOnsetDetection:
             f"Expected onset near 10ms, got {peak_ms}ms"
         )
 
+    def test_dc_artifact_at_sample_zero_ignored(self):
+        """Wiener deconvolution can leave a large DC artifact at sample 0.
+        Onset detection must skip it and find the real IR onset later."""
+        sr = 48000
+        direct_idx = int(0.015 * sr)    # 15ms = 720 samples (typical sub distance)
+
+        ir = np.zeros(24000)
+        ir[0] = 2.0                     # DC artifact (LOUDER than real IR)
+        ir[direct_idx] = 0.5            # real direct sound arrival
+
+        fr = FrequencyResponse(
+            frequencies=[20.0, 100.0],
+            spl=[0.0, 0.0],
+            sample_rate=sr,
+            sweep_duration=1.0,
+            timestamp="2026-01-01T00:00:00Z",
+            impulse_response=ir.tolist(),
+        )
+
+        meta = compute_session_metadata(fr, search_window_ms=50.0)
+
+        peak_ms = meta["ir"]["peak_time_ms"]
+        assert peak_ms > 1.0, (
+            f"Expected onset well after 0ms (DC artifact), got {peak_ms}ms"
+        )
+        assert abs(peak_ms - 15.0) < 1.0, (
+            f"Expected onset near 15ms (direct sound), got {peak_ms}ms"
+        )
+
 
 # ── parse_umik_sensitivity ────────────────────────────────────────────────────
 

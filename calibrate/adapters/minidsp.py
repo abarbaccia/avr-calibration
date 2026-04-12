@@ -67,6 +67,16 @@ minidsp-rs) has an identical workaround (``slotChangeDelay``).  Without this
 delay, only the last filter in a batch reliably takes effect.
 """
 
+CLI_COMMAND_DELAY_S: float = 0.1
+"""Delay in seconds after every CLI command (non-PEQ).
+
+The minidspd WebSocket transport serialises commands internally, but the
+miniDSP 2x4 HD firmware needs time to commit each write to the SHARC DSP.
+Without this gap, rapid-fire commands (e.g. 13 parallel set_delay/polarity/
+gain calls during DSP reset) can be silently dropped by the firmware.
+PEQ writes use the longer PEQ_WRITE_DELAY_S instead.
+"""
+
 VALID_SOURCES: frozenset[str] = frozenset({"Analog", "Toslink", "Usb", "Spdif", "Aes"})
 """Valid input source names for the miniDSP 2x4 HD."""
 
@@ -92,33 +102,56 @@ class MinidspApiError(RuntimeError):
 
 # ── CLI helper ─────────────────────────────────────────────────────────────────
 
-async def _run_minidsp_cli(*args: str, ignore_exit_codes: tuple[int, ...] = ()) -> None:
+_cli_lock = asyncio.Lock()
+"""Serialises ALL minidsp CLI access.
+
+The minidspd daemon uses a single WebSocket connection to the hardware.
+Concurrent CLI invocations can corrupt device state or be silently dropped
+by the miniDSP 2x4 HD firmware.  This lock ensures only one CLI command
+runs at a time, with a post-command delay for firmware commit.
+"""
+
+
+async def _run_minidsp_cli(
+    *args: str,
+    ignore_exit_codes: tuple[int, ...] = (),
+    post_delay: float | None = None,
+) -> None:
     """Run a minidsp CLI command, raising MinidspApiError on non-zero exit.
 
     The CLI connects to minidspd's WebSocket transport (not HTTP batch writes).
-    Call this sequentially — concurrent CLI sessions corrupt device state.
+    All calls are serialised via _cli_lock — concurrent CLI sessions corrupt
+    device state.
 
     *ignore_exit_codes*: exit codes that are treated as success. Used for FIR
     commands (import, clear) which return exit code 1 due to an unrecognised
     post-load device response (cmd_id: 01) even though the write succeeds.
     See mrene/minidsp-rs#766.
+
+    *post_delay*: seconds to sleep after the command completes.  Defaults to
+    CLI_COMMAND_DELAY_S (0.1s).  PEQ callers pass their own longer delay via
+    the existing asyncio.sleep(PEQ_WRITE_DELAY_S) after this function returns.
     """
-    proc = await asyncio.create_subprocess_exec(
-        "minidsp", *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()  # reap zombie
-        raise MinidspApiError(1, f"minidsp {' '.join(args)}: timed out after 10s")
-    if proc.returncode != 0 and proc.returncode not in ignore_exit_codes:
-        raise MinidspApiError(
-            proc.returncode or 1,
-            f"minidsp {' '.join(args)}: {stderr.decode().strip()}",
+    delay = post_delay if post_delay is not None else CLI_COMMAND_DELAY_S
+    async with _cli_lock:
+        proc = await asyncio.create_subprocess_exec(
+            "minidsp", *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()  # reap zombie
+            raise MinidspApiError(1, f"minidsp {' '.join(args)}: timed out after 10s")
+        if proc.returncode != 0 and proc.returncode not in ignore_exit_codes:
+            raise MinidspApiError(
+                proc.returncode or 1,
+                f"minidsp {' '.join(args)}: {stderr.decode().strip()}",
+            )
+        if delay > 0:
+            await asyncio.sleep(delay)
 
 
 async def _get_status_via_cli() -> dict:
