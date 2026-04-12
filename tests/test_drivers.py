@@ -383,8 +383,12 @@ async def test_minidsp_apply_input_eq_same_input_writes_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reapply_volatile_output_state_restores_input_peq() -> None:
-    """reapply_volatile_output_state() must re-send input PEQ after a source switch."""
+async def test_reapply_volatile_output_state_skips_input_peq() -> None:
+    """reapply_volatile_output_state() must NOT re-send input PEQ.
+
+    Input PEQ survives source switches on the miniDSP 2x4 HD — it is written
+    to both USB and Analog inputs at apply time and does not need restore.
+    """
     driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1, 2],
                            active_input=1, usb_input=0)
     filters = [
@@ -401,9 +405,10 @@ async def test_reapply_volatile_output_state_restores_input_peq() -> None:
 
             all_args = [c.args for c in mock_cli.call_args_list]
             input_set_calls = [a for a in all_args if a[0] == "input" and "set" in a]
-            written_inputs = {a[1] for a in input_set_calls}
-            assert "0" in written_inputs, "USB input (0) PEQ must be restored"
-            assert "1" in written_inputs, "analog input (1) PEQ must be restored"
+            assert len(input_set_calls) == 0, (
+                "Input PEQ must NOT be re-sent during volatile state restore — "
+                "it survives source switches"
+            )
 
 
 @pytest.mark.asyncio
@@ -683,6 +688,71 @@ async def test_sweep_context_exit_swallows_exceptions():
 
 
 @pytest.mark.asyncio
+async def test_sweep_context_enter_is_idempotent():
+    """Calling enter() twice is a no-op on the second call (persistent session)."""
+    with (
+        patch(_GET_SRC, new_callable=AsyncMock, return_value="Analog"),
+        patch(_CTX_CLI, new_callable=AsyncMock) as mock_cli,
+        patch(_CFG_RT, new_callable=AsyncMock) as mock_rt,
+        patch("calibrate.drivers.minidsp.asyncio.sleep", new_callable=AsyncMock),
+    ):
+        ctx = MinidspSweepContext(usb_input=0, normal_input=0, enabled_outputs={0, 1})
+        await ctx.enter()
+        assert ctx.active
+
+        # Reset mocks and enter again
+        mock_cli.reset_mock()
+        mock_rt.reset_mock()
+        await ctx.enter()
+
+    # Second enter should not make any CLI calls
+    assert not mock_cli.call_args_list, "Second enter() should be a no-op"
+    assert not mock_rt.call_args_list, "Second enter() should not reconfigure routing"
+
+
+@pytest.mark.asyncio
+async def test_sweep_context_exit_sets_active_false():
+    """exit() sets active=False so a subsequent enter() re-enters."""
+    with (
+        patch(_GET_SRC, new_callable=AsyncMock, return_value="Analog"),
+        patch(_CTX_CLI, new_callable=AsyncMock),
+        patch(_CFG_RT, new_callable=AsyncMock),
+        patch("calibrate.drivers.minidsp.asyncio.sleep", new_callable=AsyncMock),
+    ):
+        ctx = MinidspSweepContext(usb_input=0, normal_input=0, enabled_outputs={0, 1})
+        await ctx.enter()
+        assert ctx.active
+        await ctx.exit()
+        assert not ctx.active
+
+
+@pytest.mark.asyncio
+async def test_sweep_context_exit_without_enter_is_noop():
+    """exit() is safe to call without enter()."""
+    ctx = MinidspSweepContext(usb_input=0, normal_input=0, enabled_outputs={0, 1})
+    assert not ctx.active
+    await ctx.exit()  # must not raise
+    assert not ctx.active
+
+
+@pytest.mark.asyncio
+async def test_sweep_context_enter_does_not_restore_volatile_peq():
+    """enter() must NOT call reapply_volatile_output_state — only mute restore."""
+    driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[0, 1])
+    with (
+        patch(_GET_SRC, new_callable=AsyncMock, return_value="Analog"),
+        patch(_CTX_CLI, new_callable=AsyncMock),
+        patch(_CFG_RT, new_callable=AsyncMock),
+        patch("calibrate.drivers.minidsp.asyncio.sleep", new_callable=AsyncMock),
+        patch.object(driver, "reapply_volatile_output_state", new_callable=AsyncMock) as mock_reapply,
+    ):
+        ctx = MinidspSweepContext(usb_input=0, normal_input=0, enabled_outputs={0, 1}, driver=driver)
+        await ctx.enter()
+
+    mock_reapply.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_reapply_volatile_output_state_holds_lock():
     """reapply_volatile_output_state() acquires self._lock before any CLI write."""
     driver = MinidspDriver(host="localhost", port=5380, sub_outputs=[1])
@@ -707,13 +777,15 @@ async def test_reapply_volatile_output_state_holds_lock():
 
 # ── Registry ───────────────────────────────────────────────────────────────────
 
-def _mock_config(avr_driver: str = "denon", dsp_driver: str = "minidsp"):
+def _mock_config(avr_driver: str = "denon", dsp_driver: str = "minidsp",
+                  processing_rate: int = 96_000):
     cfg = MagicMock()
     cfg.avr_driver_name = avr_driver
     cfg.dsp_driver_name = dsp_driver
     cfg.denon = {"host": "192.168.1.100"}
     cfg.minidsp = {"host": "localhost", "port": 5380}
     cfg.minidsp_host_port = ("localhost", 5380)
+    cfg.eq_capabilities = {"processing_rate": processing_rate}
     return cfg
 
 
@@ -727,6 +799,21 @@ def test_load_dsp_driver_minidsp() -> None:
     cfg = _mock_config(dsp_driver="minidsp")
     driver = load_dsp_driver(cfg)
     assert isinstance(driver, MinidspDriver)
+
+
+def test_load_dsp_driver_passes_processing_rate() -> None:
+    """Registry passes processing_rate from config.eq_capabilities to the driver."""
+    cfg = _mock_config(dsp_driver="minidsp", processing_rate=48_000)
+    driver = load_dsp_driver(cfg)
+    assert driver._processing_rate == 48_000
+
+
+def test_load_dsp_driver_default_processing_rate() -> None:
+    """Default processing_rate is 96000 (miniDSP 2x4 HD)."""
+    cfg = _mock_config(dsp_driver="minidsp")
+    cfg.eq_capabilities = {}  # no explicit processing_rate
+    driver = load_dsp_driver(cfg)
+    assert driver._processing_rate == 96_000
 
 
 def test_load_avr_driver_unknown_raises() -> None:
