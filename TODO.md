@@ -156,6 +156,228 @@ Max 5 EQ iterations. Prefer cuts over boosts.
 
 ---
 
+## System Characterization & Amp Headroom Test
+
+### The problem this solves
+
+"Do I need a better amp?" is one of the most common questions in home theater — and
+almost everyone answers it wrong. They upgrade on spec sheets, vibes, or forum posts.
+
+This tool gives objective data: at what volume does your amp actually start to fail,
+where does it fail first (which channel, which driver section), and is the failure mode
+per-channel clipping or shared power supply sag? That determines whether the fix is a
+better amp, more efficient speakers, or a crossover adjustment.
+
+Someone with 95dB/W/m speakers sees a completely different headroom curve than someone
+with 87dB/W/m speakers at the same Denon volume. This tool shows that, automatically,
+for your specific hardware.
+
+### Architecture
+
+New MCP tool: `analyze_system` (orchestrates all phases)
+New skill: `/headroom` (drives the test, reports results)
+
+Four phases:
+
+**Phase 1: Speaker characterization**
+- Solo sweep per speaker (FR measurement)
+- Extract: flat passband start/end, efficiency (dBSPL @ reference level), -3dB rolloff
+- Identifies what frequency range each speaker can actually reproduce
+
+**Phase 2: Multitone cluster assignment**
+- Auto-assign 3-5 test tones per speaker, spanning its flat passband
+- Tone spacing: woofer region (low passband), crossover region (impedance dip = max amp load), tweeter region (high passband)
+- Between-speaker minimum spacing: 30Hz (prevents UMIK from mixing channels in FFT)
+- Avoid below 200Hz (room modes corrupt readings), stay within measured flat passband only
+- Result: a unique frequency "fingerprint" per speaker — FFT isolates each channel in the mix
+
+**Phase 3: Simultaneous multi-channel load test**
+- Play all channels at once with assigned multitone clusters (HDMI multichannel from Pi 5)
+- Step Denon master volume 1dB at a time, hold 2 seconds per step
+- UMIK records the room mix at each step
+- FFT extracts per-speaker SPL and THD for each cluster at each volume step
+
+**Phase 4: Analysis and recommendation**
+- Track SPL gain per dB of volume increase — should be 1:1
+- Detect **power supply sag**: all channels compress simultaneously = shared supply failing
+  (signature: THD rises in all channels at once, SPL gain falls below 1dB/step everywhere)
+- Detect **per-channel clipping**: single channel THD spikes while others stay clean
+  (signature: one speaker's cluster distorts, others stay linear)
+- Report:
+  - Headroom at reference listening level (dB before compression onset)
+  - Weakest channel (first to show distortion)
+  - Failure mode: sag vs clipping
+  - Recommended action: upgrade amp / reduce crossover / raise speaker sensitivity / add external amp
+
+### Why multitone clusters
+
+Single-frequency tones give a misleading amp load picture. Speaker impedance varies
+with frequency: peaks at resonance (easy on the amp), dips at the crossover region
+(maximum amp stress). A single tone at an impedance peak underestimates load by 2-4×.
+
+Multitone clusters drive both the woofer and tweeter simultaneously — the same load
+profile as real music/film content. THD products from multitone are also easily
+distinguished from room reflections in the FFT, unlike noise floor in swept tests.
+
+### Power supply sag vs per-channel clipping
+
+These have different signatures and different fixes:
+
+- **Sag** (shared supply): at threshold volume, *all* channels compress together. SPL
+  gain drops to 0 across all speakers simultaneously. Fix: replace receiver with separates,
+  or use external amps for most demanding channels.
+- **Clipping** (per-channel): one channel THD spikes while others stay clean. Fix:
+  more efficient speakers on that channel, or external amp for just that channel.
+
+Sag is the failure mode most Denon X-series owners hit at loud movie levels — the
+internal power supply isn't large enough to sustain all channels at high current simultaneously.
+This test quantifies exactly where that happens for your specific setup.
+
+### Implementation
+
+**New MCP tools needed**
+- [ ] `analyze_system` — orchestrate characterization + load test, return JSON report
+- [ ] `play_multitone(channel_assignments)` — play simultaneous multitone clusters
+  via HDMI multichannel (Pi 5 ALSA multichannel output, discrete per-channel tone sets)
+- [ ] `measure_fft(duration_sec)` — record + FFT, return per-frequency SPL array
+  (replaces swept IR for this use case — steady-state FFT, not impulse response)
+
+**Driver-level hooks (no new MCP tools needed)**
+- `DenonDriver.set_master_gain(db)` — already exists (wraps `set_volume`)
+- `MinidspDriver` — no changes, EQ stays as-is during test
+- Future: `CamillaDSPDriver.set_channel_volume(channel, db)` via WebSocket API
+  (for per-channel volume stepping once CamillaDSP is installed on Pi 5)
+
+**Multichannel HDMI requirement**
+Pi 5 supports multichannel HDMI output via ALSA (`plughw:0,3` or similar device).
+Test tones must be rendered to discrete HDMI channels so Denon routes each to the
+correct speaker. Mono sum playback cannot isolate per-channel load.
+
+**Implementation order**
+1. Denon + miniDSP path (current hardware) — sweep per speaker, HDMI multichannel playback
+2. FFT-based measure_fft tool (UMIK steady-state recording + numpy FFT)
+3. Volume stepping + compression detection (Denon only for now)
+4. CamillaDSP integration when installed — adds per-channel level control
+
+**Expected output**
+```json
+{
+  "reference_level_db": -20,
+  "headroom_db": 8.5,
+  "compression_onset_volume": -11.5,
+  "failure_mode": "power_supply_sag",
+  "weak_channel": null,
+  "per_channel": {
+    "FL": {"headroom_db": 8.5, "efficiency_dbspl": 87.2, "flat_band": [80, 18000]},
+    "FR": {"headroom_db": 8.5, "efficiency_dbspl": 87.1, "flat_band": [80, 18000]},
+    "C":  {"headroom_db": 8.5, "efficiency_dbspl": 86.8, "flat_band": [100, 18000]}
+  },
+  "recommendation": "Power supply sag detected at -11.5dB volume. All channels compress simultaneously. External amplification for FL/FR/C recommended."
+}
+```
+
+### Tasks
+- [ ] `measure_fft` MCP tool — UMIK steady-state recording + numpy FFT, return per-Hz SPL
+- [ ] `play_multitone` driver — ALSA multichannel tone synthesis, one cluster per HDMI channel
+- [ ] Phase 1: `analyze_system` characterization pass — solo sweep per speaker, extract passband
+- [ ] Phase 2: tone assignment algorithm — auto-assign clusters within measured flat bands
+- [ ] Phase 3: volume stepping loop — 1dB steps, record FFT, track per-cluster SPL/THD
+- [ ] Phase 4: compression detection — sag vs clipping classifier, headroom computation
+- [ ] `/headroom` skill — drives the full test, reports results conversationally
+- [ ] Tests for FFT extraction, tone assignment, and compression detection logic
+
+---
+
+## Full-Room Integration & Audyssey Enhancement
+
+### Phase 1 — Post-Audyssey Verification (DONE)
+
+Measure combined system after sub calibration + Audyssey, check crossover integration,
+recommend Denon setting adjustments.
+
+- [x] Recipe: `recipes/core/full-room-verify.md`
+- [x] Skill: `.claude/skills/verify/SKILL.md` — `/verify` drives the verification recipe
+- [x] Enhanced `/recipe` skill to support full-room calibration scope (sub cal + Audyssey + verification)
+- [ ] `measure` full_range mode — preserve Denon sound mode (no Pure Direct), full-range sweep (20Hz–20kHz)
+- [ ] DenonSweepContext option to skip Pure Direct and preserve Audyssey processing
+- [ ] Config option for full-range sweep frequency limits (measurement.full_range_freq_min/max)
+
+### Phase 2 — Guided Corrections via Denon API (TODO)
+
+After verification identifies issues, automate the Denon-side adjustments instead of
+telling the user to navigate menus manually.
+
+**Why:** The Denon exposes channel levels, crossover, and sub trim via the denonavr API.
+We already control volume and input — extending to these settings closes the loop between
+verification findings and corrective action.
+
+**Tasks:**
+- [ ] DenonDriver: `set_channel_level(channel, trim_db)` — per-channel level trim (FL, FR, C, SW, etc.)
+- [ ] DenonDriver: `set_crossover(channel, freq_hz)` — per-channel crossover frequency
+- [ ] DenonDriver: `set_sub_trim(trim_db)` — subwoofer level trim on AVR
+- [ ] DenonDriver: `get_speaker_config()` — read current speaker sizes, distances, levels, crossovers
+- [ ] DenonDriver: `set_speaker_distance(channel, distance)` — per-channel distance/delay
+- [ ] DenonDriver: `set_audyssey_mode(mode)` — switch Audyssey curve (Reference/Flat/Off)
+- [ ] DenonDriver: `set_dynamic_eq(enabled)` — toggle Dynamic EQ
+- [ ] MCP tool: `adjust_denon(setting, value)` — high-level Denon adjustment tool
+- [ ] Updated `/verify` skill: after reporting, offer to apply recommended Denon adjustments automatically
+- [ ] Safety: max ±6dB on any channel trim, confirm before applying
+
+### Phase 3 — Custom Target Curves via MultEQ Protocol (TODO)
+
+Push custom target curves to Audyssey via the reverse-engineered TCP protocol (port 1256).
+This is the big unlock — it lets our system control what Audyssey optimizes toward,
+eliminating the fight between miniDSP sub calibration and Audyssey's own bass management.
+
+**Why:** Currently Audyssey and miniDSP are calibrated independently. Audyssey may
+undo our sub work in the crossover region, or apply its own bass curve that conflicts
+with our Harman target. Custom target curves let us tell Audyssey exactly what to do
+in the crossover region so both systems cooperate.
+
+**References:** See `reference_audyssey_tcp_protocol.md` in project memory.
+ratbuddyssey (C# open source) proved the read/write path works. OCA (Python) demonstrated
+full calibration automation.
+
+**Tasks:**
+- [ ] Implement MultEQ TCP client (Python, based on ratbuddyssey protocol documentation)
+- [ ] Read current Audyssey calibration state (speaker config, distances, levels, target curves)
+- [ ] Write custom target curves per channel (the key capability)
+- [ ] MCP tool: `get_audyssey_state()` — read current MultEQ calibration
+- [ ] MCP tool: `set_audyssey_target(channel, curve_points)` — push custom target curve
+- [ ] Recipe: `recipes/core/audyssey-custom-target.md` — calibrate subs, then push a custom
+  Audyssey target that complements the sub calibration in the crossover region
+- [ ] Skill: `/audyssey` — drives the custom target workflow
+- [ ] Safety: never modify Audyssey calibration without explicit user confirmation
+  (Audyssey re-runs are time-consuming; changes must be reversible)
+- [ ] Store original Audyssey state before modifications for rollback
+
+### Phase 4 — Full Claude-Driven Room Correction (TODO, aspirational)
+
+Replace Audyssey entirely with Claude-driven room correction for users who want
+full control. This is the long-term vision — Claude measures every speaker, designs
+per-channel correction, and applies it.
+
+**Why:** Audyssey is a black box. Users with specific preferences (e.g. no treble
+rolloff, custom house curves, per-seat optimization) can't control what it does.
+Claude-driven correction lets them specify exactly what they want.
+
+**Prerequisites:**
+- Per-channel measurement capability (TODO-R1: Denon test tones or Pi 5 multichannel HDMI)
+- Either Denon manual PEQ slots (limited, ~9 bands) or external full-range DSP
+  (e.g. miniDSP SHD, CamillaDSP on Pi 5)
+
+**Tasks:**
+- [ ] Per-channel measurement via Denon test tones or Pi 5 multichannel HDMI (TODO-R1)
+- [ ] Full-range target curves (Harman preference for all channels, not just bass)
+- [ ] Per-channel PEQ design (same analysis engine as sub calibration, wider frequency range)
+- [ ] FIR filter design for linear-phase room correction (if DSP supports it)
+- [ ] Multi-position optimization (measure at multiple seats, optimize for zone)
+- [ ] Recipe: `recipes/core/full-room-correction.md`
+- [ ] Skill: `/room-correct` — full room correction workflow
+- [ ] CamillaDSP driver (if Pi 5 becomes the DSP for mains as well as subs)
+
+---
+
 ## Python Code: What to Keep vs Remove
 
 ### Keep (MCP primitives)

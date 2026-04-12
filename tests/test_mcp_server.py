@@ -668,124 +668,6 @@ async def test_trigger_measurement_no_target_for_raw_capture() -> None:
 # ── calibrate_level ────────────────────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_calibrate_level_succeeds_first_try() -> None:
-    """If SNR is good at starting volume, returns immediately."""
-    mock_avr = AsyncMock()
-    mock_avr.set_volume = AsyncMock(return_value=-10.0)
-
-    mock_fr = MagicMock()
-    mock_engine = MagicMock()
-    mock_engine.measure = AsyncMock(return_value=mock_fr)
-
-    with (
-        patch.object(sut, "_avr", mock_avr),
-        patch.object(sut, "_config"),
-        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
-        patch("calibrate.config.update_config") as mock_update,
-    ):
-        result = await _tool_calibrate_level(start_db=-10.0)
-
-    assert result["ok"]
-    assert result["calibrated_volume_db"] == -10.0
-    mock_update.assert_called_once_with({"measurement": {"denon_sweep_volume": -10.0}})
-
-
-@pytest.mark.asyncio
-async def test_calibrate_level_ramps_on_low_snr() -> None:
-    """SNR too low at start → ramps up until good."""
-    from calibrate.measurement import MeasurementQualityError
-
-    mock_avr = AsyncMock()
-    mock_avr.set_volume = AsyncMock(return_value=-10.0)
-
-    mock_fr = MagicMock()
-    mock_engine = MagicMock()
-    # Fail twice with low SNR, then succeed
-    mock_engine.measure = AsyncMock(side_effect=[
-        MeasurementQualityError("snr", "SNR 12 dB < 20 dB", "increase volume"),
-        MeasurementQualityError("snr", "SNR 16 dB < 20 dB", "increase volume"),
-        mock_fr,
-    ])
-
-    with (
-        patch.object(sut, "_avr", mock_avr),
-        patch.object(sut, "_config"),
-        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
-        patch("calibrate.config.update_config"),
-    ):
-        result = await _tool_calibrate_level(start_db=-10.0, step_db=3.0)
-
-    assert result["ok"]
-    assert result["calibrated_volume_db"] == -4.0  # -10 + 3 + 3
-
-
-@pytest.mark.asyncio
-async def test_calibrate_level_hits_ceiling() -> None:
-    """SNR never good enough → returns error at ceiling."""
-    from calibrate.measurement import MeasurementQualityError
-
-    mock_avr = AsyncMock()
-    mock_avr.set_volume = AsyncMock(return_value=-10.0)
-
-    mock_engine = MagicMock()
-    mock_engine.measure = AsyncMock(
-        side_effect=MeasurementQualityError("snr", "SNR 10 dB < 20 dB", "check subs"),
-    )
-
-    with (
-        patch.object(sut, "_avr", mock_avr),
-        patch.object(sut, "_config"),
-        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
-        patch("calibrate.config.update_config"),
-    ):
-        result = await _tool_calibrate_level(start_db=-4.0, max_volume_db=0.0, step_db=3.0)
-
-    assert not result["ok"]
-    assert "Could not achieve SNR" in result["error"]
-
-
-@pytest.mark.asyncio
-async def test_calibrate_level_no_avr_hdmi_mode() -> None:
-    """HDMI mode with no AVR driver loaded → error."""
-    mock_cfg = MagicMock()
-    mock_cfg.measurement.get.side_effect = lambda key, default=None: "hdmi" if key == "playback_route" else default
-
-    with patch.object(sut, "_avr", None), \
-         patch.object(sut, "_config", return_value=mock_cfg):
-        result = await _tool_calibrate_level()
-
-    assert not result["ok"]
-    assert "AVR driver not loaded" in result["error"]
-
-
-@pytest.mark.asyncio
-async def test_calibrate_level_ramps_on_sweep_not_detected() -> None:
-    """Sweep not captured → ramps up (same as low SNR)."""
-    from calibrate.measurement import MeasurementQualityError
-
-    mock_avr = AsyncMock()
-    mock_avr.set_volume = AsyncMock(return_value=-10.0)
-
-    mock_fr = MagicMock()
-    mock_engine = MagicMock()
-    mock_engine.measure = AsyncMock(side_effect=[
-        MeasurementQualityError("sweep_capture", "Sweep not detected", "check input"),
-        mock_fr,
-    ])
-
-    with (
-        patch.object(sut, "_avr", mock_avr),
-        patch.object(sut, "_config"),
-        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
-        patch("calibrate.config.update_config"),
-    ):
-        result = await _tool_calibrate_level(start_db=-10.0, step_db=3.0)
-
-    assert result["ok"]
-    assert result["calibrated_volume_db"] == -7.0
-
-
 def _make_usb_cfg():
     """Return a mock config that reports USB playback route."""
     mock_cfg = MagicMock()
@@ -795,14 +677,32 @@ def _make_usb_cfg():
     return mock_cfg
 
 
+def _make_hdmi_cfg():
+    """Return a mock config that reports HDMI playback route."""
+    mock_cfg = MagicMock()
+    mock_cfg.measurement.get.side_effect = lambda key, default=None: (
+        "hdmi" if key == "playback_route" else default
+    )
+    return mock_cfg
+
+
+# ── USB mode tests ──
+
+
 @pytest.mark.asyncio
-async def test_calibrate_level_usb_good_level() -> None:
-    """USB mode: sets master gain to start_db, peak_spl in range → success."""
+async def test_calibrate_level_usb_predict_verify() -> None:
+    """USB mode: probe at -30 dB sees -42 dBFS peak → computes gain = 0 dB,
+    verify sweep confirms. 2 sweeps, 2 set_master_gain calls."""
     mock_dsp = AsyncMock()
-    mock_fr = MagicMock()
-    mock_fr.peak_spl = -12.0  # within [-30, -6] window
+
+    probe_fr = MagicMock()
+    probe_fr.peak_spl = -42.0  # very quiet at -30 dB gain
+
+    verify_fr = MagicMock()
+    verify_fr.peak_spl = -12.0  # right on target
+
     mock_engine = MagicMock()
-    mock_engine.measure = AsyncMock(return_value=mock_fr)
+    mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
 
     with (
         patch.object(sut, "_dsp", mock_dsp),
@@ -812,47 +712,81 @@ async def test_calibrate_level_usb_good_level() -> None:
         patch("calibrate.config.update_config") as mock_update,
         patch("asyncio.sleep"),
     ):
-        result = await _tool_calibrate_level(start_db=-10.0)
+        result = await _tool_calibrate_level(target_peak_dbfs=-12.0, start_db=-30.0)
 
     assert result["ok"]
-    assert result["calibrated_master_gain_db"] == -10.0
-    mock_dsp.set_master_gain.assert_called_once_with(-10.0)
-    mock_update.assert_called_once_with({"measurement": {"master_gain_db": -10.0}})
-
-
-@pytest.mark.asyncio
-async def test_calibrate_level_usb_steps_down_on_hot_signal() -> None:
-    """USB mode: peak_spl too hot → steps master gain down until in range."""
-    mock_dsp = AsyncMock()
-
-    hot_fr = MagicMock()
-    hot_fr.peak_spl = 1.5  # above 0 dBFS ceiling (clipping)
-
-    good_fr = MagicMock()
-    good_fr.peak_spl = -4.0  # within range
-
-    mock_engine = MagicMock()
-    mock_engine.measure = AsyncMock(side_effect=[hot_fr, good_fr])
-
-    with (
-        patch.object(sut, "_dsp", mock_dsp),
-        patch.object(sut, "_config", return_value=_make_usb_cfg()),
-        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
-        patch("calibrate.drivers.minidsp.MinidspSweepContext.from_config", return_value=None),
-        patch("calibrate.config.update_config") as mock_update,
-        patch("asyncio.sleep"),
-    ):
-        result = await _tool_calibrate_level(start_db=-10.0, step_db=3.0, max_spl_dbfs=0.0)
-
-    assert result["ok"]
-    assert result["calibrated_master_gain_db"] == -13.0  # -10 - 3
+    # correction = -12 - (-42) = +30 → gain = -30 + 30 = 0 (clamped to 0)
+    assert result["calibrated_master_gain_db"] == 0.0
+    assert mock_engine.measure.call_count == 2
     assert mock_dsp.set_master_gain.call_count == 2
-    mock_update.assert_called_once_with({"measurement": {"master_gain_db": -13.0}})
+    mock_update.assert_called_once_with({"measurement": {"master_gain_db": 0.0}})
 
 
 @pytest.mark.asyncio
-async def test_calibrate_level_usb_snr_fail() -> None:
-    """USB mode: SNR too low → error directing user to physical knob."""
+async def test_calibrate_level_usb_verify_still_hot_backs_off() -> None:
+    """USB mode: verify sweep is above -3 dBFS ceiling → backs off."""
+    mock_dsp = AsyncMock()
+
+    probe_fr = MagicMock()
+    probe_fr.peak_spl = -20.0  # at start_db=-10
+
+    verify_fr = MagicMock()
+    verify_fr.peak_spl = -1.0  # above -3 ceiling
+
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
+
+    with (
+        patch.object(sut, "_dsp", mock_dsp),
+        patch.object(sut, "_config", return_value=_make_usb_cfg()),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.drivers.minidsp.MinidspSweepContext.from_config", return_value=None),
+        patch("calibrate.config.update_config") as mock_update,
+        patch("asyncio.sleep"),
+    ):
+        result = await _tool_calibrate_level(target_peak_dbfs=-12.0, start_db=-10.0)
+
+    assert result["ok"]
+    # probe: correction = -12 - (-20) = +8 → computed gain = -10 + 8 = -2
+    # verify: peak -1.0 > -3.0 ceiling → backoff = -1.0 - (-12.0) = 11.0
+    # final = -2 - 11 = -13
+    assert result["calibrated_master_gain_db"] == -13.0
+    # 3 set_master_gain calls: probe(-10), verify(-2), backoff(-13)
+    assert mock_dsp.set_master_gain.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_calibrate_level_usb_gain_clamped_to_zero() -> None:
+    """USB mode: computed gain would exceed 0 dB → clamped."""
+    mock_dsp = AsyncMock()
+
+    probe_fr = MagicMock()
+    probe_fr.peak_spl = -50.0  # very quiet
+
+    verify_fr = MagicMock()
+    verify_fr.peak_spl = -20.0  # under target but above ceiling? no, fine
+
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
+
+    with (
+        patch.object(sut, "_dsp", mock_dsp),
+        patch.object(sut, "_config", return_value=_make_usb_cfg()),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.drivers.minidsp.MinidspSweepContext.from_config", return_value=None),
+        patch("calibrate.config.update_config") as mock_update,
+        patch("asyncio.sleep"),
+    ):
+        result = await _tool_calibrate_level(target_peak_dbfs=-12.0, start_db=-30.0)
+
+    assert result["ok"]
+    # correction = -12 - (-50) = +38 → gain = -30 + 38 = +8 → clamped to 0
+    assert result["calibrated_master_gain_db"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_calibrate_level_usb_snr_fail_on_probe() -> None:
+    """USB mode: SNR too low on probe → error directing user to physical knob."""
     from calibrate.measurement import MeasurementQualityError
 
     mock_dsp = AsyncMock()
@@ -869,7 +803,7 @@ async def test_calibrate_level_usb_snr_fail() -> None:
         patch("calibrate.config.update_config"),
         patch("asyncio.sleep"),
     ):
-        result = await _tool_calibrate_level(start_db=-10.0)
+        result = await _tool_calibrate_level(start_db=-30.0)
 
     assert not result["ok"]
     assert "physical gain knob" in result["error"]
@@ -886,6 +820,166 @@ async def test_calibrate_level_usb_no_dsp() -> None:
 
     assert not result["ok"]
     assert "DSP driver not loaded" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_calibrate_level_usb_solo_gain_hint() -> None:
+    """USB mode with 2 subs: suggested_solo_gain_db is higher by ~6 dB."""
+    mock_dsp = AsyncMock()
+    mock_cfg = _make_usb_cfg()
+    mock_cfg.minidsp.get.side_effect = lambda key, default=None: (
+        [{"type": "sub"}, {"type": "sub"}, {"type": "shaker"}]
+        if key == "output_slots" else default
+    )
+
+    probe_fr = MagicMock()
+    probe_fr.peak_spl = -22.0
+
+    verify_fr = MagicMock()
+    verify_fr.peak_spl = -12.0
+
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
+
+    with (
+        patch.object(sut, "_dsp", mock_dsp),
+        patch.object(sut, "_config", return_value=mock_cfg),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.drivers.minidsp.MinidspSweepContext.from_config", return_value=None),
+        patch("calibrate.config.update_config"),
+        patch("asyncio.sleep"),
+    ):
+        result = await _tool_calibrate_level(target_peak_dbfs=-12.0, start_db=-20.0)
+
+    assert result["ok"]
+    # solo offset = 20*log10(2) ≈ 6.0 dB
+    assert result["suggested_solo_gain_db"] > result["calibrated_master_gain_db"]
+
+
+# ── HDMI mode tests ──
+
+
+@pytest.mark.asyncio
+async def test_calibrate_level_hdmi_predict_verify() -> None:
+    """HDMI mode: probe at -30 dB, predict correction, verify. 2 sweeps."""
+    mock_avr = AsyncMock()
+
+    probe_fr = MagicMock()
+    probe_fr.peak_spl = -32.0  # quiet at -30 dB volume
+
+    verify_fr = MagicMock()
+    verify_fr.peak_spl = -12.0  # on target
+
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
+
+    with (
+        patch.object(sut, "_avr", mock_avr),
+        patch.object(sut, "_config", return_value=_make_hdmi_cfg()),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.config.update_config") as mock_update,
+    ):
+        result = await _tool_calibrate_level(target_peak_dbfs=-12.0, start_db=-30.0)
+
+    assert result["ok"]
+    # correction = -12 - (-32) = +20 → volume = -30 + 20 = -10
+    assert result["calibrated_volume_db"] == -10.0
+    assert mock_engine.measure.call_count == 2
+    mock_update.assert_called_once_with({"measurement": {"denon_sweep_volume": -10.0}})
+
+
+@pytest.mark.asyncio
+async def test_calibrate_level_hdmi_probe_snr_fail() -> None:
+    """HDMI mode: probe sweep SNR too low → error."""
+    from calibrate.measurement import MeasurementQualityError
+
+    mock_avr = AsyncMock()
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(
+        side_effect=MeasurementQualityError("snr", "SNR 5 dB", "too quiet"),
+    )
+
+    with (
+        patch.object(sut, "_avr", mock_avr),
+        patch.object(sut, "_config", return_value=_make_hdmi_cfg()),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.config.update_config"),
+    ):
+        result = await _tool_calibrate_level(start_db=-30.0)
+
+    assert not result["ok"]
+    assert "SNR too low" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_calibrate_level_hdmi_verify_hot_backs_off() -> None:
+    """HDMI mode: verify sweep too hot → backs off volume."""
+    mock_avr = AsyncMock()
+
+    probe_fr = MagicMock()
+    probe_fr.peak_spl = -15.0
+
+    verify_fr = MagicMock()
+    verify_fr.peak_spl = -1.0  # above -3 ceiling
+
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
+
+    with (
+        patch.object(sut, "_avr", mock_avr),
+        patch.object(sut, "_config", return_value=_make_hdmi_cfg()),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.config.update_config") as mock_update,
+    ):
+        result = await _tool_calibrate_level(target_peak_dbfs=-12.0, start_db=-20.0)
+
+    assert result["ok"]
+    # probe: correction = -12 - (-15) = +3 → volume = -20 + 3 = -17
+    # verify: peak -1.0 > -3 ceiling → backoff = -1 - (-12) = 11
+    # final = -17 - 11 = -28
+    assert result["calibrated_volume_db"] == -28.0
+
+
+@pytest.mark.asyncio
+async def test_calibrate_level_hdmi_volume_clamped_to_max() -> None:
+    """HDMI mode: computed volume exceeds max_volume_db → clamped."""
+    mock_avr = AsyncMock()
+
+    probe_fr = MagicMock()
+    probe_fr.peak_spl = -60.0  # very quiet
+
+    verify_fr = MagicMock()
+    verify_fr.peak_spl = -20.0
+
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
+
+    with (
+        patch.object(sut, "_avr", mock_avr),
+        patch.object(sut, "_config", return_value=_make_hdmi_cfg()),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.config.update_config") as mock_update,
+    ):
+        result = await _tool_calibrate_level(
+            target_peak_dbfs=-12.0, start_db=-40.0, max_volume_db=-5.0
+        )
+
+    assert result["ok"]
+    # correction = -12 - (-60) = +48 → volume = -40 + 48 = +8 → clamped to -5
+    assert result["calibrated_volume_db"] == -5.0
+
+
+@pytest.mark.asyncio
+async def test_calibrate_level_no_avr_hdmi_mode() -> None:
+    """HDMI mode with no AVR driver loaded → error."""
+    with (
+        patch.object(sut, "_avr", None),
+        patch.object(sut, "_config", return_value=_make_hdmi_cfg()),
+    ):
+        result = await _tool_calibrate_level()
+
+    assert not result["ok"]
+    assert "AVR driver not loaded" in result["error"]
 
 
 # ── fetch_recipe ───────────────────────────────────────────────────────────────

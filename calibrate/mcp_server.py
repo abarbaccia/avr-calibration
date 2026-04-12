@@ -472,160 +472,193 @@ async def _tool_trigger_measurement(
 
 
 async def _tool_calibrate_level(
-    start_db: float = -10.0,
+    target_peak_dbfs: float = -12.0,
+    start_db: float = -30.0,
     max_volume_db: float = 0.0,
     target_snr_db: float = 20.0,
-    step_db: float = 3.0,
-    min_spl_dbfs: float = -30.0,
-    max_spl_dbfs: float = 0.0,
 ) -> dict:
-    """Auto-calibrate sweep level.
+    """Auto-calibrate sweep level using predict-and-verify (2 sweeps).
 
-    For HDMI/AVR mode: ramps AVR volume from start_db toward max_volume_db
-    until measurement SNR >= target_snr_db.
+    Takes one probe measurement at a safe starting level, computes the exact
+    gain correction to hit target_peak_dbfs, applies it, and verifies with a
+    second sweep.  -12 dBFS default gives 12 dB headroom + good SNR.
 
-    For USB mode: AVR volume does not affect the sweep (signal goes Pi→USB→miniDSP,
-    bypassing the Denon entirely). Sets miniDSP master gain to start_db, then steps
-    it down by step_db while peak_spl > max_spl_dbfs. Accepts the level once
-    peak_spl <= max_spl_dbfs and SNR is good. If SNR fails, the user must turn up
-    the sub's physical gain knob (master gain can only make things louder, not fix SNR).
-    Saves calibrated master gain to config on success.
+    USB mode: adjusts miniDSP master gain.
+    HDMI mode: adjusts AVR volume.
     """
     from .measurement import MeasurementEngine, MeasurementQualityError
     from .config import update_config
     from .drivers.minidsp import MinidspSweepContext
+    import math as _math
 
     cfg = _config()
     engine = MeasurementEngine(cfg)
     route = cfg.measurement.get("playback_route", "usb")
 
+    # Clipping ceiling — if verify sweep is above this, back off
+    _clip_ceiling = -3.0
+    # Gain limits
+    _gain_floor = -50.0
+    _gain_ceiling = 0.0
+
     if route == "usb":
-        # USB mode: control SPL via miniDSP master gain.
-        # Always start at start_db so calibration begins from a known state,
-        # then step down if the signal is too hot.
         if _dsp is None:
             return _err("DSP driver not loaded")
 
-        # Count active sub outputs so we can suggest a higher gain for solo sweeps.
-        # When all-but-one sub is muted, SPL drops by ~20*log10(N) dB relative to
-        # combined, meaning solo measurements can run at a proportionally higher gain.
-        import math as _math
         sub_count = sum(
-            1 for slot in cfg.minidsp.output_slots
-            if getattr(slot, "type", "unused") == "sub"
+            1 for slot in cfg.minidsp.get("output_slots", [])
+            if slot.get("type", "unused") == "sub"
         )
         _sub_count = max(1, sub_count)
 
         minidsp_ctx = MinidspSweepContext.from_config(cfg)
-        current_gain = start_db
-        # Safety floor: don't step below -40 dB (inaudible, pointless)
-        gain_floor = -40.0
 
-        async def _usb_level_loop() -> dict:
-            nonlocal current_gain
-            while current_gain >= gain_floor:
-                await _dsp.set_master_gain(current_gain)  # type: ignore[union-attr]
-                await asyncio.sleep(0.3)
-                try:
-                    fr = await engine.measure()
-                except MeasurementQualityError as exc:
-                    # SNR too low — master gain stepping can only make it louder,
-                    # not fix a signal that's already too quiet.
-                    return _err(
-                        f"USB sweep SNR too low ({exc.detail}). "
-                        "Turn up the sub's physical gain knob, then retry."
-                    )
-                except Exception as exc:
-                    return _err(f"calibrate_level failed: {exc}")
-
-                if fr.peak_spl > max_spl_dbfs:
-                    log.info(
-                        "calibrate_level: peak_spl=%.1f dBFS above max %.1f dBFS, "
-                        "stepping master gain down to %.1f dB",
-                        fr.peak_spl, max_spl_dbfs, current_gain - step_db,
-                    )
-                    current_gain -= step_db
-                    continue
-
-                # In range (or below min_spl_dbfs — SNR passed so accept it)
-                update_config({"measurement": {"master_gain_db": current_gain}})
-                # For solo sweeps (one sub muted), SPL drops ~20*log10(N) dB so we can
-                # use a proportionally higher gain without clipping the recording.
-                _solo_offset = round(20.0 * _math.log10(_sub_count), 1) if _sub_count > 1 else 0.0
-                _solo_gain = round(min(0.0, current_gain + _solo_offset), 1)
-                return _ok(
-                    calibrated_volume_db=None,
-                    calibrated_master_gain_db=current_gain,
-                    suggested_solo_gain_db=_solo_gain,
-                    message=(
-                        f"USB mode: master gain set to {current_gain:.1f} dB "
-                        f"(peak_spl={fr.peak_spl:.1f} dBFS). "
-                        f"For solo single-sub sweeps use suggested_solo_gain_db "
-                        f"({_solo_gain:.1f} dB) — muting one of {_sub_count} subs "
-                        f"reduces SPL by ~{_solo_offset:.0f} dB, allowing higher gain "
-                        "without clipping."
-                    ),
+        async def _usb_predict_verify() -> dict:
+            # ── Step 1: probe at safe starting level ──
+            probe_gain = start_db
+            await _dsp.set_master_gain(probe_gain)  # type: ignore[union-attr]
+            await asyncio.sleep(0.3)
+            try:
+                probe_fr = await engine.measure()
+            except MeasurementQualityError as exc:
+                return _err(
+                    f"USB sweep SNR too low at {probe_gain:.0f} dB ({exc.detail}). "
+                    "Turn up the sub's physical gain knob, then retry."
                 )
+            except Exception as exc:
+                return _err(f"calibrate_level probe failed: {exc}")
 
-            return _err(
-                f"peak_spl still above {max_spl_dbfs} dBFS even at "
-                f"{current_gain + step_db:.1f} dB master gain. "
-                "Check that the sub's physical gain knob is not turned up too high."
+            # ── Step 2: compute correction ──
+            correction = target_peak_dbfs - probe_fr.peak_spl
+            computed_gain = round(probe_gain + correction, 1)
+            # Clamp to valid range
+            computed_gain = max(_gain_floor, min(_gain_ceiling, computed_gain))
+
+            log.info(
+                "calibrate_level: probe at %.1f dB → peak %.1f dBFS, "
+                "correction %.1f dB → target gain %.1f dB",
+                probe_gain, probe_fr.peak_spl, correction, computed_gain,
+            )
+
+            # ── Step 3: verify at computed level ──
+            await _dsp.set_master_gain(computed_gain)  # type: ignore[union-attr]
+            await asyncio.sleep(0.3)
+            try:
+                verify_fr = await engine.measure()
+            except MeasurementQualityError as exc:
+                return _err(
+                    f"USB sweep failed at computed gain {computed_gain:.1f} dB ({exc.detail}). "
+                    "Turn up the sub's physical gain knob, then retry."
+                )
+            except Exception as exc:
+                return _err(f"calibrate_level verify failed: {exc}")
+
+            # If still clipping, back off
+            final_gain = computed_gain
+            if verify_fr.peak_spl > _clip_ceiling:
+                backoff = verify_fr.peak_spl - target_peak_dbfs
+                final_gain = round(max(_gain_floor, computed_gain - backoff), 1)
+                log.info(
+                    "calibrate_level: verify peak %.1f dBFS still hot, "
+                    "backing off to %.1f dB",
+                    verify_fr.peak_spl, final_gain,
+                )
+                await _dsp.set_master_gain(final_gain)  # type: ignore[union-attr]
+
+            update_config({"measurement": {"master_gain_db": final_gain}})
+
+            _solo_offset = round(20.0 * _math.log10(_sub_count), 1) if _sub_count > 1 else 0.0
+            _solo_gain = round(min(0.0, final_gain + _solo_offset), 1)
+            return _ok(
+                calibrated_volume_db=None,
+                calibrated_master_gain_db=final_gain,
+                suggested_solo_gain_db=_solo_gain,
+                message=(
+                    f"USB mode: master gain set to {final_gain:.1f} dB "
+                    f"(peak_spl={verify_fr.peak_spl:.1f} dBFS, "
+                    f"target={target_peak_dbfs:.0f} dBFS). "
+                    f"2 sweeps. "
+                    f"For solo single-sub sweeps use suggested_solo_gain_db "
+                    f"({_solo_gain:.1f} dB) — muting one of {_sub_count} subs "
+                    f"reduces SPL by ~{_solo_offset:.0f} dB, allowing higher gain "
+                    "without clipping."
+                ),
             )
 
         if minidsp_ctx:
             async with minidsp_ctx:
-                return await _usb_level_loop()
-        return await _usb_level_loop()
+                return await _usb_predict_verify()
+        return await _usb_predict_verify()
 
-    # HDMI/AVR mode: ramp AVR volume until SNR passes.
+    # ── HDMI/AVR mode ──
     if _avr is None:
         return _err("AVR driver not loaded")
 
-    volume = start_db
-
-    # Use DenonSweepContext with manage_volume=False — it handles input switching,
-    # Pure Direct, and state restore; we control volume ourselves in the ramp loop.
     denon_ctx = DenonSweepContext.from_config(cfg, manage_volume=False)
 
-    async def _ramp_loop() -> dict:
-        nonlocal volume
-        while volume <= max_volume_db:
-            try:
-                await _avr.set_volume(volume)  # type: ignore[union-attr]
-                await asyncio.sleep(0.5)
-
-                await engine.measure()
-
-                # SNR passed — save calibrated volume
-                update_config({"measurement": {"denon_sweep_volume": volume}})
-                return _ok(
-                    calibrated_volume_db=volume,
-                    message=f"Level calibrated at {volume} dB. SNR is good.",
+    async def _hdmi_predict_verify() -> dict:
+        # ── Step 1: probe at safe starting volume ──
+        probe_vol = start_db
+        await _avr.set_volume(probe_vol)  # type: ignore[union-attr]
+        await asyncio.sleep(0.5)
+        try:
+            probe_fr = await engine.measure()
+        except MeasurementQualityError as exc:
+            if exc.check in ("snr", "sweep_capture"):
+                return _err(
+                    f"SNR too low at {probe_vol:.0f} dB ({exc.detail}). "
+                    f"Try a higher start_db or check that subs are powered on."
                 )
+            return _err(f"measurement quality error: {exc.detail}")
+        except Exception as exc:
+            return _err(f"calibrate_level probe failed: {exc}")
 
-            except MeasurementQualityError as exc:
-                if exc.check in ("snr", "sweep_capture"):
-                    log.info(
-                        "calibrate_level: %s at %.1f dB, ramping up",
-                        exc.detail, volume,
-                    )
-                    volume += step_db
-                    continue
-                else:
-                    return _err(f"measurement quality error: {exc.detail}")
-            except Exception as exc:
-                return _err(f"calibrate_level failed: {exc}")
+        # ── Step 2: compute correction ──
+        correction = target_peak_dbfs - probe_fr.peak_spl
+        computed_vol = round(probe_vol + correction, 1)
+        computed_vol = max(-80.0, min(max_volume_db, computed_vol))
 
-        return _err(
-            f"Could not achieve SNR >= {target_snr_db} dB even at {max_volume_db} dB. "
-            "Check that subs are powered on and signal path is correct."
+        log.info(
+            "calibrate_level HDMI: probe at %.1f dB → peak %.1f dBFS, "
+            "correction %.1f dB → target volume %.1f dB",
+            probe_vol, probe_fr.peak_spl, correction, computed_vol,
+        )
+
+        # ── Step 3: verify ──
+        await _avr.set_volume(computed_vol)  # type: ignore[union-attr]
+        await asyncio.sleep(0.5)
+        try:
+            verify_fr = await engine.measure()
+        except MeasurementQualityError as exc:
+            if exc.check in ("snr", "sweep_capture"):
+                return _err(
+                    f"SNR still too low at computed volume {computed_vol:.1f} dB. "
+                    "Check that subs are powered on and signal path is correct."
+                )
+            return _err(f"measurement quality error: {exc.detail}")
+        except Exception as exc:
+            return _err(f"calibrate_level verify failed: {exc}")
+
+        final_vol = computed_vol
+        if verify_fr.peak_spl > _clip_ceiling:
+            backoff = verify_fr.peak_spl - target_peak_dbfs
+            final_vol = round(max(-80.0, computed_vol - backoff), 1)
+            await _avr.set_volume(final_vol)  # type: ignore[union-attr]
+
+        update_config({"measurement": {"denon_sweep_volume": final_vol}})
+        return _ok(
+            calibrated_volume_db=final_vol,
+            message=(
+                f"HDMI mode: volume set to {final_vol:.1f} dB "
+                f"(peak_spl={verify_fr.peak_spl:.1f} dBFS, "
+                f"target={target_peak_dbfs:.0f} dBFS). 2 sweeps."
+            ),
         )
 
     if denon_ctx:
         async with denon_ctx:
-            return await _ramp_loop()
-    return await _ramp_loop()
+            return await _hdmi_predict_verify()
+    return await _hdmi_predict_verify()
 
 
 async def _tool_fetch_recipe(name: str) -> dict:
@@ -1199,40 +1232,34 @@ _TOOLS: list[Tool] = [
     Tool(
         name="calibrate_level",
         description=(
-            "Auto-calibrate sweep level. "
-            "HDMI mode: ramps AVR volume from start_db toward max_volume_db until SNR >= target_snr_db. "
-            "USB mode: sets miniDSP master gain to start_db, steps it down by step_db while "
-            "peak_spl > max_spl_dbfs, accepts when peak_spl in range and SNR good. "
-            "Saves calibrated level to config. Call before calibration to find the right sweep level. "
-            "Returns {ok: true, calibrated_volume_db: N} (HDMI) or "
-            "{ok: true, calibrated_master_gain_db: N} (USB)."
+            "Auto-calibrate sweep level using predict-and-verify (2 sweeps). "
+            "Takes one probe sweep at a safe starting level, computes the exact gain "
+            "correction to hit target_peak_dbfs (-12 dBFS default = 12 dB headroom + good SNR), "
+            "and verifies with a second sweep. "
+            "USB mode: adjusts miniDSP master gain. HDMI mode: adjusts AVR volume. "
+            "Returns {ok, calibrated_master_gain_db, suggested_solo_gain_db} (USB) or "
+            "{ok, calibrated_volume_db} (HDMI)."
         ),
         inputSchema={
             "type": "object",
             "properties": {
+                "target_peak_dbfs": {
+                    "type": "number",
+                    "description": (
+                        "Target peak level in dBFS (default: -12). "
+                        "-12 gives 12 dB headroom before clipping with good SNR."
+                    ),
+                },
                 "start_db": {
                     "type": "number",
-                    "description": "Starting level in dB (default: -10). HDMI: AVR volume. USB: miniDSP master gain.",
+                    "description": (
+                        "Safe starting level for probe sweep in dB (default: -30). "
+                        "Should be low enough to never clip."
+                    ),
                 },
                 "max_volume_db": {
                     "type": "number",
                     "description": "HDMI only: maximum AVR volume ceiling in dB (default: 0 = reference)",
-                },
-                "target_snr_db": {
-                    "type": "number",
-                    "description": "Minimum acceptable SNR in dB (default: 20)",
-                },
-                "step_db": {
-                    "type": "number",
-                    "description": "Level increment/decrement per retry in dB (default: 3)",
-                },
-                "min_spl_dbfs": {
-                    "type": "number",
-                    "description": "USB only: minimum acceptable peak SPL in dBFS (default: -30). Accepted if SNR passes.",
-                },
-                "max_spl_dbfs": {
-                    "type": "number",
-                    "description": "USB only: maximum acceptable peak SPL in dBFS (default: 0). Steps down master gain if exceeded.",
                 },
             },
         },
@@ -1736,10 +1763,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         )
     elif name == "calibrate_level":
         result = await _tool_calibrate_level(
-            start_db=float(arguments.get("start_db", -10.0)),
+            target_peak_dbfs=float(arguments.get("target_peak_dbfs", -12.0)),
+            start_db=float(arguments.get("start_db", -30.0)),
             max_volume_db=float(arguments.get("max_volume_db", 0.0)),
-            target_snr_db=float(arguments.get("target_snr_db", 20.0)),
-            step_db=float(arguments.get("step_db", 3.0)),
         )
     elif name == "fetch_recipe":
         result = await _tool_fetch_recipe(arguments["name"])
