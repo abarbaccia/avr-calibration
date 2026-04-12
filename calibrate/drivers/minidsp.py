@@ -108,6 +108,11 @@ class MinidspDriver(DSPDriver):
         """Return in-memory EQ state for *preset* ([] if never applied)."""
         return list(self._eq_state.get(preset, []))
 
+    async def read_input_eq(self, preset: int) -> list[dict]:
+        """Return in-memory input EQ state for *preset* ([] if never applied)."""
+        key = ("input", self._active_input, preset)
+        return list(self._eq_state.get(key, []))
+
     def _parse_filter_specs(self, filters: list[dict]) -> list[FilterSpec]:
         """Parse raw filter dicts into FilterSpec objects."""
         try:

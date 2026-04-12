@@ -324,6 +324,16 @@ async def _tool_read_eq() -> dict:
         return _err(f"read_eq error: {exc}")
 
 
+async def _tool_read_input_eq() -> dict:
+    """Return current input EQ filter state (in-memory, updated by apply_input_eq)."""
+    try:
+        preset = await _dsp.current_preset()  # type: ignore[union-attr]
+        filters = await _dsp.read_input_eq(preset)  # type: ignore[union-attr]
+        return _ok(preset=preset, filters=filters, target="input")
+    except DriverError as exc:
+        return _err(f"read_input_eq error: {exc}")
+
+
 async def _tool_apply_eq(
     filters: list[dict], output_index: int | None = None,
 ) -> dict:
@@ -376,6 +386,236 @@ async def _tool_apply_input_eq(
         return _ok(filters_applied=len(filters), preset=preset, target="input")
     except DriverError as exc:
         return _err(str(exc))
+
+
+async def _tool_compute_deviation(
+    session_id: int,
+    target_curve: dict,
+    null_threshold_db: float = 15.0,
+    port_rolloff_hz: float = 28.0,
+) -> dict:
+    """Compute RMS deviation of a measurement against a target curve.
+
+    Automatically detects and excludes:
+    - Null zones: frequencies where measured SPL is > null_threshold_db below the band average
+    - Below-port rolloff: frequencies below port_rolloff_hz where the sub physically can't produce output
+
+    Returns RMS deviation, per-band errors, convergence status, and excluded zones.
+    """
+    from .storage import SessionStore
+    import math
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        session = next((s for s in sessions if s.id == session_id), None)
+        if session is None:
+            return _err(f"session {session_id} not found")
+
+        fr = session.start_fr
+        if not fr or not fr.frequencies:
+            return _err(f"session {session_id} has no frequency response data")
+
+        # Parse target curve points
+        points = target_curve.get("points", [])
+        if not points:
+            return _err("target_curve must include 'points' array with [{freq, spl}]")
+
+        band = target_curve.get("band", [20, 80])
+        band_lo, band_hi = float(band[0]), float(band[1])
+
+        # Build target interpolation function (log-frequency, linear dB)
+        target_freqs = sorted(points, key=lambda p: p["freq"])
+
+        def interpolate_target(freq_hz: float) -> float | None:
+            """Interpolate target SPL at a given frequency. Returns None if outside target range."""
+            if freq_hz < target_freqs[0]["freq"] or freq_hz > target_freqs[-1]["freq"]:
+                return None
+            # Find surrounding points
+            for i in range(len(target_freqs) - 1):
+                f0, s0 = target_freqs[i]["freq"], target_freqs[i]["spl"]
+                f1, s1 = target_freqs[i + 1]["freq"], target_freqs[i + 1]["spl"]
+                if f0 <= freq_hz <= f1:
+                    # Log-frequency interpolation
+                    if f1 == f0:
+                        return s0
+                    t = math.log(freq_hz / f0) / math.log(f1 / f0)
+                    return s0 + t * (s1 - s0)
+            return target_freqs[-1]["spl"]
+
+        # Filter FR to band range
+        pairs = [(f, s) for f, s in zip(fr.frequencies, fr.spl) if band_lo <= f <= band_hi]
+        if not pairs:
+            return _err(f"no FR data in band {band_lo}-{band_hi} Hz")
+
+        # Compute band average (for null detection)
+        measured_spls = [s for _, s in pairs]
+        band_avg = sum(measured_spls) / len(measured_spls)
+
+        # Classify each frequency point
+        per_band_errors = []
+        included_errors = []
+        excluded_null = []
+        excluded_rolloff = []
+
+        for freq, measured in pairs:
+            target = interpolate_target(freq)
+            if target is None:
+                continue
+
+            error = measured - target  # positive = above target, negative = below
+
+            # Check exclusions
+            is_null = measured < (band_avg - null_threshold_db)
+            is_rolloff = freq < port_rolloff_hz
+
+            entry = {
+                "freq_hz": round(freq, 1),
+                "measured_db": round(measured, 1),
+                "target_db": round(target, 1),
+                "error_db": round(error, 1),
+                "excluded": is_null or is_rolloff,
+            }
+
+            if is_null:
+                excluded_null.append(round(freq, 1))
+                entry["exclude_reason"] = "null"
+            elif is_rolloff:
+                excluded_rolloff.append(round(freq, 1))
+                entry["exclude_reason"] = "rolloff"
+            else:
+                included_errors.append(error)
+
+            per_band_errors.append(entry)
+
+        if not included_errors:
+            return _err("no usable frequency points after excluding nulls and rolloff")
+
+        # Compute RMS deviation
+        rms = math.sqrt(sum(e ** 2 for e in included_errors) / len(included_errors))
+        mean_error = sum(included_errors) / len(included_errors)
+        max_error = max(included_errors, key=abs)
+        converged = rms < 2.0  # Standard convergence threshold
+
+        # Downsample per_band_errors to 1/3-octave summary for compact output
+        summary = []
+        for centre in _THIRD_OCTAVE_CENTRES:
+            if centre < band_lo or centre > band_hi:
+                continue
+            factor = 2 ** (1 / 6)
+            lo = centre / factor
+            hi = centre * factor
+            band_entries = [e for e in per_band_errors if lo <= e["freq_hz"] < hi and not e.get("excluded")]
+            if band_entries:
+                avg_error = sum(e["error_db"] for e in band_entries) / len(band_entries)
+                avg_measured = sum(e["measured_db"] for e in band_entries) / len(band_entries)
+                target_at_centre = interpolate_target(centre)
+                summary.append({
+                    "freq_hz": centre,
+                    "measured_db": round(avg_measured, 1),
+                    "target_db": round(target_at_centre, 1) if target_at_centre else None,
+                    "error_db": round(avg_error, 1),
+                })
+
+        # Identify null zone ranges (contiguous excluded frequencies)
+        null_zones = []
+        if excluded_null:
+            zone_start = excluded_null[0]
+            zone_end = excluded_null[0]
+            for f in excluded_null[1:]:
+                if f - zone_end < 3.0:  # Within 3 Hz = same zone
+                    zone_end = f
+                else:
+                    null_zones.append({"lo_hz": zone_start, "hi_hz": zone_end})
+                    zone_start = zone_end = f
+            null_zones.append({"lo_hz": zone_start, "hi_hz": zone_end})
+
+        return _ok(
+            session_id=session_id,
+            rms_db=round(rms, 2),
+            converged=converged,
+            mean_error_db=round(mean_error, 2),
+            max_error_db=round(max_error, 1),
+            included_points=len(included_errors),
+            excluded_null_points=len(excluded_null),
+            excluded_rolloff_points=len(excluded_rolloff),
+            null_zones=null_zones,
+            summary=summary,
+        )
+    except Exception as exc:
+        return _err(f"compute_deviation failed: {exc}")
+
+
+async def _tool_compare_sessions(
+    session_a: int,
+    session_b: int,
+    min_hz: float = 20.0,
+    max_hz: float = 120.0,
+) -> dict:
+    """Compare frequency responses between two sessions.
+
+    Returns per-1/3-octave-band deltas (B minus A) and overall statistics.
+    Useful for verifying that EQ changes had the intended effect.
+    """
+    from .storage import SessionStore
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        sa = next((s for s in sessions if s.id == session_a), None)
+        sb = next((s for s in sessions if s.id == session_b), None)
+        if sa is None:
+            return _err(f"session {session_a} not found")
+        if sb is None:
+            return _err(f"session {session_b} not found")
+
+        for s_check, s_id in [(sa, session_a), (sb, session_b)]:
+            if not s_check.start_fr or not s_check.start_fr.frequencies:
+                return _err(f"session {s_id} has no frequency response data")
+
+        # Downsample both to 1/3-octave bands for comparison
+        bands_a = _downsample_to_third_octave(sa.start_fr.frequencies, sa.start_fr.spl)
+        bands_b = _downsample_to_third_octave(sb.start_fr.frequencies, sb.start_fr.spl)
+
+        # Build lookup by freq
+        a_by_freq = {b["freq_hz"]: b["spl_db"] for b in bands_a}
+        b_by_freq = {b["freq_hz"]: b["spl_db"] for b in bands_b}
+
+        deltas = []
+        all_freqs = sorted(set(a_by_freq.keys()) | set(b_by_freq.keys()))
+        for freq in all_freqs:
+            if freq < min_hz or freq > max_hz:
+                continue
+            spl_a = a_by_freq.get(freq)
+            spl_b = b_by_freq.get(freq)
+            if spl_a is not None and spl_b is not None:
+                delta = round(spl_b - spl_a, 1)
+                deltas.append({
+                    "freq_hz": freq,
+                    "session_a_db": spl_a,
+                    "session_b_db": spl_b,
+                    "delta_db": delta,
+                })
+
+        delta_values = [d["delta_db"] for d in deltas]
+        if delta_values:
+            import math
+            avg_delta = round(sum(delta_values) / len(delta_values), 1)
+            max_delta = round(max(delta_values, key=abs), 1)
+            rms_delta = round(math.sqrt(sum(d ** 2 for d in delta_values) / len(delta_values)), 2)
+        else:
+            avg_delta = max_delta = rms_delta = 0.0
+
+        return _ok(
+            session_a={"id": session_a, "label": sa.label},
+            session_b={"id": session_b, "label": sb.label},
+            bands=deltas,
+            avg_delta_db=avg_delta,
+            max_delta_db=max_delta,
+            rms_delta_db=rms_delta,
+        )
+    except Exception as exc:
+        return _err(f"compare_sessions failed: {exc}")
 
 
 async def _tool_avr_set_volume(level_db: float) -> dict:
@@ -453,18 +693,22 @@ async def _tool_trigger_measurement(
             metadata["position"] = position
 
         # Build descriptive label: "combined @ MLP", "sub1-solo @ MLP"
-        parts = []
-        parts.append(label or "combined")
-        if position:
-            parts.append("@ " + position)
-        full_label = " ".join(parts)
+        base_label = label or "combined"
+        if position and f"@ {position}" not in base_label:
+            full_label = f"{base_label} @ {position}"
+        else:
+            full_label = base_label
 
         store = SessionStore()
         session_id = store.save_measurement(fr, label=full_label, metadata=metadata, target_curve=target_curve)
+
+        # Strip large fields from the tool response (they're saved in the DB)
+        response_metadata = {k: v for k, v in metadata.items() if k != "group_delay"}
+
         return _ok(
             session_id=session_id,
             label=full_label,
-            metadata=metadata,
+            metadata=response_metadata,
             message="Measurement complete — use get_measurement_history() to retrieve results.",
         )
     except Exception as exc:
@@ -472,160 +716,224 @@ async def _tool_trigger_measurement(
 
 
 async def _tool_calibrate_level(
-    start_db: float = -10.0,
+    target_spl_db: float = 78.0,
+    start_db: float = -30.0,
     max_volume_db: float = 0.0,
-    target_snr_db: float = 20.0,
-    step_db: float = 3.0,
-    min_spl_dbfs: float = -30.0,
-    max_spl_dbfs: float = 0.0,
 ) -> dict:
-    """Auto-calibrate sweep level.
+    """Auto-calibrate sweep level using predict-and-verify (2 sweeps).
 
-    For HDMI/AVR mode: ramps AVR volume from start_db toward max_volume_db
-    until measurement SNR >= target_snr_db.
+    Targets a specific SPL at the microphone (default 78 dB — typical
+    listening level).  Uses the UMIK sensitivity from the cal file to
+    convert between dBFS recording level and acoustic SPL.
 
-    For USB mode: AVR volume does not affect the sweep (signal goes Pi→USB→miniDSP,
-    bypassing the Denon entirely). Sets miniDSP master gain to start_db, then steps
-    it down by step_db while peak_spl > max_spl_dbfs. Accepts the level once
-    peak_spl <= max_spl_dbfs and SNR is good. If SNR fails, the user must turn up
-    the sub's physical gain knob (master gain can only make things louder, not fix SNR).
-    Saves calibrated master gain to config on success.
+    1. Probe sweep at a safe starting level (start_db).
+    2. Compute actual SPL from peak_dBFS + mic offset.
+    3. Compute exact gain correction to hit target_spl_db.
+    4. Verify with a second sweep.
+
+    USB mode: adjusts miniDSP master gain.
+    HDMI mode: adjusts AVR volume.
     """
     from .measurement import MeasurementEngine, MeasurementQualityError
     from .config import update_config
     from .drivers.minidsp import MinidspSweepContext
+    import math as _math
+    import numpy as _np
+
+    def _ir_spl(fr) -> float:
+        """SPL estimate from deconvolved IR peak.
+
+        The IR peak (20*log10(max|h(t)|)) tracks actual SPL linearly because
+        the deconvolution H=Y/X scales with recording level.  Empirically the
+        values match acoustic dB SPL within a few dB for our sweep config.
+        Unlike recording_peak_dbfs, the IR peak is immune to ambient noise
+        and electrical interference because deconvolution separates signal
+        from noise.
+        """
+        if fr.impulse_response:
+            arr = _np.array(fr.impulse_response, dtype=_np.float64)
+            return float(round(20.0 * _np.log10(_np.max(_np.abs(arr)) + 1e-12), 1))
+        # Fallback: FR magnitude peak (less reliable for absolute SPL)
+        return fr.peak_spl
 
     cfg = _config()
     engine = MeasurementEngine(cfg)
     route = cfg.measurement.get("playback_route", "usb")
 
+    # Gain limits
+    _gain_floor = -50.0
+    _gain_ceiling = 0.0
+
+    log.info("calibrate_level: target SPL=%.0f dB, start=%.0f dB", target_spl_db, start_db)
+
     if route == "usb":
-        # USB mode: control SPL via miniDSP master gain.
-        # Always start at start_db so calibration begins from a known state,
-        # then step down if the signal is too hot.
         if _dsp is None:
             return _err("DSP driver not loaded")
 
-        # Count active sub outputs so we can suggest a higher gain for solo sweeps.
-        # When all-but-one sub is muted, SPL drops by ~20*log10(N) dB relative to
-        # combined, meaning solo measurements can run at a proportionally higher gain.
-        import math as _math
         sub_count = sum(
-            1 for slot in cfg.minidsp.output_slots
-            if getattr(slot, "type", "unused") == "sub"
+            1 for slot in cfg.minidsp.get("output_slots", [])
+            if slot.get("type", "unused") == "sub"
         )
         _sub_count = max(1, sub_count)
 
         minidsp_ctx = MinidspSweepContext.from_config(cfg)
-        current_gain = start_db
-        # Safety floor: don't step below -40 dB (inaudible, pointless)
-        gain_floor = -40.0
 
-        async def _usb_level_loop() -> dict:
-            nonlocal current_gain
-            while current_gain >= gain_floor:
-                await _dsp.set_master_gain(current_gain)  # type: ignore[union-attr]
-                await asyncio.sleep(0.3)
-                try:
-                    fr = await engine.measure()
-                except MeasurementQualityError as exc:
-                    # SNR too low — master gain stepping can only make it louder,
-                    # not fix a signal that's already too quiet.
-                    return _err(
-                        f"USB sweep SNR too low ({exc.detail}). "
-                        "Turn up the sub's physical gain knob, then retry."
-                    )
-                except Exception as exc:
-                    return _err(f"calibrate_level failed: {exc}")
-
-                if fr.peak_spl > max_spl_dbfs:
-                    log.info(
-                        "calibrate_level: peak_spl=%.1f dBFS above max %.1f dBFS, "
-                        "stepping master gain down to %.1f dB",
-                        fr.peak_spl, max_spl_dbfs, current_gain - step_db,
-                    )
-                    current_gain -= step_db
-                    continue
-
-                # In range (or below min_spl_dbfs — SNR passed so accept it)
-                update_config({"measurement": {"master_gain_db": current_gain}})
-                # For solo sweeps (one sub muted), SPL drops ~20*log10(N) dB so we can
-                # use a proportionally higher gain without clipping the recording.
-                _solo_offset = round(20.0 * _math.log10(_sub_count), 1) if _sub_count > 1 else 0.0
-                _solo_gain = round(min(0.0, current_gain + _solo_offset), 1)
-                return _ok(
-                    calibrated_volume_db=None,
-                    calibrated_master_gain_db=current_gain,
-                    suggested_solo_gain_db=_solo_gain,
-                    message=(
-                        f"USB mode: master gain set to {current_gain:.1f} dB "
-                        f"(peak_spl={fr.peak_spl:.1f} dBFS). "
-                        f"For solo single-sub sweeps use suggested_solo_gain_db "
-                        f"({_solo_gain:.1f} dB) — muting one of {_sub_count} subs "
-                        f"reduces SPL by ~{_solo_offset:.0f} dB, allowing higher gain "
-                        "without clipping."
-                    ),
+        async def _usb_predict_verify() -> dict:
+            # ── Step 1: probe at safe starting level ──
+            probe_gain = start_db
+            await _dsp.set_master_gain(probe_gain)  # type: ignore[union-attr]
+            await asyncio.sleep(0.3)
+            try:
+                probe_fr = await engine.measure()
+            except MeasurementQualityError as exc:
+                return _err(
+                    f"USB sweep SNR too low at {probe_gain:.0f} dB ({exc.detail}). "
+                    "Turn up the sub's physical gain knob, then retry."
                 )
+            except Exception as exc:
+                return _err(f"calibrate_level probe failed: {exc}")
 
-            return _err(
-                f"peak_spl still above {max_spl_dbfs} dBFS even at "
-                f"{current_gain + step_db:.1f} dB master gain. "
-                "Check that the sub's physical gain knob is not turned up too high."
+            probe_spl = _ir_spl(probe_fr)
+
+            # ── Step 2: compute correction ──
+            correction = round(target_spl_db - probe_spl, 1)
+            computed_gain = round(probe_gain + correction, 1)
+            computed_gain = max(_gain_floor, min(_gain_ceiling, computed_gain))
+
+            log.info(
+                "calibrate_level USB: probe at %.1f dB → IR peak %.1f dB SPL, "
+                "correction %.1f dB → target gain %.1f dB",
+                probe_gain, probe_spl, correction, computed_gain,
+            )
+
+            # ── Step 3: verify at computed level ──
+            await _dsp.set_master_gain(computed_gain)  # type: ignore[union-attr]
+            await asyncio.sleep(0.3)
+            try:
+                verify_fr = await engine.measure()
+            except MeasurementQualityError as exc:
+                return _err(
+                    f"USB sweep failed at computed gain {computed_gain:.1f} dB ({exc.detail}). "
+                    "Turn up the sub's physical gain knob, then retry."
+                )
+            except Exception as exc:
+                return _err(f"calibrate_level verify failed: {exc}")
+
+            verify_spl = _ir_spl(verify_fr)
+
+            # If verify is >3 dB above target, back off
+            final_gain = computed_gain
+            if verify_spl > target_spl_db + 3.0:
+                overshoot = verify_spl - target_spl_db
+                final_gain = round(max(_gain_floor, computed_gain - overshoot), 1)
+                log.info(
+                    "calibrate_level: verify %.1f dB SPL, %.1f dB over target, "
+                    "backing off to %.1f dB gain",
+                    verify_spl, overshoot, final_gain,
+                )
+                await _dsp.set_master_gain(final_gain)  # type: ignore[union-attr]
+                verify_spl = round(verify_spl - overshoot, 1)
+
+            update_config({"measurement": {"master_gain_db": final_gain}})
+
+            _solo_offset = round(20.0 * _math.log10(_sub_count), 1) if _sub_count > 1 else 0.0
+            _solo_gain = round(min(0.0, final_gain + _solo_offset), 1)
+            return _ok(
+                calibrated_volume_db=None,
+                calibrated_master_gain_db=final_gain,
+                suggested_solo_gain_db=_solo_gain,
+                estimated_spl_db=verify_spl,
+                message=(
+                    f"USB mode: master gain set to {final_gain:.1f} dB "
+                    f"(~{verify_spl:.0f} dB SPL at mic, target {target_spl_db:.0f} dB SPL). "
+                    f"2 sweeps. "
+                    f"For solo single-sub sweeps use suggested_solo_gain_db "
+                    f"({_solo_gain:.1f} dB) — muting one of {_sub_count} subs "
+                    f"reduces SPL by ~{_solo_offset:.0f} dB, allowing higher gain "
+                    "without clipping."
+                ),
             )
 
         if minidsp_ctx:
             async with minidsp_ctx:
-                return await _usb_level_loop()
-        return await _usb_level_loop()
+                return await _usb_predict_verify()
+        return await _usb_predict_verify()
 
-    # HDMI/AVR mode: ramp AVR volume until SNR passes.
+    # ── HDMI/AVR mode ──
     if _avr is None:
         return _err("AVR driver not loaded")
 
-    volume = start_db
-
-    # Use DenonSweepContext with manage_volume=False — it handles input switching,
-    # Pure Direct, and state restore; we control volume ourselves in the ramp loop.
     denon_ctx = DenonSweepContext.from_config(cfg, manage_volume=False)
 
-    async def _ramp_loop() -> dict:
-        nonlocal volume
-        while volume <= max_volume_db:
-            try:
-                await _avr.set_volume(volume)  # type: ignore[union-attr]
-                await asyncio.sleep(0.5)
-
-                await engine.measure()
-
-                # SNR passed — save calibrated volume
-                update_config({"measurement": {"denon_sweep_volume": volume}})
-                return _ok(
-                    calibrated_volume_db=volume,
-                    message=f"Level calibrated at {volume} dB. SNR is good.",
+    async def _hdmi_predict_verify() -> dict:
+        # ── Step 1: probe at safe starting volume ──
+        probe_vol = start_db
+        await _avr.set_volume(probe_vol)  # type: ignore[union-attr]
+        await asyncio.sleep(0.5)
+        try:
+            probe_fr = await engine.measure()
+        except MeasurementQualityError as exc:
+            if exc.check in ("snr", "sweep_capture"):
+                return _err(
+                    f"SNR too low at {probe_vol:.0f} dB ({exc.detail}). "
+                    f"Try a higher start_db or check that subs are powered on."
                 )
+            return _err(f"measurement quality error: {exc.detail}")
+        except Exception as exc:
+            return _err(f"calibrate_level probe failed: {exc}")
 
-            except MeasurementQualityError as exc:
-                if exc.check in ("snr", "sweep_capture"):
-                    log.info(
-                        "calibrate_level: %s at %.1f dB, ramping up",
-                        exc.detail, volume,
-                    )
-                    volume += step_db
-                    continue
-                else:
-                    return _err(f"measurement quality error: {exc.detail}")
-            except Exception as exc:
-                return _err(f"calibrate_level failed: {exc}")
+        probe_spl = _ir_spl(probe_fr)
 
-        return _err(
-            f"Could not achieve SNR >= {target_snr_db} dB even at {max_volume_db} dB. "
-            "Check that subs are powered on and signal path is correct."
+        # ── Step 2: compute correction ──
+        correction = round(target_spl_db - probe_spl, 1)
+        computed_vol = round(probe_vol + correction, 1)
+        computed_vol = max(-80.0, min(max_volume_db, computed_vol))
+
+        log.info(
+            "calibrate_level HDMI: probe at %.1f dB → IR peak %.1f dB SPL, "
+            "correction %.1f dB → target volume %.1f dB",
+            probe_vol, probe_spl, correction, computed_vol,
+        )
+
+        # ── Step 3: verify ──
+        await _avr.set_volume(computed_vol)  # type: ignore[union-attr]
+        await asyncio.sleep(0.5)
+        try:
+            verify_fr = await engine.measure()
+        except MeasurementQualityError as exc:
+            if exc.check in ("snr", "sweep_capture"):
+                return _err(
+                    f"SNR still too low at computed volume {computed_vol:.1f} dB. "
+                    "Check that subs are powered on and signal path is correct."
+                )
+            return _err(f"measurement quality error: {exc.detail}")
+        except Exception as exc:
+            return _err(f"calibrate_level verify failed: {exc}")
+
+        verify_spl = _ir_spl(verify_fr)
+
+        final_vol = computed_vol
+        if verify_spl > target_spl_db + 3.0:
+            overshoot = verify_spl - target_spl_db
+            final_vol = round(max(-80.0, computed_vol - overshoot), 1)
+            await _avr.set_volume(final_vol)  # type: ignore[union-attr]
+            verify_spl = round(verify_spl - overshoot, 1)
+
+        update_config({"measurement": {"denon_sweep_volume": final_vol}})
+        return _ok(
+            calibrated_volume_db=final_vol,
+            estimated_spl_db=verify_spl,
+            message=(
+                f"HDMI mode: volume set to {final_vol:.1f} dB "
+                f"(~{verify_spl:.0f} dB SPL at mic, target {target_spl_db:.0f} dB SPL). "
+                f"2 sweeps."
+            ),
         )
 
     if denon_ctx:
         async with denon_ctx:
-            return await _ramp_loop()
-    return await _ramp_loop()
+            return await _hdmi_predict_verify()
+    return await _hdmi_predict_verify()
 
 
 async def _tool_fetch_recipe(name: str) -> dict:
@@ -841,10 +1149,16 @@ async def _tool_analyze_ir(
         search_samples = min(search_samples, len(ir_arr))
         search_window = ir_arr[:search_samples]
 
-        peak_idx = int(np.argmax(np.abs(search_window)))
+        abs_window = np.abs(search_window)
+        max_idx = int(np.argmax(abs_window))
+        # Onset detection: first sample within 20 dB of the absolute peak.
+        # argmax finds the LOUDEST peak — in strong-mode rooms this can be a
+        # late resonance instead of the direct sound.  Onset finds first arrival.
+        onset_threshold = abs_window[max_idx] * 0.1  # -20 dB
+        peak_idx = int(np.argmax(abs_window > onset_threshold))
         peak_sign = 1 if ir_arr[peak_idx] >= 0.0 else -1
         peak_time_s = peak_idx / sample_rate
-        spl_db = float(20.0 * np.log10(abs(float(ir_arr[peak_idx])) + 1e-12))
+        spl_db = float(20.0 * np.log10(abs_window[max_idx] + 1e-12))
 
         return _ok(
             session_id=session.id,
@@ -1096,6 +1410,18 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="read_input_eq",
+        description=(
+            "Return the current DSP input EQ filter state. Tracked in-memory — "
+            "reflects filters applied via apply_input_eq() since the MCP server started. "
+            "Returns preset index and list of active input filters with freq, gain_db, q, type."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {},
+        },
+    ),
+    Tool(
         name="apply_eq",
         description=(
             "Apply EQ filters to DSP output(s). By default writes to all sub outputs "
@@ -1193,40 +1519,35 @@ _TOOLS: list[Tool] = [
     Tool(
         name="calibrate_level",
         description=(
-            "Auto-calibrate sweep level. "
-            "HDMI mode: ramps AVR volume from start_db toward max_volume_db until SNR >= target_snr_db. "
-            "USB mode: sets miniDSP master gain to start_db, steps it down by step_db while "
-            "peak_spl > max_spl_dbfs, accepts when peak_spl in range and SNR good. "
-            "Saves calibrated level to config. Call before calibration to find the right sweep level. "
-            "Returns {ok: true, calibrated_volume_db: N} (HDMI) or "
-            "{ok: true, calibrated_master_gain_db: N} (USB)."
+            "Auto-calibrate sweep level using predict-and-verify (2 sweeps). "
+            "Targets a specific SPL at the mic (default 78 dB — typical listening level). "
+            "Uses UMIK sensitivity from the cal file to convert dBFS ↔ SPL. "
+            "Takes one probe sweep at a safe starting level, computes the exact gain "
+            "correction to hit target_spl_db, and verifies with a second sweep. "
+            "USB mode: adjusts miniDSP master gain. HDMI mode: adjusts AVR volume. "
+            "Returns {ok, calibrated_master_gain_db, suggested_solo_gain_db, estimated_spl_db} (USB) or "
+            "{ok, calibrated_volume_db, estimated_spl_db} (HDMI)."
         ),
         inputSchema={
             "type": "object",
             "properties": {
+                "target_spl_db": {
+                    "type": "number",
+                    "description": (
+                        "Target peak level in dB SPL at the mic (default: 78). "
+                        "78 dB is a typical listening level for home theater."
+                    ),
+                },
                 "start_db": {
                     "type": "number",
-                    "description": "Starting level in dB (default: -10). HDMI: AVR volume. USB: miniDSP master gain.",
+                    "description": (
+                        "Safe starting level for probe sweep in dB (default: -30). "
+                        "Should be low enough to never clip."
+                    ),
                 },
                 "max_volume_db": {
                     "type": "number",
                     "description": "HDMI only: maximum AVR volume ceiling in dB (default: 0 = reference)",
-                },
-                "target_snr_db": {
-                    "type": "number",
-                    "description": "Minimum acceptable SNR in dB (default: 20)",
-                },
-                "step_db": {
-                    "type": "number",
-                    "description": "Level increment/decrement per retry in dB (default: 3)",
-                },
-                "min_spl_dbfs": {
-                    "type": "number",
-                    "description": "USB only: minimum acceptable peak SPL in dBFS (default: -30). Accepted if SNR passes.",
-                },
-                "max_spl_dbfs": {
-                    "type": "number",
-                    "description": "USB only: maximum acceptable peak SPL in dBFS (default: 0). Steps down master gain if exceeded.",
                 },
             },
         },
@@ -1685,6 +2006,95 @@ _TOOLS: list[Tool] = [
             },
         },
     ),
+    Tool(
+        name="compute_deviation",
+        description=(
+            "Compute RMS deviation of a measurement session against a target curve. "
+            "Automatically excludes null zones (deep cancellation dips) and below-port rolloff "
+            "from the RMS calculation. Returns rms_db, converged (rms < 2.0), per-band summary, "
+            "and null zone identification. Use this after each EQ iteration to check convergence."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "integer",
+                    "description": "Measurement session ID to evaluate",
+                },
+                "target_curve": {
+                    "type": "object",
+                    "description": (
+                        "Target curve with points. Shape: {points: [{freq, spl}], band: [lo_hz, hi_hz]}. "
+                        "For Harman bass target anchored at ref dB: "
+                        "points=[{freq:25,spl:ref+5},{freq:31,spl:ref+4},...,{freq:80,spl:ref}]"
+                    ),
+                    "properties": {
+                        "points": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "freq": {"type": "number"},
+                                    "spl": {"type": "number"},
+                                },
+                            },
+                        },
+                        "band": {
+                            "type": "array",
+                            "items": {"type": "number"},
+                            "description": "[lo_hz, hi_hz] — frequency range to evaluate",
+                        },
+                    },
+                },
+                "null_threshold_db": {
+                    "type": "number",
+                    "description": (
+                        "Frequencies where measured SPL is this many dB below the band average "
+                        "are classified as nulls and excluded from RMS. Default: 15."
+                    ),
+                },
+                "port_rolloff_hz": {
+                    "type": "number",
+                    "description": (
+                        "Frequencies below this are excluded as below-port rolloff. Default: 28 Hz "
+                        "(SVS PB12-NSD port tuning ~22 Hz, rolloff becomes steep by 28 Hz)."
+                    ),
+                },
+            },
+            "required": ["session_id", "target_curve"],
+        },
+    ),
+    Tool(
+        name="compare_sessions",
+        description=(
+            "Compare frequency responses between two measurement sessions. "
+            "Returns per-1/3-octave-band deltas (session B minus session A) and statistics. "
+            "Use this to verify EQ changes had the intended effect, or to compare "
+            "solo vs combined measurements."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_a": {
+                    "type": "integer",
+                    "description": "First (earlier/before) session ID",
+                },
+                "session_b": {
+                    "type": "integer",
+                    "description": "Second (later/after) session ID",
+                },
+                "min_hz": {
+                    "type": "number",
+                    "description": "Lower frequency bound in Hz (default: 20)",
+                },
+                "max_hz": {
+                    "type": "number",
+                    "description": "Upper frequency bound in Hz (default: 120)",
+                },
+            },
+            "required": ["session_a", "session_b"],
+        },
+    ),
 ]
 
 
@@ -1710,6 +2120,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         )
     elif name == "read_eq":
         result = await _tool_read_eq()
+    elif name == "read_input_eq":
+        result = await _tool_read_input_eq()
     elif name == "apply_eq":
         output_index = arguments.get("output_index")
         if output_index is not None:
@@ -1730,10 +2142,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         )
     elif name == "calibrate_level":
         result = await _tool_calibrate_level(
-            start_db=float(arguments.get("start_db", -10.0)),
+            target_spl_db=float(arguments.get("target_spl_db", 78.0)),
+            start_db=float(arguments.get("start_db", -30.0)),
             max_volume_db=float(arguments.get("max_volume_db", 0.0)),
-            target_snr_db=float(arguments.get("target_snr_db", 20.0)),
-            step_db=float(arguments.get("step_db", 3.0)),
         )
     elif name == "fetch_recipe":
         result = await _tool_fetch_recipe(arguments["name"])
@@ -1803,6 +2214,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_get_fr_summary(
             session_ids=session_ids,
             limit=int(arguments.get("limit", 5)),
+        )
+    elif name == "compute_deviation":
+        result = await _tool_compute_deviation(
+            session_id=int(arguments["session_id"]),
+            target_curve=arguments["target_curve"],
+            null_threshold_db=float(arguments.get("null_threshold_db", 15.0)),
+            port_rolloff_hz=float(arguments.get("port_rolloff_hz", 28.0)),
+        )
+    elif name == "compare_sessions":
+        result = await _tool_compare_sessions(
+            session_a=int(arguments["session_a"]),
+            session_b=int(arguments["session_b"]),
+            min_hz=float(arguments.get("min_hz", 20.0)),
+            max_hz=float(arguments.get("max_hz", 120.0)),
         )
     # Legacy aliases for backwards compatibility with cached sessions
     elif name == "mute_sub_outputs":

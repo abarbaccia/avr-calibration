@@ -196,8 +196,9 @@ The skill has specialized workflows that produce better results than ad-hoc answ
 
 Key routing rules:
 - "Calibrate", "run calibration", "tune the subs" → invoke calibrate
+- "Verify", "check integration", "how's it all sound", "post-Audyssey" → invoke verify
 - "Set up", "configure", "new hardware" → invoke setup
-- "Build a recipe", "new recipe" → invoke recipe
+- "Build a recipe", "new recipe", "full room recipe" → invoke recipe
 - "Sub crawl", "find best position" → invoke subcrawl
 - "Take a measurement", "how does it sound" → invoke measure
 - "Check system", "is everything connected" → invoke check

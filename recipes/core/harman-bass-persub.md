@@ -139,6 +139,10 @@ For each sub, compare its solo FR to flat (its own average level):
 - Peaks above the average: cut with peaking filter (always safe)
 - Dips below the average: leave alone if narrow (likely a null — unfixable)
 - Broad dips: gentle boost if > 3 dB below average (limited by safety)
+- **Q selection near adjacent features:** When a peak is adjacent to a dip
+  (< 1/3 octave apart), use Q ≥ 4 to avoid the cut bleeding into the dip.
+  A Q of 2.5 at 55 Hz will affect 43-67 Hz; a Q of 4 narrows to 48-62 Hz.
+  Use `analyze_decay` suggested_q for ringing modes — it accounts for mode width.
 
 **Prefer cuts heavily.** The goal is to flatten each sub's response,
 not to boost it to match a target. Nulls cannot be filled with EQ.
@@ -172,6 +176,17 @@ After applying per-sub EQ:
      the new ones. Never call `apply_eq` with only the delta: `apply_eq`
      replaces all slots and a delta-only write discards all prior corrections.
 4. Maximum 3 iterations per sub
+
+### 2.7 Slot utilization guidance
+
+Each sub output has 8 PEQ slots. Target usage:
+- **Iteration 1:** 2-3 filters — HPF + largest peaks. Keep it simple.
+- **Iteration 2-3:** Add 1-2 filters for remaining deviations if variance > 2 dB.
+- **Final state:** 3-5 filters typical. Using all 8 is fine if each addresses a real feature.
+
+Don't leave slots unused when measurable improvements remain. After each iteration,
+check if residual peaks > 2 dB above average could benefit from an additional filter.
+Use `analyze_decay` to identify ringing modes that benefit from narrow-Q treatment.
 
 ## Phase 3 — Harman Target (Input PEQ)
 
@@ -210,6 +225,11 @@ Algorithm:
 2. The constraint is: max(required_boost across all bands) <= 6 dB
 3. So: ref <= min(measured_spl(freq) - harman_offset(freq)) + 6
    across all frequencies in the band
+   Exclude from this calculation:
+   - Frequencies where measured SPL is > 15 dB below the band average (cancellation nulls)
+   - Frequencies below 28 Hz (below port tuning rolloff, unfixable)
+   Nulls would otherwise drag the reference down, wasting headroom on frequencies
+   that EQ cannot fix.
 4. Use that as the reference SPL for the Harman target
 
 This places the target as high as possible while keeping all boosts within the
@@ -232,7 +252,10 @@ Always include the mandatory 18Hz HPF.
 ### 3.4 Re-measure and iterate
 
 After applying EQ, re-measure combined response (label "iter-N @ MLP"):
-- RMS deviation < 2.0 dB from the anchored target: done
+- Call `compute_deviation(session_id, target_curve)` to get RMS deviation with automatic null exclusion
+- RMS deviation < 2.0 dB from the anchored target (excluding nulls): done
+- The tool automatically excludes deep cancellation nulls (>15 dB below band average)
+  and below-port rolloff from the RMS calculation
 - Do NOT re-anchor the target between iterations (it was set in 3.2)
 - Maximum 5 EQ iterations
 
@@ -248,7 +271,7 @@ On each subsequent iteration:
 - **Level match**: All subs within 3 dB before digital trim
 - **Alignment**: Combined response reinforces vs individual subs
 - **Per-sub EQ**: Each sub's solo FR variance < 3 dB across 25-80Hz
-- **Harman target**: Combined RMS deviation < 2.0 dB across 20-80Hz
+- **Harman target**: Combined RMS deviation < 2.0 dB (excluding null zones and below-port rolloff)
 
 ## When convergence fails
 
@@ -272,3 +295,6 @@ If max iterations reached:
 - `analyze_ir` — IR peak time/sign/SPL for computing delay and polarity corrections
 - `analyze_decay` — T60 ringing analysis for EQ Q selection (optional, Phase 2)
 - `calibrate_level` — find optimal sweep volume
+- `compute_deviation` — RMS deviation with automatic null/rolloff exclusion (use for convergence checks)
+- `compare_sessions` — per-band delta between two sessions (verify EQ changes)
+- `read_input_eq` — read current input PEQ state (for iterative filter merging)
