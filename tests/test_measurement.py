@@ -37,7 +37,7 @@ from click.testing import CliRunner
 
 from calibrate.cli import cli
 from calibrate.config import Config
-from calibrate.measurement import FrequencyResponse, MeasurementEngine, MeasurementQualityError, compute_session_metadata
+from calibrate.measurement import FrequencyResponse, MeasurementEngine, MeasurementQualityError, compute_session_metadata, detect_ir_onset
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -797,6 +797,57 @@ class TestOnsetDetection:
         assert abs(peak_ms - 15.0) < 1.0, (
             f"Expected onset near 15ms (direct sound), got {peak_ms}ms"
         )
+
+
+# ── detect_ir_onset (shared function) ─────────────────────────────────────────
+
+
+class TestDetectIrOnset:
+    """Direct unit tests for the extracted detect_ir_onset function."""
+
+    def test_finds_direct_sound(self):
+        sr = 48000
+        ir = np.zeros(24000)
+        ir[int(0.012 * sr)] = 1.0  # 12ms
+        result = detect_ir_onset(ir, sr, search_window_ms=50.0)
+        assert abs(result["peak_time_ms"] - 12.0) < 1.0
+
+    def test_skips_dc_artifact(self):
+        sr = 48000
+        ir = np.zeros(24000)
+        ir[0] = 5.0                     # DC artifact
+        ir[int(0.001 * sr)] = 3.0       # artifact tail at 1ms
+        ir[int(0.015 * sr)] = 0.8       # real onset at 15ms
+        result = detect_ir_onset(ir, sr, search_window_ms=50.0)
+        assert result["peak_time_ms"] > 2.0
+        assert abs(result["peak_time_ms"] - 15.0) < 1.0
+
+    def test_returns_correct_keys(self):
+        sr = 48000
+        ir = np.zeros(24000)
+        ir[int(0.010 * sr)] = 1.0
+        result = detect_ir_onset(ir, sr)
+        assert "peak_time_ms" in result
+        assert "peak_sign" in result
+        assert "spl_db" in result
+        assert "sample_rate" in result
+        assert result["sample_rate"] == sr
+
+    def test_negative_peak_sign(self):
+        sr = 48000
+        ir = np.zeros(24000)
+        ir[int(0.010 * sr)] = -1.0  # inverted polarity
+        result = detect_ir_onset(ir, sr, search_window_ms=50.0)
+        assert result["peak_sign"] == -1
+
+    def test_onset_before_mode(self):
+        """Onset finds the first arrival, not the loudest late mode."""
+        sr = 48000
+        ir = np.zeros(24000)
+        ir[int(0.008 * sr)] = 0.3       # direct sound at 8ms
+        ir[int(0.040 * sr)] = 1.0       # room mode at 40ms (louder)
+        result = detect_ir_onset(ir, sr, search_window_ms=50.0)
+        assert abs(result["peak_time_ms"] - 8.0) < 1.0
 
 
 # ── parse_umik_sensitivity ────────────────────────────────────────────────────

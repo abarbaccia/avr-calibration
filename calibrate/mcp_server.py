@@ -1851,39 +1851,16 @@ async def _tool_analyze_ir(
             )
 
         import numpy as np
+        from .measurement import detect_ir_onset
 
         sample_rate = session.start_fr.sample_rate if session.start_fr else 48000
         ir_arr = np.array(ir, dtype=np.float64)
-
-        search_samples = max(1, int(search_window_ms / 1000.0 * sample_rate))
-        search_samples = min(search_samples, len(ir_arr))
-        search_window = ir_arr[:search_samples]
-
-        abs_window = np.abs(search_window)
-        # Skip first 2ms — Wiener deconvolution leaves a DC artifact near
-        # t=0 that confuses onset detection.  The shortest sub-to-mic path in
-        # a home theater room is always > 2ms (~0.7m), so no real IR onset
-        # lives before this point.
-        skip_samples = max(1, int(0.002 * sample_rate))
-        abs_window[:skip_samples] = 0.0
-        max_idx = int(np.argmax(abs_window))
-        # Onset detection: first sample within 20 dB of the absolute peak.
-        # argmax finds the LOUDEST peak — in strong-mode rooms this can be a
-        # late resonance instead of the direct sound.  Onset finds first arrival.
-        onset_threshold = abs_window[max_idx] * 0.1  # -20 dB
-        onset_candidates = np.where(abs_window >= onset_threshold)[0]
-        peak_idx = int(onset_candidates[0]) if len(onset_candidates) > 0 else max_idx
-        peak_sign = 1 if ir_arr[peak_idx] >= 0.0 else -1
-        peak_time_s = peak_idx / sample_rate
-        spl_db = float(20.0 * np.log10(abs_window[max_idx] + 1e-12))
+        onset = detect_ir_onset(ir_arr, sample_rate, search_window_ms)
 
         return _ok(
             session_id=session.id,
-            peak_time_s=round(peak_time_s, 6),
-            peak_time_ms=round(peak_time_s * 1000.0, 3),
-            peak_sign=peak_sign,
-            spl_db=round(spl_db, 1),
-            sample_rate=sample_rate,
+            peak_time_s=round(onset["peak_time_ms"] / 1000.0, 6),
+            **onset,
         )
     except Exception as exc:
         return _err(f"analyze_ir failed: {exc}")

@@ -142,7 +142,7 @@ class Session:
     end_fr: Optional[FrequencyResponse]
     filters_applied: Optional[list[dict]]
     notes: Optional[str]
-    impulse_response: Optional[list[float]] = None  # time-domain IR (first 24 000 samples)
+    impulse_response: Optional[list[float]] = None  # time-domain IR, gated to IR_GATE_S seconds
     metadata: Optional[dict] = None  # IR-derived: ir peak, decay modes, group delay
     target_curve: Optional[dict] = None  # optimization target active at measurement time
 
