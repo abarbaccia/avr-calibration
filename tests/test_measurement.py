@@ -242,7 +242,7 @@ class TestComputeFr:
         n = 4800
         sweep = make_signal(n)
         recording = make_signal(n)
-        freqs, spl, _ir, _phase = engine._compute_fr(np, sweep, recording, 20, 200, 48000)
+        freqs, spl, _ir, _phase, _coh = engine._compute_fr(np, sweep, recording, 20, 200, 48000)
         assert all(isinstance(f, float) for f in freqs)
         assert all(isinstance(s, float) for s in spl)
         assert all(np.isfinite(s) for s in spl)
@@ -255,13 +255,13 @@ class TestComputeFr:
         sweep = MagicMock()
         sweep.timeSignal = np.zeros((n, 1))
         recording = make_signal(n)
-        freqs, spl, _ir, _phase = engine._compute_fr(np, sweep, recording, 20, 200, 48000)
+        freqs, spl, _ir, _phase, _coh = engine._compute_fr(np, sweep, recording, 20, 200, 48000)
         assert all(np.isfinite(s) for s in spl)
 
     def test_output_frequencies_in_requested_band(self):
         engine = self._engine()
         n = 4800
-        freqs, spl, _ir, _phase = engine._compute_fr(np, make_signal(n), make_signal(n), 50, 120, 48000)
+        freqs, spl, _ir, _phase, _coh = engine._compute_fr(np, make_signal(n), make_signal(n), 50, 120, 48000)
         assert all(50 <= f <= 120 for f in freqs)
 
     def test_no_frequencies_in_band_returns_empty(self):
@@ -269,7 +269,7 @@ class TestComputeFr:
         engine = self._engine()
         n = 100
         # With sample_rate=1000 and n=100, max freq=500Hz; band [600,700] is empty
-        freqs, spl, _ir, _phase = engine._compute_fr(np, make_signal(n), make_signal(n), 600, 700, 1000)
+        freqs, spl, _ir, _phase, _coh = engine._compute_fr(np, make_signal(n), make_signal(n), 600, 700, 1000)
         assert freqs == []
         assert spl == []
 
@@ -468,7 +468,7 @@ class TestComputeSessionMetadata:
         engine = MeasurementEngine(make_config(sample_rate=sample_rate))
         sweep = np.random.default_rng(42).standard_normal(n)
         rec = np.random.default_rng(99).standard_normal(n)
-        freqs, spl, ir, phase = engine._compute_fr_arrays(
+        freqs, spl, ir, phase, _coh = engine._compute_fr_arrays(
             np, sweep, rec, 20, 200, sample_rate
         )
         return FrequencyResponse(
@@ -551,7 +551,7 @@ class TestComputeSessionMetadata:
         n = 4800
         sweep = np.random.default_rng(42).standard_normal(n)
         rec = np.random.default_rng(99).standard_normal(n)
-        freqs, spl, ir, phase = engine._compute_fr_arrays(np, sweep, rec, 20, 200, 48000)
+        freqs, spl, ir, phase, _coh = engine._compute_fr_arrays(np, sweep, rec, 20, 200, 48000)
         assert len(phase) == len(freqs)
         assert all(isinstance(p, float) for p in phase)
         assert all(np.isfinite(p) for p in phase)
@@ -694,3 +694,153 @@ class TestOnsetDetection:
         assert abs(peak_ms - 10.0) < 1.0, (
             f"Expected onset near 10ms, got {peak_ms}ms"
         )
+
+
+# ── parse_umik_sensitivity ────────────────────────────────────────────────────
+
+
+class TestParseUmikCalCurve:
+    """Tests for UMIK cal file per-frequency correction parsing."""
+
+    def test_parses_standard_cal_file(self, tmp_path):
+        from calibrate.measurement import parse_umik_cal_curve
+
+        cal = tmp_path / "umik.cal"
+        cal.write_text(
+            '"Sens Factor =1.725dB, AGain =18dB, SERNO: 7079831"\n'
+            '"Auto-generated 90-degree calibration file"\n'
+            "20.0    -0.3\n"
+            "50.0    0.1\n"
+            "100.0   0.5\n"
+        )
+        curve = parse_umik_cal_curve(str(cal))
+        assert len(curve) == 3
+        assert curve[0] == (20.0, -0.3)
+        assert curve[1] == (50.0, 0.1)
+        assert curve[2] == (100.0, 0.5)
+
+    def test_sorted_by_frequency(self, tmp_path):
+        from calibrate.measurement import parse_umik_cal_curve
+
+        cal = tmp_path / "umik.cal"
+        cal.write_text(
+            '"header"\n'
+            "100.0   0.5\n"
+            "20.0    -0.3\n"
+            "50.0    0.1\n"
+        )
+        curve = parse_umik_cal_curve(str(cal))
+        freqs = [p[0] for p in curve]
+        assert freqs == sorted(freqs)
+
+    def test_missing_file_raises(self):
+        from calibrate.measurement import parse_umik_cal_curve
+
+        with pytest.raises(FileNotFoundError):
+            parse_umik_cal_curve("/nonexistent/path.cal")
+
+    def test_empty_data_raises(self, tmp_path):
+        from calibrate.measurement import parse_umik_cal_curve
+
+        cal = tmp_path / "empty.cal"
+        cal.write_text('"only a header line"\n')
+        with pytest.raises(ValueError, match="No frequency correction data"):
+            parse_umik_cal_curve(str(cal))
+
+    def test_skips_non_numeric_lines(self, tmp_path):
+        from calibrate.measurement import parse_umik_cal_curve
+
+        cal = tmp_path / "mixed.cal"
+        cal.write_text(
+            '"header"\n'
+            "not_a_number foo\n"
+            "20.0   -0.3\n"
+            "\n"
+            "50.0   0.1\n"
+        )
+        curve = parse_umik_cal_curve(str(cal))
+        assert len(curve) == 2
+
+
+class TestApplyMicCorrection:
+    """Tests for mic calibration correction application."""
+
+    def test_applies_correction(self):
+        from calibrate.measurement import apply_mic_correction
+
+        frequencies = [20.0, 50.0, 100.0]
+        spl = [70.0, 75.0, 80.0]
+        cal_curve = [(20.0, -0.5), (50.0, 0.0), (100.0, 0.5)]
+        corrected = apply_mic_correction(frequencies, spl, cal_curve)
+        assert corrected[0] == pytest.approx(69.5, abs=0.01)
+        assert corrected[1] == pytest.approx(75.0, abs=0.01)
+        assert corrected[2] == pytest.approx(80.5, abs=0.01)
+
+    def test_interpolates_between_cal_points(self):
+        from calibrate.measurement import apply_mic_correction
+
+        frequencies = [35.0]  # Between 20 and 50
+        spl = [75.0]
+        cal_curve = [(20.0, -1.0), (50.0, 1.0)]
+        corrected = apply_mic_correction(frequencies, spl, cal_curve)
+        # Log-frequency interpolation: 35 is between 20 and 50
+        # The correction should be between -1.0 and 1.0
+        assert -1.0 < corrected[0] - 75.0 < 1.0
+
+    def test_extrapolates_below_range(self):
+        from calibrate.measurement import apply_mic_correction
+
+        frequencies = [10.0]  # Below cal range
+        spl = [70.0]
+        cal_curve = [(20.0, -0.5), (100.0, 0.5)]
+        corrected = apply_mic_correction(frequencies, spl, cal_curve)
+        assert corrected[0] == pytest.approx(69.5, abs=0.01)  # Uses first cal point
+
+    def test_extrapolates_above_range(self):
+        from calibrate.measurement import apply_mic_correction
+
+        frequencies = [200.0]  # Above cal range
+        spl = [80.0]
+        cal_curve = [(20.0, -0.5), (100.0, 0.5)]
+        corrected = apply_mic_correction(frequencies, spl, cal_curve)
+        assert corrected[0] == pytest.approx(80.5, abs=0.01)  # Uses last cal point
+
+    def test_empty_cal_curve_returns_original(self):
+        from calibrate.measurement import apply_mic_correction
+
+        frequencies = [20.0, 50.0]
+        spl = [70.0, 75.0]
+        corrected = apply_mic_correction(frequencies, spl, [])
+        assert corrected == spl
+
+
+class TestParseUmikSensitivity:
+    """Tests for UMIK cal file sensitivity parsing."""
+
+    def test_parses_standard_header(self, tmp_path):
+        from calibrate.measurement import parse_umik_sensitivity
+
+        cal = tmp_path / "umik.cal"
+        cal.write_text(
+            '"Sens Factor =1.725dB, AGain =18dB, SERNO: 7079831"\n'
+            '"Auto-generated 90-degree calibration file"\n'
+            "20.0    -0.3\n"
+        )
+        offset = parse_umik_sensitivity(str(cal))
+        # effective_sens = -18 + 1.725 = -16.275
+        # offset = 94 - (-16.275) = 110.275
+        assert abs(offset - 110.275) < 0.01
+
+    def test_missing_file_raises(self):
+        from calibrate.measurement import parse_umik_sensitivity
+
+        with pytest.raises(FileNotFoundError):
+            parse_umik_sensitivity("/nonexistent/path.cal")
+
+    def test_bad_header_raises(self, tmp_path):
+        from calibrate.measurement import parse_umik_sensitivity
+
+        cal = tmp_path / "bad.cal"
+        cal.write_text("not a valid header\n20.0 -0.3\n")
+        with pytest.raises(ValueError, match="Cannot parse"):
+            parse_umik_sensitivity(str(cal))

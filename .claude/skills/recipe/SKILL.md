@@ -1,9 +1,9 @@
 ---
 name: recipe
-version: 1.0.0
+version: 2.0.0
 description: |
-  Interactive recipe builder. Asks about calibration goals, room issues,
-  and writes a hardware-agnostic recipe .md file in recipes/.
+  Interactive recipe builder. Guides the user through creating a calibration
+  recipe, validates it against the template, and saves to recipes/custom/.
 allowed-tools:
   - Bash
   - Read
@@ -17,138 +17,173 @@ allowed-tools:
 
 # /recipe
 
-Build a custom calibration recipe interactively.
+Build or validate a custom calibration recipe.
 
 ## Arguments
 
-- `$ARGUMENTS` — optional recipe name. If omitted, asks the user.
+- `$ARGUMENTS` — recipe name to create, or "validate {path}" to validate an existing recipe.
 
-## Workflow
+## Step 1 — Read the template
 
-### Step 1 — Review existing recipes
+Read `recipes/TEMPLATE.md` in full. This is the source of truth for recipe structure,
+hard rules, and available tools. Every decision in this skill flows from the template.
+
+## Step 2 — Review existing recipes
 
 ```
 List recipes in recipes/core/ and recipes/custom/.
-Show the user what's available. Ask if they want to create a new one or modify an existing one.
+Read the first few lines (Goal + Filter Strategy) of each.
+Show the user what exists. Ask if they want to:
+  a) Create a new recipe
+  b) Validate an existing custom recipe
+  c) Fork a core recipe as a starting point
 ```
 
-### Step 2 — Ask about calibration scope
+If validating, skip to the Validation step.
 
-Ask first:
+## Step 3 — Understand the user's goal
 
-> What do you want to calibrate?
-> 1. **Subs only** — calibrate subwoofers via miniDSP (EQ, alignment, target curve)
-> 2. **Full room** — sub calibration + Audyssey guidance + post-Audyssey verification
-> 3. **Verification only** — check integration after sub cal + Audyssey (no EQ changes)
+Ask one question at a time. Don't overwhelm with a questionnaire.
 
-If "verification only", point the user to `/verify` instead — that skill handles it directly.
+**Question 1: What are you trying to achieve?**
+> Examples: "flatten my sub response", "match Harman curve with FIR",
+> "calibrate for music (less bass lift)", "align 3 subs then EQ"
 
-If "full room", the recipe will include three stages:
-1. Sub calibration (via miniDSP, same as subs-only recipes)
-2. Audyssey guidance (manual steps the user performs on the Denon)
-3. Post-Audyssey verification (measure combined system, recommend adjustments)
+**Question 2: Hardware setup**
+> - How many subs?
+> - PEQ only, FIR only, or both?
+> - Any constraints? (e.g. limited PEQ slots, no FIR capability)
 
-### Step 3 — Ask about sub calibration goals
+**Question 3: What's different from existing recipes?**
+> Show which existing recipe is closest and ask what they want to change.
+> If the answer is "nothing" — point them to `/calibrate` instead.
 
-Ask one topic at a time:
+## Step 4 — Choose a starting point
 
-1. **Target curve**: Harman (default), flat, custom? If custom, ask for frequency/dB pairs.
-2. **Frequency range**: Full bass (20-80Hz default)? Extended (20-120Hz)? Sub-only (20-50Hz)?
-3. **Sub alignment**: Do they have multiple subs that need alignment first?
-4. **Convergence**: How tight? RMS < 2dB (default) or tighter/looser?
-5. **Max iterations**: How many EQ passes? (default: 5)
-6. **Room issues**: Known room modes? Placement constraints?
+Based on the answers, either:
+- **Fork an existing recipe**: copy `recipes/core/{closest}.md` to
+  `recipes/custom/{name}.md` and modify
+- **Start from scratch**: use the template structure from `recipes/TEMPLATE.md`
 
-### Step 4 — Ask about full-room integration (if scope is "full room")
+If forking, tell the user which recipe you're starting from and why.
 
-If the user chose "full room" in Step 2, also ask:
+## Step 5 — Build the recipe section by section
 
-1. **Room correction system**: What does the AVR use? (e.g. Audyssey, Dirac, YPAO, MCACC, manual, none)
-2. **Crossover frequency**: What's set on the AVR? (default: 80Hz)
-3. **Room correction curve**: Which curve/mode? (e.g. flat, reference/rolled-off, off for some channels)
-4. **Dynamic volume/EQ**: Any dynamic processing enabled? (affects bass level at lower volumes)
-5. **Listening level**: Typical volume? (affects dynamic processing interaction)
-6. **Known integration issues**: Any problems noticed after room correction? (e.g. thin bass, boomy crossover region, level mismatch)
+Walk through each required section from the template. For each section:
 
-### Step 5 — Write the recipe
+1. **Explain what it needs** (from the template's requirements)
+2. **Propose content** based on the user's goals
+3. **Ask for confirmation** before moving on
 
-Write a markdown recipe file following this format:
+Sections to walk through:
+1. Goal
+2. Filter Strategy (which layers, which tools, which NOT used)
+3. Pre-flight (always: check_system, get_config, mute shakers)
+4. Phase 0 — Setup (clear EQ, volume, matrix, level matching)
+5. Calibration phases (the core logic — this is where recipes differ)
+6. Convergence criteria (frequency range, RMS threshold, max iterations)
+7. When convergence fails
+8. Retrospective (always required — scorecard, recommendations, next steps)
+9. MCP tools list
 
-```markdown
-# Recipe: {Name}
+For the **calibration phases** (step 5), enforce these hard rules from the template:
+- Analyze fixability before designing corrections
+- Simulate before applying
+- Use optimize_q, not guessed Q values
+- Include mandatory 18Hz HPF in every apply_eq call
+- Iterative merge pattern for subsequent iterations
+- Anchor with null exclusion if using a target curve
 
-## Goal
-{1-2 sentences describing what this recipe does}
+## Step 6 — Write the recipe
 
-## Prerequisites
-{What must be done before this recipe — e.g. sub calibration completed, Audyssey run}
+Save to `recipes/custom/{name}.md`.
 
-## Pre-flight
-{What to check before starting}
+## Step 7 — Validate
 
-## Phase 1 — {First phase name}
-### 1.1 {Step}
-{Instructions in plain English, hardware-agnostic}
+Run the full validation checklist (same as validate mode). Report results
+as a pass/fail checklist. Fix any failures before finishing.
 
-## Phase 2 — {Second phase name}
-### Target curve
-| Hz | Target |
-|...|...|
+---
 
-### 2.1 {Step}
-{Instructions}
+## Validation Mode
 
-## Convergence
-{When to stop}
+When invoked with "validate {path}" or after writing a new recipe, run every
+check below. Report as a checklist with pass/fail for each item.
 
-## When convergence fails
-{What to suggest if it doesn't converge}
+### Structure checks
+- [ ] Has `## Goal` section
+- [ ] Has `## Filter Strategy` section with layer table
+- [ ] Has `## Pre-flight` section
+- [ ] Pre-flight calls `check_system`
+- [ ] Pre-flight calls `get_config`
+- [ ] Has setup phase that clears EQ before baseline
+- [ ] Has setup phase with volume setup (`set_volume` and/or `calibrate_level`)
+- [ ] Has `## Convergence` section with measurable criteria
+- [ ] Convergence uses `compute_deviation` (not manual RMS)
+- [ ] Convergence frequency range is 25-80Hz (not wider)
+- [ ] Has max iteration count
+- [ ] Has `## When convergence fails` section
+- [ ] Has retrospective phase
+- [ ] Retrospective includes before/after scorecard
+- [ ] Retrospective includes room improvement recommendations
+- [ ] Retrospective includes prioritized next steps
+- [ ] Has `## MCP tools used` section
+
+### Analytics-first workflow checks
+- [ ] Calls `analyze_phase` before designing corrections
+- [ ] Checks coherence before designing corrections
+- [ ] Calls `simulate_eq` before `apply_eq` (verify before apply)
+- [ ] Uses `optimize_q` for Q selection (not hardcoded Q values)
+- [ ] Calls `analyze_decay` for ringing mode Q selection
+
+### Safety checks
+- [ ] Every `apply_eq` / `apply_input_eq` mention includes mandatory 18Hz HPF
+- [ ] Iterative steps use merge pattern (read_eq → merge → apply full set)
+- [ ] Target curve anchor excludes nulls (>15dB below average)
+- [ ] Target curve anchor excludes below-port frequencies (<28Hz)
+- [ ] Does NOT re-anchor between iterations
+
+### Multi-sub checks (if applicable)
+- [ ] Calls `configure_matrix` for input routing
+- [ ] Calls `compare_sub_phase` before applying alignment corrections
+- [ ] Specifies delay reference sub (latest-arriving = 0)
+- [ ] Every `mute_output` has a corresponding `unmute_output`
+- [ ] Mutes shakers during calibration
+
+### Tool reference checks
+- [ ] Every tool name referenced exists in the Available MCP Tools list
+- [ ] No tools referenced that don't exist (e.g. made-up tool names)
+- [ ] Uses `measure` for fresh data (not `get_measurement_history` as baseline)
+
+### Report format
+
 ```
+Recipe Validation: {recipe_name}
+══════════════════════════════
 
-**For "full room" scope**, the recipe should chain three stages.
-Remember: recipes are **hardware-agnostic** — use generic terms (AVR, room correction,
-DSP) not brand names (Denon, Audyssey, miniDSP). The skill layer handles hardware specifics.
+Structure:        12/12 passed
+Analytics-first:   5/5 passed
+Safety:            5/5 passed
+Multi-sub:         4/5 passed  ← 1 issue
+Tool references:   3/3 passed
 
-```markdown
-# Recipe: {Name} — Full Room Calibration
+Issues:
+  ✗ Multi-sub: No configure_matrix call found. The miniDSP default
+    routing may split inputs across outputs. Add a configure_matrix
+    step in Phase 0.
 
-## Stage 1 — Sub Calibration
-{Sub alignment, per-sub EQ, target curve — same structure as sub-only recipes}
-
-## Stage 2 — Room Correction Guidance
-{Manual steps for running the AVR's room correction}
-### Preparation
-- Set all speakers to "Small" with crossover at {X}Hz on the AVR
-- Run the AVR's automatic room correction with mic at multiple positions
-### Post-Correction Settings
-- Select room correction curve (flatter vs more rolled off)
-- Enable/disable dynamic volume compensation — note interaction with sub calibration
-- Verify sub distance and level trim haven't been changed dramatically by room correction
-
-## Stage 3 — Integration Verification
-{References recipes/core/full-room-verify.md procedure}
-- Measure subs-only baseline
-- Measure full system with room correction active
-- Check crossover integration
-- Recommend AVR setting adjustments
+Overall: 29/30 checks passed — 1 issue to fix
 ```
-
-Save to `recipes/custom/{name}.md` (user recipes go in custom/, not core/).
-
-### Step 6 — Validate
-
-Read the recipe back and verify:
-- References only valid MCP tool actions (measure, apply EQ, mute, delay, polarity)
-- Contains no hardware-specific details (no model names, IPs, protocols)
-- Has clear convergence criteria
-- Has a "when convergence fails" section
-- For full-room recipes: includes all three stages (sub cal, room correction guidance, verification)
-- For verification stages: references the post-audyssey-verify recipe structure
 
 ## Important rules
 
-1. **Hardware-agnostic.** Recipes must never mention specific hardware models, IPs, or protocols.
-2. **Plain English.** Write for Claude to read and execute, not for a Python parser.
-3. **Include convergence criteria.** Every recipe must define when it's "done."
-4. **Prefer cuts over boosts.** Mention this in EQ sections.
-5. **Always include the mandatory 18Hz HPF.** Mention this in EQ sections.
+1. **Recipes go in `recipes/custom/`, never `recipes/core/`.** Core recipes are
+   maintained by the project. Custom recipes are user-contributed.
+2. **The template is the source of truth.** Always read `recipes/TEMPLATE.md`
+   before building or validating. If the template has been updated, follow the
+   latest version.
+3. **Don't skip validation.** Every recipe must pass all applicable checks
+   before the skill reports completion.
+4. **Be opinionated about quality.** If the user's proposed recipe would skip
+   analytics (e.g. "just measure and apply EQ"), explain why the analytics-first
+   workflow produces better results and guide them to include it.
