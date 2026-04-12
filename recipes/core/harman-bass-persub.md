@@ -320,6 +320,111 @@ If max iterations reached:
 - If the combined Harman pass can't converge, the per-sub corrections
   may need revisiting — check for cancellation between subs
 
+## Phase 4 — Retrospective
+
+After calibration completes (whether converged or not), analyze everything from
+the run and give the user a roadmap for further improvement. This is where the
+LLM synthesizes data that no automated tool can — physical room advice derived
+from measurement analytics.
+
+**Always run this phase**, even if calibration converged perfectly. There may be
+room improvements that would make the NEXT calibration even better.
+
+### 4.1 Gather run data
+
+Collect the key data from all phases:
+- Solo measurement session IDs from Phase 1 and Phase 2
+- Combined measurement session IDs from Phase 3
+- `analyze_phase` results from Phase 2 (fixability per band)
+- `compare_sub_phase` results from Phase 1 (reinforcement/cancellation)
+- `analyze_decay` results if run in Phase 2
+- Final `compute_deviation` from Phase 3 (what converged, what didn't)
+- `compare_sessions` between baseline (first combined) and final measurement
+
+### 4.2 Before/after scorecard
+
+Present a clear before → after comparison:
+
+```
+                    Before          After         Δ
+RMS deviation:      5.8 dB    →    1.6 dB       -4.2 dB ✓
+Worst peak:         +12 dB @45Hz → +3 dB @45Hz  -9 dB ✓
+Worst null:         -14 dB @62Hz → -13 dB @62Hz -1 dB  (unfixable)
+Sub alignment:      16.8ms apart → 0.0ms         aligned ✓
+Polarity:           mismatched  → matched         ✓
+PEQ slots used:     0/8 per sub → 4/8 per sub
+Input PEQ slots:    0/8         → 5/8
+```
+
+### 4.3 Unfixable problems — room improvement recommendations
+
+Review `analyze_phase` results across all measurements. For every band where
+`fixable=False` or where EQ couldn't converge:
+
+**Sub placement opportunities:**
+- Identify which sub(s) contribute to cancellation nulls using `compare_sub_phase`
+- Recommend specific repositioning: "Sub 2 cancels Sub 1 at 55Hz. Moving Sub 2
+  to an adjacent wall would shift this null."
+- Corner placement increases coupling — recommend for subs that are weak below 40Hz
+- If one sub has significantly more nulls than the other, it's the better candidate to move
+
+**Room treatment candidates:**
+- Review `analyze_decay` for modes with T60 > 500ms — these ring audibly
+- "50Hz mode rings for 800ms. A corner bass trap tuned to 50Hz would reduce this.
+  Budget option: OC 703 panel (4" thick) in the nearest corner."
+- Prioritize modes by audibility: higher SPL + longer T60 = more audible
+
+**Rattle and resonance detection:**
+- Check coherence data from measurements — sudden narrow coherence drops
+  at specific frequencies can indicate mechanical resonances (cabinet rattles,
+  HVAC ducts, window panes, shelving)
+- "Low coherence at 73Hz — possible rattle or mechanical resonance. Check for
+  loose objects, ductwork, or thin panels that vibrate at this frequency."
+- If coherence is consistently low across a broad band, it may be high
+  ambient noise rather than a rattle
+
+### 4.4 EQ improvement opportunities
+
+**FIR candidates:**
+- Any mode where `analyze_decay` showed T60 > 500ms but PEQ only reduced the peak
+  (not the ringing duration) is a candidate for FIR correction
+- "The 50Hz mode still rings for 600ms after PEQ. A minimum-phase FIR filter
+  (256 taps at 96kHz) could shorten the decay. Run a FIR-capable recipe next."
+
+**Slot efficiency:**
+- If all PEQ slots are used but deviation is still > 2dB, suggest:
+  - Combining closely-spaced filters
+  - Dropping the least-effective filter (smallest impact on RMS)
+  - Switching to FIR for broadband correction
+
+### 4.5 Next steps — prioritized action list
+
+Present a numbered list, ordered by expected impact:
+
+```
+## What to do next (highest impact first)
+
+1. 🔧 Move Sub 2 ~30cm away from the side wall
+   WHY: 55Hz cancellation null (-14dB) between subs. Unfixable with EQ.
+   IMPACT: Would eliminate the deepest null in the response.
+
+2. 🧱 Add bass trap to front-left corner
+   WHY: 50Hz mode rings for 800ms. PEQ reduced the peak but not the ringing.
+   IMPACT: Shorter decay → cleaner bass, less mud.
+
+3. 🔍 Check for rattle near 73Hz
+   WHY: Low coherence (0.6) at 73Hz in all measurements. Suggests something
+   is physically vibrating.
+   IMPACT: Removing rattles improves measurement accuracy AND listening quality.
+
+4. 🔄 Re-run calibration after changes
+   WHY: Moving a sub changes the room transfer function. Current EQ is
+   optimized for current placement.
+```
+
+Use plain language. The user may not be an acoustics expert — explain WHY each
+recommendation matters and WHAT to do about it, not just what the data shows.
+
 ## MCP tools used
 
 ### Hardware I/O

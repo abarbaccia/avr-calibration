@@ -162,6 +162,43 @@ If convergence is not reached after 5 iterations, report the final RMS
 deviation and remaining deviations per band. Advise on whether room
 acoustics or placement are likely contributing factors.
 
+## Phase — Retrospective
+
+After calibration completes, analyze the run and give the user a roadmap for
+further physical-world improvement. Always run this, even if EQ converged.
+
+### Before/after scorecard
+
+Use `compare_sessions` between the baseline and final measurement. Present:
+- RMS deviation before → after
+- Worst peak and null before → after
+- PEQ slots used
+- Whether convergence was reached
+
+### Unfixable problems — room improvement recommendations
+
+Review `analyze_phase` results. For every band where `fixable=False`:
+
+**Sub placement:**
+- Identify nulls that EQ couldn't address
+- Recommend repositioning: corner placement increases coupling below 40Hz,
+  moving away from a wall midpoint reduces the deepest mode
+
+**Room treatment:**
+- Review `analyze_decay` for modes with T60 > 500ms
+- Recommend bass traps for ringing modes, prioritized by audibility (SPL × T60)
+
+**Rattles:**
+- Check coherence — narrow drops at specific frequencies suggest mechanical resonances
+- Recommend the user check for loose objects, ductwork, thin panels
+
+### Next steps — prioritized action list
+
+Present a numbered list ordered by expected impact, in plain language:
+1. Physical changes (sub placement, room treatment, rattle fixes)
+2. EQ improvements (FIR for ringing modes, slot optimization)
+3. Re-run calibration after changes
+
 ## Notes
 
 **Ported sub below port resonance:** The SVS PB12-NSD has a port tuned to ~22 Hz.

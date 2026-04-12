@@ -173,3 +173,41 @@ If max iterations reached:
 - Deep nulls indicate room/placement cancellation — suggest sub repositioning
 - Frequencies below the sub's capability cannot be boosted — that's expected
 - Large level differences between subs suggest repositioning or knob adjustment
+
+## Phase 3 — Retrospective
+
+After calibration completes, analyze the run and present a roadmap for improvement.
+Always run this phase, even if calibration converged.
+
+### Before/after scorecard
+
+Use `compare_sessions` between the baseline (first combined measurement) and final
+measurement. Present RMS deviation, worst peak/null, alignment corrections applied,
+PEQ slots used, and convergence status.
+
+### Unfixable problems — room improvement recommendations
+
+Review all analytics data from the run:
+
+**Sub placement (from `compare_sub_phase` + `analyze_phase`):**
+- Identify cancellation nulls and which sub contributes
+- Recommend repositioning the sub with more nulls
+- Corner placement increases coupling; midpoint placement creates the deepest modes
+
+**Room treatment (from `analyze_decay`):**
+- Modes with T60 > 500ms are rattle/mud candidates for bass traps
+- Prioritize by audibility: higher SPL + longer T60 = most audible
+
+**Rattle detection (from coherence):**
+- Narrow coherence drops at specific frequencies → mechanical resonance
+- Broad low coherence → ambient noise issue
+
+**FIR opportunities:**
+- Ringing modes where PEQ reduced the peak but T60 is still long → FIR candidate
+
+### Next steps — prioritized action list
+
+Numbered list ordered by expected impact, in plain language:
+1. Physical changes (sub placement, bass traps, rattle fixes)
+2. EQ improvements (FIR for ringing, slot optimization)
+3. Re-run calibration after changes
