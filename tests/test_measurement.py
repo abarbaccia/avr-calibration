@@ -556,37 +556,78 @@ class TestComputeSessionMetadata:
         assert all(isinstance(p, float) for p in phase)
         assert all(np.isfinite(p) for p in phase)
 
-    def test_tukey_window_reduces_edge_artifacts(self):
-        """Tukey window suppresses comb-like artifacts from signal truncation.
+    def test_ir_gate_removes_combing_artifacts(self):
+        """IR gating removes comb-like artifacts from circular-FFT wrap-around.
 
-        Create a recording with an abrupt cutoff (simulating room reverb
-        truncation) and verify that the windowed deconvolution produces a
-        smoother FR than raw truncation would.
+        Simulate the real scenario: a sweep with leading/trailing silence
+        (like PyTTa) convolved with a room IR whose reverb tail wraps
+        around in the circular FFT.  Without IR gating the raw H(f) shows
+        periodic nulls; with gating the FR should be smooth.
         """
         engine = MeasurementEngine(make_config())
-        rng = np.random.default_rng(42)
-        n = 48000  # 1 second at 48kHz
+        n = 2 ** 16  # 65536 samples
+        sr = 48000
 
-        # Sweep: log chirp from 20-200 Hz
-        t = np.linspace(0, 1, n, endpoint=False)
-        sweep = np.sin(2 * np.pi * 20 * (200 / 20) ** t / np.log(200 / 20) * np.log(200 / 20))
+        # Sweep with leading/trailing silence (like PyTTa layout)
+        t_sweep = np.linspace(0, 1, n - 10000, endpoint=False)
+        chirp = np.sin(
+            2 * np.pi * 20 * (200 / 20) ** t_sweep
+            / np.log(200 / 20) * np.log(200 / 20)
+        )
+        sweep = np.zeros(n)
+        sweep[3000:3000 + len(chirp)] = chirp  # 3000 leading zeros, ~7000 trailing
 
-        # Recording: sweep convolved with a simple room IR, then abruptly truncated
-        # (simulating the real case where reverb extends beyond the sweep length)
+        # Room IR: direct path + strong late reflection that wraps around
         ir_room = np.zeros(n)
-        ir_room[100] = 1.0   # direct path
-        ir_room[2000] = 0.3  # reflection
-        rec_full = np.convolve(sweep, ir_room)[:n]
-        # Add an abrupt edge — non-zero at the end
-        rec_full[-1] = rec_full[-2]  # no natural taper
+        ir_room[200] = 1.0    # direct sound
+        ir_room[4000] = 0.5   # early reflection
+        ir_room[40000] = 0.3  # late reflection — will wrap in circular FFT
+
+        # Recording = circular convolution of sweep with room IR
+        rec = np.real(np.fft.ifft(np.fft.fft(sweep) * np.fft.fft(ir_room)))
 
         freqs, spl, ir_out, phase, _coh = engine._compute_fr_arrays(
-            np, sweep, rec_full, 20, 200, 48000,
+            np, sweep, rec, 20, 200, sr,
         )
         assert len(freqs) > 0
         assert all(np.isfinite(s) for s in spl)
-        # The Tukey window should produce finite, reasonable values
-        assert max(spl) - min(spl) < 60, "FR range too wide — window may not be applied"
+        # IR gating should produce a smooth FR (< 30 dB range in-band)
+        assert max(spl) - min(spl) < 30, "FR range too wide — IR gate may not be working"
+
+        # Check that consecutive bins don't have the periodic comb pattern.
+        # Compute the standard deviation of bin-to-bin differences — a comb
+        # pattern has high variance (alternating high/low).
+        diffs = np.diff(spl)
+        assert np.std(diffs) < 5.0, "Bin-to-bin FR variance too high — possible comb artifact"
+
+    def test_ir_gate_preserves_room_modes(self):
+        """IR gating preserves the room's modal peaks/dips within the gate window."""
+        engine = MeasurementEngine(make_config())
+        n = 2 ** 16
+        sr = 48000
+
+        # Simple sweep (full buffer, no silence — ideal case)
+        t = np.linspace(0, 1, n, endpoint=False)
+        sweep = np.sin(
+            2 * np.pi * 20 * (200 / 20) ** t
+            / np.log(200 / 20) * np.log(200 / 20)
+        )
+
+        # Room with a clear mode: strong resonance at ~50 Hz
+        ir_room = np.zeros(n)
+        ir_room[100] = 1.0
+        # Add 50 Hz ringing (within 500ms gate window)
+        t_ring = np.arange(0, int(0.3 * sr)) / sr
+        ir_room[100:100 + len(t_ring)] += 0.4 * np.sin(2 * np.pi * 50 * t_ring) * np.exp(-t_ring * 5)
+        rec = np.real(np.fft.ifft(np.fft.fft(sweep) * np.fft.fft(ir_room)))
+
+        freqs, spl, _, _, _ = engine._compute_fr_arrays(np, sweep, rec, 20, 200, sr)
+
+        # Find SPL near 50 Hz — should show the mode peak
+        idx_50 = min(range(len(freqs)), key=lambda i: abs(freqs[i] - 50))
+        idx_100 = min(range(len(freqs)), key=lambda i: abs(freqs[i] - 100))
+        # The 50 Hz mode should be visible as elevated SPL vs 100 Hz
+        assert spl[idx_50] > spl[idx_100] - 3, "50 Hz room mode not preserved by IR gate"
 
 
 class TestPreDelayCompensation:

@@ -521,6 +521,13 @@ class MeasurementEngine:
 
     # ── Internals ─────────────────────────────────────────────────────────
 
+    # Default IR gate length in seconds.  The gate removes circular-FFT
+    # wrap-around artifacts that appear as comb-like nulls every 3rd bin
+    # above ~55 Hz.  500 ms gives 10+ cycles at 20 Hz (adequate spectral
+    # resolution for bass) while cutting well before the artifact at
+    # ~N/3 samples (~1.8 s).
+    IR_GATE_S: float = 0.5
+
     def _compute_fr_arrays(
         self,
         np,
@@ -534,7 +541,16 @@ class MeasurementEngine:
         """
         Core deconvolution on raw numpy arrays.
 
-        H(f) = FFT(recording) / FFT(sweep)
+        Deconvolves via H(f) = Y·X* / (|X|² + ε), then gates the
+        impulse response in the time domain before converting back to
+        the frequency domain for a clean FR.
+
+        The PyTTa sweep buffer contains leading/trailing silence.  When
+        the room's reverb tail (T60 > 1 s for bass modes) wraps around
+        in the circular FFT, the raw H(f) = Y/X shows comb-like nulls
+        every 3 bins above ~55 Hz.  IR gating — deconvolve → IFFT →
+        window the IR → FFT — is the standard fix used by REW and
+        other measurement tools.
 
         Returns (frequencies, magnitude_db, ir_samples, phase_radians, coherence).
         coherence is None if scipy is unavailable or computation fails.
@@ -543,31 +559,41 @@ class MeasurementEngine:
         """
         n = min(len(sweep_array), len(rec_array))
 
-        # Apply a Tukey window to reduce spectral leakage from signal
-        # truncation.  When the recording is longer than the sweep (room
-        # reverb tail), truncating to length n creates a discontinuity at
-        # the boundary that produces comb-like artifacts in H(f).
-        # alpha=0.05 tapers only the outer 5% of each edge — enough to
-        # suppress the edge discontinuity without attenuating the main
-        # signal body.
-        try:
-            from scipy.signal.windows import tukey as _tukey
-            window = _tukey(n, alpha=0.05)
-        except ImportError:
-            window = np.ones(n)
-        X = np.fft.rfft(sweep_array[:n] * window, n=n)
-        Y = np.fft.rfft(rec_array[:n] * window, n=n)
+        # Raw FFTs — no input-signal windowing.  Applying the same window
+        # to both sides of a deconvolution (Y·W / X·W) does not cancel
+        # and introduces its own spectral artifacts.
+        X = np.fft.rfft(sweep_array[:n], n=n)
+        Y = np.fft.rfft(rec_array[:n], n=n)
 
+        # Regularised deconvolution (Wiener-style).
+        # H = Y·conj(X) / (|X|² + ε)  — avoids amplifying noise where
+        # the sweep has little energy (band edges, silence regions).
+        X_power = np.abs(X) ** 2
+        epsilon = max(float(np.max(X_power)) * 1e-6, 1e-20)
         with np.errstate(divide="ignore", invalid="ignore"):
-            H = np.where(np.abs(X) > 1e-10, Y / X, 0.0 + 0.0j)
+            H = Y * np.conj(X) / (X_power + epsilon)
 
-        # Time-domain IR (first 24 000 samples, ~500 ms window at 48 kHz)
+        # ── IR gate window ────────────────────────────────────────────
+        # Convert to time domain, gate the IR to remove wrap-around
+        # artifacts and late-time noise, then convert back.
         ir_full = np.fft.irfft(H, n=n)
-        ir_samples = ir_full[:24000].tolist()
+        ir_samples = ir_full[:24000].tolist()  # store unwindowed for decay analysis
+
+        gate_samples = min(int(self.IR_GATE_S * sample_rate), n)
+        taper_samples = min(int(0.05 * sample_rate), gate_samples // 4)  # 50 ms taper
+
+        ir_gated = np.zeros(n)
+        ir_gated[:gate_samples] = ir_full[:gate_samples]
+        # Half-Hanning taper at gate boundary for smooth roll-off
+        if taper_samples > 0:
+            taper = np.hanning(2 * taper_samples)[taper_samples:]
+            ir_gated[gate_samples - taper_samples:gate_samples] *= taper
+
+        H_gated = np.fft.rfft(ir_gated, n=n)
 
         freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
-        mag_db = 20.0 * np.log10(np.abs(H) + 1e-12)
-        phase_rad = np.angle(H)
+        mag_db = 20.0 * np.log10(np.abs(H_gated) + 1e-12)
+        phase_rad = np.angle(H_gated)
 
         mask = (freqs >= freq_min) & (freqs <= freq_max)
         freq_list = freqs[mask].tolist()
