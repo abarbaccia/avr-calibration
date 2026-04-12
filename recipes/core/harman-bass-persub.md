@@ -36,7 +36,8 @@ Use this to map the strategy below to the actual hardware:
 
 ## Pre-flight
 
-Verify all hardware is connected and reachable before starting.
+Call `check_system` to verify all hardware is connected and reachable.
+Call `get_config` to discover output slots, EQ capabilities, and mic configuration.
 Mute any non-sub outputs (e.g. shakers) during calibration.
 
 ## Phase 0 — Level Setup
@@ -102,7 +103,19 @@ For each subwoofer:
 3. Call `analyze_ir(session_id)` — get `peak_time_s`, `peak_sign`, `spl_db`
 4. Unmute
 
-### 1.2 Apply corrections
+### 1.2 Analyze phase relationship
+
+Call `compare_sub_phase(session_a, session_b)` using the solo measurement session
+IDs from 1.1. This shows per-band:
+- Phase difference between the two subs
+- Predicted coherent sum (constructive vs destructive)
+- Classification: reinforcing / partial / cancelling
+
+Use this to understand WHERE the subs reinforce vs cancel BEFORE applying
+corrections. If subs already reinforce well, delay/polarity changes may not
+be needed. If many bands cancel, the `analyze_ir` timing data guides the fix.
+
+### 1.3 Apply corrections
 
 Compare the per-sub `analyze_ir` results:
 - **Delay**: The sub with the latest `peak_time_s` is the reference (delay = 0).
@@ -110,18 +123,6 @@ Compare the per-sub `analyze_ir` results:
   Apply via `set_delay`.
 - **Polarity**: Sub 0 is the polarity reference. Any sub with opposite `peak_sign`
   gets `set_polarity(inverted=True)`.
-
-### 1.3 Analyze phase relationship
-
-Before measuring combined, call `compare_sub_phase(session_a, session_b)` using
-the solo measurement session IDs. This shows per-band:
-- Phase difference between the two subs
-- Predicted coherent sum (constructive vs destructive)
-- Classification: reinforcing / partial / cancelling
-
-Use this to understand WHERE the subs reinforce vs cancel before blindly
-re-measuring. If many bands show "cancelling", delay/polarity corrections
-from 1.2 may need revisiting before proceeding.
 
 ### 1.4 Verify alignment
 
@@ -160,7 +161,14 @@ Also check coherence in the measurement data (`get_measurement_history` with com
 format includes coherence summary). Low coherence (<0.8) means unreliable data at
 that frequency — don't design precise corrections based on noisy measurements.
 
-### 2.3 Design per-sub correction filters
+### 2.3 Analyze decay for ringing modes
+
+Call `analyze_decay(session_id)` on each sub's solo measurement. If any modes
+have T60 > 500ms, note the frequency and `suggested_q` — these ringing modes
+need narrower Q values than a typical room peak. Use this data in the filter
+design step below.
+
+### 2.4 Design per-sub correction filters
 
 For each sub, compare its solo FR to flat (its own average level):
 - Peaks above the average: cut with peaking filter (always safe)
@@ -168,8 +176,8 @@ For each sub, compare its solo FR to flat (its own average level):
   Confirm with `analyze_phase` fixability before deciding.
 - Broad dips: gentle boost if > 3 dB below average AND `fixable=True` (limited by safety)
 - **Q selection:** Call `optimize_q(session_id, freq_hz, target_gain_db)` to find the
-  best Q for each filter. For ringing modes identified by `analyze_decay`, use the
-  `suggested_q` from that tool — it accounts for mode width.
+  best Q for each filter. For ringing modes from `analyze_decay` (step 2.3), prefer
+  the `suggested_q` — it accounts for mode width and targets ringing surgically.
 - **Q near adjacent features:** When a peak is adjacent to a dip (< 1/3 octave apart),
   use Q ≥ 4 to avoid the cut bleeding into the dip.
 
@@ -182,17 +190,10 @@ not to boost it to match a target. Nulls cannot be filled with EQ.
 
 Always include the mandatory 18Hz HPF.
 
-### 2.4 Apply per-sub EQ
+### 2.5 Apply per-sub EQ
 
 For each sub, call `apply_eq` with `output_index` set to that sub's
 output index. Each sub gets its own independent filter set.
-
-### 2.5 Optional — Decay analysis after per-sub EQ
-
-After applying per-sub corrections, call `analyze_decay(session_id)` on the most
-recent solo measurement to check if any modes exhibit T60 > 500ms. If so, use
-`suggested_q` from that mode when designing the PEQ cut — a narrower Q targets
-the ringing frequency more surgically without over-cutting broadband energy.
 
 ### 2.6 Re-measure each sub solo and iterate
 
@@ -428,11 +429,13 @@ recommendation matters and WHAT to do about it, not just what the data shows.
 ## MCP tools used
 
 ### Hardware I/O
+- `check_system` — pre-flight hardware verification
 - `measure` — take a sweep measurement
 - `apply_eq` — write per-sub correction filters (with `output_index` for single-output targeting)
 - `apply_input_eq` — write shared Harman target curve to DSP input
 - `mute_output` / `unmute_output` — isolate subs for solo measurement
 - `set_delay` / `set_polarity` / `set_output_gain` — sub alignment
+- `set_volume` — set AVR volume for sweep playback
 - `calibrate_level` — find optimal sweep volume
 - `configure_matrix` — route active input to all outputs
 

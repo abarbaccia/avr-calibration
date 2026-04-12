@@ -2,7 +2,7 @@
 
 ## Goal
 
-Calibrate multiple subwoofers to the Harman bass target curve (20-80Hz).
+Calibrate multiple subwoofers to the Harman bass target curve (25-80Hz).
 Level-match and align the subs so they reinforce rather than cancel,
 then EQ the combined response to match the target.
 
@@ -21,7 +21,8 @@ If you want FIR-based correction, use a FIR-capable recipe.
 
 ## Pre-flight
 
-Verify all hardware is connected and reachable before starting.
+Call `check_system` to verify all hardware is connected and reachable.
+Call `get_config` to discover output slots, EQ capabilities, and mic configuration.
 Mute any non-sub outputs (e.g. bass shakers) during calibration.
 
 ## Phase 0 — Level Setup
@@ -33,24 +34,30 @@ call `apply_eq` with **only the mandatory 18Hz HPF** on each sub output.
 This ensures level comparisons and alignment measurements are taken from
 a clean baseline, not through invisible prior EQ from a previous session.
 
-### 0.1 Set initial volume
+### 0.1 Configure input routing
 
-Set AVR to -10 dB as a known-good starting point for measurements.
+Call `configure_matrix` with the `active_input` from config. This routes the active
+analog input to ALL outputs and mutes the unused input. Without this step, the
+miniDSP 2x4 HD default matrix may split inputs across outputs.
 
-### 0.2 Measure each sub solo
+### 0.2 Set initial volume
+
+Call `set_volume(-10)` as a known-good starting point for measurements.
+
+### 0.3 Measure each sub solo
 
 For each subwoofer output in the config:
-1. Mute all other sub outputs
-2. Take a measurement
+1. Call `mute_output` on all other sub outputs
+2. Call `measure` — note the session_id
 3. Record the peak SPL from the frequency response
-4. Unmute
+4. Call `unmute_output` on all muted outputs
 
-### 0.3 Compare levels and compute trim
+### 0.4 Compare levels and compute trim
 
 The loudest sub is the reference (trim = 0 dB).
 For each quieter sub: trim = reference_spl - measured_spl.
 
-### 0.4 Check for large level gaps
+### 0.5 Check for large level gaps
 
 If any sub needs more than **10 dB** of digital trim:
 - **STOP and tell the user.** Large digital trims waste headroom.
@@ -58,12 +65,12 @@ If any sub needs more than **10 dB** of digital trim:
   Turn up the volume knob on [label] to reduce the gap, then re-run."
 - Wait for user to confirm they've adjusted the knobs before continuing.
 
-### 0.5 Apply level trims
+### 0.6 Apply level trims
 
-Apply the computed gain trims to miniDSP output gains.
+Apply the computed gain trims via `set_output_gain` on each sub output.
 The loudest sub stays at 0 dB gain. Quieter subs get positive trim.
 
-### 0.6 Calibrate sweep level
+### 0.7 Calibrate sweep level
 
 Call `calibrate_level` to ramp volume from -10 dB toward reference (0 dB),
 finding the optimal sweep volume with good SNR. This volume will be used
@@ -74,10 +81,10 @@ for all subsequent measurements in this session.
 ### 1.1 Measure each sub solo
 
 For each subwoofer:
-1. Mute all other subs
-2. Take a measurement — note the session_id
+1. Call `mute_output` on all other subs
+2. Call `measure` — note the session_id
 3. Call `analyze_ir(session_id)` — get `peak_time_s`, `peak_sign`, `spl_db`
-4. Unmute
+4. Call `unmute_output` on all muted subs
 
 ### 1.2 Analyze phase relationship
 
@@ -89,12 +96,15 @@ interaction before applying corrections.
 ### 1.3 Apply corrections
 
 Compare the per-sub `analyze_ir` results:
-- **Delay**: If one sub arrives earlier, delay it to match the others
-- **Polarity**: If one sub is out of phase (IR peak inverted), flip its polarity
+- **Delay**: The sub with the latest `peak_time_s` is the reference (delay = 0).
+  Each other sub gets delay = (reference_peak_time_s − its_peak_time_s) × 1000 ms.
+  Apply via `set_delay`.
+- **Polarity**: Sub 0 is the polarity reference. Any sub with opposite `peak_sign`
+  gets `set_polarity(inverted=True)`.
 
 ### 1.4 Verify alignment
 
-Measure all subs together. The combined response should be louder than any
+Measure all subs together. Combined response should be louder than any
 individual sub (reinforcement). If combined is quieter at some frequencies,
 subs are still cancelling — use `compare_sub_phase` analysis from 1.2 to
 guide delay/polarity adjustments.
@@ -128,29 +138,49 @@ hardware. Always clear explicitly.
 
 ### 2.1 Baseline
 
-Measure the combined sub response. Calculate RMS deviation from the Harman target.
+Call `measure` to take a combined sub response measurement.
 
-### 2.2 Analyze fixability and design corrections
+### 2.2 Anchor the target curve
+
+Compute the optimal reference level for the Harman target. Find the highest
+reference SPL where no frequency band requires more than +6 dB of boost:
+
+  ref = min(measured(f) - harman_offset(f) + 6) across all frequencies in 25-80Hz
+
+Exclude from this calculation:
+- Frequencies where measured SPL is > 15 dB below the band average (cancellation nulls)
+- Frequencies below 28 Hz (below port tuning rolloff, unfixable)
+
+This maximizes bass extension while staying within the +6 dB safety limit.
+Report the chosen reference level and the resulting max boost needed.
+
+### 2.3 Analyze fixability and design corrections
 
 Call `analyze_phase(session_id)` on the combined measurement to determine which
 bands are fixable with EQ vs excess-phase (cancellation). Only design corrections
 for `fixable=True` bands.
 
+Call `analyze_decay(session_id)` to identify ringing modes. Use `suggested_q`
+for filters targeting modes with T60 > 500ms.
+
 For each filter, use `optimize_q` to find the best Q. Then call
 `simulate_eq(session_id, filters)` to verify the predicted FR before applying.
-Iterate in simulation until the predicted response meets the target.
+Iterate in simulation until the predicted response meets the anchored target.
 
 Apply corrections:
 - Above target: cut (always safe)
-- Below target AND fixable: boost (limited by safety)
+- Below target AND fixable: boost (limited by safety, max +6 dB per band)
 - Below target AND NOT fixable: skip — EQ cannot help cancellation
 
-Prefer cuts over boosts. Always include the mandatory infrasonic high-pass filter.
+Prefer cuts over boosts. Always include the mandatory 18Hz HPF.
 
-### 2.3 Re-measure and iterate
+### 2.4 Re-measure and iterate
 
-After applying EQ, re-measure and check convergence.
-- RMS deviation < 2.0 dB: done
+After applying EQ, re-measure combined response and check convergence:
+- Call `compute_deviation(session_id, target_curve)` to get RMS deviation
+  with automatic null zone and below-port rolloff exclusion
+- RMS deviation < 2.0 dB from the anchored target: done
+- Do NOT re-anchor the target between iterations (it was set in 2.2)
 - Maximum 5 EQ iterations
 
 On each subsequent iteration:
@@ -164,7 +194,7 @@ On each subsequent iteration:
 
 - **Level match**: All subs within 3 dB before digital trim
 - **Alignment**: Combined response reinforces vs individual subs
-- **EQ**: RMS deviation from Harman target < 2.0 dB across 20-80Hz
+- **EQ**: RMS deviation from Harman target < 2.0 dB across 25-80Hz (excluding null zones)
 
 ## When convergence fails
 
@@ -195,7 +225,7 @@ Review all analytics data from the run:
 - Corner placement increases coupling; midpoint placement creates the deepest modes
 
 **Room treatment (from `analyze_decay`):**
-- Modes with T60 > 500ms are rattle/mud candidates for bass traps
+- Modes with T60 > 500ms are bass trap candidates
 - Prioritize by audibility: higher SPL + longer T60 = most audible
 
 **Rattle detection (from coherence):**
@@ -211,3 +241,32 @@ Numbered list ordered by expected impact, in plain language:
 1. Physical changes (sub placement, bass traps, rattle fixes)
 2. EQ improvements (FIR for ringing, slot optimization)
 3. Re-run calibration after changes
+
+## MCP tools used
+
+### Hardware I/O
+- `check_system` — pre-flight hardware verification
+- `measure` — take a sweep measurement
+- `apply_eq` — write correction filters (shared across subs)
+- `mute_output` / `unmute_output` — isolate subs for solo measurement
+- `set_delay` / `set_polarity` / `set_output_gain` — sub alignment
+- `set_volume` — set AVR volume for sweep playback
+- `calibrate_level` — find optimal sweep volume
+- `configure_matrix` — route active input to all outputs
+
+### Analytics (data for LLM judgment)
+- `analyze_phase` — per-band fixability: minimum-phase vs excess-phase
+- `compare_sub_phase` — per-frequency phase relationship between solo sub measurements
+- `analyze_ir` — IR peak time/sign/SPL for delay and polarity corrections
+- `analyze_decay` — T60 ringing analysis for EQ Q selection
+- `compute_deviation` — RMS deviation with automatic null/rolloff exclusion
+
+### Simulation (verify before applying)
+- `simulate_eq` — predict FR after proposed PEQ filters
+- `optimize_q` — find best Q for a filter at a chosen frequency and gain
+
+### State and config
+- `get_config` — discover output slots, EQ capabilities, mic config
+- `get_measurement_history` — FR data with coherence for filter design
+- `compare_sessions` — per-band delta between two sessions
+- `read_eq` — current PEQ state (for iterative filter merging)
