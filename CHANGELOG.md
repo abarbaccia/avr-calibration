@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.6.0] - 2026-04-12
+
+### Changed
+- **IR onset detection extracted to shared function:** `detect_ir_onset()` replaces duplicated 18-line blocks in `measurement.py` and `mcp_server.py`. Both `compute_session_metadata` and `_tool_analyze_ir` now call the same function, eliminating drift risk.
+- **Named constants for onset detection:** `IR_ONSET_SKIP_S` (2 ms DC artifact blanking) and `IR_ONSET_THRESHOLD_DB` (-20 dB onset threshold) replace inline magic numbers.
+- **IR storage length respects sample rate:** Previously hardcoded to 24,000 samples (assumes 48 kHz). Now uses `IR_GATE_S * sample_rate`, correct at any rate.
+- **IR taper duration is a named constant:** `IR_TAPER_S` replaces the magic `0.05` in the deconvolution gate window.
+
+### Removed
+- **Dead `post_delay` parameter on `_run_minidsp_cli`:** Never passed by any caller. CLI delay now always uses `CLI_COMMAND_DELAY_S` directly.
+
 ## [0.6.5.0] - 2026-04-11
 
 ### Added
