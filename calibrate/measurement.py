@@ -664,10 +664,11 @@ def compute_session_metadata(
         search_window = ir_arr[:search_samples]
 
         abs_window = np.abs(search_window)
-        # Skip first 0.5ms — Wiener deconvolution leaves a DC artifact near
-        # t=0 that confuses onset detection.  The shortest sub-to-mic path is
-        # always > 0.5ms (~17cm), so no real IR energy lives there.
-        skip_samples = max(1, int(0.0005 * sample_rate))
+        # Skip first 2ms — Wiener deconvolution leaves a DC artifact near
+        # t=0 that confuses onset detection.  The shortest sub-to-mic path in
+        # a home theater room is always > 2ms (~0.7m), so no real IR onset
+        # lives before this point.
+        skip_samples = max(1, int(0.002 * sample_rate))
         abs_window[:skip_samples] = 0.0
         max_idx = int(np.argmax(abs_window))
         # Onset detection: first sample within 20 dB of the absolute peak.

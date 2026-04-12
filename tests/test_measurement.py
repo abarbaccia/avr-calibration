@@ -769,13 +769,14 @@ class TestOnsetDetection:
         )
 
     def test_dc_artifact_at_sample_zero_ignored(self):
-        """Wiener deconvolution can leave a large DC artifact at sample 0.
-        Onset detection must skip it and find the real IR onset later."""
+        """Wiener deconvolution can leave a large DC artifact near t=0.
+        Onset detection must skip the first 2ms and find the real IR onset."""
         sr = 48000
         direct_idx = int(0.015 * sr)    # 15ms = 720 samples (typical sub distance)
 
         ir = np.zeros(24000)
-        ir[0] = 2.0                     # DC artifact (LOUDER than real IR)
+        ir[0] = 2.0                     # DC artifact at sample 0
+        ir[int(0.001 * sr)] = 1.5       # artifact tail at 1ms
         ir[direct_idx] = 0.5            # real direct sound arrival
 
         fr = FrequencyResponse(
@@ -790,8 +791,8 @@ class TestOnsetDetection:
         meta = compute_session_metadata(fr, search_window_ms=50.0)
 
         peak_ms = meta["ir"]["peak_time_ms"]
-        assert peak_ms > 1.0, (
-            f"Expected onset well after 0ms (DC artifact), got {peak_ms}ms"
+        assert peak_ms > 2.0, (
+            f"Expected onset after 2ms skip zone, got {peak_ms}ms"
         )
         assert abs(peak_ms - 15.0) < 1.0, (
             f"Expected onset near 15ms (direct sound), got {peak_ms}ms"
