@@ -2803,8 +2803,13 @@ async def test_simulate_eq_basic_prediction() -> None:
 
 
 @pytest.mark.asyncio
-async def test_simulate_eq_hpf_response() -> None:
-    """simulate_eq applies HPF attenuation below the cutoff."""
+async def test_simulate_eq_hpf_skipped() -> None:
+    """simulate_eq skips HPF because the measurement already includes it.
+
+    The miniDSP HPF is always active during measurement, so its effect is
+    already baked into the measured FR.  Applying it again would double the
+    attenuation, causing predicted bass levels to be far too low.
+    """
     freqs = [15.0, 18.0, 20.0, 30.0, 50.0, 80.0, 100.0]
     spls = [75.0] * len(freqs)
     session = _make_fr_session(freqs, spls)
@@ -2817,20 +2822,11 @@ async def test_simulate_eq_hpf_response() -> None:
         )
     assert result["ok"]
     pairs = result["predicted_fr"].split(",")
-    # At 80+ Hz, HPF should have negligible effect
-    # At 15 Hz (below cutoff), should show significant attenuation
-    low_freq_spl = None
-    high_freq_spl = None
+    # HPF is skipped — all frequencies should remain at ~75.0 dB
     for pair in pairs:
         f, s = pair.split(":")
         f, s = float(f), float(s)
-        if abs(f - 15.0) < 1.0:
-            low_freq_spl = s
-        if abs(f - 80.0) < 1.0:
-            high_freq_spl = s
-    assert low_freq_spl is not None
-    assert high_freq_spl is not None
-    assert low_freq_spl < high_freq_spl  # HPF attenuates below cutoff
+        assert abs(s - 75.0) < 0.1, f"HPF should be skipped, but {f} Hz changed to {s}"
 
 
 @pytest.mark.asyncio

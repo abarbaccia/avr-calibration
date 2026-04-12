@@ -58,6 +58,15 @@ Slots 2-9 are available for amplitude EQ (ALIGNMENT_PEQ_SLOTS).
 ALIGNMENT_PEQ_SLOTS: range = range(2, 10)
 """PEQ slots used by the alignment amplitude-EQ pass."""
 
+PEQ_WRITE_DELAY_S: float = 0.3
+"""Delay in seconds between sequential PEQ CLI writes.
+
+The miniDSP 2x4 HD firmware can silently drop PEQ writes when commands arrive
+faster than the internal commit cycle.  The ezbeq project (which also uses
+minidsp-rs) has an identical workaround (``slotChangeDelay``).  Without this
+delay, only the last filter in a batch reliably takes effect.
+"""
+
 VALID_SOURCES: frozenset[str] = frozenset({"Analog", "Toslink", "Usb", "Spdif", "Aes"})
 """Valid input source names for the miniDSP 2x4 HD."""
 
@@ -328,7 +337,9 @@ class MinidspClient:
                     str(c["b0"]), str(c["b1"]), str(c["b2"]),
                     str(-c["a1"]), str(-c["a2"]),  # negate: scipy→miniDSP sign convention
                 )
+                await asyncio.sleep(PEQ_WRITE_DELAY_S)
                 await _run_minidsp_cli("output", str(output), "peq", slot, "bypass", "off")
+            await asyncio.sleep(PEQ_WRITE_DELAY_S)
 
     async def check_for_dsp_hang(self, suspect_outputs: list[int]) -> None:
         """Poll output levels and raise MinidspApiError if any output is frozen.
@@ -375,7 +386,9 @@ class MinidspClient:
                     str(c["b0"]), str(c["b1"]), str(c["b2"]),
                     str(-c["a1"]), str(-c["a2"]),  # negate: scipy→miniDSP sign convention
                 )
+                await asyncio.sleep(PEQ_WRITE_DELAY_S)
                 await _run_minidsp_cli("input", str(input_index), "peq", slot, "bypass", "off")
+            await asyncio.sleep(PEQ_WRITE_DELAY_S)
 
     async def set_output_fir_from_file(self, output: int, path: str) -> None:
         """Load FIR coefficients from a WAV file and activate them via CLI.

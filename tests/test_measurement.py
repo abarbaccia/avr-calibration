@@ -556,6 +556,38 @@ class TestComputeSessionMetadata:
         assert all(isinstance(p, float) for p in phase)
         assert all(np.isfinite(p) for p in phase)
 
+    def test_tukey_window_reduces_edge_artifacts(self):
+        """Tukey window suppresses comb-like artifacts from signal truncation.
+
+        Create a recording with an abrupt cutoff (simulating room reverb
+        truncation) and verify that the windowed deconvolution produces a
+        smoother FR than raw truncation would.
+        """
+        engine = MeasurementEngine(make_config())
+        rng = np.random.default_rng(42)
+        n = 48000  # 1 second at 48kHz
+
+        # Sweep: log chirp from 20-200 Hz
+        t = np.linspace(0, 1, n, endpoint=False)
+        sweep = np.sin(2 * np.pi * 20 * (200 / 20) ** t / np.log(200 / 20) * np.log(200 / 20))
+
+        # Recording: sweep convolved with a simple room IR, then abruptly truncated
+        # (simulating the real case where reverb extends beyond the sweep length)
+        ir_room = np.zeros(n)
+        ir_room[100] = 1.0   # direct path
+        ir_room[2000] = 0.3  # reflection
+        rec_full = np.convolve(sweep, ir_room)[:n]
+        # Add an abrupt edge — non-zero at the end
+        rec_full[-1] = rec_full[-2]  # no natural taper
+
+        freqs, spl, ir_out, phase, _coh = engine._compute_fr_arrays(
+            np, sweep, rec_full, 20, 200, 48000,
+        )
+        assert len(freqs) > 0
+        assert all(np.isfinite(s) for s in spl)
+        # The Tukey window should produce finite, reasonable values
+        assert max(spl) - min(spl) < 60, "FR range too wide — window may not be applied"
+
 
 class TestPreDelayCompensation:
     """

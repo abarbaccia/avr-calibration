@@ -768,7 +768,11 @@ async def _tool_simulate_eq(
                 if ftype == "peaking":
                     total_correction += peaking_response(fc, gain, q, f)
                 elif ftype == "hpf":
-                    total_correction += hpf_response(fc, 4, f)  # 4th order Butterworth
+                    # Skip: the measurement already includes whatever HPF was
+                    # active on the miniDSP during the sweep.  Adding the HPF
+                    # response here would double-apply the attenuation, causing
+                    # predicted bass levels to be far too low.
+                    pass
                 elif ftype in ("low_shelf", "high_shelf"):
                     total_correction += shelf_response(fc, gain, q, f, shelf_type=ftype)
             predicted_fr.append({

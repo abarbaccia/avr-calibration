@@ -542,8 +542,21 @@ class MeasurementEngine:
         share the same FFT grid.
         """
         n = min(len(sweep_array), len(rec_array))
-        X = np.fft.rfft(sweep_array[:n], n=n)
-        Y = np.fft.rfft(rec_array[:n], n=n)
+
+        # Apply a Tukey window to reduce spectral leakage from signal
+        # truncation.  When the recording is longer than the sweep (room
+        # reverb tail), truncating to length n creates a discontinuity at
+        # the boundary that produces comb-like artifacts in H(f).
+        # alpha=0.05 tapers only the outer 5% of each edge — enough to
+        # suppress the edge discontinuity without attenuating the main
+        # signal body.
+        try:
+            from scipy.signal.windows import tukey as _tukey
+            window = _tukey(n, alpha=0.05)
+        except ImportError:
+            window = np.ones(n)
+        X = np.fft.rfft(sweep_array[:n] * window, n=n)
+        Y = np.fft.rfft(rec_array[:n] * window, n=n)
 
         with np.errstate(divide="ignore", invalid="ignore"):
             H = np.where(np.abs(X) > 1e-10, Y / X, 0.0 + 0.0j)
