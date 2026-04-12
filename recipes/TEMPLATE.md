@@ -39,7 +39,22 @@ Sections marked [CONDITIONAL] may be omitted with justification.
  MUST mute non-sub outputs (shakers) if config has them.}
 
 ## Phase 0 — Setup
-{MUST clear existing EQ to known state before any measurement.
+{MUST reset ALL DSP state to known defaults before any measurement.
+ This includes output PEQ, input PEQ, delays, polarity, gains, FIR,
+ and master gain — not just PEQ.  `read_eq` / `get_output_state`
+ only track in-memory changes since server start; hardware flash may
+ retain settings from prior sessions.  Always write explicitly.
+
+ Required reset calls (for EVERY output, including unused/shaker):
+   - `set_delay(output_index, 0)`
+   - `set_polarity(output_index, inverted=false)`
+   - `set_output_gain(output_index, 0)`
+   - `apply_eq(output_index, [HPF only])` for each sub output
+   - `clear_fir(output_index)` for each output
+ And for inputs:
+   - `apply_input_eq([HPF only])`
+   - `set_master_gain(0)`
+
  MUST set volume and call `calibrate_level` for sweep SNR.
  For multi-sub: MUST call `configure_matrix` for input routing.
  For multi-sub: MUST measure each sub solo, level-match, apply trims.}

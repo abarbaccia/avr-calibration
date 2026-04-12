@@ -42,16 +42,30 @@ Mute any non-sub outputs (e.g. shakers) during calibration.
 
 ## Phase 0 — Level Setup
 
-### 0.0 Clear all sub output EQ
+### 0.0 Reset ALL DSP state
 
-Before any measurements, reset every sub output to a known zero state:
-call `apply_eq` with **only the mandatory 18Hz HPF** on each sub output.
+Before any measurements, reset the entire DSP to a known zero state.
+`read_eq` and `get_output_state` only track in-memory changes since the
+MCP server started — hardware flash retains settings from prior sessions.
+Always write explicitly.
+
+For **every output** (0-3, including unused/shaker):
+1. `set_delay(output_index, 0)` — clear any leftover alignment delays
+2. `set_polarity(output_index, inverted=false)` — clear polarity flips
+3. `set_output_gain(output_index, 0)` — clear level trims
+
+For **each sub output** in the config:
+4. `apply_eq(output_index, [HPF only])` — bypasses all PEQ slots
+
+For **inputs**:
+5. `apply_input_eq([HPF only])` — clears input PEQ on both inputs
+6. `set_master_gain(0)` — reset master gain
+
+For **FIR** (if previously used):
+7. `clear_fir(output_index)` for each output
+
 This ensures Phase 0 level comparisons, Phase 1 alignment, and Phase 2
-room correction measurements are all taken from a clean baseline — not
-through invisible prior EQ from a previous session.
-
-`read_eq` only tracks in-memory state since server start. Always clear
-explicitly rather than relying on it to tell you what's on the hardware.
+room correction measurements are all taken from a truly clean baseline.
 
 ### 0.1 Configure input routing
 
