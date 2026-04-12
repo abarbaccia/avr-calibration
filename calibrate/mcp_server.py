@@ -109,6 +109,41 @@ RECIPES_DIR: Path = _REPO_RECIPES if _REPO_RECIPES.is_dir() else _APP_RECIPES
 _avr: AVRDriver | None = None
 _dsp: DSPDriver | None = None
 
+# ── Persistent sweep session ─────────────────────────────────────────────────
+# Holds the miniDSP in USB source mode across multiple measurements so we
+# don't switch Analog→USB→Analog on every single sweep.  Enter on the first
+# measurement, exit explicitly via end_sweep_session or on server shutdown.
+
+_sweep_session = None  # MinidspSweepContext | None
+
+
+async def _ensure_sweep_session():
+    """Return the active sweep session, creating one if needed.
+
+    Returns None when USB sweep mode is not configured.
+    """
+    global _sweep_session
+    if _sweep_session is not None and _sweep_session.active:
+        return _sweep_session
+
+    from .drivers.minidsp import MinidspSweepContext
+    cfg = _config()
+    session = MinidspSweepContext.from_config(cfg, driver=_dsp)
+    if session is None:
+        return None
+
+    await session.enter()
+    _sweep_session = session
+    return session
+
+
+async def _end_sweep_session():
+    """End the persistent sweep session (restore source to Analog)."""
+    global _sweep_session
+    if _sweep_session is not None:
+        await _sweep_session.exit()
+        _sweep_session = None
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -703,6 +738,22 @@ async def _tool_simulate_eq(
             ratio = fc / freq
             return -10.0 * order * math.log10(1.0 + ratio ** 2)
 
+        def shelf_response(fc: float, gain_db: float, q: float, freq: float,
+                           shelf_type: str = "low_shelf") -> float:
+            """Compute exact shelf filter response using biquad math from dsp.py."""
+            if fc <= 0 or freq <= 0:
+                return 0.0
+            from .dsp import freq_gain_q_to_biquad, SAMPLE_RATE_HZ
+            import cmath
+            bq = freq_gain_q_to_biquad(freq=fc, gain_db=gain_db, q=q, filter_type=shelf_type)
+            z = cmath.exp(1j * 2.0 * math.pi * freq / SAMPLE_RATE_HZ)
+            zi = 1.0 / z
+            num = bq["b0"] + bq["b1"] * zi + bq["b2"] * zi * zi
+            den = 1.0 + bq["a1"] * zi + bq["a2"] * zi * zi
+            if abs(den) < 1e-30:
+                return 0.0
+            return 20.0 * math.log10(abs(num / den))
+
         # Compute filter effect at each frequency
         predicted_fr: list[dict] = []
         for f, measured in zip(fr.frequencies, fr.spl):
@@ -719,7 +770,7 @@ async def _tool_simulate_eq(
                 elif ftype == "hpf":
                     total_correction += hpf_response(fc, 4, f)  # 4th order Butterworth
                 elif ftype in ("low_shelf", "high_shelf"):
-                    total_correction += peaking_response(fc, gain, q, f)  # Approximation
+                    total_correction += shelf_response(fc, gain, q, f, shelf_type=ftype)
             predicted_fr.append({
                 "freq_hz": round(f, 1),
                 "original_db": round(measured, 1),
@@ -1312,16 +1363,13 @@ async def _tool_trigger_measurement(
         cfg = _config()
         engine = MeasurementEngine(cfg)
         denon_ctx = DenonSweepContext.from_config(cfg)
-        from .drivers.minidsp import MinidspSweepContext
-        minidsp_ctx = MinidspSweepContext.from_config(cfg, driver=_dsp)
 
         if denon_ctx:
             async with denon_ctx:
                 fr = await engine.measure()
-        elif minidsp_ctx:
-            async with minidsp_ctx:
-                fr = await engine.measure()
         else:
+            # USB mode: use persistent sweep session (enters once, stays active).
+            await _ensure_sweep_session()
             fr = await engine.measure()
 
         # Compute IR-derived metadata at capture time
@@ -1382,7 +1430,6 @@ async def _tool_calibrate_level(
     """
     from .measurement import MeasurementEngine, MeasurementQualityError
     from .config import update_config
-    from .drivers.minidsp import MinidspSweepContext
     import math as _math
     import numpy as _np
 
@@ -1421,8 +1468,6 @@ async def _tool_calibrate_level(
             if slot.get("type", "unused") == "sub"
         )
         _sub_count = max(1, sub_count)
-
-        minidsp_ctx = MinidspSweepContext.from_config(cfg)
 
         async def _usb_predict_verify() -> dict:
             # ── Step 1: probe at safe starting level ──
@@ -1500,9 +1545,8 @@ async def _tool_calibrate_level(
                 ),
             )
 
-        if minidsp_ctx:
-            async with minidsp_ctx:
-                return await _usb_predict_verify()
+        # USB mode: use persistent sweep session (enters once, stays active).
+        await _ensure_sweep_session()
         return await _usb_predict_verify()
 
     # ── HDMI/AVR mode ──
@@ -1720,6 +1764,22 @@ async def _tool_unmute_output(output_indices: list[int]) -> dict:
         return _ok(unmuted=output_indices)
     except Exception as exc:
         return _err(f"unmute failed: {exc}")
+
+
+async def _tool_end_sweep_session() -> dict:
+    """End the persistent USB sweep session and restore the miniDSP source.
+
+    Call this after calibration is complete (or on error) to restore the
+    miniDSP from USB source back to its original source (typically Analog).
+    Safe to call if no session is active — returns ok with a no-op message.
+    """
+    if _sweep_session is None or not _sweep_session.active:
+        return _ok(message="No active sweep session to end")
+    try:
+        await _end_sweep_session()
+        return _ok(message="Sweep session ended, source restored to original")
+    except Exception as exc:
+        return _err(f"end_sweep_session failed: {exc}")
 
 
 async def _tool_set_delay(output_index: int, delay_ms: float) -> dict:
@@ -2381,6 +2441,18 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="end_sweep_session",
+        description=(
+            "End the persistent USB sweep session and restore the miniDSP source "
+            "to its original state (typically Analog). Call after calibration is "
+            "done or on error. Safe to call if no session is active."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {},
+        },
+    ),
+    Tool(
         name="set_delay",
         description=(
             "Set delay for a single DSP output in milliseconds. "
@@ -2970,6 +3042,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_mute_output(arguments["output_indices"])
     elif name == "unmute_output":
         result = await _tool_unmute_output(arguments["output_indices"])
+    elif name == "end_sweep_session":
+        result = await _tool_end_sweep_session()
     elif name == "set_delay":
         result = await _tool_set_delay(
             output_index=int(arguments["output_index"]),
@@ -3179,6 +3253,8 @@ def create_app() -> Starlette:
                 log.warning("Failed to configure active_input routing: %s", exc)
         async with http_manager.run():
             yield
+        # Clean up persistent sweep session before closing drivers
+        await _end_sweep_session()
         await _avr.close()
         await _dsp.close()
 

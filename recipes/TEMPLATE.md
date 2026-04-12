@@ -178,6 +178,7 @@ the LLM to fail at runtime.
 | `calibrate_level` | Find optimal sweep volume with good SNR |
 | `configure_matrix` | Configure miniDSP routing matrix |
 | `set_master_gain` | Set miniDSP master gain |
+| `end_sweep_session` | Restore miniDSP source after calibration (call when done) |
 
 ### Analytics (data for LLM judgment)
 | Tool | Purpose |

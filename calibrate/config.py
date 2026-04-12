@@ -29,6 +29,9 @@ DEFAULT_CONFIG: dict = {
     "mic": {
         "name": "UMIK",
     },
+    "eq_capabilities": {
+        "processing_rate": 96000,
+    },
     "sub": {
         "port_tune_hz": None,
     },
@@ -133,6 +136,10 @@ class Config:
     @property
     def connections(self) -> dict:
         return self._data.get("connections", {})
+
+    @property
+    def eq_capabilities(self) -> dict:
+        return self._data.get("eq_capabilities", {})
 
     @property
     def minidsp_host_port(self) -> tuple[str, int]:

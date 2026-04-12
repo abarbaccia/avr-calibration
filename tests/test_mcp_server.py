@@ -1496,6 +1496,30 @@ async def test_call_tool_mute_sub_outputs_legacy(mock_dsp) -> None:
     assert data["ok"]
 
 
+# ── end_sweep_session ──────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_end_sweep_session_no_active_session() -> None:
+    """end_sweep_session returns ok when no session is active."""
+    import calibrate.mcp_server as srv
+    srv._sweep_session = None
+    result = await srv._tool_end_sweep_session()
+    assert result["ok"]
+    assert "No active" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_end_sweep_session_dispatch() -> None:
+    """end_sweep_session routes through call_tool dispatch."""
+    from calibrate.mcp_server import call_tool
+    import calibrate.mcp_server as srv
+    srv._sweep_session = None
+    texts = await call_tool("end_sweep_session", {})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+
+
 # ── set_delay ───────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -2807,6 +2831,32 @@ async def test_simulate_eq_hpf_response() -> None:
     assert low_freq_spl is not None
     assert high_freq_spl is not None
     assert low_freq_spl < high_freq_spl  # HPF attenuates below cutoff
+
+
+@pytest.mark.asyncio
+async def test_simulate_eq_low_shelf_response() -> None:
+    """simulate_eq computes correct low_shelf response (not the old peaking approximation)."""
+    freqs = [20.0, 25.0, 35.0, 50.0, 80.0, 100.0]
+    spls = [70.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+
+    filters = [{"type": "low_shelf", "freq": 35.0, "gain_db": 5.0, "q": 0.5}]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_simulate_eq(
+            session_id=1, filters=filters, min_hz=20.0, max_hz=100.0,
+        )
+    assert result["ok"]
+    pairs = result["predicted_fr"].split(",")
+    predicted = {}
+    for pair in pairs:
+        f, s = pair.split(":")
+        predicted[float(f)] = float(s)
+    # Low shelf should boost low frequencies more than high
+    assert predicted[25.0] > predicted[80.0], "low shelf must boost 25 Hz more than 80 Hz"
+    # Tilt from 25→80 Hz should be ~2.5 dB (verified numerically)
+    tilt = predicted[25.0] - predicted[80.0]
+    assert tilt > 1.5, f"shelf tilt 25→80 Hz should be >1.5 dB, got {tilt:.1f} dB"
 
 
 @pytest.mark.asyncio

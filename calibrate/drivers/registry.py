@@ -66,10 +66,12 @@ def load_dsp_driver(config: Config) -> DSPDriver:
         host, port = config.minidsp_host_port
         active_input = config.minidsp.get("active_input") or 0
         usb_input = config.measurement.get("output_channel", 1) - 1
+        processing_rate = int(config.eq_capabilities.get("processing_rate", 96_000))
         return MinidspDriver(
             host=host, port=port,
             sub_outputs=config.sub_outputs,
             active_input=active_input,
             usb_input=usb_input,
+            processing_rate=processing_rate,
         )
     return cls()  # type: ignore[call-arg]
