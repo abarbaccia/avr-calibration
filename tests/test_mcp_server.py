@@ -48,6 +48,8 @@ from calibrate.mcp_server import (
     _tool_calibrate_level,
     _tool_check_system,
     _tool_clear_fir,
+    _tool_compare_sessions,
+    _tool_compute_deviation,
     _tool_configure_matrix,
     _tool_fetch_recipe,
     _tool_get_device_state,
@@ -56,6 +58,7 @@ from calibrate.mcp_server import (
     _tool_get_output_state,
     _tool_mute_output,
     _tool_read_eq,
+    _tool_read_input_eq,
     _tool_set_delay,
     _tool_set_master_gain,
     _tool_set_output_gain,
@@ -124,9 +127,13 @@ def mock_dsp():
     async def apply_input_eq(preset: int, filters: list[dict], input_index: int | None = None) -> None:
         _eq_state[("input", preset)] = list(filters)
 
+    async def read_input_eq(preset: int) -> list[dict]:
+        return list(_eq_state.get(("input", preset), []))
+
     dsp.read_eq.side_effect = read_eq
     dsp.apply_eq.side_effect = apply_eq
     dsp.apply_input_eq.side_effect = apply_input_eq
+    dsp.read_input_eq.side_effect = read_input_eq
 
     with patch("calibrate.mcp_server._dsp", dsp):
         yield dsp
@@ -667,6 +674,15 @@ async def test_trigger_measurement_no_target_for_raw_capture() -> None:
 
 # ── calibrate_level ────────────────────────────────────────────────────────────
 
+def _make_ir(spl_db: float) -> list[float]:
+    """Build a minimal IR array whose peak gives the specified spl_db.
+
+    _ir_spl() computes 20*log10(max(abs(ir))), so we need
+    max(abs(ir)) = 10^(spl_db/20).
+    """
+    peak = 10.0 ** (spl_db / 20.0)
+    return [0.0] * 10 + [peak] + [0.0] * 10
+
 
 def _make_usb_cfg():
     """Return a mock config that reports USB playback route."""
@@ -691,15 +707,16 @@ def _make_hdmi_cfg():
 
 @pytest.mark.asyncio
 async def test_calibrate_level_usb_predict_verify() -> None:
-    """USB mode: probe at -30 dB sees -42 dBFS peak → computes gain = 0 dB,
-    verify sweep confirms. 2 sweeps, 2 set_master_gain calls."""
+    """USB mode: probe IR peak = 58 dB SPL at -30 dB gain.
+    Target 78 dB SPL. Correction = +20 → gain = -10.
+    Verify IR peak = 78 dB SPL. 2 sweeps."""
     mock_dsp = AsyncMock()
 
     probe_fr = MagicMock()
-    probe_fr.peak_spl = -42.0  # very quiet at -30 dB gain
+    probe_fr.impulse_response = _make_ir(58.0)  # 58 dB SPL at -30 gain
 
     verify_fr = MagicMock()
-    verify_fr.peak_spl = -12.0  # right on target
+    verify_fr.impulse_response = _make_ir(78.0)  # 78 dB SPL — on target
 
     mock_engine = MagicMock()
     mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
@@ -712,26 +729,27 @@ async def test_calibrate_level_usb_predict_verify() -> None:
         patch("calibrate.config.update_config") as mock_update,
         patch("asyncio.sleep"),
     ):
-        result = await _tool_calibrate_level(target_peak_dbfs=-12.0, start_db=-30.0)
+        result = await _tool_calibrate_level(target_spl_db=78.0, start_db=-30.0)
 
     assert result["ok"]
-    # correction = -12 - (-42) = +30 → gain = -30 + 30 = 0 (clamped to 0)
-    assert result["calibrated_master_gain_db"] == 0.0
+    # correction = 78 - 58 = +20 → gain = -30 + 20 = -10
+    assert result["calibrated_master_gain_db"] == -10.0
+    assert result["estimated_spl_db"] == 78.0
     assert mock_engine.measure.call_count == 2
     assert mock_dsp.set_master_gain.call_count == 2
-    mock_update.assert_called_once_with({"measurement": {"master_gain_db": 0.0}})
+    mock_update.assert_called_once_with({"measurement": {"master_gain_db": -10.0}})
 
 
 @pytest.mark.asyncio
 async def test_calibrate_level_usb_verify_still_hot_backs_off() -> None:
-    """USB mode: verify sweep is above -3 dBFS ceiling → backs off."""
+    """USB mode: verify IR peak >3 dB above target → backs off."""
     mock_dsp = AsyncMock()
 
     probe_fr = MagicMock()
-    probe_fr.peak_spl = -20.0  # at start_db=-10
+    probe_fr.impulse_response = _make_ir(90.0)  # 90 dB SPL
 
     verify_fr = MagicMock()
-    verify_fr.peak_spl = -1.0  # above -3 ceiling
+    verify_fr.impulse_response = _make_ir(85.0)  # 85 dB > 78+3 → backs off
 
     mock_engine = MagicMock()
     mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
@@ -741,17 +759,16 @@ async def test_calibrate_level_usb_verify_still_hot_backs_off() -> None:
         patch.object(sut, "_config", return_value=_make_usb_cfg()),
         patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
         patch("calibrate.drivers.minidsp.MinidspSweepContext.from_config", return_value=None),
-        patch("calibrate.config.update_config") as mock_update,
+        patch("calibrate.config.update_config"),
         patch("asyncio.sleep"),
     ):
-        result = await _tool_calibrate_level(target_peak_dbfs=-12.0, start_db=-10.0)
+        result = await _tool_calibrate_level(target_spl_db=78.0, start_db=-10.0)
 
     assert result["ok"]
-    # probe: correction = -12 - (-20) = +8 → computed gain = -10 + 8 = -2
-    # verify: peak -1.0 > -3.0 ceiling → backoff = -1.0 - (-12.0) = 11.0
-    # final = -2 - 11 = -13
-    assert result["calibrated_master_gain_db"] == -13.0
-    # 3 set_master_gain calls: probe(-10), verify(-2), backoff(-13)
+    # probe: correction = 78 - 90 = -12 → computed gain = -10 + (-12) = -22
+    # verify: 85 > 78+3 → overshoot = 85 - 78 = 7 → final = -22 - 7 = -29
+    assert result["calibrated_master_gain_db"] == -29.0
+    # 3 set_master_gain calls: probe(-10), verify(-22), backoff(-29)
     assert mock_dsp.set_master_gain.call_count == 3
 
 
@@ -761,10 +778,10 @@ async def test_calibrate_level_usb_gain_clamped_to_zero() -> None:
     mock_dsp = AsyncMock()
 
     probe_fr = MagicMock()
-    probe_fr.peak_spl = -50.0  # very quiet
+    probe_fr.impulse_response = _make_ir(40.0)  # very quiet
 
     verify_fr = MagicMock()
-    verify_fr.peak_spl = -20.0  # under target but above ceiling? no, fine
+    verify_fr.impulse_response = _make_ir(70.0)
 
     mock_engine = MagicMock()
     mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
@@ -774,13 +791,13 @@ async def test_calibrate_level_usb_gain_clamped_to_zero() -> None:
         patch.object(sut, "_config", return_value=_make_usb_cfg()),
         patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
         patch("calibrate.drivers.minidsp.MinidspSweepContext.from_config", return_value=None),
-        patch("calibrate.config.update_config") as mock_update,
+        patch("calibrate.config.update_config"),
         patch("asyncio.sleep"),
     ):
-        result = await _tool_calibrate_level(target_peak_dbfs=-12.0, start_db=-30.0)
+        result = await _tool_calibrate_level(target_spl_db=78.0, start_db=-30.0)
 
     assert result["ok"]
-    # correction = -12 - (-50) = +38 → gain = -30 + 38 = +8 → clamped to 0
+    # correction = 78 - 40 = +38 → gain = -30 + 38 = +8 → clamped to 0
     assert result["calibrated_master_gain_db"] == 0.0
 
 
@@ -833,10 +850,10 @@ async def test_calibrate_level_usb_solo_gain_hint() -> None:
     )
 
     probe_fr = MagicMock()
-    probe_fr.peak_spl = -22.0
+    probe_fr.impulse_response = _make_ir(68.0)
 
     verify_fr = MagicMock()
-    verify_fr.peak_spl = -12.0
+    verify_fr.impulse_response = _make_ir(78.0)
 
     mock_engine = MagicMock()
     mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
@@ -849,10 +866,9 @@ async def test_calibrate_level_usb_solo_gain_hint() -> None:
         patch("calibrate.config.update_config"),
         patch("asyncio.sleep"),
     ):
-        result = await _tool_calibrate_level(target_peak_dbfs=-12.0, start_db=-20.0)
+        result = await _tool_calibrate_level(target_spl_db=78.0, start_db=-20.0)
 
     assert result["ok"]
-    # solo offset = 20*log10(2) ≈ 6.0 dB
     assert result["suggested_solo_gain_db"] > result["calibrated_master_gain_db"]
 
 
@@ -861,14 +877,14 @@ async def test_calibrate_level_usb_solo_gain_hint() -> None:
 
 @pytest.mark.asyncio
 async def test_calibrate_level_hdmi_predict_verify() -> None:
-    """HDMI mode: probe at -30 dB, predict correction, verify. 2 sweeps."""
+    """HDMI mode: probe at -30 dB, predict correction to 78 dB SPL, verify."""
     mock_avr = AsyncMock()
 
     probe_fr = MagicMock()
-    probe_fr.peak_spl = -32.0  # quiet at -30 dB volume
+    probe_fr.impulse_response = _make_ir(58.0)  # 58 dB SPL
 
     verify_fr = MagicMock()
-    verify_fr.peak_spl = -12.0  # on target
+    verify_fr.impulse_response = _make_ir(78.0)  # 78 dB SPL
 
     mock_engine = MagicMock()
     mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
@@ -879,11 +895,12 @@ async def test_calibrate_level_hdmi_predict_verify() -> None:
         patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
         patch("calibrate.config.update_config") as mock_update,
     ):
-        result = await _tool_calibrate_level(target_peak_dbfs=-12.0, start_db=-30.0)
+        result = await _tool_calibrate_level(target_spl_db=78.0, start_db=-30.0)
 
     assert result["ok"]
-    # correction = -12 - (-32) = +20 → volume = -30 + 20 = -10
+    # correction = 78 - 58 = +20 → volume = -30 + 20 = -10
     assert result["calibrated_volume_db"] == -10.0
+    assert result["estimated_spl_db"] == 78.0
     assert mock_engine.measure.call_count == 2
     mock_update.assert_called_once_with({"measurement": {"denon_sweep_volume": -10.0}})
 
@@ -913,14 +930,14 @@ async def test_calibrate_level_hdmi_probe_snr_fail() -> None:
 
 @pytest.mark.asyncio
 async def test_calibrate_level_hdmi_verify_hot_backs_off() -> None:
-    """HDMI mode: verify sweep too hot → backs off volume."""
+    """HDMI mode: verify IR peak >3 dB above target → backs off volume."""
     mock_avr = AsyncMock()
 
     probe_fr = MagicMock()
-    probe_fr.peak_spl = -15.0
+    probe_fr.impulse_response = _make_ir(95.0)
 
     verify_fr = MagicMock()
-    verify_fr.peak_spl = -1.0  # above -3 ceiling
+    verify_fr.impulse_response = _make_ir(85.0)  # 85 > 78+3 → backs off
 
     mock_engine = MagicMock()
     mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
@@ -929,15 +946,14 @@ async def test_calibrate_level_hdmi_verify_hot_backs_off() -> None:
         patch.object(sut, "_avr", mock_avr),
         patch.object(sut, "_config", return_value=_make_hdmi_cfg()),
         patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
-        patch("calibrate.config.update_config") as mock_update,
+        patch("calibrate.config.update_config"),
     ):
-        result = await _tool_calibrate_level(target_peak_dbfs=-12.0, start_db=-20.0)
+        result = await _tool_calibrate_level(target_spl_db=78.0, start_db=-20.0)
 
     assert result["ok"]
-    # probe: correction = -12 - (-15) = +3 → volume = -20 + 3 = -17
-    # verify: peak -1.0 > -3 ceiling → backoff = -1 - (-12) = 11
-    # final = -17 - 11 = -28
-    assert result["calibrated_volume_db"] == -28.0
+    # probe: correction = 78 - 95 = -17 → volume = -20 + (-17) = -37
+    # verify: 85 > 78+3 → overshoot = 85 - 78 = 7 → final = -37 - 7 = -44
+    assert result["calibrated_volume_db"] == -44.0
 
 
 @pytest.mark.asyncio
@@ -946,10 +962,10 @@ async def test_calibrate_level_hdmi_volume_clamped_to_max() -> None:
     mock_avr = AsyncMock()
 
     probe_fr = MagicMock()
-    probe_fr.peak_spl = -60.0  # very quiet
+    probe_fr.impulse_response = _make_ir(30.0)  # very quiet
 
     verify_fr = MagicMock()
-    verify_fr.peak_spl = -20.0
+    verify_fr.impulse_response = _make_ir(73.0)
 
     mock_engine = MagicMock()
     mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
@@ -958,14 +974,14 @@ async def test_calibrate_level_hdmi_volume_clamped_to_max() -> None:
         patch.object(sut, "_avr", mock_avr),
         patch.object(sut, "_config", return_value=_make_hdmi_cfg()),
         patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
-        patch("calibrate.config.update_config") as mock_update,
+        patch("calibrate.config.update_config"),
     ):
         result = await _tool_calibrate_level(
-            target_peak_dbfs=-12.0, start_db=-40.0, max_volume_db=-5.0
+            target_spl_db=78.0, start_db=-40.0, max_volume_db=-5.0
         )
 
     assert result["ok"]
-    # correction = -12 - (-60) = +48 → volume = -40 + 48 = +8 → clamped to -5
+    # correction = 78 - 30 = +48 → volume = -40 + 48 = +8 → clamped to -5
     assert result["calibrated_volume_db"] == -5.0
 
 
@@ -2176,6 +2192,412 @@ async def test_get_measurement_history_rounds_floats() -> None:
     data = result["sessions"][0]
     assert data["freq_hz"] == [20.14, 40.28]
     assert data["spl_db"] == [-5.12, -3.99]
+
+
+# ── read_input_eq ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_read_input_eq_starts_empty(mock_dsp) -> None:
+    """No input EQ applied yet → empty filter list."""
+    result = await _tool_read_input_eq()
+    assert result["ok"]
+    assert result["filters"] == []
+    assert result["target"] == "input"
+
+
+@pytest.mark.asyncio
+async def test_read_input_eq_reflects_applied_state(mock_dsp) -> None:
+    """After apply_input_eq, read_input_eq returns the applied filters."""
+    from calibrate.mcp_server import _tool_apply_input_eq
+    filters = [
+        {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
+        {"freq": 50.0, "gain_db": -2.0, "q": 1.0, "type": "peaking"},
+    ]
+    apply_result = await _tool_apply_input_eq(filters)
+    assert apply_result["ok"]
+
+    read_result = await _tool_read_input_eq()
+    assert read_result["ok"]
+    assert len(read_result["filters"]) == 2
+    assert read_result["preset"] == 0
+
+
+@pytest.mark.asyncio
+async def test_read_input_eq_driver_error(mock_dsp) -> None:
+    """DriverError from dsp.current_preset → {ok: false}."""
+    mock_dsp.current_preset.side_effect = DriverError("dsp unreachable")
+    result = await _tool_read_input_eq()
+    assert not result["ok"]
+    assert "read_input_eq error" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_read_input_eq_dispatch(mock_dsp) -> None:
+    """call_tool('read_input_eq') dispatches correctly."""
+    from calibrate.mcp_server import call_tool
+    texts = await call_tool("read_input_eq", {})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "filters" in data
+    assert data["target"] == "input"
+
+
+# ── compute_deviation ────────────────────────────────────────────────────────
+
+
+def _make_deviation_session(session_id: int, freqs: list[float], spls: list[float]) -> MagicMock:
+    """Build a mock session with given FR data for deviation tests."""
+    mock_fr = MagicMock()
+    mock_fr.frequencies = freqs
+    mock_fr.spl = spls
+    session = MagicMock()
+    session.id = session_id
+    session.start_fr = mock_fr
+    session.label = f"dev-{session_id}"
+    return session
+
+
+@pytest.mark.asyncio
+async def test_compute_deviation_basic() -> None:
+    """Simple case: measured matches target within ~1 dB → converged."""
+    freqs = [30.0, 40.0, 50.0, 63.0, 80.0]
+    # Target: flat at 75 dB
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
+    # Measured: slightly above target
+    spls = [75.5, 75.8, 74.5, 75.2, 74.9]
+    session = _make_deviation_session(1, freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_compute_deviation(session_id=1, target_curve=target)
+    assert result["ok"]
+    assert result["converged"] is True
+    assert result["rms_db"] < 2.0
+    assert result["included_points"] == 5
+    assert result["session_id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_compute_deviation_null_zone_excluded() -> None:
+    """Frequencies with SPL far below band average are excluded as null zones."""
+    freqs = [30.0, 40.0, 50.0, 63.0, 80.0]
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
+    # 50 Hz is a deep null — 20 dB below everything else
+    spls = [74.0, 75.0, 55.0, 76.0, 75.0]
+    session = _make_deviation_session(1, freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_compute_deviation(
+            session_id=1, target_curve=target, null_threshold_db=15.0
+        )
+    assert result["ok"]
+    assert result["excluded_null_points"] >= 1
+    # The null at 50 Hz should appear in null_zones
+    null_freqs = []
+    for zone in result["null_zones"]:
+        null_freqs.extend([zone["lo_hz"], zone["hi_hz"]])
+    assert 50.0 in null_freqs
+
+
+@pytest.mark.asyncio
+async def test_compute_deviation_rolloff_excluded() -> None:
+    """Frequencies below port_rolloff_hz are excluded."""
+    freqs = [22.0, 25.0, 30.0, 40.0, 50.0, 63.0, 80.0]
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
+    spls = [65.0, 70.0, 74.0, 75.0, 75.0, 76.0, 75.0]
+    session = _make_deviation_session(1, freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_compute_deviation(
+            session_id=1, target_curve=target, port_rolloff_hz=28.0
+        )
+    assert result["ok"]
+    assert result["excluded_rolloff_points"] >= 2  # 22 Hz and 25 Hz
+
+
+@pytest.mark.asyncio
+async def test_compute_deviation_not_converged() -> None:
+    """RMS > 2.0 → converged is False."""
+    freqs = [30.0, 40.0, 50.0, 63.0, 80.0]
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
+    # Measured: far from target
+    spls = [80.0, 70.0, 82.0, 68.0, 81.0]
+    session = _make_deviation_session(1, freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_compute_deviation(session_id=1, target_curve=target)
+    assert result["ok"]
+    assert result["converged"] is False
+    assert result["rms_db"] > 2.0
+
+
+@pytest.mark.asyncio
+async def test_compute_deviation_session_not_found() -> None:
+    """Session ID not in store → error."""
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = []
+        result = await _tool_compute_deviation(session_id=99, target_curve=target)
+    assert not result["ok"]
+    assert "session 99 not found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_compute_deviation_empty_target_points() -> None:
+    """Target curve with no points → error."""
+    freqs = [30.0, 40.0, 50.0]
+    spls = [75.0, 75.0, 75.0]
+    session = _make_deviation_session(1, freqs, spls)
+    target = {"points": [], "band": [20, 100]}
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_compute_deviation(session_id=1, target_curve=target)
+    assert not result["ok"]
+    assert "points" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_compute_deviation_returns_summary_bands() -> None:
+    """Result includes per-1/3-octave summary with error values."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(100), 200).tolist()
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
+    spls = [77.0] * len(freqs)  # 2 dB above target everywhere
+    session = _make_deviation_session(1, freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_compute_deviation(session_id=1, target_curve=target)
+    assert result["ok"]
+    assert len(result["summary"]) > 0
+    for band in result["summary"]:
+        assert "freq_hz" in band
+        assert "error_db" in band
+        assert abs(band["error_db"] - 2.0) < 0.5  # roughly +2 dB error
+
+
+@pytest.mark.asyncio
+async def test_call_tool_compute_deviation_dispatch() -> None:
+    """call_tool('compute_deviation') dispatches correctly."""
+    from calibrate.mcp_server import call_tool
+    freqs = [30.0, 40.0, 50.0, 63.0, 80.0]
+    spls = [75.0, 75.0, 75.0, 75.0, 75.0]
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
+    session = _make_deviation_session(1, freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        texts = await call_tool("compute_deviation", {
+            "session_id": 1,
+            "target_curve": target,
+        })
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "rms_db" in data
+    assert "converged" in data
+
+
+# ── compare_sessions ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_compare_sessions_basic() -> None:
+    """Comparing two sessions returns per-band deltas (B minus A)."""
+    import numpy as np
+    freqs_a = np.logspace(np.log10(20), np.log10(200), 500).tolist()
+    spls_a = [70.0] * len(freqs_a)
+    session_a = _make_deviation_session(1, freqs_a, spls_a)
+
+    freqs_b = np.logspace(np.log10(20), np.log10(200), 500).tolist()
+    spls_b = [73.0] * len(freqs_b)  # 3 dB louder
+    session_b = _make_deviation_session(2, freqs_b, spls_b)
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session_a, session_b]
+        result = await _tool_compare_sessions(session_a=1, session_b=2)
+    assert result["ok"]
+    assert result["session_a"]["id"] == 1
+    assert result["session_b"]["id"] == 2
+    assert len(result["bands"]) > 0
+    for band in result["bands"]:
+        assert abs(band["delta_db"] - 3.0) < 0.5  # B is ~3 dB louder
+    assert abs(result["avg_delta_db"] - 3.0) < 0.5
+
+
+@pytest.mark.asyncio
+async def test_compare_sessions_session_not_found() -> None:
+    """Session A not found → error."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(200), 100).tolist()
+    spls = [75.0] * len(freqs)
+    session = _make_deviation_session(2, freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_compare_sessions(session_a=99, session_b=2)
+    assert not result["ok"]
+    assert "session 99 not found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_compare_sessions_session_b_not_found() -> None:
+    """Session B not found → error."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(200), 100).tolist()
+    spls = [75.0] * len(freqs)
+    session = _make_deviation_session(1, freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_compare_sessions(session_a=1, session_b=99)
+    assert not result["ok"]
+    assert "session 99 not found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_compare_sessions_returns_statistics() -> None:
+    """Result includes avg, max, and rms delta stats."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls_a = [72.0] * len(freqs)
+    spls_b = [75.0] * len(freqs)
+    session_a = _make_deviation_session(1, freqs, spls_a)
+    session_b = _make_deviation_session(2, freqs, spls_b)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session_a, session_b]
+        result = await _tool_compare_sessions(session_a=1, session_b=2)
+    assert result["ok"]
+    assert "avg_delta_db" in result
+    assert "max_delta_db" in result
+    assert "rms_delta_db" in result
+    assert result["rms_delta_db"] > 0
+
+
+@pytest.mark.asyncio
+async def test_call_tool_compare_sessions_dispatch() -> None:
+    """call_tool('compare_sessions') dispatches correctly."""
+    import numpy as np
+    from calibrate.mcp_server import call_tool
+    freqs = np.logspace(np.log10(20), np.log10(200), 200).tolist()
+    session_a = _make_deviation_session(1, freqs, [70.0] * len(freqs))
+    session_b = _make_deviation_session(2, freqs, [73.0] * len(freqs))
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session_a, session_b]
+        texts = await call_tool("compare_sessions", {
+            "session_a": 1,
+            "session_b": 2,
+        })
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "bands" in data
+    assert "avg_delta_db" in data
+
+
+# ── Label dedup fix ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_measure_label_dedup_no_double_position() -> None:
+    """label='foo @ MLP' with position='MLP' → 'foo @ MLP' (not 'foo @ MLP @ MLP')."""
+    mock_sd = MagicMock()
+    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
+
+    mock_fr = MagicMock()
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(return_value=mock_fr)
+
+    mock_store = MagicMock()
+    mock_store.save_measurement.return_value = 10
+
+    with (
+        patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
+        patch("calibrate.storage.SessionStore", return_value=mock_store),
+        patch.object(sut, "DenonSweepContext") as MockCtx,
+        patch("calibrate.drivers.minidsp.MinidspSweepContext") as MockMinidspCtx,
+    ):
+        MockCtx.from_config.return_value = None
+        MockMinidspCtx.from_config.return_value = None
+        result = await _tool_trigger_measurement(label="foo @ MLP", position="MLP")
+
+    assert result["ok"]
+    assert result["label"] == "foo @ MLP"
+    # Verify the label saved to the store is NOT doubled
+    call_kwargs = mock_store.save_measurement.call_args[1]
+    assert call_kwargs["label"] == "foo @ MLP"
+
+
+@pytest.mark.asyncio
+async def test_measure_label_appends_position_when_missing() -> None:
+    """label='foo' with position='MLP' → 'foo @ MLP'."""
+    mock_sd = MagicMock()
+    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
+
+    mock_fr = MagicMock()
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(return_value=mock_fr)
+
+    mock_store = MagicMock()
+    mock_store.save_measurement.return_value = 11
+
+    with (
+        patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
+        patch("calibrate.storage.SessionStore", return_value=mock_store),
+        patch.object(sut, "DenonSweepContext") as MockCtx,
+        patch("calibrate.drivers.minidsp.MinidspSweepContext") as MockMinidspCtx,
+    ):
+        MockCtx.from_config.return_value = None
+        MockMinidspCtx.from_config.return_value = None
+        result = await _tool_trigger_measurement(label="foo", position="MLP")
+
+    assert result["ok"]
+    assert result["label"] == "foo @ MLP"
+    call_kwargs = mock_store.save_measurement.call_args[1]
+    assert call_kwargs["label"] == "foo @ MLP"
+
+
+# ── group_delay stripping ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_measure_response_strips_group_delay() -> None:
+    """The measure tool response metadata does NOT include group_delay."""
+    mock_sd = MagicMock()
+    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
+
+    mock_fr = MagicMock()
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(return_value=mock_fr)
+
+    mock_store = MagicMock()
+    mock_store.save_measurement.return_value = 12
+
+    # Simulate compute_session_metadata returning group_delay among other keys
+    full_metadata = {
+        "ir": {"peak_time_ms": 5.0, "spl_db": 75.0},
+        "group_delay": {"freq_hz": [20, 40, 80], "delay_ms": [1.0, 0.5, 0.2]},
+    }
+
+    with (
+        patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement.compute_session_metadata", return_value=full_metadata),
+        patch("calibrate.storage.SessionStore", return_value=mock_store),
+        patch.object(sut, "DenonSweepContext") as MockCtx,
+        patch("calibrate.drivers.minidsp.MinidspSweepContext") as MockMinidspCtx,
+    ):
+        MockCtx.from_config.return_value = None
+        MockMinidspCtx.from_config.return_value = None
+        result = await _tool_trigger_measurement()
+
+    assert result["ok"]
+    # group_delay should be stripped from the tool response
+    assert "group_delay" not in result["metadata"]
+    # But other metadata keys should still be present
+    assert "ir" in result["metadata"]
+
+    # Verify full metadata (including group_delay) was saved to the store
+    call_kwargs = mock_store.save_measurement.call_args[1]
+    assert "group_delay" in call_kwargs["metadata"]
 
 
 @pytest.mark.asyncio

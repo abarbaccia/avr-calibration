@@ -694,3 +694,38 @@ class TestOnsetDetection:
         assert abs(peak_ms - 10.0) < 1.0, (
             f"Expected onset near 10ms, got {peak_ms}ms"
         )
+
+
+# ── parse_umik_sensitivity ────────────────────────────────────────────────────
+
+
+class TestParseUmikSensitivity:
+    """Tests for UMIK cal file sensitivity parsing."""
+
+    def test_parses_standard_header(self, tmp_path):
+        from calibrate.measurement import parse_umik_sensitivity
+
+        cal = tmp_path / "umik.cal"
+        cal.write_text(
+            '"Sens Factor =1.725dB, AGain =18dB, SERNO: 7079831"\n'
+            '"Auto-generated 90-degree calibration file"\n'
+            "20.0    -0.3\n"
+        )
+        offset = parse_umik_sensitivity(str(cal))
+        # effective_sens = -18 + 1.725 = -16.275
+        # offset = 94 - (-16.275) = 110.275
+        assert abs(offset - 110.275) < 0.01
+
+    def test_missing_file_raises(self):
+        from calibrate.measurement import parse_umik_sensitivity
+
+        with pytest.raises(FileNotFoundError):
+            parse_umik_sensitivity("/nonexistent/path.cal")
+
+    def test_bad_header_raises(self, tmp_path):
+        from calibrate.measurement import parse_umik_sensitivity
+
+        cal = tmp_path / "bad.cal"
+        cal.write_text("not a valid header\n20.0 -0.3\n")
+        with pytest.raises(ValueError, match="Cannot parse"):
+            parse_umik_sensitivity(str(cal))

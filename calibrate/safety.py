@@ -252,7 +252,8 @@ class SafetyValidator:
                 return ValidationResult.failed(
                     f"band at {f.freq:.1f} Hz (1/3-octave: {centre:.0f} Hz) "
                     f"increases by +{delta:.1f} dB "
-                    f"(max change per iteration is +{MAX_CHANGE_PER_ITER_DB:.0f} dB)"
+                    f"(previous: {prev_gain:+.1f} dB → proposed: {f.gain_db:+.1f} dB; "
+                    f"max change per iteration is +{MAX_CHANGE_PER_ITER_DB:.0f} dB)"
                 )
         return ValidationResult.passed()
 

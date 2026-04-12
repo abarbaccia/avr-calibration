@@ -72,6 +72,7 @@ class FrequencyResponse:
     warnings: list[dict] = field(default_factory=list)  # non-fatal quality warnings
     impulse_response: Optional[list[float]] = None  # time-domain IR, first 24 000 samples
     phase: Optional[list[float]] = None  # radians, same grid as frequencies/spl
+    recording_peak_dbfs: Optional[float] = None  # peak of raw recording before deconvolution
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
@@ -82,6 +83,7 @@ class FrequencyResponse:
         data.setdefault("warnings", [])     # backward compat
         data.setdefault("impulse_response", None)  # backward compat
         data.setdefault("phase", None)  # backward compat
+        data.setdefault("recording_peak_dbfs", None)  # backward compat
         return cls(**data)
 
     @property
@@ -94,6 +96,42 @@ class FrequencyResponse:
             return 0.0
         peak = max(self.spl)
         return self.frequencies[self.spl.index(peak)]
+
+
+def parse_umik_sensitivity(cal_path: str) -> float:
+    """Parse UMIK cal file and return dBFS-to-SPL offset.
+
+    The UMIK-1 cal file header looks like:
+        "Sens Factor =1.725dB, AGain =18dB, SERNO: 7079831"
+
+    Base sensitivity at AGain=18dB is -18 dBFS/Pa (94 dB SPL produces -18 dBFS).
+    Effective sensitivity = -18 + sens_factor dBFS/Pa.
+    Offset = 94 - effective_sensitivity (to convert: SPL = dBFS + offset).
+
+    Returns the offset such that: SPL_dB = peak_dBFS + offset
+    """
+    import re
+    from pathlib import Path
+
+    path = Path(cal_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"UMIK cal file not found: {cal_path}")
+
+    header = path.read_text().splitlines()[0]
+    m_sens = re.search(r"Sens Factor\s*=\s*([-\d.]+)\s*dB", header)
+    m_gain = re.search(r"AGain\s*=\s*([-\d.]+)\s*dB", header)
+    if not m_sens or not m_gain:
+        raise ValueError(f"Cannot parse UMIK cal header: {header!r}")
+
+    sens_factor = float(m_sens.group(1))
+    analog_gain = float(m_gain.group(1))
+
+    # UMIK-1 base sensitivity: at AGain dB analog gain, 94 dB SPL (1 Pa)
+    # produces -(AGain) dBFS, adjusted by sens_factor.
+    effective_sens_dbfs = -analog_gain + sens_factor  # dBFS at 94 dB SPL
+    # SPL = dBFS - effective_sens + 94
+    offset = 94.0 - effective_sens_dbfs
+    return offset
 
 
 def _find_umik_device(devices, name_substring: str = "UMIK") -> int | None:
@@ -371,6 +409,13 @@ class MeasurementEngine:
         pre_delay_samples = int(getattr(strategy, "PRE_DELAY_S", 0.0) * sample_rate)
         rec_for_deconv = rec_1d[pre_delay_samples:] if pre_delay_samples > 0 else rec_1d
 
+        # Raw recording peak in dBFS (before deconvolution) — used by
+        # calibrate_level to compute actual SPL via mic sensitivity.
+        # Use rec_for_deconv (post-pre-delay) so the peak reflects the
+        # sweep period, not transient noise during the 1s silence window.
+        rec_peak_abs = float(np.max(np.abs(rec_for_deconv)))
+        rec_peak_dbfs = round(20.0 * np.log10(rec_peak_abs + 1e-12), 1)
+
         frequencies, spl, ir_samples, phase = self._compute_fr_arrays(
             np, sweep_1d, rec_for_deconv, freq_min, freq_max, sample_rate
         )
@@ -383,6 +428,7 @@ class MeasurementEngine:
             timestamp=datetime.now(timezone.utc).isoformat(),
             impulse_response=ir_samples,
             phase=phase,
+            recording_peak_dbfs=rec_peak_dbfs,
         )
 
     # ── Internals ─────────────────────────────────────────────────────────
