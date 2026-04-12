@@ -349,3 +349,56 @@ async def test_mute_outputs_raises_on_cli_failure(client: MinidspClient) -> None
     with patch(_CLI_PATH, side_effect=side_effect):
         with pytest.raises(MinidspApiError):
             await client.mute_outputs([0, 1])
+
+
+# ── CLI serialisation lock ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cli_lock_serialises_concurrent_calls(client: MinidspClient) -> None:
+    """Concurrent CLI calls must be serialised — no two minidsp processes at once.
+
+    The miniDSP 2x4 HD firmware silently drops commands when they arrive
+    faster than its internal commit cycle.  The _cli_lock in _run_minidsp_cli
+    prevents this.
+
+    We mock asyncio.create_subprocess_exec (not _run_minidsp_cli) so the
+    real lock and delay logic runs.
+    """
+    import asyncio
+    from unittest.mock import MagicMock
+
+    call_order: list[str] = []
+    call_count = 0
+
+    async def fake_subprocess(*args, **kwargs):
+        nonlocal call_count
+        idx = call_count
+        call_count += 1
+        call_order.append(f"start:{idx}")
+        await asyncio.sleep(0.01)
+        call_order.append(f"end:{idx}")
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        return proc
+
+    with patch("calibrate.adapters.minidsp.asyncio.create_subprocess_exec",
+               side_effect=fake_subprocess):
+        with patch("calibrate.adapters.minidsp.CLI_COMMAND_DELAY_S", 0.0):
+            await asyncio.gather(
+                client.set_output_gain(0, 0.0),
+                client.set_output_gain(1, 0.0),
+                client.set_output_gain(2, 0.0),
+            )
+
+    # Verify serialisation: each "end" must come before the next "start"
+    starts = [i for i, v in enumerate(call_order) if v.startswith("start")]
+    ends = [i for i, v in enumerate(call_order) if v.startswith("end")]
+    assert len(starts) == 3, f"Expected 3 calls, got {len(starts)}: {call_order}"
+    for s, e in zip(starts[1:], ends[:-1]):
+        assert e < s, (
+            f"Commands overlapped: {call_order}"
+        )

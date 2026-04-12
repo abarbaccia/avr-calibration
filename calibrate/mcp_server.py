@@ -1860,12 +1860,18 @@ async def _tool_analyze_ir(
         search_window = ir_arr[:search_samples]
 
         abs_window = np.abs(search_window)
+        # Skip first 0.5ms — Wiener deconvolution leaves a DC artifact near
+        # t=0 that confuses onset detection.  The shortest sub-to-mic path is
+        # always > 0.5ms (~17cm), so no real IR energy lives there.
+        skip_samples = max(1, int(0.0005 * sample_rate))
+        abs_window[:skip_samples] = 0.0
         max_idx = int(np.argmax(abs_window))
         # Onset detection: first sample within 20 dB of the absolute peak.
         # argmax finds the LOUDEST peak — in strong-mode rooms this can be a
         # late resonance instead of the direct sound.  Onset finds first arrival.
         onset_threshold = abs_window[max_idx] * 0.1  # -20 dB
-        peak_idx = int(np.argmax(abs_window > onset_threshold))
+        onset_candidates = np.where(abs_window >= onset_threshold)[0]
+        peak_idx = int(onset_candidates[0]) if len(onset_candidates) > 0 else max_idx
         peak_sign = 1 if ir_arr[peak_idx] >= 0.0 else -1
         peak_time_s = peak_idx / sample_rate
         spl_db = float(20.0 * np.log10(abs_window[max_idx] + 1e-12))
