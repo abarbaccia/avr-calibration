@@ -49,7 +49,17 @@ reference SPL where no frequency band requires more than +6 dB of boost:
 This maximizes bass extension while staying within the +6 dB safety limit.
 Most corrections will be cuts. Report the chosen reference level.
 
-### Step 3 — Analyse the current response
+### Step 3 — Analyze fixability
+
+Call `analyze_phase(session_id)` on the baseline measurement to determine which
+deviations from target are fixable with EQ:
+- `fixable=True`: minimum-phase error — PEQ can correct it
+- `fixable=False`: excess-phase (cancellation) — repositioning the sub is more effective
+- Check coherence in measurement data — low coherence (<0.8) means unreliable data
+
+This avoids wasting PEQ slots on unfixable problems.
+
+### Step 4 — Analyse the current response
 
 Compare the measured SPL at each 1/3-octave band (20–200 Hz) against the Harman
 bass target anchored at the reference from Step 2. The target relative to 80 Hz is:
@@ -71,10 +81,16 @@ Note: the Harman target is a preference model, not a physical law. Adjust
 interpretation based on room acoustics — a room with significant bass buildup
 below 50 Hz should target less bass lift than a flat room.
 
-### Step 4 — Calculate corrections
+### Step 5 — Calculate corrections
 
 For each 1/3-octave band, calculate the correction needed:
   correction_db = target_db - measured_db
+
+Only design corrections for bands where `analyze_phase` reported `fixable=True`.
+Skip unfixable bands — they are cancellation nulls that EQ cannot help.
+
+For each filter, call `optimize_q(session_id, freq_hz, target_gain_db)` to find
+the best Q value. For ringing modes (from `analyze_decay`), use the `suggested_q`.
 
 Apply corrections as peaking EQ bands. Prefer cuts over boosts where possible
 — cuts are always safe; boosts are limited by SafetyValidator.
@@ -89,9 +105,16 @@ Safety constraints (enforced automatically by apply_eq):
 If a correction exceeds a limit, clip it to the maximum safe value and note
 it as a partial correction. Do not attempt to apply the over-limit value.
 
-### Step 5 — Apply corrections
+### Step 6 — Verify in simulation
 
-Call `apply_eq(filters)` with the calculated filter list. Always include the
+Call `simulate_eq(session_id, filters)` with the proposed filter set. Check the
+predicted FR against the Harman target. If the prediction shows remaining issues,
+adjust filters and re-simulate. Iterate in simulation until satisfied — this is
+free (no hardware writes, no new measurements needed).
+
+### Step 7 — Apply corrections
+
+Call `apply_eq(filters)` with the simulation-verified filter list. Always include the
 mandatory 18 Hz HPF:
 
 ```json
@@ -107,7 +130,7 @@ If `apply_eq` returns `{ok: false, error: "SafetyValidator: ..."}`:
 2. Adjust the offending filter (reduce the gain or move the frequency)
 3. Retry with the adjusted filter set
 
-### Step 6 — Re-measure and iterate
+### Step 8 — Re-measure and iterate
 
 After applying filters, ask the user to take a new measurement in the browser.
 Retrieve it with `get_measurement_history(limit=1)` and compare to the anchored target.

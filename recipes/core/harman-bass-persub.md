@@ -111,11 +111,24 @@ Compare the per-sub `analyze_ir` results:
 - **Polarity**: Sub 0 is the polarity reference. Any sub with opposite `peak_sign`
   gets `set_polarity(inverted=True)`.
 
-### 1.3 Verify alignment
+### 1.3 Analyze phase relationship
+
+Before measuring combined, call `compare_sub_phase(session_a, session_b)` using
+the solo measurement session IDs. This shows per-band:
+- Phase difference between the two subs
+- Predicted coherent sum (constructive vs destructive)
+- Classification: reinforcing / partial / cancelling
+
+Use this to understand WHERE the subs reinforce vs cancel before blindly
+re-measuring. If many bands show "cancelling", delay/polarity corrections
+from 1.2 may need revisiting before proceeding.
+
+### 1.4 Verify alignment
 
 Measure all subs together. Combined response should be louder than any
 individual sub (reinforcement). If combined is quieter at some frequencies,
-subs are still cancelling — revisit delay and polarity.
+subs are still cancelling — revisit delay and polarity using the
+`compare_sub_phase` analysis from 1.3 to guide adjustments.
 
 Maximum 3 alignment iterations.
 
@@ -133,28 +146,48 @@ For each sub listed in `eq_capabilities.output_peq`:
 3. Compute a "flat" target: the average SPL across 25-80Hz for this sub
 4. Unmute
 
-### 2.2 Design per-sub correction filters
+### 2.2 Analyze fixability
+
+For each sub's solo measurement, call `analyze_phase(session_id)` to get per-band
+fixability data. This tells you which deviations are minimum-phase (correctable with
+EQ) and which are excess-phase (cancellation — only repositioning helps).
+
+- `fixable=True` bands: safe to design PEQ corrections
+- `fixable=False` bands: skip — EQ will waste a slot without improving the null
+- `fixable=None`: no phase data available — fall back to the heuristic below
+
+Also check coherence in the measurement data (`get_measurement_history` with compact
+format includes coherence summary). Low coherence (<0.8) means unreliable data at
+that frequency — don't design precise corrections based on noisy measurements.
+
+### 2.3 Design per-sub correction filters
 
 For each sub, compare its solo FR to flat (its own average level):
 - Peaks above the average: cut with peaking filter (always safe)
-- Dips below the average: leave alone if narrow (likely a null — unfixable)
-- Broad dips: gentle boost if > 3 dB below average (limited by safety)
-- **Q selection near adjacent features:** When a peak is adjacent to a dip
-  (< 1/3 octave apart), use Q ≥ 4 to avoid the cut bleeding into the dip.
-  A Q of 2.5 at 55 Hz will affect 43-67 Hz; a Q of 4 narrows to 48-62 Hz.
-  Use `analyze_decay` suggested_q for ringing modes — it accounts for mode width.
+- Dips below the average: leave alone if narrow (likely a null — unfixable).
+  Confirm with `analyze_phase` fixability before deciding.
+- Broad dips: gentle boost if > 3 dB below average AND `fixable=True` (limited by safety)
+- **Q selection:** Call `optimize_q(session_id, freq_hz, target_gain_db)` to find the
+  best Q for each filter. For ringing modes identified by `analyze_decay`, use the
+  `suggested_q` from that tool — it accounts for mode width.
+- **Q near adjacent features:** When a peak is adjacent to a dip (< 1/3 octave apart),
+  use Q ≥ 4 to avoid the cut bleeding into the dip.
+
+**Verify before applying:** Call `simulate_eq(session_id, filters)` with the proposed
+filter set. Check the predicted FR — iterate on filter design in simulation until
+satisfied, then apply once. This avoids unnecessary hardware writes and wasted iterations.
 
 **Prefer cuts heavily.** The goal is to flatten each sub's response,
 not to boost it to match a target. Nulls cannot be filled with EQ.
 
 Always include the mandatory 18Hz HPF.
 
-### 2.3 Apply per-sub EQ
+### 2.4 Apply per-sub EQ
 
 For each sub, call `apply_eq` with `output_index` set to that sub's
 output index. Each sub gets its own independent filter set.
 
-### 2.4 Optional — Decay analysis after per-sub EQ
+### 2.5 Optional — Decay analysis after per-sub EQ
 
 After applying per-sub corrections, call `analyze_decay(session_id)` on the most
 recent solo measurement to check if any modes exhibit T60 > 500ms. If so, use
@@ -162,6 +195,10 @@ recent solo measurement to check if any modes exhibit T60 > 500ms. If so, use
 the ringing frequency more surgically without over-cutting broadband energy.
 
 ### 2.6 Re-measure each sub solo and iterate
+
+> **Iteration tip:** Before applying corrective filters, always run `simulate_eq`
+> with the proposed merged filter set to predict the result. Only `apply_eq` when
+> the simulation looks good.
 
 After applying per-sub EQ:
 1. Measure each sub solo again
@@ -285,16 +322,29 @@ If max iterations reached:
 
 ## MCP tools used
 
-- `get_config` — discover `eq_capabilities` (input/output PEQ slots, labels, current state)
+### Hardware I/O
 - `measure` — take a sweep measurement
 - `apply_eq` — write per-sub correction filters (with `output_index` for single-output targeting)
 - `apply_input_eq` — write shared Harman target curve to DSP input
 - `mute_output` / `unmute_output` — isolate subs for solo measurement
 - `set_delay` / `set_polarity` / `set_output_gain` — sub alignment
-- `get_output_state` — verify current per-output state mid-calibration
-- `analyze_ir` — IR peak time/sign/SPL for computing delay and polarity corrections
-- `analyze_decay` — T60 ringing analysis for EQ Q selection (optional, Phase 2)
 - `calibrate_level` — find optimal sweep volume
-- `compute_deviation` — RMS deviation with automatic null/rolloff exclusion (use for convergence checks)
+- `configure_matrix` — route active input to all outputs
+
+### Analytics (data for LLM judgment)
+- `analyze_phase` — per-band fixability: minimum-phase (EQ-correctable) vs excess-phase (reposition sub)
+- `compare_sub_phase` — per-frequency phase relationship between solo sub measurements
+- `analyze_ir` — IR peak time/sign/SPL for computing delay and polarity corrections
+- `analyze_decay` — T60 ringing analysis for EQ Q selection
+- `compute_deviation` — RMS deviation with automatic null/rolloff exclusion
+
+### Simulation (verify before applying)
+- `simulate_eq` — predict FR after proposed PEQ filters (iterate in simulation, apply once)
+- `optimize_q` — find best Q for a filter at a chosen frequency and gain
+
+### State and config
+- `get_config` — discover `eq_capabilities` (input/output PEQ slots, labels, current state)
+- `get_output_state` — verify current per-output state mid-calibration
+- `get_measurement_history` — FR data with coherence for filter design
 - `compare_sessions` — per-band delta between two sessions (verify EQ changes)
-- `read_input_eq` — read current input PEQ state (for iterative filter merging)
+- `read_eq` / `read_input_eq` — current PEQ state (for iterative filter merging)

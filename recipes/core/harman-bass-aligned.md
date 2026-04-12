@@ -75,21 +75,29 @@ for all subsequent measurements in this session.
 
 For each subwoofer:
 1. Mute all other subs
-2. Take a measurement
-3. Record the impulse response (IR peak time and polarity)
+2. Take a measurement — note the session_id
+3. Call `analyze_ir(session_id)` — get `peak_time_s`, `peak_sign`, `spl_db`
 4. Unmute
 
-### 1.2 Apply corrections
+### 1.2 Analyze phase relationship
 
-Compare the per-sub impulse responses:
+Call `compare_sub_phase(session_a, session_b)` using the solo session IDs.
+This shows per-band phase difference, predicted coherent sum, and whether
+subs reinforce or cancel at each frequency. Use this to understand the
+interaction before applying corrections.
+
+### 1.3 Apply corrections
+
+Compare the per-sub `analyze_ir` results:
 - **Delay**: If one sub arrives earlier, delay it to match the others
 - **Polarity**: If one sub is out of phase (IR peak inverted), flip its polarity
 
-### 1.3 Verify alignment
+### 1.4 Verify alignment
 
 Measure all subs together. The combined response should be louder than any
 individual sub (reinforcement). If combined is quieter at some frequencies,
-subs are still cancelling — revisit delay and polarity.
+subs are still cancelling — use `compare_sub_phase` analysis from 1.2 to
+guide delay/polarity adjustments.
 
 Repeat alignment until combined response shows reinforcement across the band.
 Maximum 3 alignment iterations.
@@ -122,11 +130,20 @@ hardware. Always clear explicitly.
 
 Measure the combined sub response. Calculate RMS deviation from the Harman target.
 
-### 2.2 Apply EQ corrections
+### 2.2 Analyze fixability and design corrections
 
-For each frequency band deviating from target:
+Call `analyze_phase(session_id)` on the combined measurement to determine which
+bands are fixable with EQ vs excess-phase (cancellation). Only design corrections
+for `fixable=True` bands.
+
+For each filter, use `optimize_q` to find the best Q. Then call
+`simulate_eq(session_id, filters)` to verify the predicted FR before applying.
+Iterate in simulation until the predicted response meets the target.
+
+Apply corrections:
 - Above target: cut (always safe)
-- Below target: boost (limited by safety)
+- Below target AND fixable: boost (limited by safety)
+- Below target AND NOT fixable: skip — EQ cannot help cancellation
 
 Prefer cuts over boosts. Always include the mandatory infrasonic high-pass filter.
 
