@@ -1432,28 +1432,32 @@ async def _tool_calibrate_level(
     USB mode: adjusts miniDSP master gain.
     HDMI mode: adjusts AVR volume.
     """
-    from .measurement import MeasurementEngine, MeasurementQualityError
+    from .measurement import MeasurementEngine, MeasurementQualityError, parse_umik_sensitivity
     from .config import update_config
     import math as _math
     import numpy as _np
 
-    def _ir_spl(fr) -> float:
-        """SPL estimate from deconvolved IR peak.
-
-        The IR peak (20*log10(max|h(t)|)) tracks actual SPL linearly because
-        the deconvolution H=Y/X scales with recording level.  Empirically the
-        values match acoustic dB SPL within a few dB for our sweep config.
-        Unlike recording_peak_dbfs, the IR peak is immune to ambient noise
-        and electrical interference because deconvolution separates signal
-        from noise.
-        """
-        if fr.impulse_response:
-            arr = _np.array(fr.impulse_response, dtype=_np.float64)
-            return float(round(20.0 * _np.log10(_np.max(_np.abs(arr)) + 1e-12), 1))
-        # Fallback: FR magnitude peak (less reliable for absolute SPL)
-        return fr.peak_spl
-
     cfg = _config()
+
+    # Load UMIK sensitivity offset: SPL = dBFS + offset
+    _mic_offset = 0.0
+    cal_path = cfg._data.get("mic", {}).get("cal_file")
+    if cal_path:
+        try:
+            _mic_offset = parse_umik_sensitivity(cal_path)
+            log.info("calibrate_level: UMIK sensitivity offset = %.1f dB", _mic_offset)
+        except Exception as exc:
+            log.warning("calibrate_level: failed to parse UMIK sensitivity: %s", exc)
+
+    def _ir_spl(fr) -> float:
+        """SPL estimate from recording peak + UMIK sensitivity offset.
+
+        Uses the raw recording peak (dBFS) converted to acoustic SPL via
+        the UMIK cal file sensitivity.  This is more accurate than the
+        deconvolved IR peak, which includes a sweep-dependent normalization
+        constant that doesn't map directly to SPL.
+        """
+        return float(round(fr.recording_peak_dbfs + _mic_offset, 1))
     engine = MeasurementEngine(cfg)
     route = cfg.measurement.get("playback_route", "usb")
 

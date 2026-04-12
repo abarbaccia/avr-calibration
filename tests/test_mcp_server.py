@@ -681,14 +681,15 @@ async def test_trigger_measurement_no_target_for_raw_capture() -> None:
 
 # ── calibrate_level ────────────────────────────────────────────────────────────
 
-def _make_ir(spl_db: float) -> list[float]:
-    """Build a minimal IR array whose peak gives the specified spl_db.
+def _make_fr(spl_db: float) -> MagicMock:
+    """Build a mock FrequencyResponse with recording_peak_dbfs set.
 
-    _ir_spl() computes 20*log10(max(abs(ir))), so we need
-    max(abs(ir)) = 10^(spl_db/20).
+    _ir_spl() computes recording_peak_dbfs + mic_offset.
+    In tests the mic offset is 0 (no cal file), so SPL = recording_peak_dbfs.
     """
-    peak = 10.0 ** (spl_db / 20.0)
-    return [0.0] * 10 + [peak] + [0.0] * 10
+    fr = MagicMock()
+    fr.recording_peak_dbfs = spl_db
+    return fr
 
 
 def _make_usb_cfg():
@@ -697,6 +698,8 @@ def _make_usb_cfg():
     mock_cfg.measurement.get.side_effect = lambda key, default=None: (
         "usb" if key == "playback_route" else default
     )
+    # No mic cal file → sensitivity offset = 0 → SPL = recording_peak_dbfs
+    mock_cfg._data = {}
     return mock_cfg
 
 
@@ -706,6 +709,7 @@ def _make_hdmi_cfg():
     mock_cfg.measurement.get.side_effect = lambda key, default=None: (
         "hdmi" if key == "playback_route" else default
     )
+    mock_cfg._data = {}
     return mock_cfg
 
 
@@ -719,11 +723,8 @@ async def test_calibrate_level_usb_predict_verify() -> None:
     Verify IR peak = 78 dB SPL. 2 sweeps."""
     mock_dsp = AsyncMock()
 
-    probe_fr = MagicMock()
-    probe_fr.impulse_response = _make_ir(58.0)  # 58 dB SPL at -30 gain
-
-    verify_fr = MagicMock()
-    verify_fr.impulse_response = _make_ir(78.0)  # 78 dB SPL — on target
+    probe_fr = _make_fr(58.0)  # 58 dB SPL at -30 gain
+    verify_fr = _make_fr(78.0)  # 78 dB SPL — on target
 
     mock_engine = MagicMock()
     mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
@@ -752,11 +753,8 @@ async def test_calibrate_level_usb_verify_still_hot_backs_off() -> None:
     """USB mode: verify IR peak >3 dB above target → backs off."""
     mock_dsp = AsyncMock()
 
-    probe_fr = MagicMock()
-    probe_fr.impulse_response = _make_ir(90.0)  # 90 dB SPL
-
-    verify_fr = MagicMock()
-    verify_fr.impulse_response = _make_ir(85.0)  # 85 dB > 78+3 → backs off
+    probe_fr = _make_fr(90.0)  # 90 dB SPL
+    verify_fr = _make_fr(85.0)  # 85 dB > 78+3 → backs off
 
     mock_engine = MagicMock()
     mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
@@ -784,11 +782,8 @@ async def test_calibrate_level_usb_gain_clamped_to_zero() -> None:
     """USB mode: computed gain would exceed 0 dB → clamped."""
     mock_dsp = AsyncMock()
 
-    probe_fr = MagicMock()
-    probe_fr.impulse_response = _make_ir(40.0)  # very quiet
-
-    verify_fr = MagicMock()
-    verify_fr.impulse_response = _make_ir(70.0)
+    probe_fr = _make_fr(40.0)  # very quiet
+    verify_fr = _make_fr(70.0)
 
     mock_engine = MagicMock()
     mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
@@ -856,11 +851,8 @@ async def test_calibrate_level_usb_solo_gain_hint() -> None:
         if key == "output_slots" else default
     )
 
-    probe_fr = MagicMock()
-    probe_fr.impulse_response = _make_ir(68.0)
-
-    verify_fr = MagicMock()
-    verify_fr.impulse_response = _make_ir(78.0)
+    probe_fr = _make_fr(68.0)
+    verify_fr = _make_fr(78.0)
 
     mock_engine = MagicMock()
     mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
@@ -887,11 +879,8 @@ async def test_calibrate_level_hdmi_predict_verify() -> None:
     """HDMI mode: probe at -30 dB, predict correction to 78 dB SPL, verify."""
     mock_avr = AsyncMock()
 
-    probe_fr = MagicMock()
-    probe_fr.impulse_response = _make_ir(58.0)  # 58 dB SPL
-
-    verify_fr = MagicMock()
-    verify_fr.impulse_response = _make_ir(78.0)  # 78 dB SPL
+    probe_fr = _make_fr(58.0)  # 58 dB SPL
+    verify_fr = _make_fr(78.0)  # 78 dB SPL
 
     mock_engine = MagicMock()
     mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
@@ -940,11 +929,8 @@ async def test_calibrate_level_hdmi_verify_hot_backs_off() -> None:
     """HDMI mode: verify IR peak >3 dB above target → backs off volume."""
     mock_avr = AsyncMock()
 
-    probe_fr = MagicMock()
-    probe_fr.impulse_response = _make_ir(95.0)
-
-    verify_fr = MagicMock()
-    verify_fr.impulse_response = _make_ir(85.0)  # 85 > 78+3 → backs off
+    probe_fr = _make_fr(95.0)
+    verify_fr = _make_fr(85.0)  # 85 > 78+3 → backs off
 
     mock_engine = MagicMock()
     mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
@@ -968,11 +954,8 @@ async def test_calibrate_level_hdmi_volume_clamped_to_max() -> None:
     """HDMI mode: computed volume exceeds max_volume_db → clamped."""
     mock_avr = AsyncMock()
 
-    probe_fr = MagicMock()
-    probe_fr.impulse_response = _make_ir(30.0)  # very quiet
-
-    verify_fr = MagicMock()
-    verify_fr.impulse_response = _make_ir(73.0)
+    probe_fr = _make_fr(30.0)  # very quiet
+    verify_fr = _make_fr(73.0)
 
     mock_engine = MagicMock()
     mock_engine.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
