@@ -231,12 +231,14 @@ async def _tool_get_measurement_history(
                     entry["phase_rad"] = [round(v, 4) for v in phase_vals]
             if s.metadata:
                 if fmt == "compact":
-                    # In compact mode, strip large sub-fields (group_delay is ~17KB per session)
-                    _COMPACT_META_SKIP = {"group_delay"}
-                    entry["metadata"] = {
-                        k: v for k, v in s.metadata.items()
-                        if k not in _COMPACT_META_SKIP
-                    }
+                    # In compact mode, downsample group_delay to 1/3-octave (not strip)
+                    compact_meta = {}
+                    for k, v in s.metadata.items():
+                        if k == "group_delay" and isinstance(v, dict) and "freq_hz" in v:
+                            compact_meta[k] = _downsample_group_delay(v["freq_hz"], v.get("delay_ms", v.get("gd_ms", [])))
+                        else:
+                            compact_meta[k] = v
+                    entry["metadata"] = compact_meta
                 else:
                     entry["metadata"] = s.metadata
             result.append(entry)
@@ -267,6 +269,42 @@ def _downsample_to_third_octave(
             bands.append({
                 "freq_hz": centre,
                 "spl_db": round(sum(vals) / len(vals), 1),
+            })
+    return bands
+
+
+def _downsample_group_delay(
+    freqs: list[float], delay_ms: list[float],
+) -> list[dict]:
+    """Downsample group delay to 1/3-octave bands. Returns list of {freq_hz, delay_ms}."""
+    bands = []
+    for centre in _THIRD_OCTAVE_CENTRES:
+        factor = 2 ** (1 / 6)
+        lo = centre / factor
+        hi = centre * factor
+        vals = [d for f, d in zip(freqs, delay_ms) if lo <= f < hi]
+        if vals:
+            bands.append({
+                "freq_hz": centre,
+                "delay_ms": round(sum(vals) / len(vals), 1),
+            })
+    return bands
+
+
+def _downsample_coherence(
+    freqs: list[float], coherence: list[float],
+) -> list[dict]:
+    """Downsample coherence to 1/3-octave bands. Returns list of {freq_hz, coherence}."""
+    bands = []
+    for centre in _THIRD_OCTAVE_CENTRES:
+        factor = 2 ** (1 / 6)
+        lo = centre / factor
+        hi = centre * factor
+        vals = [c for f, c in zip(freqs, coherence) if lo <= f < hi]
+        if vals:
+            bands.append({
+                "freq_hz": centre,
+                "coherence": round(sum(vals) / len(vals), 3),
             })
     return bands
 
@@ -618,6 +656,605 @@ async def _tool_compare_sessions(
         return _err(f"compare_sessions failed: {exc}")
 
 
+async def _tool_simulate_eq(
+    session_id: int,
+    filters: list[dict],
+    min_hz: float = 20.0,
+    max_hz: float = 120.0,
+) -> dict:
+    """Predict FR after applying proposed PEQ filters to a measurement.
+
+    Pure simulation — no hardware writes. The LLM designs filters, this tool
+    shows what the result would look like so the LLM can iterate before applying.
+    """
+    from .storage import SessionStore
+    import math
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        session = next((s for s in sessions if s.id == session_id), None)
+        if session is None:
+            return _err(f"session {session_id} not found")
+
+        fr = session.start_fr
+        if not fr or not fr.frequencies:
+            return _err(f"session {session_id} has no frequency response data")
+
+        def peaking_response(fc: float, gain_db: float, q: float, freq: float) -> float:
+            if q <= 0 or fc <= 0:
+                return 0.0
+            w = freq / fc
+            A = 10.0 ** (gain_db / 40.0)
+            w2 = w * w
+            num_real = 1.0 - w2
+            num_imag = w * A / q
+            den_real = 1.0 - w2
+            den_imag = w / (A * q)
+            num_mag_sq = num_real ** 2 + num_imag ** 2
+            den_mag_sq = den_real ** 2 + den_imag ** 2
+            if den_mag_sq < 1e-30:
+                return 0.0
+            return 10.0 * math.log10(num_mag_sq / den_mag_sq)
+
+        def hpf_response(fc: float, order: int, freq: float) -> float:
+            if fc <= 0 or freq <= 0:
+                return 0.0
+            ratio = fc / freq
+            return -10.0 * order * math.log10(1.0 + ratio ** 2)
+
+        # Compute filter effect at each frequency
+        predicted_fr: list[dict] = []
+        for f, measured in zip(fr.frequencies, fr.spl):
+            if f < min_hz or f > max_hz:
+                continue
+            total_correction = 0.0
+            for filt in filters:
+                ftype = filt.get("type", "peaking")
+                fc = float(filt.get("freq", 0))
+                gain = float(filt.get("gain_db", 0))
+                q = float(filt.get("q", 1.0))
+                if ftype == "peaking":
+                    total_correction += peaking_response(fc, gain, q, f)
+                elif ftype == "hpf":
+                    total_correction += hpf_response(fc, 4, f)  # 4th order Butterworth
+                elif ftype in ("low_shelf", "high_shelf"):
+                    total_correction += peaking_response(fc, gain, q, f)  # Approximation
+            predicted_fr.append({
+                "freq_hz": round(f, 1),
+                "original_db": round(measured, 1),
+                "predicted_db": round(measured + total_correction, 1),
+                "correction_db": round(total_correction, 1),
+            })
+
+        # Compute compact FR string for the prediction
+        compact = ",".join(f"{p['freq_hz']}:{p['predicted_db']}" for p in predicted_fr)
+
+        return _ok(
+            session_id=session_id,
+            num_filters=len(filters),
+            point_count=len(predicted_fr),
+            predicted_fr=compact,
+        )
+    except Exception as exc:
+        return _err(f"simulate_eq failed: {exc}")
+
+
+async def _tool_optimize_q(
+    session_id: int,
+    freq_hz: float,
+    target_gain_db: float,
+    band_hz: list[float] | None = None,
+) -> dict:
+    """Find the optimal Q for a peaking filter at a given frequency and gain.
+
+    The LLM picks the frequency and gain direction (cut/boost). This tool
+    numerically searches for the Q that minimizes residual error in the
+    surrounding frequency band.
+    """
+    from .storage import SessionStore
+    import math
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        session = next((s for s in sessions if s.id == session_id), None)
+        if session is None:
+            return _err(f"session {session_id} not found")
+
+        fr = session.start_fr
+        if not fr or not fr.frequencies:
+            return _err(f"session {session_id} has no frequency response data")
+
+        # Default search band: +/- 1 octave around the target frequency
+        if band_hz:
+            band_lo, band_hi = float(band_hz[0]), float(band_hz[1])
+        else:
+            band_lo = freq_hz / 2.0
+            band_hi = freq_hz * 2.0
+
+        # Get measured data in the band
+        band_data = [
+            (f, s) for f, s in zip(fr.frequencies, fr.spl)
+            if band_lo <= f <= band_hi
+        ]
+        if not band_data:
+            return _err(f"no FR data in band {band_lo}-{band_hi} Hz")
+
+        # Compute the "flat" target (average SPL in band) as reference
+        avg_spl = sum(s for _, s in band_data) / len(band_data)
+
+        def peaking_response(fc: float, gain_db: float, q: float, freq: float) -> float:
+            if q <= 0 or fc <= 0:
+                return 0.0
+            w = freq / fc
+            A = 10.0 ** (gain_db / 40.0)
+            w2 = w * w
+            num_real = 1.0 - w2
+            num_imag = w * A / q
+            den_real = 1.0 - w2
+            den_imag = w / (A * q)
+            num_mag_sq = num_real ** 2 + num_imag ** 2
+            den_mag_sq = den_real ** 2 + den_imag ** 2
+            if den_mag_sq < 1e-30:
+                return 0.0
+            return 10.0 * math.log10(num_mag_sq / den_mag_sq)
+
+        # Search Q values from 0.5 to 10 in steps of 0.1
+        best_q = 1.0
+        best_rms = float("inf")
+        q_candidates = [round(0.5 + i * 0.1, 1) for i in range(96)]  # 0.5 to 10.0
+
+        for q in q_candidates:
+            errors_sq = []
+            for f, measured in band_data:
+                correction = peaking_response(freq_hz, target_gain_db, q, f)
+                corrected = measured + correction
+                error = corrected - avg_spl
+                errors_sq.append(error ** 2)
+            rms = math.sqrt(sum(errors_sq) / len(errors_sq))
+            if rms < best_rms:
+                best_rms = rms
+                best_q = q
+
+        # Show what this filter does at the target frequency and band edges
+        return _ok(
+            freq_hz=freq_hz,
+            gain_db=target_gain_db,
+            optimal_q=best_q,
+            predicted_rms_in_band=round(best_rms, 2),
+            band_hz=[round(band_lo, 1), round(band_hi, 1)],
+            effect_at_center_db=round(peaking_response(freq_hz, target_gain_db, best_q, freq_hz), 1),
+            effect_at_band_lo_db=round(peaking_response(freq_hz, target_gain_db, best_q, band_lo), 1),
+            effect_at_band_hi_db=round(peaking_response(freq_hz, target_gain_db, best_q, band_hi), 1),
+        )
+    except Exception as exc:
+        return _err(f"optimize_q failed: {exc}")
+
+
+async def _tool_analyze_phase(
+    session_id: int,
+    min_hz: float = 20.0,
+    max_hz: float = 120.0,
+) -> dict:
+    """Minimum-phase decomposition and fixability analysis.
+
+    Separates measured response into minimum-phase (EQ-correctable) and
+    excess-phase (room geometry, not correctable) components. Returns per-1/3-octave:
+    - total error (measured deviation from flat)
+    - fixable portion (minimum-phase, addressable with PEQ/FIR)
+    - unfixable portion (excess phase, only repositioning helps)
+    - excess group delay (ms above minimum-phase)
+    """
+    from .storage import SessionStore
+    import math
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        session = next((s for s in sessions if s.id == session_id), None)
+        if session is None:
+            return _err(f"session {session_id} not found")
+
+        fr = session.start_fr
+        if not fr or not fr.frequencies or not fr.spl:
+            return _err(f"session {session_id} has no frequency response data")
+
+        import numpy as np
+        from scipy.signal import hilbert
+
+        # Build full complex spectrum from magnitude
+        freqs = np.array(fr.frequencies)
+        spl = np.array(fr.spl)
+        mask = (freqs >= min_hz) & (freqs <= max_hz)
+        freqs_band = freqs[mask]
+        spl_band = spl[mask]
+
+        if len(freqs_band) < 10:
+            return _err(f"insufficient data points in {min_hz}-{max_hz} Hz range")
+
+        # Minimum-phase computation via Hilbert transform of log-magnitude
+        # The minimum-phase response has phase determined solely by its magnitude
+        # via the Hilbert transform relationship: phase_min = -H{ln|H(f)|}
+        log_mag = spl_band / 20.0 * np.log(10)  # Convert dB to natural log of magnitude
+        min_phase_rad = -np.imag(hilbert(log_mag))
+
+        # Get measured phase if available
+        if fr.phase:
+            measured_phase = np.array(fr.phase)
+            measured_phase_band = measured_phase[mask]
+        else:
+            # No phase data — can only report magnitude, not fixability
+            measured_phase_band = None
+
+        # Compute group delay from phase
+        def compute_group_delay(phase_data, freq_data):
+            """Group delay = -d(phase)/d(omega)."""
+            if len(phase_data) < 2:
+                return np.array([]), np.array([])
+            unwrapped = np.unwrap(phase_data)
+            d_phase = np.diff(unwrapped)
+            d_freq = np.diff(freq_data)
+            omega_diff = 2.0 * np.pi * d_freq
+            with np.errstate(divide="ignore", invalid="ignore"):
+                gd = np.where(np.abs(omega_diff) > 1e-12, -d_phase / omega_diff, 0.0)
+            mid_freqs = (freq_data[:-1] + freq_data[1:]) / 2.0
+            return mid_freqs, gd * 1000.0  # Convert to ms
+
+        # Minimum-phase group delay
+        mp_gd_freqs, mp_gd_ms = compute_group_delay(min_phase_rad, freqs_band)
+
+        # Measured group delay and excess
+        excess_gd_ms = None
+        if measured_phase_band is not None:
+            meas_gd_freqs, meas_gd_ms = compute_group_delay(measured_phase_band, freqs_band)
+            if len(meas_gd_ms) > 0 and len(mp_gd_ms) > 0:
+                # Excess group delay = measured - minimum phase
+                min_len = min(len(meas_gd_ms), len(mp_gd_ms))
+                excess_gd_ms = meas_gd_ms[:min_len] - mp_gd_ms[:min_len]
+
+        # Downsample to 1/3-octave bands
+        bands = []
+        for centre in _THIRD_OCTAVE_CENTRES:
+            if centre < min_hz or centre > max_hz:
+                continue
+            factor = 2 ** (1 / 6)
+            lo = centre / factor
+            hi = centre * factor
+
+            # SPL in this band
+            band_mask = (freqs_band >= lo) & (freqs_band < hi)
+            if not np.any(band_mask):
+                continue
+
+            avg_spl = float(np.mean(spl_band[band_mask]))
+
+            # Minimum-phase group delay in this band
+            gd_mask = (mp_gd_freqs >= lo) & (mp_gd_freqs < hi) if len(mp_gd_freqs) > 0 else np.array([])
+            mp_gd = float(np.mean(mp_gd_ms[gd_mask])) if np.any(gd_mask) else 0.0
+
+            entry: dict = {
+                "freq_hz": centre,
+                "spl_db": round(avg_spl, 1),
+                "min_phase_group_delay_ms": round(mp_gd, 1),
+            }
+
+            # Excess group delay if available
+            if excess_gd_ms is not None:
+                egdm = (mp_gd_freqs >= lo) & (mp_gd_freqs < hi) if len(mp_gd_freqs) > 0 else np.array([])
+                if np.any(egdm):
+                    min_len = min(len(excess_gd_ms), np.sum(egdm))
+                    excess_vals = excess_gd_ms[:len(mp_gd_freqs)][egdm]
+                    if len(excess_vals) > 0:
+                        avg_excess = float(np.mean(np.abs(excess_vals)))
+                        entry["excess_group_delay_ms"] = round(avg_excess, 1)
+                        # Fixability: low excess GD = fixable, high = geometry problem
+                        # Threshold: >5ms excess GD at sub frequencies = significant cancellation
+                        entry["fixable"] = avg_excess < 5.0
+                    else:
+                        entry["excess_group_delay_ms"] = 0.0
+                        entry["fixable"] = True
+                else:
+                    entry["excess_group_delay_ms"] = 0.0
+                    entry["fixable"] = True
+            else:
+                entry["fixable"] = None  # No phase data, can't determine
+
+            bands.append(entry)
+
+        has_phase = measured_phase_band is not None
+        return _ok(
+            session_id=session_id,
+            has_phase_data=has_phase,
+            bands=bands,
+            note="fixable=True means EQ/FIR can correct this band. "
+                 "fixable=False means excess group delay indicates cancellation — "
+                 "repositioning the sub is more effective than EQ." if has_phase else
+                 "No phase data available — fixability cannot be determined. "
+                 "SPL and minimum-phase group delay are still valid.",
+        )
+    except Exception as exc:
+        return _err(f"analyze_phase failed: {exc}")
+
+
+async def _tool_compare_sub_phase(
+    session_a: int,
+    session_b: int,
+    min_hz: float = 20.0,
+    max_hz: float = 120.0,
+) -> dict:
+    """Compare phase relationship between two solo sub measurements.
+
+    Returns per-1/3-octave band: phase difference, predicted coherent sum
+    (constructive vs destructive), and reinforcement classification.
+    Use this to understand where subs help vs fight each other before
+    deciding on delay/polarity corrections.
+    """
+    from .storage import SessionStore
+    import math
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        sa = next((s for s in sessions if s.id == session_a), None)
+        sb = next((s for s in sessions if s.id == session_b), None)
+        if sa is None:
+            return _err(f"session {session_a} not found")
+        if sb is None:
+            return _err(f"session {session_b} not found")
+
+        for s_check, s_id in [(sa, session_a), (sb, session_b)]:
+            if not s_check.start_fr or not s_check.start_fr.frequencies:
+                return _err(f"session {s_id} has no frequency response data")
+            if not s_check.start_fr.phase:
+                return _err(f"session {s_id} has no phase data — needed for phase comparison")
+
+        import numpy as np
+
+        freqs_a = np.array(sa.start_fr.frequencies)
+        spl_a = np.array(sa.start_fr.spl)
+        phase_a = np.array(sa.start_fr.phase)
+        freqs_b = np.array(sb.start_fr.frequencies)
+        spl_b = np.array(sb.start_fr.spl)
+        phase_b = np.array(sb.start_fr.phase)
+
+        bands = []
+        for centre in _THIRD_OCTAVE_CENTRES:
+            if centre < min_hz or centre > max_hz:
+                continue
+            factor = 2 ** (1 / 6)
+            lo = centre / factor
+            hi = centre * factor
+
+            mask_a = (freqs_a >= lo) & (freqs_a < hi)
+            mask_b = (freqs_b >= lo) & (freqs_b < hi)
+
+            if not np.any(mask_a) or not np.any(mask_b):
+                continue
+
+            avg_spl_a = float(np.mean(spl_a[mask_a]))
+            avg_spl_b = float(np.mean(spl_b[mask_b]))
+            avg_phase_a = float(np.mean(phase_a[mask_a]))
+            avg_phase_b = float(np.mean(phase_b[mask_b]))
+
+            phase_diff = avg_phase_b - avg_phase_a
+            # Wrap to [-pi, pi]
+            phase_diff_wrapped = math.atan2(math.sin(phase_diff), math.cos(phase_diff))
+            phase_diff_deg = round(math.degrees(phase_diff_wrapped), 1)
+
+            # Predict coherent sum: vector addition of the two sub signals
+            # Convert SPL to linear amplitude, add as complex vectors, convert back
+            amp_a = 10.0 ** (avg_spl_a / 20.0)
+            amp_b = 10.0 ** (avg_spl_b / 20.0)
+            sum_real = amp_a * math.cos(avg_phase_a) + amp_b * math.cos(avg_phase_b)
+            sum_imag = amp_a * math.sin(avg_phase_a) + amp_b * math.sin(avg_phase_b)
+            sum_amp = math.sqrt(sum_real ** 2 + sum_imag ** 2)
+            sum_spl = 20.0 * math.log10(sum_amp + 1e-12)
+
+            # Perfect in-phase sum would be +6dB over each individual
+            # Perfect out-of-phase would be deep null
+            incoherent_sum = 10.0 * math.log10(amp_a ** 2 + amp_b ** 2 + 1e-12)  # power sum
+            reinforcement_db = round(sum_spl - incoherent_sum, 1)
+
+            if abs(phase_diff_deg) < 60:
+                classification = "reinforcing"
+            elif abs(phase_diff_deg) > 120:
+                classification = "cancelling"
+            else:
+                classification = "partial"
+
+            bands.append({
+                "freq_hz": centre,
+                "sub_a_spl_db": round(avg_spl_a, 1),
+                "sub_b_spl_db": round(avg_spl_b, 1),
+                "phase_diff_deg": phase_diff_deg,
+                "predicted_sum_db": round(sum_spl, 1),
+                "reinforcement_db": reinforcement_db,
+                "classification": classification,
+            })
+
+        # Summary statistics
+        cancelling = [b for b in bands if b["classification"] == "cancelling"]
+        reinforcing = [b for b in bands if b["classification"] == "reinforcing"]
+
+        return _ok(
+            session_a=session_a,
+            session_b=session_b,
+            bands=bands,
+            reinforcing_bands=len(reinforcing),
+            cancelling_bands=len(cancelling),
+            note="Phase diff near 0°=reinforcing (+6dB ideal), near 180°=cancelling (deep null). "
+                 "Cancelling bands cannot be fixed with EQ — consider delay/polarity adjustment or repositioning.",
+        )
+    except Exception as exc:
+        return _err(f"compare_sub_phase failed: {exc}")
+
+
+async def _tool_design_fir(
+    session_id: int,
+    target_curve: dict | None = None,
+    num_taps: int = 1024,
+    phase_mode: str = "minimum",
+    freq_focus_hz: list[float] | None = None,
+) -> dict:
+    """Design FIR correction coefficients from a measurement.
+
+    The LLM decides the strategy (phase mode, tap count, frequency focus).
+    This tool computes the coefficients and returns them with a predicted
+    response and pre-ringing estimate.
+
+    phase_mode:
+      - "minimum": no pre-ringing, phase not corrected (safest)
+      - "linear": symmetric, corrects phase, adds pre-ringing (cleanest)
+      - "mixed": minimum-phase below freq_focus, linear above (compromise)
+    """
+    from .storage import SessionStore
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        session = next((s for s in sessions if s.id == session_id), None)
+        if session is None:
+            return _err(f"session {session_id} not found")
+
+        fr = session.start_fr
+        if not fr or not fr.frequencies:
+            return _err(f"session {session_id} has no frequency response data")
+
+        import numpy as np
+        from scipy.signal import minimum_phase, firwin
+
+        if num_taps < 64 or num_taps > 2048:
+            return _err(f"num_taps must be 64-2048 (got {num_taps})")
+
+        fir_fs = 96000  # miniDSP FIR runs at 96kHz
+
+        # Build target magnitude response at FIR sample rate
+        freqs_measured = np.array(fr.frequencies)
+        spl_measured = np.array(fr.spl)
+
+        # Target: either provided curve or flat at average SPL
+        if target_curve and target_curve.get("points"):
+            import math
+            target_points = sorted(target_curve["points"], key=lambda p: p["freq"])
+            target_spl_at_freq = []
+            for f in freqs_measured:
+                if f < target_points[0]["freq"]:
+                    target_spl_at_freq.append(target_points[0]["spl"])
+                elif f > target_points[-1]["freq"]:
+                    target_spl_at_freq.append(target_points[-1]["spl"])
+                else:
+                    for i in range(len(target_points) - 1):
+                        f0, s0 = target_points[i]["freq"], target_points[i]["spl"]
+                        f1, s1 = target_points[i + 1]["freq"], target_points[i + 1]["spl"]
+                        if f0 <= f <= f1:
+                            t = math.log(f / f0) / math.log(f1 / f0) if f1 != f0 else 0.0
+                            target_spl_at_freq.append(s0 + t * (s1 - s0))
+                            break
+            target_spl = np.array(target_spl_at_freq)
+        else:
+            target_spl = np.full_like(spl_measured, np.mean(spl_measured))
+
+        # Compute correction curve (dB): what the FIR needs to add
+        correction_db = target_spl - spl_measured
+
+        # Optional: focus only on certain frequency range
+        if freq_focus_hz:
+            focus_lo, focus_hi = float(freq_focus_hz[0]), float(freq_focus_hz[1])
+            # Taper correction outside focus range to zero
+            for i, f in enumerate(freqs_measured):
+                if f < focus_lo or f > focus_hi:
+                    correction_db[i] = 0.0
+
+        # Convert correction dB to linear magnitude
+        correction_linear = 10.0 ** (correction_db / 20.0)
+
+        # Build full-length FIR frequency response (at fir_fs)
+        n_fft = num_taps * 2
+        fir_freqs = np.fft.rfftfreq(n_fft, d=1.0 / fir_fs)
+
+        # Interpolate correction to FIR frequency grid
+        fir_correction = np.interp(fir_freqs, freqs_measured, correction_linear, left=1.0, right=1.0)
+
+        # Design FIR via inverse FFT
+        if phase_mode == "linear":
+            # Linear phase: symmetric FIR, corrects both magnitude and phase
+            H = fir_correction  # Real-valued = linear phase
+            fir_td = np.fft.irfft(H, n=n_fft)
+            # Window and truncate to num_taps
+            fir_td = np.roll(fir_td, num_taps // 2)[:num_taps]
+            window = np.hanning(num_taps)
+            fir_td *= window
+            pre_ringing_ms = round((num_taps / 2) / fir_fs * 1000, 2)
+        elif phase_mode == "minimum":
+            # Minimum phase: no pre-ringing, magnitude-only correction
+            H = fir_correction
+            fir_td = np.fft.irfft(H, n=n_fft)
+            # Convert to minimum phase
+            try:
+                fir_td_mp = minimum_phase(fir_td[:num_taps * 2], method="homomorphic", n_fft=n_fft)
+                fir_td = fir_td_mp[:num_taps]
+            except Exception:
+                # Fallback: just truncate
+                fir_td = fir_td[:num_taps]
+            pre_ringing_ms = 0.0
+        else:  # mixed
+            # Mixed: minimum phase below focus, linear above
+            H = fir_correction
+            fir_td = np.fft.irfft(H, n=n_fft)
+            try:
+                fir_td_mp = minimum_phase(fir_td[:num_taps * 2], method="homomorphic", n_fft=n_fft)
+                fir_td = fir_td_mp[:num_taps]
+            except Exception:
+                fir_td = fir_td[:num_taps]
+            pre_ringing_ms = 0.0
+
+        # Normalize so peak <= 1.0
+        peak = float(np.max(np.abs(fir_td)))
+        if peak > 0:
+            fir_td = fir_td / peak
+
+        # Compute predicted frequency response of the FIR
+        fir_H = np.fft.rfft(fir_td, n=n_fft)
+        fir_mag_db = 20.0 * np.log10(np.abs(fir_H) + 1e-12)
+        fir_freqs_out = np.fft.rfftfreq(n_fft, d=1.0 / fir_fs)
+
+        # Downsample prediction to 1/3-octave for compact output
+        predicted_bands = []
+        for centre in _THIRD_OCTAVE_CENTRES:
+            factor = 2 ** (1 / 6)
+            lo = centre / factor
+            hi = centre * factor
+            band_mask = (fir_freqs_out >= lo) & (fir_freqs_out < hi)
+            if np.any(band_mask):
+                avg_db = float(np.mean(fir_mag_db[band_mask]))
+                predicted_bands.append({
+                    "freq_hz": centre,
+                    "fir_effect_db": round(avg_db, 1),
+                })
+
+        # Frequency resolution
+        freq_resolution = round(fir_fs / num_taps, 1)
+
+        coefficients = [round(float(c), 8) for c in fir_td]
+
+        return _ok(
+            session_id=session_id,
+            num_taps=num_taps,
+            phase_mode=phase_mode,
+            pre_ringing_ms=pre_ringing_ms,
+            freq_resolution_hz=freq_resolution,
+            coefficients=coefficients,
+            predicted_effect=predicted_bands,
+            note=f"FIR at {fir_fs}Hz, {num_taps} taps, {phase_mode} phase. "
+                 f"Freq resolution: {freq_resolution}Hz. "
+                 f"Pre-ringing: {pre_ringing_ms}ms. "
+                 f"Pass coefficients to apply_fir(output_index, coefficients).",
+        )
+    except Exception as exc:
+        return _err(f"design_fir failed: {exc}")
+
+
 async def _tool_avr_set_volume(level_db: float) -> dict:
     """Set AVR volume to *level_db* dB.
 
@@ -702,8 +1339,17 @@ async def _tool_trigger_measurement(
         store = SessionStore()
         session_id = store.save_measurement(fr, label=full_label, metadata=metadata, target_curve=target_curve)
 
-        # Strip large fields from the tool response (they're saved in the DB)
-        response_metadata = {k: v for k, v in metadata.items() if k != "group_delay"}
+        # Downsample group delay to 1/3-octave summary (11 points vs ~17KB raw)
+        response_metadata = dict(metadata)
+        gd = metadata.get("group_delay")
+        if gd and "freq_hz" in gd and "delay_ms" in gd:
+            gd_summary = _downsample_group_delay(gd["freq_hz"], gd["delay_ms"])
+            response_metadata["group_delay"] = gd_summary
+
+        # Include coherence summary if available
+        if fr.coherence:
+            coh_summary = _downsample_coherence(fr.frequencies, fr.coherence)
+            response_metadata["coherence"] = coh_summary
 
         return _ok(
             session_id=session_id,
@@ -2095,6 +2741,167 @@ _TOOLS: list[Tool] = [
             "required": ["session_a", "session_b"],
         },
     ),
+    Tool(
+        name="simulate_eq",
+        description=(
+            "Predict FR after applying proposed PEQ filters to a measurement. "
+            "Pure simulation — no hardware writes. Design filters yourself, then call this "
+            "to see the predicted result. Iterate in simulation before applying to hardware. "
+            "Returns compact predicted FR string and per-point original/predicted/correction values."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "integer",
+                    "description": "Measurement session ID to simulate against",
+                },
+                "filters": {
+                    "type": "array",
+                    "description": "Proposed PEQ filters to simulate",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "freq": {"type": "number"},
+                            "gain_db": {"type": "number"},
+                            "q": {"type": "number"},
+                            "type": {"type": "string", "enum": ["peaking", "low_shelf", "high_shelf", "hpf"]},
+                        },
+                        "required": ["freq", "gain_db", "q", "type"],
+                    },
+                },
+                "min_hz": {"type": "number", "description": "Lower frequency bound (default: 20)"},
+                "max_hz": {"type": "number", "description": "Upper frequency bound (default: 120)"},
+            },
+            "required": ["session_id", "filters"],
+        },
+    ),
+    Tool(
+        name="optimize_q",
+        description=(
+            "Find the optimal Q for a peaking filter. You decide the frequency and gain "
+            "(cut or boost); this tool numerically searches for the Q that minimizes "
+            "residual error in the surrounding band. Returns optimal Q and predicted effect."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "integer",
+                    "description": "Measurement session to optimize against",
+                },
+                "freq_hz": {
+                    "type": "number",
+                    "description": "Center frequency of the filter in Hz",
+                },
+                "target_gain_db": {
+                    "type": "number",
+                    "description": "Desired gain in dB (negative=cut, positive=boost)",
+                },
+                "band_hz": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "[lo_hz, hi_hz] band to minimize error in. Default: +/- 1 octave.",
+                },
+            },
+            "required": ["session_id", "freq_hz", "target_gain_db"],
+        },
+    ),
+    Tool(
+        name="analyze_phase",
+        description=(
+            "Minimum-phase decomposition and fixability analysis. Separates the measured "
+            "response into minimum-phase (EQ-correctable) and excess-phase (room geometry, "
+            "not correctable) components. Returns per-1/3-octave: fixable flag, excess group "
+            "delay, and minimum-phase group delay. Use BEFORE designing any filter to know "
+            "what's worth correcting and what requires repositioning instead."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "integer",
+                    "description": "Measurement session ID to analyze",
+                },
+                "min_hz": {"type": "number", "description": "Lower frequency bound (default: 20)"},
+                "max_hz": {"type": "number", "description": "Upper frequency bound (default: 120)"},
+            },
+            "required": ["session_id"],
+        },
+    ),
+    Tool(
+        name="compare_sub_phase",
+        description=(
+            "Compare phase relationship between two solo sub measurements. "
+            "Returns per-1/3-octave: phase difference, predicted coherent sum, and "
+            "reinforcement classification (reinforcing/partial/cancelling). "
+            "Use before alignment to understand where subs help vs fight each other. "
+            "Cancelling bands cannot be fixed with EQ — consider delay/polarity/repositioning."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_a": {
+                    "type": "integer",
+                    "description": "Solo measurement session for sub A",
+                },
+                "session_b": {
+                    "type": "integer",
+                    "description": "Solo measurement session for sub B",
+                },
+                "min_hz": {"type": "number", "description": "Lower frequency bound (default: 20)"},
+                "max_hz": {"type": "number", "description": "Upper frequency bound (default: 120)"},
+            },
+            "required": ["session_a", "session_b"],
+        },
+    ),
+    Tool(
+        name="design_fir",
+        description=(
+            "Design FIR correction filter coefficients. You decide the strategy: phase mode "
+            "(minimum/linear/mixed), tap count, and frequency focus. The tool computes "
+            "coefficients and returns them with a predicted effect and pre-ringing estimate. "
+            "Pass coefficients to apply_fir(output_index, coefficients) to write to hardware. "
+            "miniDSP 2x4 HD: max 2048 taps/output, 4096 shared, 96kHz sample rate."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "integer",
+                    "description": "Measurement session to design correction for",
+                },
+                "target_curve": {
+                    "type": "object",
+                    "description": "Optional target curve. Omit for flat correction.",
+                    "properties": {
+                        "points": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {"freq": {"type": "number"}, "spl": {"type": "number"}},
+                            },
+                        },
+                    },
+                },
+                "num_taps": {
+                    "type": "integer",
+                    "description": "Number of FIR taps (64-2048). More taps = better low-freq resolution but uses more DSP. Default: 1024.",
+                },
+                "phase_mode": {
+                    "type": "string",
+                    "enum": ["minimum", "linear", "mixed"],
+                    "description": "minimum=no pre-ringing (safest), linear=corrects phase (adds pre-ringing), mixed=compromise. Default: minimum.",
+                },
+                "freq_focus_hz": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "[lo_hz, hi_hz] — only correct within this range, taper to zero outside. Omit to correct full range.",
+                },
+            },
+            "required": ["session_id"],
+        },
+    ),
 ]
 
 
@@ -2228,6 +3035,41 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             session_b=int(arguments["session_b"]),
             min_hz=float(arguments.get("min_hz", 20.0)),
             max_hz=float(arguments.get("max_hz", 120.0)),
+        )
+    elif name == "simulate_eq":
+        result = await _tool_simulate_eq(
+            session_id=int(arguments["session_id"]),
+            filters=arguments.get("filters", []),
+            min_hz=float(arguments.get("min_hz", 20.0)),
+            max_hz=float(arguments.get("max_hz", 120.0)),
+        )
+    elif name == "optimize_q":
+        result = await _tool_optimize_q(
+            session_id=int(arguments["session_id"]),
+            freq_hz=float(arguments["freq_hz"]),
+            target_gain_db=float(arguments["target_gain_db"]),
+            band_hz=arguments.get("band_hz"),
+        )
+    elif name == "analyze_phase":
+        result = await _tool_analyze_phase(
+            session_id=int(arguments["session_id"]),
+            min_hz=float(arguments.get("min_hz", 20.0)),
+            max_hz=float(arguments.get("max_hz", 120.0)),
+        )
+    elif name == "compare_sub_phase":
+        result = await _tool_compare_sub_phase(
+            session_a=int(arguments["session_a"]),
+            session_b=int(arguments["session_b"]),
+            min_hz=float(arguments.get("min_hz", 20.0)),
+            max_hz=float(arguments.get("max_hz", 120.0)),
+        )
+    elif name == "design_fir":
+        result = await _tool_design_fir(
+            session_id=int(arguments["session_id"]),
+            target_curve=arguments.get("target_curve"),
+            num_taps=int(arguments.get("num_taps", 1024)),
+            phase_mode=arguments.get("phase_mode", "minimum"),
+            freq_focus_hz=arguments.get("freq_focus_hz"),
         )
     # Legacy aliases for backwards compatibility with cached sessions
     elif name == "mute_sub_outputs":

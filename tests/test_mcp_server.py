@@ -38,10 +38,13 @@ import pytest
 
 from calibrate import mcp_server as sut
 from calibrate.mcp_server import (
+    _downsample_coherence,
+    _downsample_group_delay,
     _downsample_to_third_octave,
     _read_resource,
     _tool_analyze_decay,
     _tool_analyze_ir,
+    _tool_analyze_phase,
     _tool_apply_eq,
     _tool_apply_fir,
     _tool_avr_set_volume,
@@ -49,20 +52,24 @@ from calibrate.mcp_server import (
     _tool_check_system,
     _tool_clear_fir,
     _tool_compare_sessions,
+    _tool_compare_sub_phase,
     _tool_compute_deviation,
     _tool_configure_matrix,
+    _tool_design_fir,
     _tool_fetch_recipe,
     _tool_get_device_state,
     _tool_get_fr_summary,
     _tool_get_measurement_history,
     _tool_get_output_state,
     _tool_mute_output,
+    _tool_optimize_q,
     _tool_read_eq,
     _tool_read_input_eq,
     _tool_set_delay,
     _tool_set_master_gain,
     _tool_set_output_gain,
     _tool_set_polarity,
+    _tool_simulate_eq,
     _tool_trigger_measurement,
     _tool_unmute_output,
 )
@@ -2559,12 +2566,13 @@ async def test_measure_label_appends_position_when_missing() -> None:
 
 
 @pytest.mark.asyncio
-async def test_measure_response_strips_group_delay() -> None:
-    """The measure tool response metadata does NOT include group_delay."""
+async def test_measure_response_downsamples_group_delay() -> None:
+    """The measure tool response includes group_delay downsampled to 1/3-octave."""
     mock_sd = MagicMock()
     mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
 
     mock_fr = MagicMock()
+    mock_fr.coherence = None
     mock_engine = MagicMock()
     mock_engine.measure = AsyncMock(return_value=mock_fr)
 
@@ -2590,9 +2598,10 @@ async def test_measure_response_strips_group_delay() -> None:
         result = await _tool_trigger_measurement()
 
     assert result["ok"]
-    # group_delay should be stripped from the tool response
-    assert "group_delay" not in result["metadata"]
-    # But other metadata keys should still be present
+    # group_delay should be present but downsampled to 1/3-octave summary
+    assert "group_delay" in result["metadata"]
+    gd = result["metadata"]["group_delay"]
+    assert isinstance(gd, list)  # Downsampled to list of {freq_hz, delay_ms}
     assert "ir" in result["metadata"]
 
     # Verify full metadata (including group_delay) was saved to the store
@@ -2633,14 +2642,14 @@ async def test_get_measurement_history_compact_with_range() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_measurement_history_compact_strips_group_delay() -> None:
-    """group_delay is ~17KB per session; compact mode must exclude it."""
+async def test_get_measurement_history_compact_downsamples_group_delay() -> None:
+    """Compact mode downsamples group_delay to 1/3-octave instead of stripping."""
     freqs = [20.0, 40.0]
     spls  = [1.0, 2.0]
     session = _make_fr_session(freqs, spls)
     session.metadata = {
         "ir": {"peak_time_ms": 5.0, "spl_db": 80.0},
-        "group_delay": {"freq_hz": list(range(500)), "gd_ms": list(range(500))},
+        "group_delay": {"freq_hz": [20.0, 30.0, 40.0, 50.0, 80.0], "delay_ms": [5.0, 4.0, 3.0, 2.0, 1.0]},
         "position": "MLP",
     }
     with patch("calibrate.storage.SessionStore") as MockStore:
@@ -2648,7 +2657,11 @@ async def test_get_measurement_history_compact_strips_group_delay() -> None:
         result = await _tool_get_measurement_history(limit=1, fmt="compact")
     data = result["sessions"][0]
     assert "metadata" in data
-    assert "group_delay" not in data["metadata"]
+    # group_delay should be present but downsampled to 1/3-octave
+    assert "group_delay" in data["metadata"]
+    gd = data["metadata"]["group_delay"]
+    assert isinstance(gd, list)
+    assert all("freq_hz" in b and "delay_ms" in b for b in gd)
     assert "ir" in data["metadata"]
     assert "position" in data["metadata"]
 
@@ -2667,3 +2680,538 @@ async def test_get_measurement_history_full_keeps_group_delay() -> None:
         result = await _tool_get_measurement_history(limit=1, fmt="full")
     data = result["sessions"][0]
     assert "group_delay" in data["metadata"]
+
+
+# ── downsample_group_delay / downsample_coherence ───────────────────────────
+
+
+def test_downsample_group_delay_basic() -> None:
+    """Group delay downsampled to 1/3-octave bands."""
+    freqs = [20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0]
+    delays = [5.0, 4.0, 3.5, 3.0, 2.5, 2.0, 1.5, 1.0]
+    result = _downsample_group_delay(freqs, delays)
+    assert len(result) > 0
+    for band in result:
+        assert "freq_hz" in band
+        assert "delay_ms" in band
+    # Centre frequencies should be from the 1/3-octave list
+    centres = {b["freq_hz"] for b in result}
+    assert centres.issubset({20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0, 160.0, 200.0})
+
+
+def test_downsample_group_delay_empty() -> None:
+    """Empty input returns empty output."""
+    assert _downsample_group_delay([], []) == []
+
+
+def test_downsample_coherence_basic() -> None:
+    """Coherence downsampled to 1/3-octave bands."""
+    freqs = [20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0]
+    coh = [0.99, 0.98, 0.97, 0.95, 0.90, 0.85, 0.80, 0.75]
+    result = _downsample_coherence(freqs, coh)
+    assert len(result) > 0
+    for band in result:
+        assert "freq_hz" in band
+        assert "coherence" in band
+        assert 0.0 <= band["coherence"] <= 1.0
+
+
+def test_downsample_coherence_empty() -> None:
+    """Empty input returns empty output."""
+    assert _downsample_coherence([], []) == []
+
+
+# ── Helpers for new analytics tools ─────────────────────────────────────────
+
+
+def _make_fr_session_with_phase(
+    freqs: list[float],
+    spls: list[float],
+    phase: list[float] | None = None,
+    session_id: int = 1,
+) -> MagicMock:
+    """Build a mock session with FR data including phase."""
+    import math
+
+    mock_fr = MagicMock()
+    mock_fr.frequencies = freqs
+    mock_fr.spl = spls
+    mock_fr.phase = phase if phase is not None else [0.0] * len(freqs)
+    session = MagicMock()
+    session.id = session_id
+    session.timestamp = "2026-04-12T00:00:00Z"
+    session.label = f"session-{session_id}"
+    session.start_fr = mock_fr
+    session.metadata = None
+    return session
+
+
+# ── simulate_eq ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_simulate_eq_basic_prediction() -> None:
+    """simulate_eq predicts FR after applying a peaking cut."""
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    # Create a 10 dB peak at 50 Hz
+    spls = [75.0 + 10.0 * np.exp(-((f - 50) ** 2) / 100) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+
+    filters = [
+        {"type": "peaking", "freq": 50.0, "gain_db": -8.0, "q": 2.0},
+    ]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_simulate_eq(session_id=1, filters=filters)
+    assert result["ok"]
+    assert result["num_filters"] == 1
+    assert result["point_count"] > 0
+    # Parse compact FR and verify the peak is reduced
+    pairs = result["predicted_fr"].split(",")
+    for pair in pairs:
+        freq_str, spl_str = pair.split(":")
+        f, s = float(freq_str), float(spl_str)
+        if abs(f - 50.0) < 1.0:
+            # Original was ~85 dB at 50 Hz, after -8 dB cut should be lower
+            assert s < 85.0
+
+
+@pytest.mark.asyncio
+async def test_simulate_eq_hpf_response() -> None:
+    """simulate_eq applies HPF attenuation below the cutoff."""
+    freqs = [15.0, 18.0, 20.0, 30.0, 50.0, 80.0, 100.0]
+    spls = [75.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+
+    filters = [{"type": "hpf", "freq": 18.0}]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_simulate_eq(
+            session_id=1, filters=filters, min_hz=15.0, max_hz=100.0,
+        )
+    assert result["ok"]
+    pairs = result["predicted_fr"].split(",")
+    # At 80+ Hz, HPF should have negligible effect
+    # At 15 Hz (below cutoff), should show significant attenuation
+    low_freq_spl = None
+    high_freq_spl = None
+    for pair in pairs:
+        f, s = pair.split(":")
+        f, s = float(f), float(s)
+        if abs(f - 15.0) < 1.0:
+            low_freq_spl = s
+        if abs(f - 80.0) < 1.0:
+            high_freq_spl = s
+    assert low_freq_spl is not None
+    assert high_freq_spl is not None
+    assert low_freq_spl < high_freq_spl  # HPF attenuates below cutoff
+
+
+@pytest.mark.asyncio
+async def test_simulate_eq_session_not_found() -> None:
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = []
+        result = await _tool_simulate_eq(session_id=999, filters=[])
+    assert not result["ok"]
+    assert "999" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_simulate_eq_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+
+    freqs = [20.0, 40.0, 60.0, 80.0, 100.0]
+    spls = [75.0, 78.0, 80.0, 76.0, 74.0]
+    session = _make_fr_session(freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        texts = await call_tool("simulate_eq", {
+            "session_id": 1,
+            "filters": [{"type": "peaking", "freq": 60.0, "gain_db": -3.0, "q": 1.0}],
+        })
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "predicted_fr" in data
+
+
+# ── optimize_q ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_optimize_q_finds_reasonable_q() -> None:
+    """optimize_q should find a Q that reduces RMS error in the band."""
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    # Create a narrow 10 dB peak at 50 Hz
+    spls = [75.0 + 10.0 * np.exp(-((f - 50) ** 2) / 50) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_optimize_q(
+            session_id=1, freq_hz=50.0, target_gain_db=-10.0,
+        )
+    assert result["ok"]
+    assert 0.5 <= result["optimal_q"] <= 10.0
+    assert result["freq_hz"] == 50.0
+    assert result["gain_db"] == -10.0
+    assert "predicted_rms_in_band" in result
+    assert "effect_at_center_db" in result
+
+
+@pytest.mark.asyncio
+async def test_optimize_q_custom_band() -> None:
+    """optimize_q respects a custom search band."""
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [75.0 + 8.0 * np.exp(-((f - 60) ** 2) / 80) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_optimize_q(
+            session_id=1, freq_hz=60.0, target_gain_db=-6.0,
+            band_hz=[40.0, 80.0],
+        )
+    assert result["ok"]
+    assert result["band_hz"] == [40.0, 80.0]
+
+
+@pytest.mark.asyncio
+async def test_optimize_q_session_not_found() -> None:
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = []
+        result = await _tool_optimize_q(
+            session_id=999, freq_hz=50.0, target_gain_db=-5.0,
+        )
+    assert not result["ok"]
+    assert "999" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_optimize_q_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls = [75.0 + 5.0 * np.exp(-((f - 50) ** 2) / 100) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        texts = await call_tool("optimize_q", {
+            "session_id": 1, "freq_hz": 50.0, "target_gain_db": -5.0,
+        })
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "optimal_q" in data
+
+
+# ── analyze_phase ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_analyze_phase_with_phase_data() -> None:
+    """analyze_phase returns fixability when phase data is present."""
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [75.0 + 2.0 * np.sin(2 * np.pi * f / 40) for f in freqs]
+    # Gentle phase: roughly minimum-phase-like
+    phase = [-0.1 * f for f in freqs]
+    session = _make_fr_session_with_phase(freqs, spls, phase)
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_analyze_phase(session_id=1)
+    assert result["ok"]
+    assert result["has_phase_data"] is True
+    assert len(result["bands"]) > 0
+    for band in result["bands"]:
+        assert "freq_hz" in band
+        assert "spl_db" in band
+        assert "min_phase_group_delay_ms" in band
+        assert "fixable" in band
+
+
+@pytest.mark.asyncio
+async def test_analyze_phase_without_phase_data() -> None:
+    """analyze_phase reports fixable=None when no phase data is available."""
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [75.0] * len(freqs)
+    session = _make_fr_session_with_phase(freqs, spls, phase=None)
+    session.start_fr.phase = None  # Explicitly no phase
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_analyze_phase(session_id=1)
+    assert result["ok"]
+    assert result["has_phase_data"] is False
+    for band in result["bands"]:
+        assert band["fixable"] is None
+
+
+@pytest.mark.asyncio
+async def test_analyze_phase_session_not_found() -> None:
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = []
+        result = await _tool_analyze_phase(session_id=999)
+    assert not result["ok"]
+    assert "999" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_phase_insufficient_data() -> None:
+    """Too few data points in range → error."""
+    session = _make_fr_session_with_phase([30.0], [75.0], [0.0])
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_analyze_phase(session_id=1)
+    assert not result["ok"]
+    assert "insufficient" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_analyze_phase_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [75.0] * len(freqs)
+    phase = [-0.05 * f for f in freqs]
+    session = _make_fr_session_with_phase(freqs, spls, phase)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        texts = await call_tool("analyze_phase", {"session_id": 1})
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "bands" in data
+
+
+# ── compare_sub_phase ───────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_compare_sub_phase_reinforcing() -> None:
+    """Two subs with similar phase → reinforcing classification."""
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls_a = [75.0] * len(freqs)
+    spls_b = [75.0] * len(freqs)
+    # Nearly identical phase → reinforcing
+    phase_a = [0.1 * f for f in freqs]
+    phase_b = [0.1 * f + 0.05 for f in freqs]  # ~3 deg difference
+    session_a = _make_fr_session_with_phase(freqs, spls_a, phase_a, session_id=1)
+    session_b = _make_fr_session_with_phase(freqs, spls_b, phase_b, session_id=2)
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session_a, session_b]
+        result = await _tool_compare_sub_phase(session_a=1, session_b=2)
+    assert result["ok"]
+    assert result["reinforcing_bands"] > 0
+    for band in result["bands"]:
+        assert "freq_hz" in band
+        assert "phase_diff_deg" in band
+        assert "predicted_sum_db" in band
+        assert "classification" in band
+
+
+@pytest.mark.asyncio
+async def test_compare_sub_phase_cancelling() -> None:
+    """Two subs with ~180° phase difference → cancelling."""
+    import numpy as np
+    import math
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls_a = [75.0] * len(freqs)
+    spls_b = [75.0] * len(freqs)
+    phase_a = [0.0] * len(freqs)
+    phase_b = [math.pi] * len(freqs)  # 180 degrees out of phase
+    session_a = _make_fr_session_with_phase(freqs, spls_a, phase_a, session_id=1)
+    session_b = _make_fr_session_with_phase(freqs, spls_b, phase_b, session_id=2)
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session_a, session_b]
+        result = await _tool_compare_sub_phase(session_a=1, session_b=2)
+    assert result["ok"]
+    assert result["cancelling_bands"] > 0
+
+
+@pytest.mark.asyncio
+async def test_compare_sub_phase_missing_phase() -> None:
+    """Session without phase data → error."""
+    freqs = [20.0, 50.0, 80.0]
+    spls = [75.0, 75.0, 75.0]
+    session_a = _make_fr_session(freqs, spls, session_id=1)  # No phase
+    session_b = _make_fr_session_with_phase(freqs, spls, session_id=2)
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session_a, session_b]
+        result = await _tool_compare_sub_phase(session_a=1, session_b=2)
+    assert not result["ok"]
+    assert "phase data" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_compare_sub_phase_session_not_found() -> None:
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = []
+        result = await _tool_compare_sub_phase(session_a=1, session_b=2)
+    assert not result["ok"]
+    assert "not found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_compare_sub_phase_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls = [75.0] * len(freqs)
+    phase = [0.0] * len(freqs)
+    sa = _make_fr_session_with_phase(freqs, spls, phase, session_id=1)
+    sb = _make_fr_session_with_phase(freqs, spls, phase, session_id=2)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [sa, sb]
+        texts = await call_tool("compare_sub_phase", {
+            "session_a": 1, "session_b": 2,
+        })
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "bands" in data
+
+
+# ── design_fir ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_design_fir_minimum_phase() -> None:
+    """design_fir returns coefficients in minimum-phase mode."""
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [75.0 + 5.0 * np.sin(2 * np.pi * f / 40) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_fir(
+            session_id=1, num_taps=256, phase_mode="minimum",
+        )
+    assert result["ok"]
+    assert result["num_taps"] == 256
+    assert result["phase_mode"] == "minimum"
+    assert result["pre_ringing_ms"] == 0.0
+    assert len(result["coefficients"]) == 256
+    assert len(result["predicted_effect"]) > 0
+    assert result["freq_resolution_hz"] > 0
+
+
+@pytest.mark.asyncio
+async def test_design_fir_linear_phase() -> None:
+    """design_fir in linear-phase mode has non-zero pre-ringing."""
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [75.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_fir(
+            session_id=1, num_taps=512, phase_mode="linear",
+        )
+    assert result["ok"]
+    assert result["phase_mode"] == "linear"
+    assert result["pre_ringing_ms"] > 0  # Linear phase has pre-ringing
+
+
+@pytest.mark.asyncio
+async def test_design_fir_with_target_curve() -> None:
+    """design_fir accepts a custom target curve."""
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [75.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+
+    target = {
+        "points": [
+            {"freq": 25, "spl": 80.0},
+            {"freq": 80, "spl": 75.0},
+        ]
+    }
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_fir(
+            session_id=1, target_curve=target, num_taps=256,
+        )
+    assert result["ok"]
+    assert len(result["coefficients"]) == 256
+
+
+@pytest.mark.asyncio
+async def test_design_fir_invalid_tap_count() -> None:
+    """Tap count outside 64-2048 → error."""
+    freqs = [20.0, 50.0, 100.0]
+    spls = [75.0, 75.0, 75.0]
+    session = _make_fr_session(freqs, spls)
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_fir(session_id=1, num_taps=32)
+    assert not result["ok"]
+    assert "64-2048" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_design_fir_session_not_found() -> None:
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = []
+        result = await _tool_design_fir(session_id=999)
+    assert not result["ok"]
+    assert "999" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_design_fir_coefficients_normalized() -> None:
+    """FIR coefficients should be normalized so peak <= 1.0."""
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    # Large deviation to ensure non-trivial FIR
+    spls = [75.0 + 10.0 * np.sin(2 * np.pi * f / 30) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_fir(
+            session_id=1, num_taps=256, phase_mode="minimum",
+        )
+    assert result["ok"]
+    peak = max(abs(c) for c in result["coefficients"])
+    assert peak <= 1.0 + 1e-8  # Normalized
+
+
+@pytest.mark.asyncio
+async def test_call_tool_design_fir_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls = [75.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        texts = await call_tool("design_fir", {
+            "session_id": 1, "num_taps": 128,
+        })
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "coefficients" in data
