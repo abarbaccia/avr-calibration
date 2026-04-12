@@ -618,6 +618,212 @@ async def _tool_compare_sessions(
         return _err(f"compare_sessions failed: {exc}")
 
 
+async def _tool_suggest_filters(
+    session_id: int,
+    target_curve: dict,
+    num_slots: int = 5,
+    null_threshold_db: float = 15.0,
+    port_rolloff_hz: float = 28.0,
+    max_boost_db: float = 6.0,
+) -> dict:
+    """Suggest an optimized PEQ filter set to match a measurement to a target curve.
+
+    Uses a greedy residual-fitting algorithm:
+    1. Compute error = measured - target at each frequency
+    2. Find the frequency with the largest absolute error
+    3. Design a peaking filter to correct it (gain = -error, Q from bandwidth)
+    4. Simulate the filter's effect on the residual
+    5. Repeat for each available slot
+
+    The first slot is always the mandatory 18Hz HPF. The remaining (num_slots - 1)
+    slots are available for peaking filters.
+
+    All boosts are clamped to SafetyValidator limits. Cuts have no floor.
+    """
+    from .storage import SessionStore
+    import math
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        session = next((s for s in sessions if s.id == session_id), None)
+        if session is None:
+            return _err(f"session {session_id} not found")
+
+        fr = session.start_fr
+        if not fr or not fr.frequencies:
+            return _err(f"session {session_id} has no frequency response data")
+
+        points = target_curve.get("points", [])
+        if not points:
+            return _err("target_curve must include 'points' array with [{freq, spl}]")
+
+        band = target_curve.get("band", [20, 120])
+        band_lo, band_hi = float(band[0]), float(band[1])
+
+        # Build target interpolation (log-frequency, linear dB)
+        target_freqs = sorted(points, key=lambda p: p["freq"])
+
+        def interp_target(freq_hz: float) -> float | None:
+            if freq_hz < target_freqs[0]["freq"] or freq_hz > target_freqs[-1]["freq"]:
+                return None
+            for i in range(len(target_freqs) - 1):
+                f0, s0 = target_freqs[i]["freq"], target_freqs[i]["spl"]
+                f1, s1 = target_freqs[i + 1]["freq"], target_freqs[i + 1]["spl"]
+                if f0 <= freq_hz <= f1:
+                    if f1 == f0:
+                        return s0
+                    t = math.log(freq_hz / f0) / math.log(f1 / f0)
+                    return s0 + t * (s1 - s0)
+            return target_freqs[-1]["spl"]
+
+        # Build residual array: (freq, error) where error = measured - target
+        # Positive error = above target (need cut), negative = below (need boost)
+        residual: list[tuple[float, float]] = []
+        for f, s in zip(fr.frequencies, fr.spl):
+            if f < band_lo or f > band_hi:
+                continue
+            target_spl = interp_target(f)
+            if target_spl is None:
+                continue
+            residual.append((f, s - target_spl))
+
+        if not residual:
+            return _err(f"no FR data in band {band_lo}-{band_hi} Hz")
+
+        # Compute band average for null detection
+        measured_in_band = [s for f, s in zip(fr.frequencies, fr.spl) if band_lo <= f <= band_hi]
+        band_avg = sum(measured_in_band) / len(measured_in_band) if measured_in_band else 0.0
+
+        # Mark null/rolloff zones — don't design filters targeting these
+        def is_excluded(freq: float) -> bool:
+            # Check null: find measured SPL at this freq
+            for f, s in zip(fr.frequencies, fr.spl):
+                if abs(f - freq) < 0.5:
+                    if s < (band_avg - null_threshold_db):
+                        return True
+                    break
+            return freq < port_rolloff_hz
+
+        # Peaking filter response at a given frequency
+        def peaking_response(fc: float, gain_db: float, q: float, freq: float) -> float:
+            """Approximate magnitude response of a peaking EQ filter at *freq*."""
+            if q <= 0 or fc <= 0:
+                return 0.0
+            w = freq / fc
+            # Second-order peaking filter magnitude (analog approximation)
+            # H(s) = (s^2 + s*(A/Q) + 1) / (s^2 + s/(A*Q) + 1)
+            # where A = 10^(gain/40), s = jw
+            A = 10.0 ** (gain_db / 40.0)
+            w2 = w * w
+            num_real = 1.0 - w2
+            num_imag = w * A / q
+            den_real = 1.0 - w2
+            den_imag = w / (A * q)
+            num_mag_sq = num_real ** 2 + num_imag ** 2
+            den_mag_sq = den_real ** 2 + den_imag ** 2
+            if den_mag_sq < 1e-30:
+                return 0.0
+            return 10.0 * math.log10(num_mag_sq / den_mag_sq)
+
+        # Greedy filter design — reserve slot 0 for HPF
+        filters = [{"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"}]
+        peaking_slots = num_slots - 1  # Remaining slots for peaking filters
+
+        # Work on a mutable copy of the residual
+        residual_errors = [err for _, err in residual]
+        residual_freqs = [f for f, _ in residual]
+
+        for _slot in range(peaking_slots):
+            # Find frequency with largest absolute error (excluding nulls/rolloff)
+            best_idx = None
+            best_abs_err = 0.0
+            for i, (freq, err) in enumerate(zip(residual_freqs, residual_errors)):
+                if is_excluded(freq):
+                    continue
+                if abs(err) > best_abs_err:
+                    best_abs_err = abs(err)
+                    best_idx = i
+
+            if best_idx is None or best_abs_err < 0.5:
+                break  # No significant error left, or all excluded
+
+            fc = residual_freqs[best_idx]
+            error = residual_errors[best_idx]
+            gain = -error  # Invert: positive error → need cut (negative gain)
+
+            # Clamp boost to safety limit
+            if gain > max_boost_db:
+                gain = max_boost_db
+            # Additional safety: no boost below 25 Hz
+            if gain > 0 and fc < 25.0:
+                gain = 0.0
+                continue  # Skip this slot, can't help here
+
+            # Estimate Q from the error shape — find bandwidth where error is > half peak
+            half_peak = abs(error) / 2.0
+            lo_idx = best_idx
+            hi_idx = best_idx
+            while lo_idx > 0 and abs(residual_errors[lo_idx - 1]) > half_peak:
+                lo_idx -= 1
+            while hi_idx < len(residual_errors) - 1 and abs(residual_errors[hi_idx + 1]) > half_peak:
+                hi_idx += 1
+
+            bw_lo = residual_freqs[lo_idx]
+            bw_hi = residual_freqs[hi_idx]
+            if bw_hi > bw_lo:
+                # Q = fc / bandwidth (in octaves: Q ≈ fc / (bw_hi - bw_lo) * sqrt(2))
+                bw = bw_hi - bw_lo
+                q = fc / bw if bw > 0 else 2.0
+                q = max(0.5, min(q, 10.0))  # Clamp Q to reasonable range
+            else:
+                q = 2.0  # Default Q for single-point peaks
+
+            filters.append({
+                "freq": round(fc, 1),
+                "gain_db": round(gain, 1),
+                "q": round(q, 2),
+                "type": "peaking",
+            })
+
+            # Simulate this filter's effect on the residual
+            for i in range(len(residual_errors)):
+                correction = peaking_response(fc, gain, q, residual_freqs[i])
+                residual_errors[i] += correction  # Filter adds to the signal
+
+        # Compute predicted RMS after all filters
+        included_errors = [
+            err for freq, err in zip(residual_freqs, residual_errors)
+            if not is_excluded(freq)
+        ]
+        if included_errors:
+            predicted_rms = math.sqrt(sum(e ** 2 for e in included_errors) / len(included_errors))
+        else:
+            predicted_rms = 0.0
+
+        # Also compute original RMS for comparison
+        original_errors = [
+            err for (freq, err) in residual
+            if not is_excluded(freq)
+        ]
+        if original_errors:
+            original_rms = math.sqrt(sum(e ** 2 for e in original_errors) / len(original_errors))
+        else:
+            original_rms = 0.0
+
+        return _ok(
+            session_id=session_id,
+            filters=filters,
+            num_filters=len(filters),
+            peaking_filters=len(filters) - 1,
+            original_rms_db=round(original_rms, 2),
+            predicted_rms_db=round(predicted_rms, 2),
+            improvement_db=round(original_rms - predicted_rms, 2),
+        )
+    except Exception as exc:
+        return _err(f"suggest_filters failed: {exc}")
+
+
 async def _tool_avr_set_volume(level_db: float) -> dict:
     """Set AVR volume to *level_db* dB.
 
@@ -2095,6 +2301,80 @@ _TOOLS: list[Tool] = [
             "required": ["session_a", "session_b"],
         },
     ),
+    Tool(
+        name="suggest_filters",
+        description=(
+            "Suggest an optimized PEQ filter set to match a measurement to a target curve. "
+            "Uses a greedy residual-fitting algorithm: finds the largest error between measured and target, "
+            "designs a peaking filter to correct it, simulates the effect, and repeats for each available slot. "
+            "Returns a ready-to-use filter set (including mandatory 18Hz HPF) that can be passed directly "
+            "to apply_eq or apply_input_eq. Also returns predicted RMS deviation. "
+            "Null zones and below-port rolloff are automatically excluded from optimization."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "integer",
+                    "description": "Measurement session ID to optimize against",
+                },
+                "target_curve": {
+                    "type": "object",
+                    "description": (
+                        "Target curve with points. Shape: {points: [{freq, spl}], band: [lo_hz, hi_hz]}. "
+                        "For Harman bass target anchored at ref dB: "
+                        "points=[{freq:25,spl:ref+5},{freq:31,spl:ref+4},...,{freq:80,spl:ref}]"
+                    ),
+                    "properties": {
+                        "points": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "freq": {"type": "number"},
+                                    "spl": {"type": "number"},
+                                },
+                            },
+                        },
+                        "band": {
+                            "type": "array",
+                            "items": {"type": "number"},
+                            "description": "[lo_hz, hi_hz] — frequency range to optimize",
+                        },
+                    },
+                },
+                "num_slots": {
+                    "type": "integer",
+                    "description": (
+                        "Total PEQ slots available (including the mandatory HPF). "
+                        "Default: 5. miniDSP 2x4 HD has 10 slots per output (2-9 usable). "
+                        "More slots = finer correction but more DSP resources used."
+                    ),
+                },
+                "null_threshold_db": {
+                    "type": "number",
+                    "description": (
+                        "Frequencies where measured SPL is this many dB below the band average "
+                        "are classified as nulls and excluded from optimization. Default: 15."
+                    ),
+                },
+                "port_rolloff_hz": {
+                    "type": "number",
+                    "description": (
+                        "Frequencies below this are excluded as below-port rolloff. Default: 28 Hz."
+                    ),
+                },
+                "max_boost_db": {
+                    "type": "number",
+                    "description": (
+                        "Maximum boost per filter in dB. Default: 6 (SafetyValidator max). "
+                        "Use lower values for more conservative suggestions."
+                    ),
+                },
+            },
+            "required": ["session_id", "target_curve"],
+        },
+    ),
 ]
 
 
@@ -2228,6 +2508,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             session_b=int(arguments["session_b"]),
             min_hz=float(arguments.get("min_hz", 20.0)),
             max_hz=float(arguments.get("max_hz", 120.0)),
+        )
+    elif name == "suggest_filters":
+        result = await _tool_suggest_filters(
+            session_id=int(arguments["session_id"]),
+            target_curve=arguments["target_curve"],
+            num_slots=int(arguments.get("num_slots", 5)),
+            null_threshold_db=float(arguments.get("null_threshold_db", 15.0)),
+            port_rolloff_hz=float(arguments.get("port_rolloff_hz", 28.0)),
+            max_boost_db=float(arguments.get("max_boost_db", 6.0)),
         )
     # Legacy aliases for backwards compatibility with cached sessions
     elif name == "mute_sub_outputs":

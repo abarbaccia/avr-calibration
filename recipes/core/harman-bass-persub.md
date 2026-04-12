@@ -135,24 +135,28 @@ For each sub listed in `eq_capabilities.output_peq`:
 
 ### 2.2 Design per-sub correction filters
 
-For each sub, compare its solo FR to flat (its own average level):
-- Peaks above the average: cut with peaking filter (always safe)
-- Dips below the average: leave alone if narrow (likely a null — unfixable)
-- Broad dips: gentle boost if > 3 dB below average (limited by safety)
-- **Q selection near adjacent features:** When a peak is adjacent to a dip
-  (< 1/3 octave apart), use Q ≥ 4 to avoid the cut bleeding into the dip.
-  A Q of 2.5 at 55 Hz will affect 43-67 Hz; a Q of 4 narrows to 48-62 Hz.
-  Use `analyze_decay` suggested_q for ringing modes — it accounts for mode width.
+Use `suggest_filters(session_id, flat_target, num_slots)` where flat_target
+is anchored to this sub's average SPL across 25-80Hz. Pass the full number of
+available output PEQ slots to use all DSP resources.
+
+The greedy algorithm will:
+- Target the largest room mode peaks first (cuts — always safe)
+- Skip null zones (deep cancellation dips are unfixable with EQ)
+- Clamp any boosts to safety limits
+- Estimate Q from the error shape for surgical corrections
+
+Review the suggested filters. For ringing modes, cross-reference with
+`analyze_decay` — its `suggested_q` accounts for mode width and may be
+more accurate than the data-driven Q estimate.
 
 **Prefer cuts heavily.** The goal is to flatten each sub's response,
 not to boost it to match a target. Nulls cannot be filled with EQ.
-
-Always include the mandatory 18Hz HPF.
+If suggest_filters proposes boosts you're unsure about, reduce `max_boost_db`.
 
 ### 2.3 Apply per-sub EQ
 
 For each sub, call `apply_eq` with `output_index` set to that sub's
-output index. Each sub gets its own independent filter set.
+output index. Pass the filters from `suggest_filters` directly.
 
 ### 2.4 Optional — Decay analysis after per-sub EQ
 
@@ -240,14 +244,20 @@ Report the chosen reference level and the resulting max boost needed.
 
 ### 3.3 Apply Harman EQ to input
 
-Design filters to match the Harman target (anchored in 3.2):
-- Above target: cut (always safe)
-- Below target: boost (limited by safety, max +6 dB per band)
+Use `suggest_filters(session_id, target_curve, num_slots)` to generate an
+optimized filter set. This greedy algorithm designs filters one at a time,
+targeting the largest remaining error first, and simulates each filter's
+effect before designing the next. Pass the full number of available input PEQ
+slots (from `eq_capabilities.input_peq.num_slots`) to use all DSP resources.
 
-Call `apply_input_eq` with the target curve filters. This writes to the
-input PEQ so all subs receive the same correction.
+Review the suggested filters and predicted RMS improvement. Then call
+`apply_input_eq` with the suggested filter set. This writes to the input PEQ
+so all subs receive the same correction.
 
-Always include the mandatory 18Hz HPF.
+If the suggestion includes boosts that seem too aggressive, reduce `max_boost_db`
+or manually adjust individual filters before applying.
+
+Always include the mandatory 18Hz HPF (suggest_filters includes it automatically).
 
 ### 3.4 Re-measure and iterate
 
@@ -298,3 +308,4 @@ If max iterations reached:
 - `compute_deviation` — RMS deviation with automatic null/rolloff exclusion (use for convergence checks)
 - `compare_sessions` — per-band delta between two sessions (verify EQ changes)
 - `read_input_eq` — read current input PEQ state (for iterative filter merging)
+- `suggest_filters` — greedy residual-fitting optimizer: designs optimal PEQ set for all available slots

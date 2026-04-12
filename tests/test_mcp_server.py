@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import math
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -63,6 +64,7 @@ from calibrate.mcp_server import (
     _tool_set_master_gain,
     _tool_set_output_gain,
     _tool_set_polarity,
+    _tool_suggest_filters,
     _tool_trigger_measurement,
     _tool_unmute_output,
 )
@@ -2667,3 +2669,217 @@ async def test_get_measurement_history_full_keeps_group_delay() -> None:
         result = await _tool_get_measurement_history(limit=1, fmt="full")
     data = result["sessions"][0]
     assert "group_delay" in data["metadata"]
+
+
+# ── suggest_filters ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_suggest_filters_basic() -> None:
+    """Simple case: measured is 5 dB above flat target → suggests cuts."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}], "band": [20, 120]}
+    # Measured: 5 dB above target at ~50 Hz, flat elsewhere
+    spls = []
+    for f in freqs:
+        bump = 5.0 * math.exp(-((math.log(f / 50.0)) ** 2) / (2 * 0.15 ** 2))
+        spls.append(75.0 + bump)
+    session = _make_deviation_session(1, freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_suggest_filters(session_id=1, target_curve=target, num_slots=4)
+    assert result["ok"]
+    assert result["num_filters"] >= 2  # HPF + at least one peaking
+    # First filter must be HPF
+    assert result["filters"][0]["type"] == "hpf"
+    assert result["filters"][0]["freq"] == 18.0
+    # At least one peaking filter should target the 50 Hz bump
+    peaking = [f for f in result["filters"] if f["type"] == "peaking"]
+    assert len(peaking) >= 1
+    # The primary correction should be near 50 Hz and a cut
+    main_filter = peaking[0]
+    assert 35.0 <= main_filter["freq"] <= 65.0
+    assert main_filter["gain_db"] < 0  # Should be a cut
+    # Predicted RMS should be better than original
+    assert result["predicted_rms_db"] < result["original_rms_db"]
+
+
+@pytest.mark.asyncio
+async def test_suggest_filters_boost_clamped() -> None:
+    """Boost is clamped to max_boost_db."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    target = {"points": [{"freq": 20, "spl": 85.0}, {"freq": 120, "spl": 85.0}], "band": [20, 120]}
+    # Measured: 10 dB below target at 50 Hz → needs +10 dB boost, but clamped to +6
+    spls = []
+    for f in freqs:
+        dip = -10.0 * math.exp(-((math.log(f / 50.0)) ** 2) / (2 * 0.15 ** 2))
+        spls.append(85.0 + dip)
+    session = _make_deviation_session(1, freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_suggest_filters(session_id=1, target_curve=target, max_boost_db=6.0)
+    assert result["ok"]
+    peaking = [f for f in result["filters"] if f["type"] == "peaking"]
+    for f in peaking:
+        assert f["gain_db"] <= 6.0  # Must not exceed safety limit
+
+
+@pytest.mark.asyncio
+async def test_suggest_filters_no_boost_below_25hz() -> None:
+    """Boost below 25 Hz is forbidden (ported sub protection)."""
+    freqs = [20.0, 22.0, 25.0, 30.0, 40.0, 50.0, 63.0, 80.0]
+    target = {"points": [{"freq": 20, "spl": 85.0}, {"freq": 100, "spl": 85.0}], "band": [20, 100]}
+    # Very low at 20-22 Hz → would want boost, but must not
+    spls = [65.0, 66.0, 80.0, 84.0, 85.0, 85.0, 85.0, 85.0]
+    session = _make_deviation_session(1, freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_suggest_filters(
+            session_id=1, target_curve=target, port_rolloff_hz=28.0,
+        )
+    assert result["ok"]
+    peaking = [f for f in result["filters"] if f["type"] == "peaking"]
+    for f in peaking:
+        if f["gain_db"] > 0:
+            assert f["freq"] >= 25.0
+
+
+@pytest.mark.asyncio
+async def test_suggest_filters_null_zone_excluded() -> None:
+    """Null zones are excluded from optimization — don't try to fill cancellation dips."""
+    freqs = [30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 70.0, 80.0]
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
+    # Deep null at 45 Hz (20 dB below average)
+    spls = [75.0, 75.0, 75.0, 55.0, 75.0, 75.0, 75.0, 75.0, 75.0]
+    session = _make_deviation_session(1, freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_suggest_filters(
+            session_id=1, target_curve=target, null_threshold_db=15.0,
+        )
+    assert result["ok"]
+    # Should NOT suggest a big boost at 45 Hz to fill the null
+    peaking = [f for f in result["filters"] if f["type"] == "peaking"]
+    for f in peaking:
+        if 42.0 <= f["freq"] <= 48.0:
+            assert f["gain_db"] <= 0, "Should not boost into a null zone"
+
+
+@pytest.mark.asyncio
+async def test_suggest_filters_session_not_found() -> None:
+    """Missing session → error."""
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = []
+        result = await _tool_suggest_filters(session_id=99, target_curve=target)
+    assert not result["ok"]
+    assert "session 99 not found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_suggest_filters_empty_target() -> None:
+    """Empty target points → error."""
+    freqs = [30.0, 40.0, 50.0]
+    spls = [75.0, 75.0, 75.0]
+    session = _make_deviation_session(1, freqs, spls)
+    target = {"points": [], "band": [20, 100]}
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_suggest_filters(session_id=1, target_curve=target)
+    assert not result["ok"]
+    assert "points" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_suggest_filters_more_slots_better_rms() -> None:
+    """More PEQ slots should produce equal or better predicted RMS."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}], "band": [20, 120]}
+    # Measured: multi-peak response
+    spls = []
+    for f in freqs:
+        bump1 = 4.0 * math.exp(-((math.log(f / 40.0)) ** 2) / (2 * 0.1 ** 2))
+        bump2 = -3.0 * math.exp(-((math.log(f / 70.0)) ** 2) / (2 * 0.12 ** 2))
+        spls.append(75.0 + bump1 + bump2)
+    session = _make_deviation_session(1, freqs, spls)
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result_3 = await _tool_suggest_filters(session_id=1, target_curve=target, num_slots=3)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result_6 = await _tool_suggest_filters(session_id=1, target_curve=target, num_slots=6)
+
+    assert result_3["ok"] and result_6["ok"]
+    assert result_6["predicted_rms_db"] <= result_3["predicted_rms_db"] + 0.1  # Tolerance for rounding
+
+
+@pytest.mark.asyncio
+async def test_suggest_filters_harman_target() -> None:
+    """Works with the Harman bass target curve (the real use case)."""
+    import numpy as np
+    ref = 75.0
+    harman_target = {
+        "points": [
+            {"freq": 25, "spl": ref + 5},
+            {"freq": 31, "spl": ref + 4},
+            {"freq": 40, "spl": ref + 3},
+            {"freq": 50, "spl": ref + 2},
+            {"freq": 63, "spl": ref + 1},
+            {"freq": 80, "spl": ref},
+        ],
+        "band": [25, 80],
+    }
+    freqs = np.logspace(np.log10(25), np.log10(80), 200).tolist()
+    # Measured: roughly flat at 75 dB (needs Harman slope)
+    spls = [75.0] * len(freqs)
+    session = _make_deviation_session(1, freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_suggest_filters(session_id=1, target_curve=harman_target, num_slots=6)
+    assert result["ok"]
+    # Should suggest boosts at low end, cuts at high end
+    peaking = [f for f in result["filters"] if f["type"] == "peaking"]
+    assert len(peaking) >= 1
+    # Predicted RMS should be meaningfully improved
+    assert result["predicted_rms_db"] < result["original_rms_db"]
+
+
+@pytest.mark.asyncio
+async def test_suggest_filters_already_converged() -> None:
+    """Measured nearly matches target → few or no peaking filters suggested."""
+    freqs = [30.0, 40.0, 50.0, 63.0, 80.0]
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
+    spls = [75.1, 74.9, 75.2, 74.8, 75.0]  # Already nearly flat
+    session = _make_deviation_session(1, freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_suggest_filters(session_id=1, target_curve=target)
+    assert result["ok"]
+    # Only the HPF — errors too small to warrant correction
+    peaking = [f for f in result["filters"] if f["type"] == "peaking"]
+    assert len(peaking) == 0
+    assert result["predicted_rms_db"] < 1.0
+
+
+@pytest.mark.asyncio
+async def test_call_tool_suggest_filters_dispatch() -> None:
+    """call_tool('suggest_filters') dispatches correctly."""
+    from calibrate.mcp_server import call_tool
+    freqs = [30.0, 40.0, 50.0, 63.0, 80.0]
+    spls = [80.0, 75.0, 78.0, 74.0, 76.0]
+    session = _make_deviation_session(1, freqs, spls)
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await call_tool("suggest_filters", {
+            "session_id": 1,
+            "target_curve": target,
+            "num_slots": 4,
+        })
+    data = json.loads(result[0].text)
+    assert data["ok"]
+    assert data["filters"][0]["type"] == "hpf"
