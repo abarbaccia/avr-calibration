@@ -115,7 +115,6 @@ runs at a time, with a post-command delay for firmware commit.
 async def _run_minidsp_cli(
     *args: str,
     ignore_exit_codes: tuple[int, ...] = (),
-    post_delay: float | None = None,
 ) -> None:
     """Run a minidsp CLI command, raising MinidspApiError on non-zero exit.
 
@@ -128,11 +127,10 @@ async def _run_minidsp_cli(
     post-load device response (cmd_id: 01) even though the write succeeds.
     See mrene/minidsp-rs#766.
 
-    *post_delay*: seconds to sleep after the command completes.  Defaults to
-    CLI_COMMAND_DELAY_S (0.1s).  PEQ callers pass their own longer delay via
-    the existing asyncio.sleep(PEQ_WRITE_DELAY_S) after this function returns.
+    After each command, sleeps CLI_COMMAND_DELAY_S (0.1s) for firmware commit.
+    PEQ callers add their own longer delay (PEQ_WRITE_DELAY_S) after this
+    function returns.
     """
-    delay = post_delay if post_delay is not None else CLI_COMMAND_DELAY_S
     async with _cli_lock:
         proc = await asyncio.create_subprocess_exec(
             "minidsp", *args,
@@ -150,8 +148,8 @@ async def _run_minidsp_cli(
                 proc.returncode or 1,
                 f"minidsp {' '.join(args)}: {stderr.decode().strip()}",
             )
-        if delay > 0:
-            await asyncio.sleep(delay)
+        if CLI_COMMAND_DELAY_S > 0:
+            await asyncio.sleep(CLI_COMMAND_DELAY_S)
 
 
 async def _get_status_via_cli() -> dict:

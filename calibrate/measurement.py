@@ -70,7 +70,7 @@ class FrequencyResponse:
     sweep_duration: float     # seconds
     timestamp: str            # ISO-8601 UTC
     warnings: list[dict] = field(default_factory=list)  # non-fatal quality warnings
-    impulse_response: Optional[list[float]] = None  # time-domain IR, first 24 000 samples
+    impulse_response: Optional[list[float]] = None  # time-domain IR, gated to IR_GATE_S seconds
     phase: Optional[list[float]] = None  # radians, same grid as frequencies/spl
     recording_peak_dbfs: Optional[float] = None  # peak of raw recording before deconvolution
     coherence: Optional[list[float]] = None  # 0-1 per frequency, measurement reliability
@@ -527,6 +527,8 @@ class MeasurementEngine:
     # resolution for bass) while cutting well before the artifact at
     # ~N/3 samples (~1.8 s).
     IR_GATE_S: float = 0.5
+    IR_TAPER_S: float = 0.05
+    """Half-Hanning taper duration at the gate boundary (seconds)."""
 
     def _compute_fr_arrays(
         self,
@@ -577,10 +579,9 @@ class MeasurementEngine:
         # Convert to time domain, gate the IR to remove wrap-around
         # artifacts and late-time noise, then convert back.
         ir_full = np.fft.irfft(H, n=n)
-        ir_samples = ir_full[:24000].tolist()  # store unwindowed for decay analysis
-
         gate_samples = min(int(self.IR_GATE_S * sample_rate), n)
-        taper_samples = min(int(0.05 * sample_rate), gate_samples // 4)  # 50 ms taper
+        ir_samples = ir_full[:gate_samples].tolist()  # store unwindowed for decay analysis
+        taper_samples = min(int(self.IR_TAPER_S * sample_rate), gate_samples // 4)
 
         ir_gated = np.zeros(n)
         ir_gated[:gate_samples] = ir_full[:gate_samples]
@@ -637,6 +638,69 @@ class MeasurementEngine:
         return self._compute_fr_arrays(np, x, y, freq_min, freq_max, sample_rate, cal_curve=cal_curve)
 
 
+# ── IR onset detection constants ──────────────────────────────────────────────
+
+IR_ONSET_SKIP_S: float = 0.002
+"""Seconds to blank at the start of the IR before onset detection.
+
+Wiener deconvolution leaves a DC artifact near t=0. The shortest realistic
+sub-to-mic path in a home theater room is ~0.7 m (~2 ms), so no real IR
+onset lives before this point.
+"""
+
+IR_ONSET_THRESHOLD_DB: float = -20.0
+"""Onset threshold relative to the absolute IR peak, in dB.
+
+The first sample whose amplitude exceeds 10^(threshold/20) × peak is
+reported as the onset.  -20 dB (×0.1) finds the first arrival even when a
+later room mode is louder than the direct sound.
+"""
+
+
+def detect_ir_onset(
+    ir: "np.ndarray",
+    sample_rate: int,
+    search_window_ms: float = 50.0,
+) -> dict:
+    """Detect the onset of an impulse response, returning peak timing and level.
+
+    Skips the first IR_ONSET_SKIP_S seconds to avoid the Wiener deconvolution
+    DC artifact, then finds the first sample within IR_ONSET_THRESHOLD_DB of
+    the absolute peak.
+
+    Returns:
+        {peak_time_ms, peak_sign, spl_db, sample_rate}
+    """
+    import numpy as np
+
+    search_samples = max(1, int(search_window_ms / 1000.0 * sample_rate))
+    search_samples = min(search_samples, len(ir))
+    window = ir[:search_samples]
+
+    abs_window = np.abs(window)
+
+    skip_samples = max(1, int(IR_ONSET_SKIP_S * sample_rate))
+    abs_window[:skip_samples] = 0.0
+
+    max_idx = int(np.argmax(abs_window))
+
+    onset_ratio = 10.0 ** (IR_ONSET_THRESHOLD_DB / 20.0)  # 0.1 for -20 dB
+    onset_threshold = abs_window[max_idx] * onset_ratio
+    onset_candidates = np.where(abs_window >= onset_threshold)[0]
+    peak_idx = int(onset_candidates[0]) if len(onset_candidates) > 0 else max_idx
+
+    peak_sign = 1 if ir[peak_idx] >= 0.0 else -1
+    peak_time_s = peak_idx / sample_rate
+    spl_db = float(20.0 * np.log10(abs_window[max_idx] + 1e-12))
+
+    return {
+        "peak_time_ms": round(peak_time_s * 1000.0, 3),
+        "peak_sign": peak_sign,
+        "spl_db": round(spl_db, 1),
+        "sample_rate": sample_rate,
+    }
+
+
 def compute_session_metadata(
     fr: FrequencyResponse,
     search_window_ms: float = 50.0,
@@ -647,7 +711,7 @@ def compute_session_metadata(
     """Compute IR-derived metadata from a FrequencyResponse at capture time.
 
     Returns a dict with:
-      ir:           {peak_time_ms, peak_sign, spl_db}
+      ir:           {peak_time_ms, peak_sign, spl_db, sample_rate}
       decay_modes:  [{freq_hz, t60_ms, peak_db, suggested_q, priority}, ...]
       group_delay:  {freq_hz: [...], delay_ms: [...]}
     """
@@ -659,35 +723,7 @@ def compute_session_metadata(
     # ── IR peak analysis (replaces analyze_ir) ────────────────────────────
     if fr.impulse_response:
         ir_arr = np.array(fr.impulse_response, dtype=np.float64)
-        search_samples = max(1, int(search_window_ms / 1000.0 * sample_rate))
-        search_samples = min(search_samples, len(ir_arr))
-        search_window = ir_arr[:search_samples]
-
-        abs_window = np.abs(search_window)
-        # Skip first 2ms — Wiener deconvolution leaves a DC artifact near
-        # t=0 that confuses onset detection.  The shortest sub-to-mic path in
-        # a home theater room is always > 2ms (~0.7m), so no real IR onset
-        # lives before this point.
-        skip_samples = max(1, int(0.002 * sample_rate))
-        abs_window[:skip_samples] = 0.0
-        max_idx = int(np.argmax(abs_window))
-        # Onset detection: first sample within 20 dB of the absolute peak.
-        # argmax(abs(ir)) finds the LOUDEST peak, which in rooms with strong
-        # bass modes can be a late resonance (e.g. 48ms) instead of the direct
-        # sound arrival (e.g. 8ms).  Onset detection finds the first arrival.
-        onset_threshold = abs_window[max_idx] * 0.1  # -20 dB
-        onset_candidates = np.where(abs_window >= onset_threshold)[0]
-        peak_idx = int(onset_candidates[0]) if len(onset_candidates) > 0 else max_idx
-        peak_sign = 1 if ir_arr[peak_idx] >= 0.0 else -1
-        peak_time_s = peak_idx / sample_rate
-        spl_db = float(20.0 * np.log10(abs_window[max_idx] + 1e-12))
-
-        metadata["ir"] = {
-            "peak_time_ms": round(peak_time_s * 1000.0, 3),
-            "peak_sign": peak_sign,
-            "spl_db": round(spl_db, 1),
-            "sample_rate": sample_rate,
-        }
+        metadata["ir"] = detect_ir_onset(ir_arr, sample_rate, search_window_ms)
 
     # ── Decay analysis (replaces analyze_decay) ──────────────────────────
     if fr.impulse_response:
