@@ -335,7 +335,104 @@ If max iterations reached:
 - If the combined Harman pass can't converge, the per-sub corrections
   may need revisiting — check for cancellation between subs
 
-## Phase 4 — Retrospective
+## Phase 4 — Performance Optimization (Optional)
+
+After Phase 3 converges (or reaches max iterations), inventory the remaining
+DSP resources and suggest concrete optimizations to push RMS lower. Present
+options to the user and let them choose which to pursue.
+
+### 4.1 Inventory available resources
+
+Check what's still unused:
+- **Output PEQ slots**: `read_eq(output_index)` per sub — how many of the 8 slots are free?
+- **Input PEQ slots**: `read_input_eq` — how many of the 8 shared slots are free?
+- **FIR taps**: `get_config` → `eq_capabilities.fir_capable`, `fir_max_taps_per_output`,
+  `fir_shared_tap_pool`, `fir_sample_rate_hz`. If FIR is available and unused, that's a
+  major lever for ringing reduction.
+- **Between-band peaks**: Pull `get_measurement_history(format="compact", min_hz=20, max_hz=120)`
+  and scan for narrow peaks between the 1/3-octave centers. `compute_deviation` summary only
+  reports 6 band centers — a 3 dB peak at 54 Hz hides between 50 Hz and 63 Hz.
+
+Report the inventory:
+```
+## DSP resource inventory
+- Output PEQ: 5/8 slots used per sub (3 free)
+- Input PEQ: 6/8 slots used (2 free)
+- FIR: 2048 taps/output available (unused)
+- Current RMS: 1.4 dB
+- Between-band max error: +3.1 dB @ 54 Hz
+```
+
+### 4.2 FIR for ringing reduction
+
+If FIR taps are available AND `analyze_decay` from Phase 2 showed modes with T60 > 500ms:
+
+1. Use the Phase 2 solo measurements (or re-measure each sub solo if needed)
+2. Call `design_fir(session_id, ...)` for each sub using minimum-phase mode and
+   `freq_focus_hz` matching the sub's operating range (e.g. [35, 90])
+3. Apply FIR to the **correct output index** — match each sub's coefficients to its output
+4. Re-measure combined response — FIR changes magnitude, not just time domain
+5. Adjust output PEQ to compensate for any FIR magnitude over-correction
+
+**Warning:** FIR and output PEQ interact. After applying FIR, the existing output PEQ
+may over-correct or under-correct specific bands. Design output PEQ compensation from
+a fresh combined measurement taken with FIR active — do not reuse the Phase 2 filters.
+
+### 4.3 Between-band peak hunting
+
+If `compute_deviation` shows max_error > 2 dB but 1/3-octave band errors are all < 1 dB,
+narrow peaks or dips exist between the standard reporting frequencies.
+
+1. Pull full-res FR: `get_measurement_history(format="compact", min_hz=20, max_hz=120)`
+2. Interpolate the Harman target at each measurement frequency
+3. Find the frequency with the largest positive error (peak above target)
+4. Design a narrow cut (Q=4-8) at that frequency
+5. Call `simulate_eq` to verify the cut doesn't bleed into adjacent well-tuned bands
+6. Apply and re-measure
+
+Cuts between bands are safe and effective. Use narrow Q to avoid disrupting neighboring
+1/3-octave centers. Be careful with filters closer than 1/3 octave — their skirts
+overlap and interact.
+
+### 4.4 Per-sub PEQ differentiation
+
+If output PEQ is currently broadcast (same filters on all subs from FIR compensation
+or combined-response tuning), per-sub corrections can improve further:
+
+1. Re-measure each sub solo with current FIR and input PEQ active
+2. Design independent output PEQ for each sub from its solo measurement
+3. Apply with `output_index` to target each sub independently
+
+Per-sub PEQ corrects each sub's unique room interaction. Broadcast PEQ is a
+compromise that averages over asymmetric room modes.
+
+### 4.5 Present optimization menu
+
+Don't auto-execute. Present available options with expected impact and let the
+user choose:
+
+```
+## Optimization opportunities (pick any)
+
+A) FIR ringing reduction — 46.9Hz T60 2852ms, 70.3Hz T60 2186ms
+   EXPECTED: 30-60% shorter decay, tighter bass transients
+   COST: Uses FIR taps (2048/output), may need output PEQ re-tuning
+
+B) Between-band peak hunting — 3.1 dB peak at 54Hz hidden between 50/63Hz bands
+   EXPECTED: RMS drop of ~0.3-0.5 dB
+   COST: Uses 1 PEQ slot per sub
+
+C) Per-sub PEQ tuning — currently broadcast, each sub gets its own correction
+   EXPECTED: Better null avoidance, tighter per-sub response
+   COST: Re-measure each sub solo, redesign all output PEQ
+
+D) Skip — current result is good enough, proceed to retrospective
+```
+
+Execute the user's chosen optimizations, re-measure after each, and report
+the updated RMS. Multiple optimizations can be combined (e.g. FIR + per-sub PEQ).
+
+## Phase 5 — Retrospective
 
 After calibration completes (whether converged or not), analyze everything from
 the run and give the user a roadmap for further improvement. This is where the
@@ -345,7 +442,7 @@ from measurement analytics.
 **Always run this phase**, even if calibration converged perfectly. There may be
 room improvements that would make the NEXT calibration even better.
 
-### 4.1 Gather run data
+### 5.1 Gather run data
 
 Collect the key data from all phases:
 - Solo measurement session IDs from Phase 1 and Phase 2
@@ -356,7 +453,7 @@ Collect the key data from all phases:
 - Final `compute_deviation` from Phase 3 (what converged, what didn't)
 - `compare_sessions` between baseline (first combined) and final measurement
 
-### 4.2 Before/after scorecard
+### 5.2 Before/after scorecard
 
 Present a clear before → after comparison:
 
@@ -371,7 +468,7 @@ PEQ slots used:     0/8 per sub → 4/8 per sub
 Input PEQ slots:    0/8         → 5/8
 ```
 
-### 4.3 Unfixable problems — room improvement recommendations
+### 5.3 Unfixable problems — room improvement recommendations
 
 Review `analyze_phase` results across all measurements. For every band where
 `fixable=False` or where EQ couldn't converge:
@@ -398,7 +495,7 @@ Review `analyze_phase` results across all measurements. For every band where
 - If coherence is consistently low across a broad band, it may be high
   ambient noise rather than a rattle
 
-### 4.4 EQ improvement opportunities
+### 5.4 EQ improvement opportunities
 
 **FIR candidates:**
 - Any mode where `analyze_decay` showed T60 > 500ms but PEQ only reduced the peak
@@ -412,7 +509,7 @@ Review `analyze_phase` results across all measurements. For every band where
   - Dropping the least-effective filter (smallest impact on RMS)
   - Switching to FIR for broadband correction
 
-### 4.5 Next steps — prioritized action list
+### 5.5 Next steps — prioritized action list
 
 Present a numbered list, ordered by expected impact:
 

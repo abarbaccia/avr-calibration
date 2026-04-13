@@ -161,7 +161,44 @@ Stop when: RMS deviation from Harman target < 2.0 dB across 25–80Hz
 
 Maximum iterations: 5
 
-## Phase 2 — Retrospective
+## Phase 2 — Performance Optimization (Optional)
+
+After convergence, inventory remaining DSP resources and suggest ways to push
+RMS lower. Present options and let the user choose.
+
+### 2.1 Inventory available resources
+
+Check what's still unused:
+- **Output PEQ slots**: `read_eq` — how many of the 8 slots are free?
+- **FIR taps**: `get_config` → `eq_capabilities.fir_capable`, `fir_max_taps_per_output`.
+  FIR can reduce ringing that PEQ can only attenuate.
+- **Between-band peaks**: Pull `get_measurement_history(format="compact", min_hz=20, max_hz=120)`
+  and scan for narrow peaks between the 1/3-octave centers that `compute_deviation`
+  summary doesn't report.
+
+Report the inventory to the user with current RMS and remaining resources.
+
+### 2.2 Optimization options
+
+Present available optimizations with expected impact:
+
+**FIR for ringing:** If `analyze_decay` showed modes with T60 > 500ms, FIR can
+shorten the decay where PEQ only reduced the peak amplitude. Call `design_fir`
+with minimum-phase mode using the baseline solo measurement. Apply to the sub's
+output, re-measure, and adjust PEQ to compensate for FIR magnitude changes.
+
+**Between-band peak hunting:** If max_error > 2 dB but 1/3-octave bands look good,
+narrow peaks exist between reporting frequencies. Pull full-res FR, find the worst
+peak, design a narrow cut (Q=4-8), simulate, and apply. Use narrow Q to avoid
+disrupting adjacent well-tuned bands.
+
+**Slot optimization:** If all slots are used but some filters have < 0.5 dB impact,
+consider dropping the least effective filter to free a slot for a higher-impact
+correction elsewhere.
+
+Let the user choose which to pursue, or skip to the retrospective.
+
+## Phase 3 — Retrospective
 
 After calibration completes, analyze the run and give the user a roadmap for
 further improvement. Always run this, even if EQ converged.

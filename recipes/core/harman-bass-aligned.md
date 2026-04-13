@@ -218,7 +218,43 @@ If max iterations reached:
 - Frequencies below the sub's capability cannot be boosted — that's expected
 - Large level differences between subs suggest repositioning or knob adjustment
 
-## Phase 3 — Retrospective
+## Phase 3 — Performance Optimization (Optional)
+
+After Phase 2 converges, inventory remaining DSP resources and suggest ways to
+push RMS lower. Present options and let the user choose.
+
+### 3.1 Inventory available resources
+
+Check what's still unused:
+- **Output PEQ slots**: `read_eq` — how many of the 8 slots are free?
+- **FIR taps**: `get_config` → `eq_capabilities.fir_capable`, `fir_max_taps_per_output`.
+  If FIR is available and unused, it can reduce ringing that PEQ can't.
+- **Between-band peaks**: Pull `get_measurement_history(format="compact", min_hz=20, max_hz=120)`
+  and check for narrow peaks between the 1/3-octave centers that `compute_deviation`
+  summary misses.
+
+Report the inventory to the user with current RMS and remaining resources.
+
+### 3.2 Optimization options
+
+Present available optimizations with expected impact:
+
+**FIR for ringing:** If `analyze_decay` showed modes with T60 > 500ms, FIR can
+shorten the decay. Measure each sub solo, call `design_fir` with minimum-phase mode,
+apply to correct output indices. Re-measure combined and adjust PEQ to compensate
+for FIR magnitude changes.
+
+**Between-band peak hunting:** If max_error > 2 dB but 1/3-octave bands are < 1 dB,
+there are narrow peaks between reporting frequencies. Design narrow cuts (Q=4-8)
+at the peak frequency. Simulate first — narrow filters close together interact.
+
+**Per-sub PEQ:** If EQ is currently shared (broadcast), switching to per-sub
+corrections with `output_index` can address each sub's unique room interaction.
+Requires re-measuring each sub solo.
+
+Let the user choose which optimizations to pursue, or skip to the retrospective.
+
+## Phase 4 — Retrospective
 
 After calibration completes, analyze the run and present a roadmap for improvement.
 Always run this phase, even if calibration converged.
