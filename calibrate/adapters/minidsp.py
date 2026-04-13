@@ -115,6 +115,7 @@ runs at a time, with a post-command delay for firmware commit.
 async def _run_minidsp_cli(
     *args: str,
     ignore_exit_codes: tuple[int, ...] = (),
+    timeout: float = 10.0,
 ) -> None:
     """Run a minidsp CLI command, raising MinidspApiError on non-zero exit.
 
@@ -138,11 +139,11 @@ async def _run_minidsp_cli(
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()  # reap zombie
-            raise MinidspApiError(1, f"minidsp {' '.join(args)}: timed out after 10s")
+            raise MinidspApiError(1, f"minidsp {' '.join(args)}: timed out after {timeout}s")
         if proc.returncode != 0 and proc.returncode not in ignore_exit_codes:
             raise MinidspApiError(
                 proc.returncode or 1,
@@ -429,7 +430,8 @@ class MinidspClient:
         """
         self._validate_output(output)
         # fir import returns exit code 1 on success (minidsp-rs#766) — ignore it
-        await _run_minidsp_cli("output", str(output), "fir", "import", path, ignore_exit_codes=(1,))
+        # FIR import transfers a WAV file over USB — needs longer timeout than PEQ commands
+        await _run_minidsp_cli("output", str(output), "fir", "import", path, ignore_exit_codes=(1,), timeout=60.0)
         await _run_minidsp_cli("output", str(output), "fir", "bypass", "off")
 
     async def set_output_fir_bypass(self, output: int, bypassed: bool) -> None:
@@ -447,7 +449,7 @@ class MinidspClient:
         """
         self._validate_output(output)
         # fir clear returns exit code 1 on success (minidsp-rs#766) — ignore it
-        await _run_minidsp_cli("output", str(output), "fir", "clear", ignore_exit_codes=(1,))
+        await _run_minidsp_cli("output", str(output), "fir", "clear", ignore_exit_codes=(1,), timeout=60.0)
         await _run_minidsp_cli("output", str(output), "fir", "bypass", "off")
 
     async def set_input_routing(
