@@ -682,13 +682,14 @@ async def test_trigger_measurement_no_target_for_raw_capture() -> None:
 # ── calibrate_level ────────────────────────────────────────────────────────────
 
 def _make_fr(spl_db: float) -> MagicMock:
-    """Build a mock FrequencyResponse with recording_peak_dbfs set.
+    """Build a mock FrequencyResponse with recording_rms_dbfs set.
 
-    _ir_spl() computes recording_peak_dbfs + mic_offset.
-    In tests the mic offset is 0 (no cal file), so SPL = recording_peak_dbfs.
+    _ir_spl() computes recording_rms_dbfs + mic_offset.
+    In tests the mic offset is 0 (no cal file), so SPL = recording_rms_dbfs.
     """
     fr = MagicMock()
-    fr.recording_peak_dbfs = spl_db
+    fr.recording_rms_dbfs = spl_db
+    fr.recording_peak_dbfs = spl_db  # fallback field
     return fr
 
 

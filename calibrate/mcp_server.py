@@ -1450,13 +1450,15 @@ async def _tool_calibrate_level(
             log.warning("calibrate_level: failed to parse UMIK sensitivity: %s", exc)
 
     def _ir_spl(fr) -> float:
-        """SPL estimate from recording peak + UMIK sensitivity offset.
+        """SPL estimate from recording RMS + UMIK sensitivity offset.
 
-        Uses the raw recording peak (dBFS) converted to acoustic SPL via
-        the UMIK cal file sensitivity.  This is more accurate than the
-        deconvolved IR peak, which includes a sweep-dependent normalization
-        constant that doesn't map directly to SPL.
+        Uses the RMS of the raw recording (dBFS) converted to acoustic SPL
+        via the UMIK cal file sensitivity.  RMS gives broadband average SPL,
+        which is what the target represents.  Peak would overestimate by
+        10-20 dB due to room modes and crest factor.
         """
+        if fr.recording_rms_dbfs is not None:
+            return float(round(fr.recording_rms_dbfs + _mic_offset, 1))
         return float(round(fr.recording_peak_dbfs + _mic_offset, 1))
     engine = MeasurementEngine(cfg)
     route = cfg.measurement.get("playback_route", "usb")

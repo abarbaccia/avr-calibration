@@ -73,6 +73,7 @@ class FrequencyResponse:
     impulse_response: Optional[list[float]] = None  # time-domain IR, gated to IR_GATE_S seconds
     phase: Optional[list[float]] = None  # radians, same grid as frequencies/spl
     recording_peak_dbfs: Optional[float] = None  # peak of raw recording before deconvolution
+    recording_rms_dbfs: Optional[float] = None  # RMS of raw recording (sweep portion)
     coherence: Optional[list[float]] = None  # 0-1 per frequency, measurement reliability
 
     def to_json(self) -> str:
@@ -85,6 +86,7 @@ class FrequencyResponse:
         data.setdefault("impulse_response", None)  # backward compat
         data.setdefault("phase", None)  # backward compat
         data.setdefault("recording_peak_dbfs", None)  # backward compat
+        data.setdefault("recording_rms_dbfs", None)  # backward compat
         data.setdefault("coherence", None)  # backward compat
         return cls(**data)
 
@@ -491,6 +493,8 @@ class MeasurementEngine:
         # sweep period, not transient noise during the 1s silence window.
         rec_peak_abs = float(np.max(np.abs(rec_for_deconv)))
         rec_peak_dbfs = round(20.0 * np.log10(rec_peak_abs + 1e-12), 1)
+        rec_rms = float(np.sqrt(np.mean(rec_for_deconv ** 2)))
+        rec_rms_dbfs = round(20.0 * np.log10(rec_rms + 1e-12), 1)
 
         # Load mic calibration curve if configured
         cal_curve = None
@@ -516,6 +520,7 @@ class MeasurementEngine:
             impulse_response=ir_samples,
             phase=phase,
             recording_peak_dbfs=rec_peak_dbfs,
+            recording_rms_dbfs=rec_rms_dbfs,
             coherence=coherence,
         )
 
