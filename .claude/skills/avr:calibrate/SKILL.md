@@ -32,67 +32,41 @@ Run a calibration recipe by reading it and executing each step via MCP tools.
 1. Call `get_config` to read the user's hardware setup.
 
 2. Show a HARDWARE LAYOUT diagram — all physical boxes and connections.
-   Build dynamically from config — do not hardcode labels, counts, or speaker models.
+   Build ENTIRELY from config — do not hardcode ANY labels, counts, models, or
+   connection types. Every piece of information comes from `get_config`.
 
-   The diagram has a top-to-bottom flow:
-   - Top: Pi 5 (controller)
-   - Middle: Denon AVR + miniDSP DSP (processing)
-   - Bottom: Speakers (grouped by what drives them) → room → UMIK → back to Pi
+   **Data sources:**
+   - `config.connections` → physical wiring between devices (from/to/via arrays)
+   - `config.minidsp.output_slots` → per-output label and type (sub/shaker/unused)
+   - `config.eq_capabilities` → PEQ slot counts, FIR tap counts per output
+   - `config.speakers` → speaker groups with positions and models
+   - `config.mic.name` → mic model
+   - `config.denon` → AVR info
 
-   Template (populate ALL fields from config):
+   **How to build the diagram:**
 
-   ```
-                            ┌──────────────┐
-                            │     Pi 5     │
-                            └──┬──┬──┬──▲──┘
-                   USB ctrl/   │  │  │  │ USB
-                   audio       │  │  │  │ recording
-                       ┌───────┘  │  │  │
-                       │    HDMI──┘  │  │
-                       │       Net───┘  │
-                       ▼                │
-   ┌───────────────────────────┐        │
-   │      miniDSP 2x4 HD      │        │
-   │                           │        │
-   │ Input PEQ [N, shared]     │        │
-   │                           │        │
-   │ Out 0: [label or unused]  │        │
-   │ Out 1: PEQ[N]→FIR[N]     │─┐      │
-   │ Out 2: PEQ[N]→FIR[N]     │─│─┐    │
-   │ Out 3: MUTED during cal   │─│─│─┐  │
-   └────────────▲──────────────┘ │ │ │  │
-                │[AVR→DSP conn]  │ │ │  │
-   ┌────────────┴──────────────┐ │ │ │  │
-   │      [AVR model]          │ │ │ │  │
-   │      [room correction]    │ │ │ │  │
-   └────────────┬──────────────┘ │ │ │  │
-                │[AVR→speakers]  │ │ │  │
-                ▼                ▼ ▼ ▼  │
-   ┌─────────────────┐ ┌──────────────────┐
-   │ [speakers from   │ │ [subs from       │
-   │  config.speakers]│ │  output_slots]   │
-   │ L/C/R: model     │ │ [shakers from    │
-   │ SL/SR: model     │ │  output_slots]   │
-   │ Atmos: model(xN) │ └────────┬─────────┘
-   └────────┬─────────┘          │
-            │                    │
-            ▼                    ▼
-   ┌──────────────────────────────────┐
-   │              room                │
-   └───────────────┬──────────────────┘
-                   │
-            ┌──────▼──────┐
-            │  [mic name] │── USB ──▶ Pi
-            └─────────────┘
-   ```
+   a. Draw a box for each unique device mentioned in `config.connections`
+      (pi, denon, minidsp, mic, speakers, subs, shakers). Use the device
+      model/name from config where available (e.g. config.denon for AVR name).
 
-   Populate from:
-   - config.minidsp.output_slots → per-output label and type (sub/shaker/unused)
-   - config.eq_capabilities → PEQ slot counts, FIR tap counts per output
-   - config.speakers → speaker groups with positions and models
-   - config.mic.name → mic model
-   - config.denon → AVR info
-   Mark shaker outputs as "MUTED during cal". Mark unused outputs as "(unused)".
+   b. Draw connection lines between boxes using the `via` field from each
+      connection entry. Label each line with the connection type(s).
+      Example: if connections has `{"from": "pi", "to": "denon", "via": ["hdmi", "network"]}`,
+      draw lines labeled "HDMI" and "Network" from Pi to Denon.
+
+   c. Inside the miniDSP box, list each output from `config.minidsp.output_slots`
+      with its label, type, and EQ capability from `config.eq_capabilities`.
+
+   d. Inside the speakers box, list groups from `config.speakers` with positions
+      and models.
+
+   e. Mark shaker outputs as "MUTED during cal". Mark unused outputs as "(unused)".
+
+   f. The room box sits between all speakers/subs and the mic. The mic connects
+      back to Pi (via its connection type from config.connections).
+
+   **Layout:** Top-to-bottom flow — Pi (controller) at top, processing in middle,
+   speakers/subs at bottom, room and mic below that feeding back to Pi.
 
 3. List all .md files in recipes/core/ using Glob.
 4. Read the first few lines of each recipe to get the Goal section.

@@ -53,6 +53,7 @@ DEFAULT_CONFIG: dict = {
         "ir_search_window_ms": 50.0,
     },
     "speakers": [],
+    "connections": [],
 }
 
 CONFIG_TEMPLATE = """\
