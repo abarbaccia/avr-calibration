@@ -38,13 +38,22 @@ MIN_BOOST_FREQ_HZ: float = 25.0
 """Minimum frequency at which a boost is permitted (ported sub port resonance protection)."""
 
 MAX_BOOST_PER_BAND_DB: float = 6.0
-"""Maximum boost allowed on any single EQ band."""
+"""Maximum boost allowed on any single EQ band (below FREQ_DEPENDENT_BOOST_THRESHOLD_HZ)."""
+
+MAX_BOOST_ABOVE_THRESHOLD_DB: float = 8.0
+"""Maximum boost above FREQ_DEPENDENT_BOOST_THRESHOLD_HZ (thermal limit only, SHARC has no saturation)."""
+
+FREQ_DEPENDENT_BOOST_THRESHOLD_HZ: float = 30.0
+"""Frequency above which the higher boost limit applies. Below this, port unloading risk is real."""
 
 MAX_CUMULATIVE_BOOST_DB: float = 9.0
 """Maximum total boost allowed in any single 1/3-octave band."""
 
 MAX_CHANGE_PER_ITER_DB: float = 3.0
 """Maximum increase in gain from the previous iteration on any band."""
+
+MAX_CHANGE_SIMULATED_DB: float = 6.0
+"""Maximum increase when the filter set has been verified by simulate_eq beforehand."""
 
 HPF_FREQ_HZ: float = 18.0
 """Infrasonic HPF cutoff frequency (Hz). Always injected; cannot be removed."""
@@ -139,15 +148,21 @@ class SafetyValidator:
         self,
         filters: list[FilterSpec],
         previous_filters: list[FilterSpec] | None = None,
+        simulation_verified: bool = False,
     ) -> ValidationResult:
         """Run all safety checks on *filters*.
 
         Checks (in order):
           1. Per-band boost frequency floor (≥ 25 Hz)
-          2. Per-band boost ceiling (≤ +6 dB)
+          2. Per-band boost ceiling (frequency-dependent: +6 dB below 30 Hz, +8 dB above)
           3. Cumulative 1/3-octave boost ceiling (≤ +9 dB)
-          4. Per-iteration change limit (≤ +3 dB increase vs previous_filters)
+          4. Per-iteration change limit (≤ +3 dB, or +6 dB if simulation_verified)
           5. HPF presence — mandatory 18 Hz 4th-order Butterworth
+
+        Args:
+            simulation_verified: If True, the caller has verified the filter set via
+                simulate_eq immediately before applying.  Relaxes the per-iteration
+                change limit from +3 dB to +6 dB.
 
         Returns ValidationResult.passed() if all checks pass, or
         ValidationResult.failed(reason) on the first violation found.
@@ -165,7 +180,9 @@ class SafetyValidator:
                 return result
 
         if previous_filters is not None:
-            result = self._check_per_iteration_change(filters, previous_filters)
+            result = self._check_per_iteration_change(
+                filters, previous_filters, simulation_verified=simulation_verified
+            )
             if not result.ok:
                 return result
 
@@ -190,14 +207,24 @@ class SafetyValidator:
     def _check_per_band_boost_ceiling(
         self, filters: list[FilterSpec]
     ) -> ValidationResult:
-        """Reject any single band with gain > MAX_BOOST_PER_BAND_DB."""
+        """Reject any single band with gain above the frequency-dependent limit.
+
+        Below 30 Hz: +6 dB (port unloading protection for ported subs).
+        At/above 30 Hz: +8 dB (thermal limit only; SHARC DSP has no saturation concern).
+        """
         for f in filters:
             if f.type == "hpf":
                 continue
-            if f.gain_db > MAX_BOOST_PER_BAND_DB:
+            limit = (
+                MAX_BOOST_PER_BAND_DB
+                if f.freq < FREQ_DEPENDENT_BOOST_THRESHOLD_HZ
+                else MAX_BOOST_ABOVE_THRESHOLD_DB
+            )
+            if f.gain_db > limit:
                 return ValidationResult.failed(
                     f"band at {f.freq:.1f} Hz requests +{f.gain_db:.1f} dB "
-                    f"(max per-band boost is +{MAX_BOOST_PER_BAND_DB:.0f} dB)"
+                    f"(max per-band boost at {'<' if f.freq < FREQ_DEPENDENT_BOOST_THRESHOLD_HZ else '>='}"
+                    f"{FREQ_DEPENDENT_BOOST_THRESHOLD_HZ:.0f} Hz is +{limit:.0f} dB)"
                 )
         return ValidationResult.passed()
 
@@ -226,13 +253,20 @@ class SafetyValidator:
         self,
         filters: list[FilterSpec],
         previous_filters: list[FilterSpec],
+        simulation_verified: bool = False,
     ) -> ValidationResult:
-        """Reject if any band increases by more than MAX_CHANGE_PER_ITER_DB vs previous.
+        """Reject if any band increases by more than the per-iteration limit vs previous.
+
+        Default limit is +3 dB.  If *simulation_verified* is True (the caller ran
+        ``simulate_eq`` and confirmed the predicted response), the limit relaxes to
+        +6 dB — halving measurement cycles after structural DSP changes like FIR.
 
         Matches filters by nearest 1/3-octave band (not exact frequency) to
         prevent drift-based bypasses where a correction algorithm shifts a
         filter from 50.0 Hz to 49.9 Hz to dodge the delta check.
         """
+        limit = MAX_CHANGE_SIMULATED_DB if simulation_verified else MAX_CHANGE_PER_ITER_DB
+
         # Build a lookup: previous gain by 1/3-octave centre
         prev_by_band: dict[float, float] = {}
         for f in previous_filters:
@@ -248,12 +282,13 @@ class SafetyValidator:
             centre = _third_octave_for_freq(f.freq)
             prev_gain = prev_by_band.get(centre, 0.0)
             delta = f.gain_db - prev_gain
-            if delta > MAX_CHANGE_PER_ITER_DB:
+            if delta > limit:
                 return ValidationResult.failed(
                     f"band at {f.freq:.1f} Hz (1/3-octave: {centre:.0f} Hz) "
                     f"increases by +{delta:.1f} dB "
                     f"(previous: {prev_gain:+.1f} dB → proposed: {f.gain_db:+.1f} dB; "
-                    f"max change per iteration is +{MAX_CHANGE_PER_ITER_DB:.0f} dB)"
+                    f"max change per iteration is +{limit:.0f} dB"
+                    f"{' [simulation-verified]' if simulation_verified else ''})"
                 )
         return ValidationResult.passed()
 

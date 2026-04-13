@@ -1,5 +1,5 @@
 ---
-name: subcrawl
+name: avr:subcrawl
 version: 1.0.0
 description: |
   Sub crawl placement optimization. Guides user through sub crawl procedure,
@@ -15,7 +15,7 @@ allowed-tools:
   - AskUserQuestion
 ---
 
-# /subcrawl
+# /avr:subcrawl
 
 Guide the user through a sub crawl to find the optimal subwoofer placement.
 

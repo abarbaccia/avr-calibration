@@ -1,5 +1,5 @@
 ---
-name: setup
+name: avr:configure
 version: 1.0.0
 description: |
   Interactive equipment configuration. Asks about hardware (AVR, DSP, subs, mic),
@@ -15,7 +15,7 @@ allowed-tools:
   - AskUserQuestion
 ---
 
-# /setup
+# /avr:configure
 
 Configure your calibration equipment interactively.
 

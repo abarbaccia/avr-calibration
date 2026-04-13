@@ -1,0 +1,18 @@
+{
+  "name": "House Curve (+3 dB)",
+  "description": "Gentle 3 dB bass shelf. A compromise between Harman and flat — popular with audiophiles who want warmth without the full Harman rise. The shelf shape is simpler to achieve with fewer PEQ slots than the Harman slope. Good for music-first systems.",
+  "reference_freq_hz": 80,
+  "points": [
+    { "freq_hz": 20, "offset_db": 3 },
+    { "freq_hz": 25, "offset_db": 3 },
+    { "freq_hz": 31.5, "offset_db": 3 },
+    { "freq_hz": 40, "offset_db": 2.5 },
+    { "freq_hz": 50, "offset_db": 2 },
+    { "freq_hz": 63, "offset_db": 1 },
+    { "freq_hz": 80, "offset_db": 0 },
+    { "freq_hz": 100, "offset_db": 0 },
+    { "freq_hz": 120, "offset_db": 0 }
+  ],
+  "default": false,
+  "tags": ["audiophile", "music", "compromise"]
+}

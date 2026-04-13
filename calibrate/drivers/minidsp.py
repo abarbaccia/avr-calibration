@@ -154,6 +154,7 @@ class MinidspDriver(DSPDriver):
     async def apply_eq(
         self, preset: int, filters: list[dict],
         output_index: int | None = None,
+        simulation_verified: bool = False,
     ) -> None:
         """Validate and apply EQ filters atomically under asyncio lock.
 
@@ -187,7 +188,10 @@ class MinidspDriver(DSPDriver):
             ] if prev_raw else None
 
             validator = SafetyValidator()
-            result = validator.validate(filter_specs, prev_specs)
+            result = validator.validate(
+                filter_specs, prev_specs,
+                simulation_verified=simulation_verified,
+            )
             if not result.ok:
                 raise DriverError(f"SafetyValidator: {result.error}")
 
@@ -215,6 +219,7 @@ class MinidspDriver(DSPDriver):
     async def apply_input_eq(
         self, preset: int, filters: list[dict],
         input_index: int | None = None,
+        simulation_verified: bool = False,
     ) -> None:
         """Apply EQ filters to the DSP input channel (shared across all outputs).
 
@@ -259,7 +264,10 @@ class MinidspDriver(DSPDriver):
             ] if prev_raw else None
 
             validator = SafetyValidator()
-            result = validator.validate(filter_specs, prev_specs)
+            result = validator.validate(
+                filter_specs, prev_specs,
+                simulation_verified=simulation_verified,
+            )
             if not result.ok:
                 raise DriverError(f"SafetyValidator: {result.error}")
 

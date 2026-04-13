@@ -128,10 +128,10 @@ def mock_dsp():
     async def read_eq(preset: int) -> list[dict]:
         return list(_eq_state.get(preset, []))
 
-    async def apply_eq(preset: int, filters: list[dict], output_index: int | None = None) -> None:
+    async def apply_eq(preset: int, filters: list[dict], output_index: int | None = None, simulation_verified: bool = False) -> None:
         _eq_state[preset] = list(filters)
 
-    async def apply_input_eq(preset: int, filters: list[dict], input_index: int | None = None) -> None:
+    async def apply_input_eq(preset: int, filters: list[dict], input_index: int | None = None, simulation_verified: bool = False) -> None:
         _eq_state[("input", preset)] = list(filters)
 
     async def read_input_eq(preset: int) -> list[dict]:

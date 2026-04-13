@@ -1,5 +1,5 @@
 ---
-name: status
+name: avr:status
 version: 1.0.0
 description: |
   Current system state review. Shows EQ state, last measurement,
@@ -15,7 +15,7 @@ allowed-tools:
   - AskUserQuestion
 ---
 
-# /status
+# /avr:status
 
 Review the current state of the calibration system.
 
@@ -45,7 +45,7 @@ Show the active EQ filters on the DSP:
 If measurements exist:
 - When the last measurement was taken
 - Key metrics: bass extension, smoothness, average level
-- If a Harman target comparison is possible, show RMS deviation
+- If a target comparison is possible, show RMS deviation
 
 ### Step 4 — Calibration history
 
@@ -63,10 +63,10 @@ If calibration runs exist:
 ### Step 6 — Summary
 
 One-paragraph summary: "System is calibrated to X with Y dB deviation" or
-"System has no active calibration. Run /calibrate to start."
+"System has no active calibration. Run /avr:calibrate to start."
 
 ## Important rules
 
 1. **Read-only.** This skill never modifies anything.
 2. **Be concise.** Show the important numbers, not raw data dumps.
-3. **Suggest next steps.** If the system isn't calibrated, suggest /calibrate.
+3. **Suggest next steps.** If the system isn't calibrated, suggest /avr:calibrate.

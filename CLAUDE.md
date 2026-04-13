@@ -42,7 +42,7 @@ STOP — that logic belongs in a Claude skill or recipe, not in Python code.
 
 | Concern | Where | Example |
 |---------|-------|---------|
-| Loop logic (measure→analyze→adjust→repeat) | Claude skill / recipe | `/calibrate` reads recipe, calls MCP tools |
+| Loop logic (measure→analyze→adjust→repeat) | Claude skill / recipe | `/avr:calibrate` reads recipe, calls MCP tools |
 | Decision-making (what to adjust next) | Claude | "subs are 3ms apart, increase delay on sub 1" |
 | Filter design (which freqs, PEQ vs FIR) | Claude | "45Hz is min-phase, cut it; 55Hz is cancellation, skip" |
 | Numerical computation (FFT, biquad math) | MCP tools | `simulate_eq`, `optimize_q`, `design_fir` |
@@ -238,14 +238,14 @@ tool as your FIRST action. Do NOT answer directly, do NOT use other tools first.
 The skill has specialized workflows that produce better results than ad-hoc answers.
 
 Key routing rules:
-- "Calibrate", "run calibration", "tune the subs" → invoke calibrate
-- "Verify", "check integration", "how's it all sound", "post-Audyssey" → invoke verify
-- "Set up", "configure", "new hardware" → invoke setup
-- "Build a recipe", "new recipe", "full room recipe" → invoke recipe
-- "Sub crawl", "find best position" → invoke subcrawl
-- "Take a measurement", "how does it sound" → invoke measure
-- "Check system", "is everything connected" → invoke check
-- "What's the current state", "where are we" → invoke status
+- "Calibrate", "run calibration", "tune the subs" → invoke avr:calibrate
+- "Verify", "check integration", "how's it all sound", "post-Audyssey" → invoke avr:verify
+- "Set up", "configure", "new hardware" → invoke avr:configure
+- "Build a recipe", "new recipe", "full room recipe" → invoke avr:recipe
+- "Sub crawl", "find best position" → invoke avr:subcrawl
+- "Take a measurement", "how does it sound" → invoke avr:measure
+- "Check system", "is everything connected" → invoke avr:check
+- "What's the current state", "where are we" → invoke avr:status
 - Bugs, errors, "why is this broken" → invoke investigate
 - Ship, deploy, push, create PR → invoke ship
 - Code review, check my diff → invoke review
