@@ -442,15 +442,15 @@ class MinidspClient:
         )
 
     async def clear_output_fir(self, output: int) -> None:
-        """Clear FIR coefficients and reset to passthrough (bypass off) via CLI.
+        """Clear FIR coefficients and bypass the FIR stage via CLI.
 
-        Explicitly sets bypass=off after clearing to ensure a deterministic
-        passthrough state regardless of firmware behaviour post-clear.
+        After clearing, bypass must be ON — cleared coefficients are zeros,
+        so bypass=off would zero out all signal through the FIR engine.
         """
         self._validate_output(output)
         # fir clear returns exit code 1 on success (minidsp-rs#766) — ignore it
         await _run_minidsp_cli("output", str(output), "fir", "clear", ignore_exit_codes=(1,), timeout=60.0)
-        await _run_minidsp_cli("output", str(output), "fir", "bypass", "off")
+        await _run_minidsp_cli("output", str(output), "fir", "bypass", "on")
 
     async def set_input_routing(
         self,
