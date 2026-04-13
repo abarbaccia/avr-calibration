@@ -1,7 +1,7 @@
 """FastAPI web server — read-only calibration dashboard.
 
 Shows system status, measurement history, calibration runs, and FR plots.
-Headless measurement via POST /api/measure (Pi 5 with UMIK-1).
+Observation deck for AI-driven calibration — Claude drives measurements via MCP.
 """
 
 from __future__ import annotations
@@ -23,8 +23,8 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from .config import Config, CONFIG_PATH
-from .drivers.denon import DenonDriver, DenonSweepContext
-from .measurement import MeasurementEngine, FrequencyResponse, _find_umik_device
+from .drivers.denon import DenonDriver
+from .measurement import FrequencyResponse, _find_umik_device
 from .storage import SessionStore
 
 app = FastAPI(title="avr-calibration")
@@ -39,9 +39,6 @@ _VERSION_CACHE_TTL = 3600
 _version_cache: dict = {}
 _DATA_DIR = Path(os.environ.get("HOME", "/data")) / ".avr-calibration"
 
-# Headless measurement lock — prevents concurrent /api/measure calls from racing
-# on sd.default.device (a global PortAudio setting).
-_measurement_lock = asyncio.Lock()
 
 # ── HTML page ─────────────────────────────────────────────────────────────────
 
@@ -55,9 +52,10 @@ _HTML = """<!DOCTYPE html>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
-      --bg: #0d0f14; --card: #1a1f2e; --border: #2d3748; --text: #e2e8f0;
-      --muted: #94a3b8; --dim: #64748b; --accent: #3b82f6; --green: #4ade80;
-      --yellow: #fbbf24; --red: #f87171; --teal: #2dd4bf;
+      --bg: #0d0f14; --card: #1a1f2e; --card2: #151a27; --border: #2d3748;
+      --text: #e2e8f0; --muted: #94a3b8; --dim: #64748b;
+      --accent: #3b82f6; --green: #4ade80; --yellow: #fbbf24;
+      --red: #f87171; --teal: #2dd4bf;
     }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -70,12 +68,12 @@ _HTML = """<!DOCTYPE html>
 
     /* ── Layout ── */
     .container { width: 100%; max-width: 900px; }
-    .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.5rem; }
+    .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
     .header h1 { font-size: 1.2rem; font-weight: 600; color: var(--muted); letter-spacing: .04em; text-transform: uppercase; }
     #versionChip {
       font-size: .7rem; font-weight: 600; letter-spacing: .03em;
       background: var(--card); border: 1px solid var(--border); border-radius: 999px;
-      padding: .2rem .6rem; color: var(--muted); cursor: default; white-space: nowrap;
+      padding: .2rem .6rem; color: var(--muted); cursor: pointer; white-space: nowrap;
     }
     #versionChip.up-to-date { color: var(--green); border-color: var(--green); }
     #versionChip.update-available { color: var(--yellow); border-color: var(--yellow); }
@@ -89,6 +87,18 @@ _HTML = """<!DOCTYPE html>
       font-size: .8rem; text-transform: uppercase; letter-spacing: .08em;
       color: var(--dim); margin-bottom: .75rem;
     }
+
+    /* ── Hardware status bar ── */
+    .hw-bar-card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+      padding: .75rem 1.25rem; margin-bottom: 1rem;
+    }
+    .hw-bar { display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }
+    .hw-item { display: flex; align-items: center; gap: .35rem; font-size: .78rem; color: var(--muted); }
+    .hw-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+    .hw-dot.ok { background: var(--green); box-shadow: 0 0 4px var(--green); }
+    .hw-dot.err { background: var(--red); box-shadow: 0 0 4px var(--red); }
+    .hw-detail { font-size: .7rem; color: var(--dim); }
 
     /* ── Hero score ── */
     .hero { display: flex; align-items: center; gap: 1.5rem; flex-wrap: wrap; }
@@ -106,14 +116,9 @@ _HTML = """<!DOCTYPE html>
     .hero-meta { flex: 1; min-width: 200px; }
     .hero-meta .label { font-size: .78rem; color: var(--dim); margin-bottom: .25rem; }
     .hero-meta .detail { font-size: .88rem; color: var(--text); margin-bottom: .5rem; }
-    .hero-actions { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .25rem; }
-
-    /* ── Hardware status (inline) ── */
-    .hw-bar { display: flex; gap: .75rem; flex-wrap: wrap; padding: .5rem 0; }
-    .hw-item { display: flex; align-items: center; gap: .35rem; font-size: .78rem; color: var(--muted); }
-    .hw-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
-    .hw-dot.ok { background: var(--green); box-shadow: 0 0 4px var(--green); }
-    .hw-dot.err { background: var(--red); box-shadow: 0 0 4px var(--red); }
+    .trend-up { color: var(--green); }
+    .trend-down { color: var(--red); }
+    .trend-flat { color: var(--dim); }
 
     /* ── Buttons ── */
     button, .btn {
@@ -167,9 +172,7 @@ _HTML = """<!DOCTYPE html>
     .badge-warn    { background: rgba(245,158,11,.15); color: var(--yellow); border: 1px solid #f59e0b; }
     .badge-danger  { background: rgba(239,68,68,.15);  color: var(--red); border: 1px solid #ef4444; }
     .badge-empty   { background: rgba(100,116,139,.15);color: var(--muted); border: 1px solid #475569; }
-    @keyframes versionPulse { 0%,100% { opacity:1; } 50% { opacity:.5; } }
-    .badge-upgrading { animation: versionPulse 1.2s ease-in-out infinite;
-      background: rgba(45,212,191,.15); color: var(--teal); border: 1px solid var(--teal); }
+    .badge-run     { background: rgba(59,130,246,.12); color: var(--accent); border: 1px solid rgba(59,130,246,.3); font-size: .68rem; }
 
     /* ── Collapsible sections ── */
     .collapse-header {
@@ -182,6 +185,74 @@ _HTML = """<!DOCTYPE html>
     .collapse-header.open .arrow { transform: rotate(90deg); }
     .collapse-body { overflow: hidden; transition: max-height .25s ease; }
     .collapse-body.collapsed { max-height: 0 !important; }
+
+    /* ── DSP state ── */
+    .dsp-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: .75rem; margin-top: .5rem; }
+    .dsp-output {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+      padding: .6rem .75rem;
+    }
+    .dsp-output-header { display: flex; align-items: center; gap: .4rem; margin-bottom: .4rem; }
+    .dsp-output-label { font-weight: 600; font-size: .85rem; }
+    .dsp-output-type { font-size: .68rem; color: var(--dim); }
+    .dsp-param { font-size: .75rem; color: var(--muted); margin-bottom: .15rem; }
+    .dsp-param span { color: var(--text); }
+    .dsp-filter-list { font-size: .72rem; color: var(--muted); margin-top: .3rem; }
+    .dsp-filter-list .f-row { display: flex; gap: .5rem; padding: .1rem 0; border-bottom: 1px solid #1a2030; }
+    .dsp-filter-list .f-row:last-child { border-bottom: none; }
+    .dsp-section-label { font-size: .75rem; font-weight: 600; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; margin-bottom: .4rem; }
+
+    /* ── Activity timeline ── */
+    .timeline { display: flex; flex-direction: column; gap: .25rem; }
+    .timeline-event {
+      display: flex; align-items: flex-start; gap: .6rem;
+      padding: .35rem 0; border-bottom: 1px solid rgba(45,55,72,.4);
+      font-size: .78rem;
+    }
+    .timeline-event:last-child { border-bottom: none; }
+    .timeline-time { color: var(--dim); font-size: .7rem; white-space: nowrap; min-width: 3.5rem; }
+    .timeline-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; margin-top: 5px; }
+    .timeline-dot.measurement { background: var(--accent); }
+    .timeline-dot.run_start { background: var(--yellow); }
+    .timeline-dot.run_complete { background: var(--green); }
+    .timeline-dot.eq_applied { background: var(--teal); }
+    .timeline-summary { color: var(--text); flex: 1; }
+
+    /* ── Tabs ── */
+    .tab-bar { display: flex; gap: 0; margin-bottom: 1rem; border-bottom: 2px solid var(--border); }
+    .tab-btn {
+      padding: .5rem 1.25rem; font-size: .82rem; font-weight: 500; cursor: pointer;
+      background: none; border: none; color: var(--dim); border-bottom: 2px solid transparent;
+      margin-bottom: -2px; transition: color .15s, border-color .15s;
+    }
+    .tab-btn:hover { color: var(--text); }
+    .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    /* ── Run cards ── */
+    .run-card {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+      margin-bottom: .5rem; overflow: hidden;
+    }
+    .run-card-header {
+      display: flex; align-items: center; gap: .75rem; padding: .6rem .75rem;
+      cursor: pointer; user-select: none; flex-wrap: wrap;
+    }
+    .run-card-header:hover { background: #1e2535; }
+    .run-card-arrow { font-size: .7rem; color: var(--dim); transition: transform .2s; flex-shrink: 0; }
+    .run-card-arrow.open { transform: rotate(90deg); }
+    .run-card-title { font-size: .85rem; font-weight: 500; flex: 1; }
+    .run-card-rms { font-size: .78rem; font-weight: 600; }
+    .run-card-body { padding: .5rem .75rem .75rem; border-top: 1px solid var(--border); }
+    .run-card-meta { font-size: .75rem; color: var(--dim); margin-bottom: .5rem; }
+    .run-sessions { display: flex; gap: .35rem; flex-wrap: wrap; margin-top: .35rem; }
+    .run-session-chip {
+      display: inline-block; padding: .15rem .45rem; border-radius: 4px; font-size: .7rem;
+      background: rgba(59,130,246,.1); color: var(--accent); border: 1px solid rgba(59,130,246,.25);
+      cursor: pointer;
+    }
+    .run-session-chip:hover { background: rgba(59,130,246,.2); }
 
     /* ── Saved states ── */
     .state-list { display: flex; flex-direction: column; gap: .5rem; }
@@ -216,12 +287,29 @@ _HTML = """<!DOCTYPE html>
       padding: 1.5rem; width: 90%; max-width: 400px;
     }
     .modal h3 { font-size: 1rem; margin-bottom: 1rem; }
-    .modal input[type=text] {
+    .modal input[type=text], .modal textarea {
       width: 100%; padding: .5rem .75rem; background: var(--bg); border: 1px solid var(--border);
       border-radius: 6px; color: var(--text); font-size: .9rem; margin-bottom: .75rem;
+      font-family: inherit;
     }
-    .modal input[type=text]:focus { outline: none; border-color: var(--accent); }
+    .modal input[type=text]:focus, .modal textarea:focus { outline: none; border-color: var(--accent); }
+    .modal textarea { resize: vertical; min-height: 60px; }
     .modal-actions { display: flex; justify-content: flex-end; gap: .5rem; }
+
+    /* ── Feedback ── */
+    .feedback-bar {
+      display: flex; align-items: center; gap: .5rem; margin-top: .5rem;
+      padding: .4rem 0; font-size: .78rem;
+    }
+    .feedback-btn {
+      padding: .2rem .5rem; border-radius: 4px; font-size: .85rem; cursor: pointer;
+      background: var(--bg); border: 1px solid var(--border); color: var(--muted);
+      transition: all .15s;
+    }
+    .feedback-btn:hover { border-color: var(--accent); color: var(--text); }
+    .feedback-btn.active-up { border-color: var(--green); color: var(--green); background: rgba(74,222,128,.1); }
+    .feedback-btn.active-down { border-color: var(--red); color: var(--red); background: rgba(248,113,113,.1); }
+    .feedback-existing { font-size: .72rem; color: var(--dim); font-style: italic; }
 
     /* ── Harman delta colors ── */
     .harman-good { color: var(--green); }
@@ -237,28 +325,14 @@ _HTML = """<!DOCTYPE html>
     }
     #toast.show { opacity: 1; }
 
-    /* ── DSP state ── */
-    .dsp-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: .75rem; margin-top: .5rem; }
-    .dsp-output {
-      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
-      padding: .6rem .75rem;
+    /* ── Ad-hoc group ── */
+    .adhoc-group { margin-top: .75rem; }
+    .adhoc-header { font-size: .78rem; color: var(--dim); font-weight: 500; margin-bottom: .35rem; }
+    .adhoc-item {
+      display: flex; align-items: center; gap: .5rem; padding: .3rem .5rem;
+      font-size: .78rem; cursor: pointer; border-radius: 4px;
     }
-    .dsp-output-header { display: flex; align-items: center; gap: .4rem; margin-bottom: .4rem; }
-    .dsp-output-label { font-weight: 600; font-size: .85rem; }
-    .dsp-output-type { font-size: .68rem; color: var(--dim); }
-    .dsp-param { font-size: .75rem; color: var(--muted); margin-bottom: .15rem; }
-    .dsp-param span { color: var(--text); }
-    .dsp-filter-list { font-size: .72rem; color: var(--muted); margin-top: .3rem; }
-    .dsp-filter-list .f-row { display: flex; gap: .5rem; padding: .1rem 0; border-bottom: 1px solid #1a2030; }
-    .dsp-filter-list .f-row:last-child { border-bottom: none; }
-    .dsp-section-label { font-size: .75rem; font-weight: 600; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; margin-bottom: .4rem; }
-
-    /* ── Version footer ── */
-    #versionFooter {
-      width: 100%; max-width: 900px; margin-top: .5rem; padding: .4rem 1rem;
-      display: flex; align-items: center; justify-content: space-between; gap: .75rem;
-      flex-wrap: wrap; font-size: .75rem; color: var(--dim);
-    }
+    .adhoc-item:hover { background: #1e2535; }
   </style>
 </head>
 <body>
@@ -267,7 +341,12 @@ _HTML = """<!DOCTYPE html>
   <!-- Header -->
   <div class="header">
     <h1><a href="/" style="color:inherit;text-decoration:none">AVR Calibration</a></h1>
-    <span id="versionChip" title="Running version">...</span>
+    <span id="versionChip" title="Running version" onclick="toggleVersionPopover()">...</span>
+  </div>
+
+  <!-- Hardware Status Bar -->
+  <div class="hw-bar-card">
+    <div class="hw-bar" id="hwBar">Loading hardware status...</div>
   </div>
 
   <!-- Hero: Room Score + Latest FR -->
@@ -280,24 +359,18 @@ _HTML = """<!DOCTYPE html>
       <div class="hero-meta">
         <div class="label" id="heroLabel">No measurements yet</div>
         <div class="detail" id="heroDetail">Take a measurement to see your room's bass response</div>
-        <div class="detail" id="heroContext" style="font-size:.75rem;color:var(--dim);margin-top:-.25rem;margin-bottom:.5rem;"></div>
-        <div class="hw-bar" id="hwBar">Loading...</div>
+        <div class="detail" id="heroContext" style="font-size:.75rem;color:var(--dim);margin-top:-.25rem"></div>
       </div>
     </div>
   </div>
 
-  <!-- Active DSP State -->
+  <!-- Active DSP State (always visible) -->
   <div class="card" id="dspCard" style="display:none">
-    <div class="collapse-header" onclick="toggleSection('dsp')">
-      <h2>Active DSP State</h2>
-      <span class="arrow">&#9654;</span>
-    </div>
-    <div id="dspBody" class="collapse-body">
-      <div id="dspContent" style="font-size:.82rem;"></div>
-    </div>
+    <h2>Active DSP State</h2>
+    <div id="dspContent" style="font-size:.82rem;"></div>
   </div>
 
-  <!-- FR Plot (always visible when data exists) -->
+  <!-- FR Plot -->
   <div class="card" id="plotCard" style="display:none">
     <div class="chart-controls">
       <label for="curveSelect">Compare:</label>
@@ -316,6 +389,14 @@ _HTML = """<!DOCTYPE html>
     <div class="overlay-chips" id="overlayChips"></div>
     <canvas id="frPlot"></canvas>
     <p id="plotStatus"></p>
+    <!-- Feedback bar for current session -->
+    <div class="feedback-bar" id="feedbackBar" style="display:none">
+      <span style="color:var(--dim)">How does it sound?</span>
+      <button class="feedback-btn" id="fbUp" onclick="submitFeedback('up')">&#x1f44d;</button>
+      <button class="feedback-btn" id="fbDown" onclick="submitFeedback('down')">&#x1f44e;</button>
+      <input type="text" id="fbText" placeholder="Optional: too boomy, thin, etc." style="flex:1;padding:.25rem .5rem;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.75rem;">
+      <span class="feedback-existing" id="fbExisting"></span>
+    </div>
   </div>
 
   <!-- Convergence Delta (shown when viewing a session) -->
@@ -327,60 +408,66 @@ _HTML = """<!DOCTYPE html>
     </table>
   </div>
 
-  <!-- Saved States -->
-  <div class="card" id="statesCard">
-    <div class="collapse-header open" onclick="toggleSection('states')">
-      <h2>Saved States <span class="count" id="statesCount"></span></h2>
-      <span class="arrow" id="statesArrow">&#9654;</span>
+  <!-- Activity Timeline -->
+  <div class="card" id="activityCard">
+    <div class="collapse-header open" onclick="toggleSection('activity')">
+      <h2>Activity</h2>
+      <span class="arrow" id="activityArrow">&#9654;</span>
     </div>
-    <div class="collapse-body" id="statesBody">
-      <div class="state-list" id="stateList">
-        <div style="color:var(--dim);font-size:.82rem;">No saved states yet</div>
+    <div class="collapse-body" id="activityBody">
+      <div class="timeline" id="activityTimeline">
+        <div style="color:var(--dim);font-size:.82rem;">Loading activity...</div>
       </div>
     </div>
   </div>
 
-  <!-- Sweep History -->
-  <div class="card">
-    <div class="collapse-header open" onclick="toggleSection('hist')">
-      <h2>Measurements <span class="count" id="histCount"></span></h2>
-      <span class="arrow" id="histArrow">&#9654;</span>
-    </div>
-    <div class="collapse-body" id="histSection">
-      <div style="display:flex;gap:.5rem;margin-bottom:.5rem;">
-        <button class="btn-secondary btn-sm" id="overlayBtn" style="display:none" onclick="overlaySelected()">Overlay Selected</button>
-        <button class="btn-secondary btn-sm" id="avgBtn" style="display:none" onclick="averageSelected()">Average Selected</button>
-      </div>
-      <table id="histTable">
-        <thead>
-          <tr><th class="cb-col"></th><th>#</th><th>Date</th><th>Type</th><th>Peak SPL</th><th>&Delta; Harman</th></tr>
-        </thead>
-        <tbody id="histBody"></tbody>
-      </table>
+  <!-- Tab bar: Runs | Sessions -->
+  <div class="tab-bar">
+    <button class="tab-btn active" data-tab="runs" onclick="switchTab('runs')">Runs</button>
+    <button class="tab-btn" data-tab="sessions" onclick="switchTab('sessions')">Sessions</button>
+  </div>
+
+  <!-- Runs tab -->
+  <div class="tab-panel active" id="tab-runs">
+    <div id="runsContent">
+      <div style="color:var(--dim);font-size:.82rem;">Loading calibration runs...</div>
     </div>
   </div>
 
-  <!-- Calibration Runs -->
-  <div class="card" id="runsCard">
-    <div class="collapse-header" onclick="toggleSection('runs')">
-      <h2>Calibration Runs <span class="count" id="runsCount"></span></h2>
-      <span class="arrow" id="runsArrow">&#9654;</span>
+  <!-- Sessions tab -->
+  <div class="tab-panel" id="tab-sessions">
+    <div style="display:flex;gap:.5rem;margin-bottom:.5rem;">
+      <button class="btn-secondary btn-sm" id="overlayBtn" style="display:none" onclick="overlaySelected()">Overlay Selected</button>
+      <button class="btn-secondary btn-sm" id="avgBtn" style="display:none" onclick="averageSelected()">Average Selected</button>
     </div>
-    <div class="collapse-body collapsed" id="runsSection">
-      <table><thead><tr>
-        <th>#</th><th>Date</th><th>Recipe</th><th>Target</th>
-        <th>Status</th><th>Iters</th><th>Baseline</th><th>Final</th>
-      </tr></thead><tbody id="runsBody"></tbody></table>
-    </div>
+    <table id="histTable">
+      <thead>
+        <tr><th class="cb-col"></th><th>#</th><th>Date</th><th>Type</th><th>Peak SPL</th><th>&Delta; Target</th><th>Run</th></tr>
+      </thead>
+      <tbody id="histBody"></tbody>
+    </table>
   </div>
 
-  <!-- Run Detail -->
+  <!-- Run Detail (convergence chart) -->
   <div class="card" id="runDetailCard" style="display:none">
     <h2>Run Detail</h2>
     <canvas id="convergenceChart" height="200"></canvas>
     <table style="margin-top:.75rem"><thead><tr>
       <th>Iter</th><th>RMS Before</th><th>RMS After</th><th>Safety</th><th>Filters</th>
     </tr></thead><tbody id="runIterBody"></tbody></table>
+  </div>
+
+  <!-- Saved States -->
+  <div class="card" id="statesCard">
+    <div class="collapse-header" onclick="toggleSection('states')">
+      <h2>Saved States <span class="count" id="statesCount"></span></h2>
+      <span class="arrow" id="statesArrow">&#9654;</span>
+    </div>
+    <div class="collapse-body collapsed" id="statesBody">
+      <div class="state-list" id="stateList">
+        <div style="color:var(--dim);font-size:.82rem;">No saved states yet</div>
+      </div>
+    </div>
   </div>
 
 </div><!-- /container -->
@@ -400,21 +487,9 @@ _HTML = """<!DOCTYPE html>
 
 <div id="toast"></div>
 
-<div id="versionFooter">
-  <div id="versionBadge"><span class="badge badge-empty">Checking version...</span></div>
-  <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;">
-    <span id="versionStatus" role="status" aria-live="polite" tabindex="-1"
-          style="display:none;"></span>
-    <div id="upgradeConfirm" style="display:none;font-size:.8rem;">
-      Restart to install update?
-      <button type="button" onclick="confirmUpgrade()" class="btn-save btn-sm" style="margin-left:.5rem;">Confirm</button>
-      <button type="button" onclick="cancelUpgrade()" class="btn-secondary btn-sm">Cancel</button>
-    </div>
-    <button type="button" id="upgradeBtn" class="btn-save btn-sm" style="display:none;" onclick="showUpgradeConfirm()">Upgrade</button>
-  </div>
-</div>
-
-<footer style="width:100%;max-width:900px;margin-top:.25rem;text-align:center;padding:.5rem 0;">
+<footer style="width:100%;max-width:900px;margin-top:.5rem;text-align:center;padding:.5rem 0;">
+  <span id="versionFooterText" style="color:var(--dim);font-size:.72rem;"></span>
+  <span style="color:var(--dim);font-size:.72rem;"> &middot; </span>
   <a href="https://github.com/abarbaccia/avr-calibration" target="_blank" rel="noopener"
      style="color:var(--dim);font-size:.72rem;">github.com/abarbaccia/avr-calibration</a>
 </footer>
@@ -427,16 +502,12 @@ let selectedSessionId = null;
 let overlayIds = [];
 let latestSession = null;
 let allSessions = [];
+let previousRms = null;
 
 const OVERLAY_COLORS = ['#3b82f6','#f472b6','#a78bfa','#fb923c','#34d399','#f87171'];
 
 // ── Target curves ───────────────────────────────────────────────────────────
-// ── Target curve — stored from calibration, comparison curves as overlays ──
-
-// Stored target from last calibration run (loaded from /api/dsp-state)
-let storedTarget = null;  // {type, reference_spl, points: [{freq, spl}]}
-
-// Harman bass offsets for comparison curve generation
+let storedTarget = null;
 const HARMAN_TABLE = {20:6, 25:5, 31.5:4, 40:3, 50:2, 63:1, 80:0, 100:0, 125:0, 160:-1, 200:-2};
 
 function harmanOffset(f) {
@@ -452,9 +523,7 @@ function harmanOffset(f) {
   return 0;
 }
 
-// Comparison curves: use the stored target's reference_spl so they're at the same level
-let comparisonCurves = [];  // ['harman', 'flat', 'ht', 'music']
-
+let comparisonCurves = [];
 function onAddComparison() {
   const sel = document.getElementById('curveSelect');
   const type = sel.value;
@@ -475,7 +544,6 @@ function buildComparisonCurve(type, freqs, refSpl) {
     const oct = Math.log2(f / 30);
     return {x: f, y: refSpl + 4 * Math.exp(-(oct * oct) / (2 * 0.7 * 0.7))};
   });
-  // harman
   return freqs.map(f => ({x: f, y: refSpl + harmanOffset(f)}));
 }
 
@@ -492,10 +560,16 @@ function toast(msg) {
 
 // ── Collapsible sections ────────────────────────────────────────────────────
 function toggleSection(name) {
-  const body = document.getElementById(name + (name === 'hist' ? 'Section' : name === 'runs' ? 'Section' : 'Body'));
+  const body = document.getElementById(name + 'Body');
   const header = body.previousElementSibling || body.closest('.card').querySelector('.collapse-header');
   body.classList.toggle('collapsed');
   header.classList.toggle('open');
+}
+
+// ── Tabs ────────────────────────────────────────────────────────────────────
+function switchTab(tab) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'tab-' + tab));
 }
 
 // ── Convergence delta table ─────────────────────────────────────────────────
@@ -507,13 +581,10 @@ function renderDeltaTable(freqs, spl) {
     document.getElementById('deltaCard').style.display = 'none';
     return;
   }
-  // Build lookup from stored target points
   const tPts = storedTarget.points;
   const rows = THIRD_OCT.map(fc => {
-    // Closest measurement bin
     let bi = 0, bd = Infinity;
     freqs.forEach((f, i) => { const d = Math.abs(f - fc); if (d < bd) { bd = d; bi = i; } });
-    // Closest target point
     let ti = 0, td = Infinity;
     tPts.forEach((pt, i) => { const d = Math.abs(pt.freq - fc); if (d < td) { td = d; ti = i; } });
     const measSpl = spl[bi];
@@ -529,10 +600,36 @@ function renderDeltaTable(freqs, spl) {
 
 // ── FR chart rendering ──────────────────────────────────────────────────────
 let portTuneHz = null;
-let chartData = {};  // {primary: {freqs, spl, label}, overlays: [{id, freqs, spl, label}]}
+let chartData = {};
 
 function toXY(freqs, spl) {
   return freqs.map((f, i) => ({x: f, y: spl[i]}));
+}
+
+function classifyLabel(label) {
+  if (!label) return { type: 'unknown', desc: 'Unknown measurement', position: null };
+  const l = label.toLowerCase();
+  let position = null;
+  const atMatch = label.match(/@\\s*(.+)$/);
+  if (atMatch) position = atMatch[1].trim();
+  const pos = position ? ' at ' + position : '';
+  if (l.includes('sub1-solo') || l.match(/sub\\s*1.*solo/))
+    return { type: 'solo', desc: 'Sub 1 solo' + pos, position };
+  if (l.includes('sub2-solo') || l.match(/sub\\s*2.*solo/))
+    return { type: 'solo', desc: 'Sub 2 solo' + pos, position };
+  if (l.includes('solo'))
+    return { type: 'solo', desc: 'Solo sub' + pos, position };
+  if (l.includes('subcrawl') || l.includes('crawl'))
+    return { type: 'crawl', desc: 'Sub crawl' + pos, position };
+  if (l.includes('baseline'))
+    return { type: 'baseline', desc: 'Baseline (before EQ)' + pos, position };
+  if (l.match(/iter-?\\d|iteration/))
+    return { type: 'iteration', desc: 'Calibration iteration' + pos, position };
+  if (l.includes('combined'))
+    return { type: 'combined', desc: 'Combined response' + pos, position };
+  if (l === 'mcp-triggered' || l === 'headless')
+    return { type: 'combined', desc: 'Combined response' + pos, position };
+  return { type: 'other', desc: label, position };
 }
 
 function renderChart() {
@@ -543,7 +640,6 @@ function renderChart() {
   const info = classifyLabel(p.label);
   document.getElementById('plotStatus').textContent = info.desc + (p.label && p.label !== info.desc ? ' (' + p.label + ')' : '');
 
-  const sel = document.getElementById('curveSelect');
   const ctx = document.getElementById('frPlot').getContext('2d');
   if (frChart) frChart.destroy();
 
@@ -560,7 +656,6 @@ function renderChart() {
     },
   ];
 
-  // Stored target curve from calibration (primary target line)
   if (storedTarget && storedTarget.points && storedTarget.points.length > 0) {
     datasets.push({
       label: (storedTarget.type || 'Target').charAt(0).toUpperCase() + (storedTarget.type || 'target').slice(1) + ' Target',
@@ -574,8 +669,6 @@ function renderChart() {
     });
   }
 
-  // Comparison curves — anchor to the measurement's SPL at 80 Hz so the shape
-  // lines up with what you're actually hearing, regardless of absolute level.
   const compRef = (() => {
     let bi = 0, bd = Infinity;
     p.freqs.forEach((f, i) => { const d = Math.abs(f - 80); if (d < bd) { bd = d; bi = i; } });
@@ -596,7 +689,6 @@ function renderChart() {
     });
   }
 
-  // Overlays
   chartData.overlays.forEach((ov, i) => {
     datasets.push({
       label: ov.label,
@@ -609,13 +701,12 @@ function renderChart() {
     });
   });
 
-  // Port tune marker
   if (portTuneHz && p.freqs[0] <= portTuneHz && portTuneHz <= p.freqs[p.freqs.length-1]) {
     const targetSpl = (storedTarget && storedTarget.points) ? storedTarget.points.map(pt => pt.spl) : [];
-    const allSpl = [...p.spl, ...targetSpl].filter(v => v != null && isFinite(v));
+    const allSplVals = [...p.spl, ...targetSpl].filter(v => v != null && isFinite(v));
     datasets.push({
       label: 'Port tune (' + portTuneHz + ' Hz)',
-      data: [{x: portTuneHz, y: Math.min(...allSpl)-3}, {x: portTuneHz, y: Math.max(...allSpl)+3}],
+      data: [{x: portTuneHz, y: Math.min(...allSplVals)-3}, {x: portTuneHz, y: Math.max(...allSplVals)+3}],
       borderColor: '#f59e0b',
       borderDash: [4, 4],
       borderWidth: 1.5,
@@ -657,9 +748,7 @@ function renderChart() {
   renderOverlayChips();
 }
 
-function refreshChart() {
-  if (chartData.primary) renderChart();
-}
+function refreshChart() { if (chartData.primary) renderChart(); }
 
 function renderOverlayChips() {
   const el = document.getElementById('overlayChips');
@@ -680,7 +769,6 @@ function removeOverlay(id) {
   overlayIds = overlayIds.filter(x => x !== id);
   chartData.overlays = chartData.overlays.filter(x => x.id !== id);
   renderChart();
-  // Uncheck in history
   const cb = document.querySelector('#histBody input[data-id="'+id+'"]');
   if (cb) cb.checked = false;
   updateHistButtons();
@@ -701,7 +789,6 @@ async function loadSession(id) {
     const r = await fetch('/api/sessions/' + id);
     if (!r.ok) return;
     const s = await r.json();
-    // Set (or clear) the stored target from the session itself
     storedTarget = s.target_curve || null;
     const startFr = s.start_fr;
     if (startFr && startFr.frequencies) {
@@ -709,6 +796,9 @@ async function loadSession(id) {
       chartData.overlays = chartData.overlays || [];
       renderChart();
     }
+    // Show feedback bar
+    document.getElementById('feedbackBar').style.display = '';
+    loadFeedback(id);
   } catch (e) {
     console.warn('loadSession error:', e);
   }
@@ -725,7 +815,6 @@ async function overlaySelected() {
     if (!r.ok) return;
     const sessions = await r.json();
 
-    // First becomes primary if no primary set
     if (!chartData.primary && sessions.length > 0) {
       const first = sessions.shift();
       chartData.primary = { freqs: first.frequencies, spl: first.spl, label: first.label };
@@ -764,36 +853,46 @@ async function averageSelected() {
   }
 }
 
-// ── History ─────────────────────────────────────────────────────────────────
+// ── History (Sessions tab) ──────────────────────────────────────────────────
 async function loadHistory() {
   const r = await fetch('/api/sessions');
   if (!r.ok) return;
   allSessions = await r.json();
-  document.getElementById('histCount').textContent = '(' + allSessions.length + ')';
 
   const tbody = document.getElementById('histBody');
+  const typeColors = {combined:'#3b82f6', solo:'#a78bfa', crawl:'#fb923c', baseline:'#64748b', iteration:'#4ade80', other:'#94a3b8', unknown:'#94a3b8'};
+
   tbody.innerHTML = allSessions.map(s => {
     const ts = s.timestamp.slice(0,19).replace('T',' ');
     const info = classifyLabel(s.label);
-    const typeColors = {combined:'#3b82f6', solo:'#a78bfa', crawl:'#fb923c', baseline:'#64748b', iteration:'#4ade80', other:'#94a3b8', unknown:'#94a3b8'};
-    const typeLabel = '<span style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:.7rem;background:'+typeColors[info.type]+'22;color:'+typeColors[info.type]+';border:1px solid '+typeColors[info.type]+'44">'+info.type+'</span>'
-      + (info.position ? '<span style="font-size:.68rem;color:var(--dim);margin-left:4px">'+info.position+'</span>' : '');
+    const typeLabel = '<span style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:.7rem;background:'+typeColors[info.type]+'22;color:'+typeColors[info.type]+';border:1px solid '+typeColors[info.type]+'44">'+info.type+'</span>';
     const peak = s.peak_spl.toFixed(1) + ' dBFS';
-    let deltaStr = '\\u2014';
+    let deltaStr = '\u2014';
     let deltaCls = '';
     if (s.harman_delta_db != null) {
       deltaStr = s.harman_delta_db.toFixed(1) + ' dB';
       deltaCls = s.harman_delta_db <= 3 ? 'harman-good' : s.harman_delta_db <= 6 ? 'harman-ok' : 'harman-bad';
     }
+    const runBadge = s.run_context
+      ? '<span class="badge badge-run">Run #'+s.run_context.run_id+'</span>'
+      : '<span style="font-size:.68rem;color:var(--dim)">Ad-hoc</span>';
     return '<tr class="clickable" data-session-id="'+s.id+'" onclick="loadSession('+s.id+')">'
       + '<td class="cb-col" onclick="event.stopPropagation()"><input type="checkbox" data-id="'+s.id+'" onchange="updateHistButtons()"></td>'
       + '<td>'+s.id+'</td><td>'+ts+'</td><td>'+typeLabel+'</td>'
-      + '<td style="color:#38bdf8">'+peak+'</td><td class="'+deltaCls+'">'+deltaStr+'</td></tr>';
+      + '<td style="color:#38bdf8">'+peak+'</td><td class="'+deltaCls+'">'+deltaStr+'</td>'
+      + '<td>'+runBadge+'</td></tr>';
   }).join('');
 
-  // Auto-load latest session into hero + chart
+  // Update Sessions tab count
+  document.querySelector('[data-tab="sessions"]').textContent = 'Sessions (' + allSessions.length + ')';
+
+  // Auto-load latest session
   if (allSessions.length > 0) {
     latestSession = allSessions[0];
+    // Store previous RMS for trend
+    if (allSessions.length > 1 && allSessions[1].harman_delta_db != null) {
+      previousRms = allSessions[1].harman_delta_db;
+    }
     loadSession(latestSession.id);
     updateHero(latestSession);
   }
@@ -808,36 +907,6 @@ function updateHistButtons() {
 }
 
 // ── Hero score ──────────────────────────────────────────────────────────────
-function classifyLabel(label) {
-  if (!label) return { type: 'unknown', desc: 'Unknown measurement', position: null };
-  const l = label.toLowerCase();
-
-  // Extract position from "label @ position" format
-  let position = null;
-  const atMatch = label.match(/@\\s*(.+)$/);
-  if (atMatch) position = atMatch[1].trim();
-
-  const pos = position ? ' at ' + position : '';
-
-  if (l.includes('sub1-solo') || l.match(/sub\\s*1.*solo/))
-    return { type: 'solo', desc: 'Sub 1 solo' + pos, position };
-  if (l.includes('sub2-solo') || l.match(/sub\\s*2.*solo/))
-    return { type: 'solo', desc: 'Sub 2 solo' + pos, position };
-  if (l.includes('solo'))
-    return { type: 'solo', desc: 'Solo sub' + pos, position };
-  if (l.includes('subcrawl') || l.includes('crawl'))
-    return { type: 'crawl', desc: 'Sub crawl' + pos, position };
-  if (l.includes('baseline'))
-    return { type: 'baseline', desc: 'Baseline (before EQ)' + pos, position };
-  if (l.match(/iter-?\\d|iteration/))
-    return { type: 'iteration', desc: 'Calibration iteration' + pos, position };
-  if (l.includes('combined'))
-    return { type: 'combined', desc: 'Combined response' + pos, position };
-  if (l === 'mcp-triggered' || l === 'headless')
-    return { type: 'combined', desc: 'Combined response' + pos, position };
-  return { type: 'other', desc: label, position };
-}
-
 function updateHero(session) {
   const ring = document.getElementById('scoreRing');
   const val = document.getElementById('scoreValue');
@@ -851,7 +920,15 @@ function updateHero(session) {
   if (rms != null) {
     val.textContent = rms.toFixed(1);
     ring.className = 'score-ring ' + (rms <= 2 ? 'optimal' : rms <= 4 ? 'good' : 'poor');
-    label.textContent = rms <= 2 ? 'Optimal' : rms <= 4 ? 'Good' : 'Needs work';
+
+    let trendHtml = '';
+    if (previousRms != null) {
+      const diff = rms - previousRms;
+      if (Math.abs(diff) < 0.2) trendHtml = ' <span class="trend-flat">\u2192</span>';
+      else if (diff < 0) trendHtml = ' <span class="trend-up">\u2193 ' + Math.abs(diff).toFixed(1) + '</span>';
+      else trendHtml = ' <span class="trend-down">\u2191 ' + diff.toFixed(1) + '</span>';
+    }
+    label.innerHTML = (rms <= 2 ? 'Optimal' : rms <= 4 ? 'Good' : 'Needs work') + trendHtml;
   } else {
     val.textContent = '--';
     ring.className = 'score-ring none';
@@ -860,11 +937,28 @@ function updateHero(session) {
 
   const ts = session.timestamp.slice(0,19).replace('T',' ');
   const info = classifyLabel(session.label);
-  detail.textContent = 'Session #' + session.id + ' \\u2014 ' + ts;
-  ctx.textContent = info.desc + (rms != null && storedTarget ? ' \\u2014 vs ' + (storedTarget.type || 'Target') : '');
+  detail.textContent = 'Session #' + session.id + ' \u2014 ' + ts;
+  ctx.textContent = info.desc + (rms != null && storedTarget ? ' \u2014 vs ' + (storedTarget.type || 'Target') : '');
 }
 
 // ── System status (hardware bar) ────────────────────────────────────────────
+async function loadStatus() {
+  try {
+    const r = await fetch('/api/status');
+    if (!r.ok) return;
+    const data = await r.json();
+    portTuneHz = data.port_tune_hz || null;
+
+    const bar = document.getElementById('hwBar');
+    bar.innerHTML = data.devices.map(d => {
+      const cls = d.connected ? 'ok' : 'err';
+      return '<span class="hw-item"><span class="hw-dot '+cls+'"></span>'+d.name
+        + (d.detail && d.connected ? '<span class="hw-detail"> '+d.detail+'</span>' : '')
+        + '</span>';
+    }).join('');
+  } catch(e) { console.warn('status load failed:', e); }
+}
+
 // ── Active DSP state ────────────────────────────────────────────────────────
 async function loadDspState() {
   try {
@@ -872,7 +966,6 @@ async function loadDspState() {
     if (!r.ok) return;
     const data = await r.json();
 
-    // Store the target curve for chart display
     if (data.target_curve) {
       storedTarget = data.target_curve;
       refreshChart();
@@ -885,7 +978,6 @@ async function loadDspState() {
     const el = document.getElementById('dspContent');
     let html = '<div class="dsp-grid">';
 
-    // Per-output cards
     const outputs = Object.entries(data.outputs || {}).sort((a,b) => a[0]-b[0]);
     for (const [idx, out] of outputs) {
       const typeColor = out.type === 'sub' ? 'var(--accent)' : out.type === 'shaker' ? 'var(--yellow)' : 'var(--dim)';
@@ -912,7 +1004,6 @@ async function loadDspState() {
     }
     html += '</div>';
 
-    // Input EQ (shared)
     if (data.input_eq && data.input_eq.filters && data.input_eq.filters.length > 0) {
       html += '<div style="margin-top:.75rem"><div class="dsp-section-label">Shared Input EQ</div>';
       html += '<div class="dsp-filter-list">';
@@ -928,51 +1019,138 @@ async function loadDspState() {
   } catch(e) { console.warn('dsp state load failed:', e); }
 }
 
-async function loadStatus() {
+// ── Activity timeline ───────────────────────────────────────────────────────
+async function loadActivity() {
   try {
-    const r = await fetch('/api/status');
+    const r = await fetch('/api/activity?limit=10');
     if (!r.ok) return;
-    const data = await r.json();
-    portTuneHz = data.port_tune_hz || null;
+    const events = await r.json();
+    const el = document.getElementById('activityTimeline');
 
-    const bar = document.getElementById('hwBar');
-    bar.innerHTML = data.devices.map(d => {
-      const cls = d.connected ? 'ok' : 'err';
-      return '<span class="hw-item"><span class="hw-dot '+cls+'"></span>'+d.name+'</span>';
-    }).join('');
-
-    if (data.last_run) {
-      const lr = data.last_run;
-      bar.innerHTML += '<span class="hw-item" style="margin-left:.5rem;border-left:1px solid var(--border);padding-left:.75rem;">'
-        + '<span class="hw-dot '+(lr.converged?'ok':'err')+'"></span>'
-        + 'Last: '+lr.recipe_name+' '+(lr.final_rms?.toFixed(1)||'?')+' dB</span>';
+    if (events.length === 0) {
+      el.innerHTML = '<div style="color:var(--dim);font-size:.82rem;">No activity yet. Start a calibration with Claude to see events here.</div>';
+      return;
     }
-  } catch(e) { console.warn('status load failed:', e); }
+
+    el.innerHTML = events.map(ev => {
+      const ts = ev.timestamp.slice(11,16);
+      return '<div class="timeline-event">'
+        + '<span class="timeline-time">' + ts + '</span>'
+        + '<span class="timeline-dot ' + ev.type + '"></span>'
+        + '<span class="timeline-summary">' + ev.summary + '</span>'
+        + '</div>';
+    }).join('');
+  } catch(e) { console.warn('activity load failed:', e); }
 }
 
-// ── Calibration runs ────────────────────────────────────────────────────────
+// ── Calibration runs (Runs tab) ─────────────────────────────────────────────
+let runsData = [];
 async function loadRuns() {
   try {
     const r = await fetch('/api/runs');
     if (!r.ok) return;
-    const runs = await r.json();
-    document.getElementById('runsCount').textContent = '(' + runs.length + ')';
-    const tbody = document.getElementById('runsBody');
-    tbody.innerHTML = runs.map(run => {
-      const ts = run.timestamp.slice(0,19).replace('T',' ');
-      const status = run.converged ? '<span class="badge badge-optimal">Converged</span>' :
-                     run.error ? '<span class="badge badge-danger">Error</span>' :
-                     '<span class="badge badge-warn">Max iters</span>';
-      const baseline = run.baseline_rms != null ? run.baseline_rms.toFixed(1) + ' dB' : '\\u2014';
-      const final_rms = run.final_rms != null ? run.final_rms.toFixed(1) + ' dB' : '\\u2014';
-      return '<tr class="clickable" onclick="loadRunDetail('+run.id+')">'
-        + '<td>'+run.id+'</td><td>'+ts+'</td><td>'+run.recipe_name+'</td><td>'+run.target+'</td>'
-        + '<td>'+status+'</td><td>'+run.iterations_run+'</td><td>'+baseline+'</td><td>'+final_rms+'</td></tr>';
-    }).join('');
-    if (runs.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="8" style="color:var(--dim);text-align:center;">No calibration runs yet</td></tr>';
+    runsData = await r.json();
+
+    // Update Runs tab count
+    document.querySelector('[data-tab="runs"]').textContent = 'Runs (' + runsData.length + ')';
+
+    const container = document.getElementById('runsContent');
+    if (runsData.length === 0) {
+      container.innerHTML = '<div style="color:var(--dim);font-size:.82rem;padding:.5rem 0;">No calibration runs yet. Start a calibration with Claude to see runs here.</div>';
+      return;
     }
+
+    // Build run cards
+    let html = '';
+    for (const run of runsData) {
+      const converged = run.converged;
+      const statusBadge = converged ? '<span class="badge badge-optimal">Converged</span>' :
+                         run.error ? '<span class="badge badge-danger">Error</span>' :
+                         '<span class="badge badge-warn">Max iters</span>';
+      const baseline = run.baseline_rms != null ? run.baseline_rms.toFixed(1) : '?';
+      const final_rms = run.final_rms != null ? run.final_rms.toFixed(1) : '?';
+      const rmsColor = run.final_rms != null ? (run.final_rms <= 2 ? 'var(--green)' : run.final_rms <= 4 ? 'var(--yellow)' : 'var(--red)') : 'var(--dim)';
+      const ts = run.timestamp.slice(0,10);
+      const sessionIds = run.session_ids || [];
+
+      html += '<div class="run-card" id="run-'+run.id+'">';
+      html += '<div class="run-card-header" onclick="toggleRun('+run.id+')">';
+      html += '<span class="run-card-arrow" id="runArrow-'+run.id+'">&#9654;</span>';
+      html += '<span class="run-card-title">#'+run.id+' &mdash; '+run.recipe_name+' &mdash; '+run.target+'</span>';
+      html += statusBadge;
+      html += '<span class="run-card-rms" style="color:'+rmsColor+'">'+baseline+' &rarr; '+final_rms+' dB</span>';
+      html += '<span style="font-size:.7rem;color:var(--dim)">'+ts+'</span>';
+      html += '</div>';
+
+      html += '<div class="run-card-body" id="runBody-'+run.id+'" style="display:none">';
+      html += '<div class="run-card-meta">';
+      html += 'Iterations: '+(run.iterations_run||0)+' &middot; Target: '+run.target;
+      html += '</div>';
+
+      if (sessionIds.length > 0) {
+        html += '<div style="font-size:.75rem;color:var(--dim);margin-bottom:.25rem">Associated measurements:</div>';
+        html += '<div class="run-sessions">';
+        for (const sid of sessionIds) {
+          html += '<span class="run-session-chip" onclick="event.stopPropagation();loadSession('+sid+')">#'+sid+'</span>';
+        }
+        html += '</div>';
+      }
+
+      html += '<div style="margin-top:.5rem;display:flex;gap:.35rem;">';
+      html += '<button class="btn-secondary btn-sm" onclick="event.stopPropagation();loadRunDetail('+run.id+')">Convergence</button>';
+      if (sessionIds.length >= 2) {
+        html += '<button class="btn-secondary btn-sm" onclick="event.stopPropagation();compareRunBA('+run.id+','+sessionIds[0]+','+sessionIds[sessionIds.length-1]+')">Compare First/Last</button>';
+      }
+      html += '</div>';
+      html += '</div>';
+      html += '</div>';
+    }
+
+    // Ad-hoc sessions (not in any run)
+    const runSessionIds = new Set(runsData.flatMap(r => r.session_ids || []));
+    const adhocSessions = allSessions.filter(s => !runSessionIds.has(s.id));
+    if (adhocSessions.length > 0) {
+      html += '<div class="adhoc-group">';
+      html += '<div class="adhoc-header">Ad-hoc Measurements ('+adhocSessions.length+')</div>';
+      for (const s of adhocSessions.slice(0, 20)) {
+        const info = classifyLabel(s.label);
+        const ts = s.timestamp.slice(0,10);
+        html += '<div class="adhoc-item" onclick="loadSession('+s.id+')">';
+        html += '<span style="color:var(--accent)">#'+s.id+'</span>';
+        html += '<span>'+info.desc+'</span>';
+        html += '<span style="color:var(--dim);margin-left:auto">'+ts+'</span>';
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+
+    container.innerHTML = html;
   } catch(e) { console.warn('runs load failed:', e); }
+}
+
+function toggleRun(runId) {
+  const body = document.getElementById('runBody-' + runId);
+  const arrow = document.getElementById('runArrow-' + runId);
+  const visible = body.style.display !== 'none';
+  body.style.display = visible ? 'none' : '';
+  arrow.classList.toggle('open', !visible);
+}
+
+async function compareRunBA(runId, firstSessionId, lastSessionId) {
+  // Overlay first and last session for before/after comparison
+  try {
+    const r = await fetch('/api/sessions/overlay?ids=' + firstSessionId + ',' + lastSessionId);
+    if (!r.ok) return;
+    const sessions = await r.json();
+    if (sessions.length >= 1) {
+      chartData.primary = { freqs: sessions[0].frequencies, spl: sessions[0].spl, label: sessions[0].label + ' (first)' };
+    }
+    if (sessions.length >= 2) {
+      chartData.overlays = [{ id: sessions[1].id, freqs: sessions[1].frequencies, spl: sessions[1].spl, label: sessions[1].label + ' (last)' }];
+    }
+    renderChart();
+    toast('Showing first vs last measurement for Run #' + runId);
+  } catch(e) { toast('Compare error'); }
 }
 
 async function loadRunDetail(runId) {
@@ -1038,10 +1216,10 @@ async function loadStates() {
       const ts = s.timestamp.slice(0,19).replace('T',' ');
       const rms = s.rms_deviation != null ? s.rms_deviation.toFixed(1) + ' dB RMS' : '';
       const curve = s.target_curve || '';
-      const meta = [curve, rms, ts].filter(Boolean).join(' \\u2014 ');
+      const meta = [curve, rms, ts].filter(Boolean).join(' \u2014 ');
       return '<div class="state-item">'
         + '<div class="state-info"><div class="state-name">'+s.name+'</div>'
-        + '<div class="state-meta">'+meta+(s.notes ? ' \\u2014 '+s.notes : '')+'</div></div>'
+        + '<div class="state-meta">'+meta+(s.notes ? ' \u2014 '+s.notes : '')+'</div></div>'
         + '<div class="state-actions">'
         + (s.measurement_session_id ? '<button class="btn-secondary btn-sm" onclick="loadSession('+s.measurement_session_id+')">View</button>' : '')
         + '<button class="btn-danger btn-sm" onclick="deleteState('+s.id+')">Delete</button>'
@@ -1096,6 +1274,45 @@ async function deleteState(id) {
   } catch(e) { toast('Delete error'); }
 }
 
+// ── Feedback ────────────────────────────────────────────────────────────────
+async function loadFeedback(sessionId) {
+  const existing = document.getElementById('fbExisting');
+  const upBtn = document.getElementById('fbUp');
+  const downBtn = document.getElementById('fbDown');
+  upBtn.className = 'feedback-btn';
+  downBtn.className = 'feedback-btn';
+  existing.textContent = '';
+  document.getElementById('fbText').value = '';
+
+  try {
+    const r = await fetch('/api/feedback/' + sessionId);
+    if (!r.ok) return;
+    const entries = await r.json();
+    if (entries.length > 0) {
+      const last = entries[entries.length - 1];
+      if (last.content_tag === 'up') upBtn.classList.add('active-up');
+      if (last.content_tag === 'down') downBtn.classList.add('active-down');
+      const text = last.text.replace(/^\\[(up|down)\\]\\s*/, '');
+      if (text) existing.textContent = text;
+    }
+  } catch(e) {}
+}
+
+async function submitFeedback(rating) {
+  if (!selectedSessionId) return;
+  const text = document.getElementById('fbText').value.trim() || null;
+  try {
+    const r = await fetch('/api/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: selectedSessionId, rating, text }),
+    });
+    if (!r.ok) { toast('Feedback failed'); return; }
+    toast('Feedback saved');
+    loadFeedback(selectedSessionId);
+  } catch(e) { toast('Feedback error'); }
+}
+
 // ── Export chart ─────────────────────────────────────────────────────────────
 function exportChart() {
   if (!frChart) return;
@@ -1107,8 +1324,6 @@ function exportChart() {
 }
 
 // ── Version ─────────────────────────────────────────────────────────────────
-let _upgradePolling = false;
-
 function _setChip(text, cls, title) {
   const chip = document.getElementById('versionChip');
   if (!chip) return;
@@ -1125,71 +1340,60 @@ async function loadVersion() {
     const d = await r.json();
     const sha7 = d.current_sha !== 'unknown' ? d.current_sha.slice(0,7) : 'unknown';
     const semver = (d.semantic_version && d.semantic_version !== 'unknown') ? d.semantic_version : sha7;
-    const badge = document.getElementById('versionBadge');
-    const btn = document.getElementById('upgradeBtn');
-    const confirm = document.getElementById('upgradeConfirm');
+
+    const footer = document.getElementById('versionFooterText');
+    footer.textContent = 'v' + semver + (sha7 !== 'unknown' ? ' (' + sha7 + ')' : '');
 
     if (d.up_to_date) {
-      badge.innerHTML = '<span class="badge badge-optimal">v'+sha7+' \\u2014 Up to date</span>';
-      btn.style.display = 'none'; confirm.style.display = 'none';
-      _setChip('v'+semver, 'up-to-date', 'v'+semver+' ('+sha7+') \\u2014 Up to date');
+      _setChip('v'+semver, 'up-to-date', 'Up to date');
     } else if (d.latest_sha) {
-      badge.innerHTML = '<span class="badge badge-warn">v'+sha7+' \\u2014 Update available</span>';
-      btn.style.display = ''; confirm.style.display = 'none';
-      _setChip('v'+semver+' \\u25b2', 'update-available', 'Update available');
+      _setChip('v'+semver+' \u25b2', 'update-available', 'Update available \u2014 click to upgrade');
     } else if (d.checking) {
-      badge.innerHTML = '<span class="badge badge-empty">v'+sha7+'</span>';
-      btn.style.display = 'none'; confirm.style.display = 'none';
       _setChip('v'+semver, null, 'Checking...');
       setTimeout(loadVersion, 8000);
     } else {
-      badge.innerHTML = '<span class="badge badge-empty">v'+sha7+'</span>';
-      btn.style.display = 'none'; confirm.style.display = 'none';
       _setChip('v'+semver, null, 'v'+semver);
     }
   } catch (e) {
-    document.getElementById('versionBadge').innerHTML = '<span class="badge badge-empty">Version unavailable</span>';
-    _setChip('\\u2014', null, 'Version unavailable');
+    _setChip('\u2014', null, 'Version unavailable');
   }
 }
 
-function showUpgradeConfirm() {
-  document.getElementById('upgradeBtn').style.display = 'none';
-  document.getElementById('upgradeConfirm').style.display = '';
+function toggleVersionPopover() {
+  const chip = document.getElementById('versionChip');
+  if (chip.classList.contains('update-available')) {
+    if (confirm('Restart to install update?')) {
+      chip.textContent = 'Upgrading...';
+      fetch('/api/upgrade', {method: 'POST'}).then(r => {
+        if (r.ok) {
+          toast('Upgrade triggered \u2014 reloading in 30s...');
+          setTimeout(() => window.location.reload(), 30000);
+        } else {
+          toast('Upgrade failed');
+          loadVersion();
+        }
+      }).catch(() => { toast('Upgrade request failed'); loadVersion(); });
+    }
+  }
 }
 
-function cancelUpgrade() {
-  document.getElementById('upgradeConfirm').style.display = 'none';
-  document.getElementById('upgradeBtn').style.display = '';
-}
-
-async function confirmUpgrade() {
-  document.getElementById('upgradeConfirm').style.display = 'none';
-  const badge = document.getElementById('versionBadge');
-  const status = document.getElementById('versionStatus');
-  badge.innerHTML = '<span class="badge badge-upgrading">Upgrading...</span>';
-  status.textContent = 'Upgrading...'; status.style.display = '';
-  _upgradePolling = true;
-
+// ── Auto-refresh ────────────────────────────────────────────────────────────
+let lastSessionCount = 0;
+async function checkForUpdates() {
   try {
-    const r = await fetch('/api/upgrade', {method: 'POST'});
-    if (r.status === 409) { status.textContent = 'Upgrade already in progress.'; return; }
-    if (!r.ok) { status.textContent = 'Upgrade failed'; _upgradePolling = false; loadVersion(); return; }
-  } catch (e) { status.textContent = 'Upgrade request failed'; _upgradePolling = false; loadVersion(); return; }
-
-  const startTime = Date.now();
-  async function poll() {
-    if (!_upgradePolling) return;
-    const elapsed = Math.round((Date.now() - startTime) / 1000);
-    status.textContent = 'Upgrading... ' + elapsed + 's';
-    if (elapsed >= 180) { status.textContent = 'Taking too long. Check Pi.'; _upgradePolling = false; loadVersion(); return; }
-    try {
-      const h = await fetch('/health', {cache: 'no-store'});
-      if (h.ok && elapsed >= 5) { status.textContent = 'Updated! Reloading...'; setTimeout(() => window.location.reload(), 2000); return; }
-    } catch (_) {}
-    setTimeout(poll, 3000);
-  }
-  setTimeout(poll, 5000);
+    const r = await fetch('/api/sessions');
+    if (!r.ok) return;
+    const sessions = await r.json();
+    if (sessions.length !== lastSessionCount && lastSessionCount > 0) {
+      // New data arrived — refresh everything
+      allSessions = sessions;
+      loadHistory();
+      loadDspState();
+      loadActivity();
+      loadRuns();
+    }
+    lastSessionCount = sessions.length;
+  } catch(e) {}
 }
 
 // ── Boot ────────────────────────────────────────────────────────────────────
@@ -1200,9 +1404,12 @@ loadStatus();
 loadDspState();
 loadRuns();
 loadStates();
+loadActivity();
 loadVersion();
 
 setInterval(loadStatus, 30000);
+setInterval(loadActivity, 10000);
+setInterval(checkForUpdates, 10000);
 
 window.addEventListener('popstate', (e) => {
   const id = e.state && e.state.session;
@@ -1215,14 +1422,17 @@ window.addEventListener('popstate', (e) => {
 """
 
 
+
 # ── Pydantic models ────────────────────────────────────────────────────────────
 
 class AverageRequest(BaseModel):
     session_ids: list[int]
 
 
-class HeadlessMeasureRequest(BaseModel):
-    label: str | None = None
+class FeedbackRequest(BaseModel):
+    session_id: int
+    rating: str  # "up" or "down"
+    text: str | None = None
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -1397,54 +1607,6 @@ async def api_upgrade() -> dict:
     return {"status": "upgrade_triggered"}
 
 
-@app.post("/api/measure")
-async def measure_headless(body: HeadlessMeasureRequest) -> dict:
-    """Headless measurement for Pi 5: Pi records via UMIK-1 using PyTTa.
-
-    MeasurementEngine.measure() handles UMIK selection and route-aware playback.
-    Denon lifecycle (input/volume switching) is managed here via DenonSweepContext
-    when the HDMI route is configured.
-
-    Requires UMIK-1 connected and the 'measurement' extra installed (arm64/amd64 images).
-    """
-    if _measurement_lock.locked():
-        raise HTTPException(status_code=409, detail="measurement already in progress")
-
-    try:
-        import sounddevice as sd
-        devices = sd.query_devices()
-    except ImportError:
-        raise HTTPException(
-            status_code=503,
-            detail="sounddevice not available on this platform — use browser-based measurement",
-        )
-
-    cfg = _load_config()
-    mic_name: str = cfg.mic.get("name", "UMIK")
-    umik_idx = _find_umik_device(devices, name_substring=mic_name)
-    if umik_idx is None:
-        raise HTTPException(
-            status_code=503,
-            detail=f"No microphone matching '{mic_name}' found — check USB connection",
-        )
-
-    async with _measurement_lock:
-        engine = MeasurementEngine(cfg)
-        try:
-            denon_ctx = DenonSweepContext.from_config(cfg)
-            if denon_ctx:
-                async with denon_ctx:
-                    fr = await engine.measure()
-            else:
-                fr = await engine.measure()
-        except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc))
-
-    store = SessionStore()
-    session_id = store.save_measurement(fr, label=body.label or "headless")
-    return {"session_id": session_id, "status": "ok"}
-
-
 @app.post("/api/sessions/average")
 async def average_sessions(body: AverageRequest) -> dict:
     """Average multiple sessions in the linear pressure domain.
@@ -1503,11 +1665,33 @@ async def average_sessions(body: AverageRequest) -> dict:
 
 @app.get("/api/sessions")
 async def list_sessions() -> list[dict]:
-    """Return all sessions for the history table, with Harman delta."""
+    """Return all sessions for the history table, with Harman delta and run context."""
     from .analysis import HarmanTarget, rms_deviation
 
     store = SessionStore()
     sessions = store.list_sessions()
+
+    # Build run context: map sessions to runs by timestamp correlation
+    runs = store.get_runs(limit=100)
+    run_windows: list[dict] = []
+    for run in runs:
+        run_start = run["timestamp"]
+        # Find the end of the run: latest iteration timestamp or run timestamp
+        detail = store.get_run_detail(run["id"])
+        iters = detail.get("iterations", []) if detail else []
+        run_end = run_start
+        for it in iters:
+            # Iterations don't have timestamps, so use the run's convergence
+            pass
+        run_windows.append({
+            "run_id": run["id"],
+            "recipe_name": run["recipe_name"],
+            "target": run["target"],
+            "timestamp": run_start,
+            "iterations_run": run.get("iterations_run") or 0,
+            "converged": run.get("converged"),
+        })
+
     result = []
     for s in sessions:
         harman_delta: float | None = None
@@ -1521,6 +1705,29 @@ async def list_sessions() -> list[dict]:
                     harman_delta = round(rms_deviation(s.start_fr, target, band), 1)
         except Exception:
             pass  # analysis failure — leave as None
+
+        # Find run context by timestamp proximity (session within 2h of run start)
+        run_context: dict | None = None
+        for rw in run_windows:
+            try:
+                from datetime import datetime, timezone
+                # Parse both timestamps — handle Z suffix
+                run_ts = rw["timestamp"].replace("Z", "+00:00")
+                sess_ts = s.timestamp.replace("Z", "+00:00")
+                rt = datetime.fromisoformat(run_ts)
+                st = datetime.fromisoformat(sess_ts)
+                delta = (st - rt).total_seconds()
+                # Session is part of a run if it's after run start and within 2 hours
+                if 0 <= delta <= 7200:
+                    run_context = {
+                        "run_id": rw["run_id"],
+                        "recipe_name": rw["recipe_name"],
+                        "target": rw["target"],
+                    }
+                    break
+            except (ValueError, TypeError):
+                continue
+
         result.append({
             "id": s.id,
             "timestamp": s.timestamp,
@@ -1530,6 +1737,7 @@ async def list_sessions() -> list[dict]:
             "n_freqs": len(s.start_fr.frequencies),
             "has_end_fr": s.end_fr is not None,
             "harman_delta_db": harman_delta,
+            "run_context": run_context,
         })
     return result
 
@@ -1590,19 +1798,179 @@ async def get_session_detail(session_id: int) -> dict:
 
 @app.get("/api/runs")
 async def list_runs(limit: int = 20) -> list[dict]:
-    """List calibration runs."""
+    """List calibration runs with associated session IDs."""
     store = SessionStore()
-    return store.get_runs(limit=limit)
+    runs = store.get_runs(limit=limit)
+
+    # Correlate sessions to runs by timestamp (sessions within 2h of run start)
+    sessions = store.list_sessions()
+    for run in runs:
+        run_ts_str = run["timestamp"]
+        associated: list[int] = []
+        try:
+            from datetime import datetime
+            rt_str = run_ts_str.replace("Z", "+00:00")
+            rt = datetime.fromisoformat(rt_str)
+            for s in sessions:
+                st_str = s.timestamp.replace("Z", "+00:00")
+                st = datetime.fromisoformat(st_str)
+                delta = (st - rt).total_seconds()
+                if 0 <= delta <= 7200:
+                    associated.append(s.id)
+        except (ValueError, TypeError):
+            pass
+        run["session_ids"] = associated
+    return runs
 
 
 @app.get("/api/runs/{run_id}")
 async def get_run_detail(run_id: int) -> dict:
-    """Return run detail with iteration history."""
+    """Return run detail with iteration history and associated sessions."""
     store = SessionStore()
     detail = store.get_run_detail(run_id)
     if detail is None:
         raise HTTPException(status_code=404, detail=f"Run #{run_id} not found")
+
+    # Find associated sessions by timestamp
+    sessions = store.list_sessions()
+    run_ts_str = detail["timestamp"]
+    associated: list[int] = []
+    try:
+        from datetime import datetime
+        rt_str = run_ts_str.replace("Z", "+00:00")
+        rt = datetime.fromisoformat(rt_str)
+        for s in sessions:
+            st_str = s.timestamp.replace("Z", "+00:00")
+            st = datetime.fromisoformat(st_str)
+            delta = (st - rt).total_seconds()
+            if 0 <= delta <= 7200:
+                associated.append(s.id)
+    except (ValueError, TypeError):
+        pass
+    detail["session_ids"] = associated
     return detail
+
+
+# ── Activity timeline ────────────────────────────────────────────────────────
+
+
+@app.get("/api/activity")
+async def activity_timeline(limit: int = 15) -> list[dict]:
+    """Unified activity timeline from sessions, runs, and DSP state changes.
+
+    Returns significant events (measurements, EQ changes, run start/complete)
+    sorted most-recent-first. No schema changes — queries existing tables.
+    """
+    store = SessionStore()
+    events: list[dict] = []
+
+    # Recent measurements
+    sessions = store.list_sessions()
+    for s in sessions[:limit]:
+        events.append({
+            "type": "measurement",
+            "timestamp": s.timestamp,
+            "summary": f"Measurement #{s.id}" + (f" ({s.label})" if s.label else ""),
+            "detail": {
+                "session_id": s.id,
+                "label": s.label,
+                "peak_spl": s.start_fr.peak_spl if s.start_fr and s.start_fr.frequencies else None,
+            },
+        })
+
+    # Recent calibration run events
+    runs = store.get_runs(limit=limit)
+    for run in runs:
+        converged = run.get("converged")
+        final_rms = run.get("final_rms")
+        if converged is not None:
+            status = "converged" if converged else ("error" if run.get("error") else "max-iters")
+            rms_str = f" — {final_rms:.1f} dB RMS" if final_rms is not None else ""
+            events.append({
+                "type": "run_complete",
+                "timestamp": run["timestamp"],
+                "summary": f"Run #{run['id']} {status}: {run['recipe_name']}{rms_str}",
+                "detail": {
+                    "run_id": run["id"],
+                    "recipe_name": run["recipe_name"],
+                    "target": run["target"],
+                    "converged": bool(converged),
+                    "final_rms": final_rms,
+                },
+            })
+        else:
+            events.append({
+                "type": "run_start",
+                "timestamp": run["timestamp"],
+                "summary": f"Run #{run['id']} started: {run['recipe_name']}",
+                "detail": {
+                    "run_id": run["id"],
+                    "recipe_name": run["recipe_name"],
+                    "target": run["target"],
+                },
+            })
+
+    # Recent DSP state changes
+    dsp_state = store.get_active_dsp()
+    for key, data in dsp_state.items():
+        ts = data.get("timestamp")
+        if not ts:
+            continue
+        if key.startswith("output_eq_"):
+            idx = key.split("_")[-1]
+            n_filters = len(data.get("filters", []))
+            events.append({
+                "type": "eq_applied",
+                "timestamp": ts,
+                "summary": f"EQ applied: {n_filters} filters → output {idx}",
+                "detail": {"output_index": int(idx), "n_filters": n_filters},
+            })
+        elif key == "input_eq":
+            n_filters = len(data.get("filters", []))
+            events.append({
+                "type": "eq_applied",
+                "timestamp": ts,
+                "summary": f"Input EQ applied: {n_filters} shared filters",
+                "detail": {"shared": True, "n_filters": n_filters},
+            })
+
+    # Sort by timestamp descending, cap at limit
+    events.sort(key=lambda e: e["timestamp"], reverse=True)
+    return events[:limit]
+
+
+# ── Feedback ─────────────────────────────────────────────────────────────────
+
+
+@app.post("/api/feedback")
+async def submit_feedback(body: FeedbackRequest) -> dict:
+    """Submit subjective feedback on a measurement session.
+
+    Rating is 'up' or 'down', with optional free-text description.
+    """
+    if body.rating not in ("up", "down"):
+        raise HTTPException(status_code=422, detail="rating must be 'up' or 'down'")
+
+    store = SessionStore()
+    session = store.get_session(body.session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=404, detail=f"Session #{body.session_id} not found"
+        )
+
+    text = f"[{body.rating}]"
+    if body.text:
+        text += f" {body.text}"
+
+    feedback_id = store.add_feedback(body.session_id, text, content_tag=body.rating)
+    return {"id": feedback_id, "status": "saved"}
+
+
+@app.get("/api/feedback/{session_id}")
+async def get_feedback(session_id: int) -> list[dict]:
+    """Return all feedback entries for a session."""
+    store = SessionStore()
+    return store.get_feedback(session_id)
 
 
 @app.get("/api/status")

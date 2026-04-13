@@ -1,17 +1,25 @@
-"""Tests for calibrate.web — simplified endpoint suite.
+"""Tests for calibrate.web — observation deck dashboard.
 
-Covers all 11 endpoints remaining in the simplified web.py:
-  GET  /              — HTML dashboard
-  GET  /health        — health check
-  GET  /api/version   — version info (mocked GHCR)
-  POST /api/upgrade   — trigger upgrade file
-  POST /api/measure   — headless measurement
+Covers all endpoints:
+  GET  /                     — HTML dashboard
+  GET  /health               — health check
+  GET  /api/version          — version info (mocked GHCR)
+  POST /api/upgrade          — trigger upgrade file
   POST /api/sessions/average — average multiple sessions
-  GET  /api/sessions  — list sessions with harman_delta_db
-  GET  /api/sessions/{id} — session detail
-  GET  /api/runs      — list calibration runs
-  GET  /api/runs/{id} — run detail
-  GET  /api/status    — system status
+  GET  /api/sessions         — list sessions with harman_delta_db + run_context
+  GET  /api/sessions/{id}    — session detail
+  GET  /api/sessions/overlay — overlay FR data
+  GET  /api/runs             — list calibration runs with session_ids
+  GET  /api/runs/{id}        — run detail with session_ids
+  GET  /api/status           — system status
+  GET  /api/activity         — activity timeline
+  POST /api/feedback         — submit feedback
+  GET  /api/feedback/{id}    — get feedback for session
+  GET  /api/states           — list saved states
+  POST /api/states           — save state
+  GET  /api/states/{id}      — get state detail
+  DELETE /api/states/{id}    — delete state
+  GET  /api/dsp-state        — active DSP state
 """
 
 from __future__ import annotations
@@ -227,153 +235,6 @@ class TestUpgrade:
         assert "disk full" in resp.json()["detail"]
 
 
-# ── POST /api/measure ───────────────────────────────────────────────────────
-
-
-class TestMeasure:
-    def _mock_sounddevice(self) -> MagicMock:
-        """Create a sounddevice mock with a UMIK device."""
-        sd = MagicMock()
-        sd.query_devices.return_value = [
-            {"name": "UMIK-1", "max_input_channels": 1},
-            {"name": "Built-in Output", "max_input_channels": 0},
-        ]
-        return sd
-
-    def _mock_denonavr(self) -> MagicMock:
-        """Create a denonavr mock with a receiver."""
-        denonavr = MagicMock()
-        receiver = MagicMock()
-        receiver.power = "ON"
-        receiver.input_func = "Blu-ray"
-        receiver.volume = -30.0
-        receiver.input_func_list = ["CD", "Blu-ray", "Media Player"]
-        receiver.model_name = "X3800H"
-
-        # Make all async methods proper coroutines
-        receiver.async_setup = AsyncMock()
-        receiver.async_update = AsyncMock()
-        receiver.async_power_on = AsyncMock()
-        receiver.async_set_input_func = AsyncMock()
-        receiver.async_set_volume = AsyncMock()
-        receiver.async_power_off = AsyncMock()
-
-        denonavr.DenonAVR.return_value = receiver
-        return denonavr
-
-    def test_measure_happy_path(self, tmp_path: Path, client: TestClient) -> None:
-        from unittest.mock import AsyncMock
-        sd_mock = self._mock_sounddevice()
-        denonavr_mock = self._mock_denonavr()
-        fr = _make_fr()
-        engine_mock = MagicMock()
-        engine_mock.measure = AsyncMock(return_value=fr)
-        store = SessionStore(db_path=tmp_path / "test.db")
-
-        with (
-            patch.dict(sys.modules, {"sounddevice": sd_mock, "denonavr": denonavr_mock}),
-            patch("calibrate.web._load_config", return_value=_make_config()),
-            patch("calibrate.web.MeasurementEngine", return_value=engine_mock),
-            patch("calibrate.web.SessionStore", return_value=store),
-        ):
-            resp = client.post("/api/measure", json={"label": "test-sweep"})
-
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "ok"
-        assert data["session_id"] == 1
-
-    def test_measure_no_sounddevice(self, client: TestClient) -> None:
-        """When sounddevice is not installed, return 503."""
-        original = sys.modules.get("sounddevice")
-        sys.modules["sounddevice"] = None  # type: ignore[assignment]
-        try:
-            resp = client.post("/api/measure", json={})
-        finally:
-            if original is not None:
-                sys.modules["sounddevice"] = original
-            else:
-                sys.modules.pop("sounddevice", None)
-        assert resp.status_code == 503
-        assert "sounddevice" in resp.json()["detail"]
-
-    def test_measure_no_umik(self, tmp_path: Path, client: TestClient) -> None:
-        """When no UMIK device is found, return 503."""
-        sd_mock = MagicMock()
-        sd_mock.query_devices.return_value = [
-            {"name": "Built-in Mic", "max_input_channels": 1},
-        ]
-        with (
-            patch.dict(sys.modules, {"sounddevice": sd_mock}),
-            patch("calibrate.web._load_config", return_value=_make_config()),
-        ):
-            resp = client.post("/api/measure", json={})
-
-        assert resp.status_code == 503
-        assert "UMIK" in resp.json()["detail"]
-
-    def test_measure_concurrent_409(self, tmp_path: Path, client: TestClient) -> None:
-        """When measurement lock is held, return 409."""
-        import calibrate.web as web_mod
-
-        # Simulate the lock being held
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(web_mod._measurement_lock.acquire())
-
-        sd_mock = self._mock_sounddevice()
-        try:
-            with patch.dict(sys.modules, {"sounddevice": sd_mock}):
-                resp = client.post("/api/measure", json={})
-        finally:
-            web_mod._measurement_lock.release()
-            loop.close()
-
-        assert resp.status_code == 409
-        assert "already in progress" in resp.json()["detail"]
-
-    def test_measure_runtime_error(self, tmp_path: Path, client: TestClient) -> None:
-        """MeasurementEngine.measure raising RuntimeError returns 503."""
-        from unittest.mock import AsyncMock
-        sd_mock = self._mock_sounddevice()
-        denonavr_mock = self._mock_denonavr()
-        engine_mock = MagicMock()
-        engine_mock.measure = AsyncMock(side_effect=RuntimeError("sweep failed"))
-
-        with (
-            patch.dict(sys.modules, {"sounddevice": sd_mock, "denonavr": denonavr_mock}),
-            patch("calibrate.web._load_config", return_value=_make_config()),
-            patch("calibrate.web.MeasurementEngine", return_value=engine_mock),
-        ):
-            resp = client.post("/api/measure", json={})
-
-        assert resp.status_code == 503
-        assert "sweep failed" in resp.json()["detail"]
-
-    def test_measure_default_label(self, tmp_path: Path, client: TestClient) -> None:
-        """When no label is provided, defaults to 'headless'."""
-        from unittest.mock import AsyncMock
-        sd_mock = self._mock_sounddevice()
-        denonavr_mock = self._mock_denonavr()
-        fr = _make_fr()
-        engine_mock = MagicMock()
-        engine_mock.measure = AsyncMock(return_value=fr)
-        store = SessionStore(db_path=tmp_path / "test.db")
-
-        with (
-            patch.dict(sys.modules, {"sounddevice": sd_mock, "denonavr": denonavr_mock}),
-            patch("calibrate.web._load_config", return_value=_make_config()),
-            patch("calibrate.web.MeasurementEngine", return_value=engine_mock),
-            patch("calibrate.web.SessionStore", return_value=store),
-        ):
-            resp = client.post("/api/measure", json={})
-
-        assert resp.status_code == 200
-        # Verify label stored as "headless"
-        session = store.get_session(1)
-        assert session is not None
-        assert session.label == "headless"
-
-
 # ── POST /api/sessions/average ──────────────────────────────────────────────
 
 
@@ -494,7 +355,7 @@ class TestListSessions:
 
         entry = resp.json()[0]
         expected_keys = {"id", "timestamp", "label", "peak_spl", "freq_at_peak",
-                         "n_freqs", "has_end_fr", "harman_delta_db"}
+                         "n_freqs", "has_end_fr", "harman_delta_db", "run_context"}
         assert set(entry.keys()) == expected_keys
 
 
@@ -930,3 +791,176 @@ class TestDspState:
         assert data["outputs"]["1"]["eq"][0]["freq"] == 47
         assert data["outputs"]["2"]["polarity_inverted"] is True
         assert data["input_eq"]["filters"][0]["type"] == "hpf"
+
+
+# ── GET /api/activity ─────────────────────────────────────────────────────
+
+
+class TestActivity:
+    def test_activity_empty(self, db_store: SessionStore, client: TestClient) -> None:
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.get("/api/activity")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_activity_with_sessions(self, seeded_store: SessionStore, client: TestClient) -> None:
+        with patch("calibrate.web.SessionStore", return_value=seeded_store):
+            resp = client.get("/api/activity")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) >= 2
+        # Should contain measurement events
+        types = [e["type"] for e in data]
+        assert "measurement" in types
+
+    def test_activity_with_runs(self, db_store: SessionStore, client: TestClient) -> None:
+        """Runs appear as run_complete events in the timeline."""
+        with db_store._connect() as conn:
+            conn.execute(
+                "INSERT INTO calibration_runs (timestamp, recipe_name, target, converged, final_rms) "
+                "VALUES ('2025-01-15T12:00:00Z', 'bass-cal', 'harman', 1, 2.1)"
+            )
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.get("/api/activity")
+        data = resp.json()
+        types = [e["type"] for e in data]
+        assert "run_complete" in types
+
+    def test_activity_with_dsp_changes(self, db_store: SessionStore, client: TestClient) -> None:
+        """DSP state changes appear as eq_applied events."""
+        db_store.set_active_dsp("output_eq_0", {
+            "filters": [{"freq": 45, "gain_db": -3, "q": 4, "type": "peaking"}]
+        })
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.get("/api/activity")
+        data = resp.json()
+        types = [e["type"] for e in data]
+        assert "eq_applied" in types
+
+    def test_activity_limit(self, seeded_store: SessionStore, client: TestClient) -> None:
+        with patch("calibrate.web.SessionStore", return_value=seeded_store):
+            resp = client.get("/api/activity?limit=1")
+        assert resp.status_code == 200
+        assert len(resp.json()) <= 1
+
+
+# ── POST /api/feedback ───────────────────────────────────────────────────────
+
+
+class TestFeedback:
+    def test_submit_feedback_up(self, db_store: SessionStore, client: TestClient) -> None:
+        db_store.save_measurement(_make_fr(), label="test")
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.post("/api/feedback", json={
+                "session_id": 1, "rating": "up", "text": "sounds great"
+            })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "saved"
+        assert "id" in data
+
+    def test_submit_feedback_down(self, db_store: SessionStore, client: TestClient) -> None:
+        db_store.save_measurement(_make_fr(), label="test")
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.post("/api/feedback", json={
+                "session_id": 1, "rating": "down", "text": "too boomy at 50Hz"
+            })
+        assert resp.status_code == 200
+
+    def test_submit_feedback_invalid_rating(self, db_store: SessionStore, client: TestClient) -> None:
+        db_store.save_measurement(_make_fr(), label="test")
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.post("/api/feedback", json={
+                "session_id": 1, "rating": "meh"
+            })
+        assert resp.status_code == 422
+        assert "rating" in resp.json()["detail"]
+
+    def test_submit_feedback_session_not_found(self, db_store: SessionStore, client: TestClient) -> None:
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.post("/api/feedback", json={
+                "session_id": 999, "rating": "up"
+            })
+        assert resp.status_code == 404
+
+    def test_submit_feedback_no_text(self, db_store: SessionStore, client: TestClient) -> None:
+        """Feedback without text stores just the rating tag."""
+        db_store.save_measurement(_make_fr(), label="test")
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.post("/api/feedback", json={
+                "session_id": 1, "rating": "up"
+            })
+        assert resp.status_code == 200
+
+    def test_get_feedback(self, db_store: SessionStore, client: TestClient) -> None:
+        db_store.save_measurement(_make_fr(), label="test")
+        db_store.add_feedback(1, "[up] sounds great", content_tag="up")
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.get("/api/feedback/1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["content_tag"] == "up"
+
+    def test_get_feedback_empty(self, db_store: SessionStore, client: TestClient) -> None:
+        db_store.save_measurement(_make_fr(), label="test")
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.get("/api/feedback/1")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+
+# ── Run context in sessions ──────────────────────────────────────────────────
+
+
+class TestRunContext:
+    def test_sessions_include_run_context(self, db_store: SessionStore, client: TestClient) -> None:
+        """Sessions created during a run include run_context."""
+        # Create a run, then a session with the same timestamp
+        with db_store._connect() as conn:
+            conn.execute(
+                "INSERT INTO calibration_runs (timestamp, recipe_name, target, converged) "
+                "VALUES ('2025-01-15T12:00:00Z', 'bass-cal', 'harman', 1)"
+            )
+        # Session created at the same time as the run
+        fr = _make_fr()
+        fr_data = fr.__class__(
+            frequencies=fr.frequencies, spl=fr.spl,
+            sample_rate=fr.sample_rate, sweep_duration=fr.sweep_duration,
+            timestamp="2025-01-15T12:05:00Z",
+        )
+        db_store.save_measurement(fr_data, label="baseline")
+
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.get("/api/sessions")
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["run_context"] is not None
+        assert data[0]["run_context"]["run_id"] == 1
+        assert data[0]["run_context"]["recipe_name"] == "bass-cal"
+
+    def test_adhoc_sessions_null_run_context(self, seeded_store: SessionStore, client: TestClient) -> None:
+        """Sessions not during any run have run_context=None."""
+        with patch("calibrate.web.SessionStore", return_value=seeded_store):
+            resp = client.get("/api/sessions")
+        data = resp.json()
+        for session in data:
+            assert session["run_context"] is None
+
+
+# ── Runs include session_ids ─────────────────────────────────────────────────
+
+
+class TestRunSessionIds:
+    def test_runs_include_session_ids(self, db_store: SessionStore, client: TestClient) -> None:
+        with db_store._connect() as conn:
+            conn.execute(
+                "INSERT INTO calibration_runs (timestamp, recipe_name, target, converged) "
+                "VALUES ('2025-01-15T12:00:00Z', 'bass-cal', 'harman', 1)"
+            )
+        with patch("calibrate.web.SessionStore", return_value=db_store):
+            resp = client.get("/api/runs")
+        data = resp.json()
+        assert len(data) == 1
+        assert "session_ids" in data[0]
+        assert isinstance(data[0]["session_ids"], list)
