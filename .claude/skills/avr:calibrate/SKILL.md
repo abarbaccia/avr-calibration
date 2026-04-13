@@ -31,42 +31,48 @@ Run a calibration recipe by reading it and executing each step via MCP tools.
 ```
 1. Call `get_config` to read the user's hardware setup.
 
-2. Show a HARDWARE LAYOUT diagram — all physical boxes and connections.
-   Build ENTIRELY from config — do not hardcode ANY labels, counts, models, or
-   connection types. Every piece of information comes from `get_config`.
+2. Show a three-layer system diagram. Build ENTIRELY from config — do not
+   hardcode ANY labels, counts, models, or connection types.
 
    **Data sources:**
    - `config.connections` → physical wiring between devices (from/to/via arrays)
    - `config.minidsp.output_slots` → per-output label and type (sub/shaker/unused)
    - `config.eq_capabilities` → PEQ slot counts, FIR tap counts per output
-   - `config.speakers` → speaker groups with positions and models
+   - `config.speakers` → speaker groups with positions, models, and specs
    - `config.mic.name` → mic model
    - `config.denon` → AVR info
 
-   **How to build the diagram:**
+   **Three layers, same heading style for each:**
 
-   a. Draw a box for each unique device mentioned in `config.connections`
-      (pi, denon, minidsp, mic, speakers, subs, shakers). Use the device
-      model/name from config where available (e.g. config.denon for AVR name).
+   Each layer uses a `═══ LABEL ═══` banner, with boxes below it connected by
+   labeled lines. Lines between layers show connection type from `config.connections`.
 
-   b. Draw connection lines between boxes using the `via` field from each
-      connection entry. Label each line with the connection type(s).
-      Example: if connections has `{"from": "pi", "to": "denon", "via": ["hdmi", "network"]}`,
-      draw lines labeled "HDMI" and "Network" from Pi to Denon.
+   **a. INTELLIGENCE layer** (top)
+   Banner: `═══ INTELLIGENCE ═══`
+   One box: "avr-calibration (Pi 5) / Claude orchestrator"
+   Three lines descend from this box to the hardware layer, labeled with their
+   connection types from `config.connections` (e.g. "HDMI, Network", "USB", "USB").
 
-   c. Inside the miniDSP box, list each output from `config.minidsp.output_slots`
-      with its label, type, and EQ capability from `config.eq_capabilities`.
+   **b. HARDWARE layer** (middle)
+   Banner: `═══ HARDWARE ═══`
+   One separate box per MCP-controlled device — read from `config.connections`:
+   - **AVR box** — model from `config.denon`. Connections to other hardware devices
+     (e.g. Analog arrow to miniDSP) shown as horizontal labeled arrows between boxes.
+   - **DSP box** — "miniDSP 2x4 HD". Inside, list each output from
+     `config.minidsp.output_slots` with label, type, and EQ capability from
+     `config.eq_capabilities`. Mark shaker outputs "MUTED during cal", unused "(unused)".
+   - **Mic box** — model from `config.mic.name`, plus cal file info.
+   Lines descend from AVR and DSP boxes into the physical layer, labeled with
+   connection types (speaker_wire, analog).
 
-   d. Inside the speakers box, list groups from `config.speakers` with positions
-      and models.
-
-   e. Mark shaker outputs as "MUTED during cal". Mark unused outputs as "(unused)".
-
-   f. The room box sits between all speakers/subs and the mic. The mic connects
-      back to Pi (via its connection type from config.connections).
-
-   **Layout:** Top-to-bottom flow — Pi (controller) at top, processing in middle,
-   speakers/subs at bottom, room and mic below that feeding back to Pi.
+   **c. PHYSICAL layer** (bottom)
+   Banner: `═══ PHYSICAL ═══`
+   One room box containing ALL sound-producing transducers (these are NOT
+   separate device boxes — they live in the room):
+   - Speakers from `config.speakers` with positions, models, and specs (sensitivity, impedance)
+   - Subs from `config.minidsp.output_slots` where type=sub, with labels
+   - Shakers from `config.minidsp.output_slots` where type=shaker, with labels
+   Group by which hardware device drives them and label the connection type.
 
 3. List all .md files in recipes/core/ using Glob.
 4. Read the first few lines of each recipe to get the Goal section.
