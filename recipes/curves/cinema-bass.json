@@ -1,0 +1,18 @@
+{
+  "name": "Cinema Bass (BEQ)",
+  "description": "Restores theatrical bass impact lost in home releases. Based on the X-curve standard where LFE is mixed +10 dB hot in cinemas. Home masters often compress this dynamic range. Popular in the BEQ community (beqdesigner, miniDSP users). Best for movie-watching — can be fatiguing for music. Note: achieving the full +10 dB rise requires room gain and headroom — the calibration system anchors reference level to minimize boost, using cuts above 40 Hz rather than boosting the deep bass.",
+  "reference_freq_hz": 80,
+  "points": [
+    { "freq_hz": 20, "offset_db": 10 },
+    { "freq_hz": 25, "offset_db": 9 },
+    { "freq_hz": 31.5, "offset_db": 7 },
+    { "freq_hz": 40, "offset_db": 5 },
+    { "freq_hz": 50, "offset_db": 3 },
+    { "freq_hz": 63, "offset_db": 1.5 },
+    { "freq_hz": 80, "offset_db": 0 },
+    { "freq_hz": 100, "offset_db": 0 },
+    { "freq_hz": 120, "offset_db": 0 }
+  ],
+  "default": false,
+  "tags": ["home-theater", "movies", "high-output"]
+}

@@ -1,0 +1,18 @@
+{
+  "name": "Harman In-Room (Full Research)",
+  "description": "The full preferred in-room bass response from Olive/Welti/McMullin research at Harman International. Steeper than the conservative 'harman-bass' variant commonly shared on forums. Derived from listener preference studies showing most people prefer ~9 dB of bass rise at 20 Hz relative to 80 Hz in typical listening rooms. The conservative harman-bass (+6 dB) is safer for smaller subs; this curve is for systems with headroom to spare.",
+  "reference_freq_hz": 80,
+  "points": [
+    { "freq_hz": 20, "offset_db": 9 },
+    { "freq_hz": 25, "offset_db": 7.5 },
+    { "freq_hz": 31.5, "offset_db": 6 },
+    { "freq_hz": 40, "offset_db": 4.5 },
+    { "freq_hz": 50, "offset_db": 3 },
+    { "freq_hz": 63, "offset_db": 1.5 },
+    { "freq_hz": 80, "offset_db": 0 },
+    { "freq_hz": 100, "offset_db": 0 },
+    { "freq_hz": 120, "offset_db": 0 }
+  ],
+  "default": false,
+  "tags": ["home-theater", "music", "research-based"]
+}

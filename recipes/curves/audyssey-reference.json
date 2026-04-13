@@ -1,0 +1,18 @@
+{
+  "name": "Audyssey Reference (Bass Portion)",
+  "description": "The bass portion of the Audyssey MultEQ Reference target curve. Audyssey Reference is a mild house curve — gentle bass rise plus high-frequency rolloff (HF rolloff is above our sub range). Less aggressive than Harman in the bass. Use this when you want your sub calibration to match what MultEQ XT32 targets for the mains, ensuring a seamless handoff at the crossover. Pair with Audyssey Reference curve enabled on the Denon.",
+  "reference_freq_hz": 80,
+  "points": [
+    { "freq_hz": 20, "offset_db": 3 },
+    { "freq_hz": 25, "offset_db": 2.5 },
+    { "freq_hz": 31.5, "offset_db": 2 },
+    { "freq_hz": 40, "offset_db": 1.5 },
+    { "freq_hz": 50, "offset_db": 1 },
+    { "freq_hz": 63, "offset_db": 0.5 },
+    { "freq_hz": 80, "offset_db": 0 },
+    { "freq_hz": 100, "offset_db": 0 },
+    { "freq_hz": 120, "offset_db": 0 }
+  ],
+  "default": false,
+  "tags": ["audyssey", "denon", "crossover-match"]
+}
