@@ -433,7 +433,9 @@ async def _tool_read_input_eq() -> dict:
 
 
 async def _tool_apply_eq(
-    filters: list[dict], output_index: int | None = None,
+    filters: list[dict],
+    output_index: int | None = None,
+    simulation_verified: bool = False,
 ) -> dict:
     """Validate and apply EQ filters to DSP output(s).
 
@@ -444,7 +446,7 @@ async def _tool_apply_eq(
     """
     try:
         preset = await _dsp.current_preset()  # type: ignore[union-attr]
-        await _dsp.apply_eq(preset, filters, output_index=output_index)  # type: ignore[union-attr]
+        await _dsp.apply_eq(preset, filters, output_index=output_index, simulation_verified=simulation_verified)  # type: ignore[union-attr]
         # Persist to SQLite so the web dashboard can show active DSP state
         if output_index is not None:
             _persist_dsp_state(f"output_eq_{output_index}", {"filters": filters, "preset": preset})
@@ -463,6 +465,7 @@ async def _tool_apply_eq(
 async def _tool_apply_input_eq(
     filters: list[dict],
     target_curve: dict | None = None,
+    simulation_verified: bool = False,
 ) -> dict:
     """Validate and apply EQ filters to the DSP input channel.
 
@@ -477,7 +480,7 @@ async def _tool_apply_input_eq(
     """
     try:
         preset = await _dsp.current_preset()  # type: ignore[union-attr]
-        await _dsp.apply_input_eq(preset, filters)  # type: ignore[union-attr]
+        await _dsp.apply_input_eq(preset, filters, simulation_verified=simulation_verified)  # type: ignore[union-attr]
         _persist_dsp_state("input_eq", {"filters": filters, "preset": preset})
         if target_curve:
             _persist_dsp_state("target_curve", target_curve)
@@ -491,12 +494,19 @@ async def _tool_compute_deviation(
     target_curve: dict,
     null_threshold_db: float = 15.0,
     port_rolloff_hz: float = 28.0,
+    resolution: str = "sixth_octave",
+    convergence_threshold: float = 1.5,
 ) -> dict:
     """Compute RMS deviation of a measurement against a target curve.
 
     Automatically detects and excludes:
     - Null zones: frequencies where measured SPL is > null_threshold_db below the band average
     - Below-port rolloff: frequencies below port_rolloff_hz where the sub physically can't produce output
+
+    Resolution controls the summary band density:
+    - "third_octave": ~6 bands in 25-80 Hz (original, coarse)
+    - "sixth_octave": ~12 bands (default — good balance of detail and readability)
+    - "twelfth_octave": ~24 bands (full detail for filter design)
 
     Returns RMS deviation, per-band errors, convergence status, and excluded zones.
     """
@@ -593,14 +603,18 @@ async def _tool_compute_deviation(
         rms = math.sqrt(sum(e ** 2 for e in included_errors) / len(included_errors))
         mean_error = sum(included_errors) / len(included_errors)
         max_error = max(included_errors, key=abs)
-        converged = rms < 2.0  # Standard convergence threshold
+        converged = rms < convergence_threshold
 
-        # Downsample per_band_errors to 1/3-octave summary for compact output
+        # Generate band centres based on resolution
+        band_centres = _generate_band_centres(resolution, band_lo, band_hi)
+
+        # Downsample per_band_errors to summary at chosen resolution
         summary = []
-        for centre in _THIRD_OCTAVE_CENTRES:
-            if centre < band_lo or centre > band_hi:
-                continue
-            factor = 2 ** (1 / 6)
+        for centre in band_centres:
+            # Band edges: centre / 2^(1/(2*N)) to centre * 2^(1/(2*N))
+            # where N is bands per octave (3 for third, 6 for sixth, 12 for twelfth)
+            bpo = {"third_octave": 3, "sixth_octave": 6, "twelfth_octave": 12}.get(resolution, 6)
+            factor = 2 ** (1 / (2 * bpo))
             lo = centre / factor
             hi = centre * factor
             band_entries = [e for e in per_band_errors if lo <= e["freq_hz"] < hi and not e.get("excluded")]
@@ -609,7 +623,7 @@ async def _tool_compute_deviation(
                 avg_measured = sum(e["measured_db"] for e in band_entries) / len(band_entries)
                 target_at_centre = interpolate_target(centre)
                 summary.append({
-                    "freq_hz": centre,
+                    "freq_hz": round(centre, 1),
                     "measured_db": round(avg_measured, 1),
                     "target_db": round(target_at_centre, 1) if target_at_centre else None,
                     "error_db": round(avg_error, 1),
@@ -632,6 +646,8 @@ async def _tool_compute_deviation(
             session_id=session_id,
             rms_db=round(rms, 2),
             converged=converged,
+            convergence_threshold=convergence_threshold,
+            resolution=resolution,
             mean_error_db=round(mean_error, 2),
             max_error_db=round(max_error, 1),
             included_points=len(included_errors),
@@ -642,6 +658,30 @@ async def _tool_compute_deviation(
         )
     except Exception as exc:
         return _err(f"compute_deviation failed: {exc}")
+
+
+def _generate_band_centres(
+    resolution: str, lo_hz: float, hi_hz: float
+) -> list[float]:
+    """Generate fractional-octave band centres between lo_hz and hi_hz.
+
+    Supports: "third_octave" (ISO 266), "sixth_octave", "twelfth_octave".
+    """
+    import math
+    if resolution == "third_octave":
+        return [c for c in _THIRD_OCTAVE_CENTRES if lo_hz <= c <= hi_hz]
+
+    # Generate from base frequency 1000 Hz using ISO formula: f = 1000 * 2^(k/N)
+    bpo = 6 if resolution == "sixth_octave" else 12
+    centres = []
+    # k ranges to cover 20-200 Hz: 1000 * 2^(k/N) → k = N * log2(f/1000)
+    k_min = int(math.floor(bpo * math.log2(lo_hz / 1000)))
+    k_max = int(math.ceil(bpo * math.log2(hi_hz / 1000)))
+    for k in range(k_min, k_max + 1):
+        c = 1000.0 * (2.0 ** (k / bpo))
+        if lo_hz <= c <= hi_hz:
+            centres.append(round(c, 2))
+    return centres
 
 
 async def _tool_compare_sessions(
@@ -1658,6 +1698,80 @@ async def _tool_get_calibration_runs(limit: int = 10, run_id: int | None = None)
     return _ok(runs=runs)
 
 
+async def _tool_save_calibration_run(
+    recipe_name: str,
+    target: str,
+    device_state: dict | None = None,
+) -> dict:
+    """Create a new calibration run record with optional equipment state snapshot."""
+    from .storage import SessionStore
+
+    try:
+        store = SessionStore()
+        run_id = store.save_run(recipe_name, target, device_state=device_state)
+        return _ok(run_id=run_id)
+    except Exception as exc:
+        return _err(f"save_calibration_run failed: {exc}")
+
+
+async def _tool_update_calibration_run(
+    run_id: int,
+    converged: bool,
+    iterations_run: int,
+    baseline_rms: float | None = None,
+    final_rms: float | None = None,
+    error: str = "",
+    target_curve_data: dict | None = None,
+) -> dict:
+    """Update a calibration run with final results."""
+    from .storage import SessionStore
+
+    try:
+        store = SessionStore()
+        store.update_run(
+            run_id,
+            converged=converged,
+            iterations_run=iterations_run,
+            baseline_rms=baseline_rms,
+            final_rms=final_rms,
+            error=error,
+            target_curve_data=target_curve_data,
+        )
+        return _ok(run_id=run_id, updated=True)
+    except Exception as exc:
+        return _err(f"update_calibration_run failed: {exc}")
+
+
+async def _tool_save_calibration_iteration(
+    run_id: int,
+    iteration: int,
+    rms_before: float,
+    rms_after: float,
+    filters_proposed: list[dict],
+    filters_applied: list[dict],
+    safety_ok: bool = True,
+    safety_error: str = "",
+) -> dict:
+    """Save one iteration of a calibration run."""
+    from .storage import SessionStore
+
+    try:
+        store = SessionStore()
+        iter_id = store.save_iteration(
+            run_id=run_id,
+            iteration=iteration,
+            rms_before=rms_before,
+            rms_after=rms_after,
+            filters_proposed=filters_proposed,
+            filters_applied=filters_applied,
+            safety_ok=safety_ok,
+            safety_error=safety_error,
+        )
+        return _ok(iteration_id=iter_id, run_id=run_id)
+    except Exception as exc:
+        return _err(f"save_calibration_iteration failed: {exc}")
+
+
 async def _tool_get_config() -> dict:
     """Return the current config.yaml plus EQ capabilities discovery."""
     try:
@@ -2138,6 +2252,14 @@ _TOOLS: list[Tool] = [
                         "If omitted, writes to all configured sub outputs."
                     ),
                 },
+                "simulation_verified": {
+                    "type": "boolean",
+                    "description": (
+                        "Set to true if the filter set was verified by simulate_eq "
+                        "immediately before this apply call. Relaxes the per-iteration "
+                        "change limit from +3 dB to +6 dB."
+                    ),
+                },
             },
             "required": ["filters"],
         },
@@ -2191,6 +2313,14 @@ _TOOLS: list[Tool] = [
                             },
                         },
                     },
+                },
+                "simulation_verified": {
+                    "type": "boolean",
+                    "description": (
+                        "Set to true if the filter set was verified by simulate_eq "
+                        "immediately before this apply call. Relaxes the per-iteration "
+                        "change limit from +3 dB to +6 dB."
+                    ),
                 },
             },
             "required": ["filters"],
@@ -2333,6 +2463,126 @@ _TOOLS: list[Tool] = [
                     "description": "If provided, return full detail for this run only",
                 },
             },
+        },
+    ),
+    Tool(
+        name="save_calibration_run",
+        description=(
+            "Create a new calibration run record. Returns the run_id for use with "
+            "save_calibration_iteration and update_calibration_run. Call this at the "
+            "start of a calibration session. Optionally captures equipment state "
+            "(get_device_state output) for later review."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "recipe_name": {
+                    "type": "string",
+                    "description": "Name of the recipe being run (e.g. 'bass-calibration')",
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Target curve name (e.g. 'harman-bass', 'flat')",
+                },
+                "device_state": {
+                    "type": "object",
+                    "description": (
+                        "Snapshot of the hardware state at run start. Pass the output "
+                        "of get_device_state here to record AVR volume, DSP preset, "
+                        "input routing, and EQ state alongside the run."
+                    ),
+                },
+            },
+            "required": ["recipe_name", "target"],
+        },
+    ),
+    Tool(
+        name="update_calibration_run",
+        description=(
+            "Update a calibration run with final results (convergence, RMS, etc.). "
+            "Call this when calibration completes or fails."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "run_id": {
+                    "type": "integer",
+                    "description": "Run ID returned by save_calibration_run",
+                },
+                "converged": {
+                    "type": "boolean",
+                    "description": "Whether the calibration converged to the target",
+                },
+                "iterations_run": {
+                    "type": "integer",
+                    "description": "Total number of iterations completed",
+                },
+                "baseline_rms": {
+                    "type": "number",
+                    "description": "RMS deviation before calibration",
+                },
+                "final_rms": {
+                    "type": "number",
+                    "description": "RMS deviation after calibration",
+                },
+                "error": {
+                    "type": "string",
+                    "description": "Error message if calibration failed",
+                },
+                "target_curve_data": {
+                    "type": "object",
+                    "description": "Full target curve data used during calibration",
+                },
+            },
+            "required": ["run_id", "converged", "iterations_run"],
+        },
+    ),
+    Tool(
+        name="save_calibration_iteration",
+        description=(
+            "Save one iteration of a calibration run. Records RMS before/after, "
+            "filters proposed, filters applied, and safety validation results."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "run_id": {
+                    "type": "integer",
+                    "description": "Run ID returned by save_calibration_run",
+                },
+                "iteration": {
+                    "type": "integer",
+                    "description": "Iteration number (1-based)",
+                },
+                "rms_before": {
+                    "type": "number",
+                    "description": "RMS deviation before this iteration",
+                },
+                "rms_after": {
+                    "type": "number",
+                    "description": "RMS deviation after this iteration",
+                },
+                "filters_proposed": {
+                    "type": "array",
+                    "description": "Filter set proposed (before safety validation)",
+                    "items": {"type": "object"},
+                },
+                "filters_applied": {
+                    "type": "array",
+                    "description": "Filter set actually applied (after safety validation)",
+                    "items": {"type": "object"},
+                },
+                "safety_ok": {
+                    "type": "boolean",
+                    "description": "Whether the proposed filters passed safety validation",
+                },
+                "safety_error": {
+                    "type": "string",
+                    "description": "Safety validation error message if safety_ok is false",
+                },
+            },
+            "required": ["run_id", "iteration", "rms_before", "rms_after",
+                         "filters_proposed", "filters_applied"],
         },
     ),
     Tool(
@@ -2703,8 +2953,9 @@ _TOOLS: list[Tool] = [
         description=(
             "Compute RMS deviation of a measurement session against a target curve. "
             "Automatically excludes null zones (deep cancellation dips) and below-port rolloff "
-            "from the RMS calculation. Returns rms_db, converged (rms < 2.0), per-band summary, "
-            "and null zone identification. Use this after each EQ iteration to check convergence."
+            "from the RMS calculation. Returns rms_db, converged (rms < threshold), per-band summary "
+            "at configurable resolution (sixth_octave default ~12 bands), and null zone identification. "
+            "Use this after each EQ iteration to check convergence."
         ),
         inputSchema={
             "type": "object",
@@ -2750,6 +3001,22 @@ _TOOLS: list[Tool] = [
                     "description": (
                         "Frequencies below this are excluded as below-port rolloff. Default: 28 Hz "
                         "(SVS PB12-NSD port tuning ~22 Hz, rolloff becomes steep by 28 Hz)."
+                    ),
+                },
+                "resolution": {
+                    "type": "string",
+                    "enum": ["third_octave", "sixth_octave", "twelfth_octave"],
+                    "description": (
+                        "Summary band density. 'third_octave': ~6 bands (coarse), "
+                        "'sixth_octave': ~12 bands (default), "
+                        "'twelfth_octave': ~24 bands (full detail). Default: sixth_octave."
+                    ),
+                },
+                "convergence_threshold": {
+                    "type": "number",
+                    "description": (
+                        "RMS threshold in dB below which the result is marked 'converged'. "
+                        "Default: 1.5. Adjust based on recipe's convergence goals."
                     ),
                 },
             },
@@ -2979,11 +3246,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         output_index = arguments.get("output_index")
         if output_index is not None:
             output_index = int(output_index)
-        result = await _tool_apply_eq(arguments.get("filters", []), output_index=output_index)
+        result = await _tool_apply_eq(
+            arguments.get("filters", []),
+            output_index=output_index,
+            simulation_verified=bool(arguments.get("simulation_verified", False)),
+        )
     elif name == "apply_input_eq":
         result = await _tool_apply_input_eq(
             arguments.get("filters", []),
             target_curve=arguments.get("target_curve"),
+            simulation_verified=bool(arguments.get("simulation_verified", False)),
         )
     elif name in ("set_volume", "avr_set_volume", "set_denon_volume"):
         result = await _tool_avr_set_volume(float(arguments["level_db"]))
@@ -3005,6 +3277,33 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_get_calibration_runs(
             limit=int(arguments.get("limit", 10)),
             run_id=arguments.get("run_id"),
+        )
+    elif name == "save_calibration_run":
+        result = await _tool_save_calibration_run(
+            recipe_name=arguments["recipe_name"],
+            target=arguments["target"],
+            device_state=arguments.get("device_state"),
+        )
+    elif name == "update_calibration_run":
+        result = await _tool_update_calibration_run(
+            run_id=int(arguments["run_id"]),
+            converged=bool(arguments["converged"]),
+            iterations_run=int(arguments["iterations_run"]),
+            baseline_rms=float(arguments["baseline_rms"]) if arguments.get("baseline_rms") is not None else None,
+            final_rms=float(arguments["final_rms"]) if arguments.get("final_rms") is not None else None,
+            error=arguments.get("error", ""),
+            target_curve_data=arguments.get("target_curve_data"),
+        )
+    elif name == "save_calibration_iteration":
+        result = await _tool_save_calibration_iteration(
+            run_id=int(arguments["run_id"]),
+            iteration=int(arguments["iteration"]),
+            rms_before=float(arguments["rms_before"]),
+            rms_after=float(arguments["rms_after"]),
+            filters_proposed=arguments.get("filters_proposed", []),
+            filters_applied=arguments.get("filters_applied", []),
+            safety_ok=bool(arguments.get("safety_ok", True)),
+            safety_error=arguments.get("safety_error", ""),
         )
     elif name == "get_config":
         result = await _tool_get_config()
@@ -3076,6 +3375,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             target_curve=arguments["target_curve"],
             null_threshold_db=float(arguments.get("null_threshold_db", 15.0)),
             port_rolloff_hz=float(arguments.get("port_rolloff_hz", 28.0)),
+            resolution=arguments.get("resolution", "sixth_octave"),
+            convergence_threshold=float(arguments.get("convergence_threshold", 1.5)),
         )
     elif name == "compare_sessions":
         result = await _tool_compare_sessions(

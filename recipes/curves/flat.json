@@ -1,0 +1,18 @@
+{
+  "name": "Flat",
+  "description": "Ruler-flat response across the bass range. No bass rise. Best for well-treated rooms or studio monitoring where accuracy matters more than preference. Most listeners find flat bass thin-sounding in untreated rooms because room gain varies with frequency and seating position.",
+  "reference_freq_hz": 80,
+  "points": [
+    { "freq_hz": 20, "offset_db": 0 },
+    { "freq_hz": 25, "offset_db": 0 },
+    { "freq_hz": 31.5, "offset_db": 0 },
+    { "freq_hz": 40, "offset_db": 0 },
+    { "freq_hz": 50, "offset_db": 0 },
+    { "freq_hz": 63, "offset_db": 0 },
+    { "freq_hz": 80, "offset_db": 0 },
+    { "freq_hz": 100, "offset_db": 0 },
+    { "freq_hz": 120, "offset_db": 0 }
+  ],
+  "default": false,
+  "tags": ["studio", "reference", "treated-room"]
+}

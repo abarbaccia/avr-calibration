@@ -1,5 +1,5 @@
 ---
-name: measure
+name: avr:measure
 version: 1.0.0
 description: |
   Take a single measurement and analyze the frequency response.
@@ -15,7 +15,7 @@ allowed-tools:
   - AskUserQuestion
 ---
 
-# /measure
+# /avr:measure
 
 Take a single frequency response measurement and analyze the result.
 
@@ -60,10 +60,10 @@ If there are previous measurements:
 Present results clearly:
 - Use a simple table for frequency response data if helpful.
 - Highlight the most important finding (e.g. "You have a 12dB null at 45Hz — this is likely a room mode").
-- Suggest next steps if appropriate (e.g. "Try /calibrate to EQ this response to a target").
+- Suggest next steps if appropriate (e.g. "Try /avr:calibrate to EQ this response to a target").
 
 ## Important rules
 
-1. **Don't apply anything.** This skill only measures and reports. Use /calibrate to apply EQ.
+1. **Don't apply anything.** This skill only measures and reports. Use /avr:calibrate to apply EQ.
 2. **Be specific.** Name exact frequencies and dB values.
 3. **Explain room modes.** Users often don't understand why they have a null at 45Hz. Briefly explain.

@@ -201,6 +201,10 @@ class SessionStore:
                 conn.execute(
                     "ALTER TABLE calibration_runs ADD COLUMN target_curve_data TEXT DEFAULT NULL"
                 )
+            if "device_state" not in run_cols:
+                conn.execute(
+                    "ALTER TABLE calibration_runs ADD COLUMN device_state TEXT DEFAULT NULL"
+                )
 
     # ── Sessions ─────────────────────────────────────────────────────────────
 
@@ -381,14 +385,24 @@ class SessionStore:
 
     # ── Calibration runs ────────────────────────────────────────────────────
 
-    def save_run(self, recipe_name: str, target: str) -> int:
-        """Create a new calibration run record. Returns the run id."""
+    def save_run(
+        self,
+        recipe_name: str,
+        target: str,
+        device_state: dict | None = None,
+    ) -> int:
+        """Create a new calibration run record. Returns the run id.
+
+        *device_state* captures the AVR/DSP hardware state at the start of the
+        run (volume, preset, input, EQ state) so it can be reviewed later.
+        """
         ts = datetime.now(timezone.utc).isoformat()
+        ds_json = json.dumps(device_state) if device_state else None
         with self._connect() as conn:
             cur = conn.execute(
-                "INSERT INTO calibration_runs (timestamp, recipe_name, target)"
-                " VALUES (?, ?, ?)",
-                (ts, recipe_name, target),
+                "INSERT INTO calibration_runs (timestamp, recipe_name, target, device_state)"
+                " VALUES (?, ?, ?, ?)",
+                (ts, recipe_name, target, ds_json),
             )
             return cur.lastrowid
 
@@ -482,11 +496,12 @@ class SessionStore:
             iterations.append(d)
 
         # Parse JSON columns
-        if run.get("target_curve_data"):
-            try:
-                run["target_curve_data"] = json.loads(run["target_curve_data"])
-            except (json.JSONDecodeError, TypeError):
-                run["target_curve_data"] = None
+        for json_col in ("target_curve_data", "device_state"):
+            if run.get(json_col):
+                try:
+                    run[json_col] = json.loads(run[json_col])
+                except (json.JSONDecodeError, TypeError):
+                    run[json_col] = None
 
         run["iterations"] = iterations
         return run

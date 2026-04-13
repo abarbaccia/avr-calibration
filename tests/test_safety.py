@@ -98,15 +98,31 @@ def test_boost_at_6db_passes(validator: SafetyValidator) -> None:
     assert result.ok
 
 
-def test_boost_above_6db_fails(validator: SafetyValidator) -> None:
-    filters = [hpf(), make_filter(80.0, 6.1)]
+def test_boost_above_limit_at_80hz_fails(validator: SafetyValidator) -> None:
+    """80 Hz is above 30 Hz → limit is +8 dB. 8.1 dB should fail."""
+    filters = [hpf(), make_filter(80.0, 8.1)]
     result = validator.validate(filters)
     assert not result.ok
-    assert "6" in result.error
+    assert "8" in result.error
 
 
-def test_boost_7db_fails(validator: SafetyValidator) -> None:
+def test_boost_7db_at_80hz_passes(validator: SafetyValidator) -> None:
+    """80 Hz is above 30 Hz → +7 dB is under the +8 dB limit."""
     filters = [hpf(), make_filter(80.0, 7.0)]
+    result = validator.validate(filters)
+    assert result.ok
+
+
+def test_boost_8db_at_80hz_passes(validator: SafetyValidator) -> None:
+    """80 Hz is above 30 Hz → +8 dB is exactly at the limit."""
+    filters = [hpf(), make_filter(80.0, 8.0)]
+    result = validator.validate(filters)
+    assert result.ok
+
+
+def test_boost_above_6db_below_30hz_fails(validator: SafetyValidator) -> None:
+    """25 Hz is below 30 Hz → limit is still +6 dB. 6.1 dB should fail."""
+    filters = [hpf(), make_filter(25.0, 6.1)]
     result = validator.validate(filters)
     assert not result.ok
 
@@ -190,6 +206,34 @@ def test_new_band_too_large_increase_from_zero(validator: SafetyValidator) -> No
     prev = [hpf()]
     curr = [hpf(), make_filter(80.0, 4.0)]
     result = validator.validate(curr, prev)
+    assert not result.ok
+
+
+# ── Simulation-verified iteration limit ────────────────────────────────────────
+
+def test_simulation_verified_allows_6db_change(validator: SafetyValidator) -> None:
+    """With simulation_verified=True, +6 dB change per iteration is allowed."""
+    prev = [hpf(), make_filter(80.0, 0.0)]
+    curr = [hpf(), make_filter(80.0, 6.0)]
+    result = validator.validate(curr, prev, simulation_verified=True)
+    assert result.ok
+
+
+def test_simulation_verified_rejects_above_6db(validator: SafetyValidator) -> None:
+    """Even with simulation_verified, > +6 dB change is rejected."""
+    prev = [hpf(), make_filter(80.0, 0.0)]
+    curr = [hpf(), make_filter(80.0, 7.0)]
+    result = validator.validate(curr, prev, simulation_verified=True)
+    assert not result.ok
+    assert "6" in result.error
+    assert "simulation-verified" in result.error
+
+
+def test_without_simulation_verified_4db_rejected(validator: SafetyValidator) -> None:
+    """Without simulation_verified, +4 dB change exceeds +3 dB limit."""
+    prev = [hpf(), make_filter(80.0, 0.0)]
+    curr = [hpf(), make_filter(80.0, 4.0)]
+    result = validator.validate(curr, prev, simulation_verified=False)
     assert not result.ok
 
 

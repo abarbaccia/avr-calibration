@@ -1,5 +1,5 @@
 ---
-name: verify
+name: avr:verify
 version: 1.0.0
 description: |
   Post-calibration full-room verification. Measures the combined system response
@@ -16,7 +16,7 @@ allowed-tools:
   - AskUserQuestion
 ---
 
-# /verify
+# /avr:verify
 
 Verify full-room integration after sub calibration and Audyssey.
 
@@ -109,7 +109,7 @@ Present a structured integration report:
 - Average SPL (30-80Hz): XX dB
 - RMS from target: X.X dB
 - Bass extension (-3dB): XX Hz
-- Status: [Holding / Drifted — re-run /calibrate if drifted]
+- Status: [Holding / Drifted — re-run /avr:calibrate if drifted]
 
 ### Crossover Integration (40-160Hz)
 Rating: [Good/Fair/Poor/Critical]
@@ -135,13 +135,13 @@ Difference: XX dB → [matches target / subs too loud by X / subs too quiet by X
 ```
 
 After presenting the report, suggest: "Make the recommended adjustments on the Denon,
-then run `/verify` again to confirm they helped."
+then run `/avr:verify` again to confirm they helped."
 
 ### Step 7 — Re-run sub calibration?
 
 If the analysis suggests sub calibration needs refreshing (sub drift detected,
 crossover frequency changed, large sub trim adjustment needed), recommend:
-"Run `/calibrate` to re-tune the subs for the new Denon settings, then `/verify` again."
+"Run `/avr:calibrate` to re-tune the subs for the new Denon settings, then `/avr:verify` again."
 
 ## Key MCP tools
 
@@ -155,9 +155,9 @@ crossover frequency changed, large sub trim adjustment needed), recommend:
 
 ## Important rules
 
-1. **Don't apply EQ.** This skill measures and recommends. Sub EQ changes go through `/calibrate`.
+1. **Don't apply EQ.** This skill measures and recommends. Sub EQ changes go through `/avr:calibrate`.
 2. **Denon adjustments are manual.** Give the user exact menu paths and specific dB values.
 3. **Check sound mode first.** Verification MUST be done with Audyssey active, not Pure Direct.
-4. **After adjustments, re-verify.** Always suggest running `/verify` again after changes.
+4. **After adjustments, re-verify.** Always suggest running `/avr:verify` again after changes.
 5. **Describe every measurement.** Before each sweep, explain what's being measured and why.
 6. **Use compact format.** Always pass `format="compact"` to `get_measurement_history`.

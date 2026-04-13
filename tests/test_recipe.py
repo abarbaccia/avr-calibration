@@ -15,16 +15,16 @@ from calibrate.recipe import (
 
 # ── load_recipe_text ─────────────────────────────────────────────────────────
 
-def test_load_harman_bass_md() -> None:
+def test_load_bass_calibration_md() -> None:
     """Core markdown recipe loads successfully."""
-    text = load_recipe_text("harman-bass")
-    assert "Harman" in text
+    text = load_recipe_text("bass-calibration")
+    assert "Bass Calibration" in text or "bass" in text.lower()
     assert len(text) > 100
 
 
-def test_load_harman_bass_aligned_md() -> None:
-    text = load_recipe_text("harman-bass-aligned")
-    assert "Sub Alignment" in text or "alignment" in text.lower()
+def test_load_full_room_verify_md() -> None:
+    text = load_recipe_text("full-room-verify")
+    assert "verify" in text.lower() or "integration" in text.lower()
 
 
 def test_load_by_path(tmp_path: Path) -> None:
@@ -37,7 +37,7 @@ def test_load_by_path(tmp_path: Path) -> None:
 
 def test_load_yaml_fallback() -> None:
     """YAML recipes in recipes/ dir still load."""
-    text = load_recipe_text("harman-bass")
+    text = load_recipe_text("bass-calibration")
     # Should find either .md or .yaml version
     assert len(text) > 0
 
@@ -52,8 +52,8 @@ def test_recipe_not_found() -> None:
 def test_list_recipes_includes_core() -> None:
     recipes = list_recipes()
     names = [r["name"] for r in recipes]
-    assert "harman-bass" in names
-    assert "harman-bass-aligned" in names
+    assert "bass-calibration" in names
+    assert "full-room-verify" in names
 
 
 def test_list_recipes_format_field() -> None:
