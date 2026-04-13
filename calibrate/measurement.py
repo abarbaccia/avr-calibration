@@ -75,6 +75,7 @@ class FrequencyResponse:
     recording_peak_dbfs: Optional[float] = None  # peak of raw recording before deconvolution
     recording_rms_dbfs: Optional[float] = None  # RMS of raw recording (sweep portion)
     coherence: Optional[list[float]] = None  # 0-1 per frequency, measurement reliability
+    xcorr_peak_ms: Optional[float] = None  # cross-correlation peak time (propagation delay)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
@@ -88,6 +89,7 @@ class FrequencyResponse:
         data.setdefault("recording_peak_dbfs", None)  # backward compat
         data.setdefault("recording_rms_dbfs", None)  # backward compat
         data.setdefault("coherence", None)  # backward compat
+        data.setdefault("xcorr_peak_ms", None)  # backward compat
         return cls(**data)
 
     @property
@@ -506,7 +508,7 @@ class MeasurementEngine:
             except Exception as exc:
                 log.warning("Failed to load mic cal file %s: %s", cal_path, exc)
 
-        frequencies, spl, ir_samples, phase, coherence = self._compute_fr_arrays(
+        frequencies, spl, ir_samples, phase, coherence, xcorr_peak_ms = self._compute_fr_arrays(
             np, sweep_1d, rec_for_deconv, freq_min, freq_max, sample_rate,
             cal_curve=cal_curve,
         )
@@ -522,6 +524,7 @@ class MeasurementEngine:
             recording_peak_dbfs=rec_peak_dbfs,
             recording_rms_dbfs=rec_rms_dbfs,
             coherence=coherence,
+            xcorr_peak_ms=xcorr_peak_ms,
         )
 
     # ── Internals ─────────────────────────────────────────────────────────
@@ -544,13 +547,17 @@ class MeasurementEngine:
         freq_max: int,
         sample_rate: int,
         cal_curve: list[tuple[float, float]] | None = None,
-    ) -> tuple[list[float], list[float], list[float], list[float], list[float] | None]:
+    ) -> tuple[list[float], list[float], list[float], list[float], list[float] | None, float]:
         """
         Core deconvolution on raw numpy arrays.
 
         Deconvolves via H(f) = Y·X* / (|X|² + ε), then gates the
         impulse response in the time domain before converting back to
         the frequency domain for a clean FR.
+
+        Also computes cross-correlation peak timing for IR onset detection.
+        Cross-correlation (C = IFFT(conj(X)·Y)) has no division, so it
+        avoids the DC artifact that Wiener deconvolution creates near t=0.
 
         The PyTTa sweep buffer contains leading/trailing silence.  When
         the room's reverb tail (T60 > 1 s for bass modes) wraps around
@@ -559,7 +566,8 @@ class MeasurementEngine:
         window the IR → FFT — is the standard fix used by REW and
         other measurement tools.
 
-        Returns (frequencies, magnitude_db, ir_samples, phase_radians, coherence).
+        Returns (frequencies, magnitude_db, ir_samples, phase_radians,
+                 coherence, xcorr_peak_ms).
         coherence is None if scipy is unavailable or computation fails.
         Arrays are zero-padded / truncated to the shorter length so they
         share the same FFT grid.
@@ -571,6 +579,20 @@ class MeasurementEngine:
         # and introduces its own spectral artifacts.
         X = np.fft.rfft(sweep_array[:n], n=n)
         Y = np.fft.rfft(rec_array[:n], n=n)
+
+        # ── Cross-correlation for timing ─────────────────────────────
+        # C = IFFT(conj(X)·Y) — no division, no DC artifact.
+        # Peak of C = propagation delay (sub → mic travel time).
+        # Used by detect_ir_onset instead of deconvolved IR peak.
+        C = np.fft.irfft(np.conj(X) * Y, n=n)
+        search_n = min(int(0.050 * sample_rate), n)  # 50ms search window
+        xcorr_peak_idx = int(np.argmax(np.abs(C[:search_n])))
+        xcorr_peak_ms = round(xcorr_peak_idx / sample_rate * 1000.0, 3)
+        xcorr_peak_sign = 1 if C[xcorr_peak_idx] >= 0.0 else -1
+        log.info(
+            "xcorr peak: %.3f ms (sample %d), sign=%+d",
+            xcorr_peak_ms, xcorr_peak_idx, xcorr_peak_sign,
+        )
 
         # Regularised deconvolution (Wiener-style).
         # H = Y·conj(X) / (|X|² + ε)  — avoids amplifying noise where
@@ -625,7 +647,7 @@ class MeasurementEngine:
         except (ImportError, Exception) as exc:
             log.warning("coherence computation failed: %s", exc)
 
-        return freq_list, spl_list, ir_samples, phase_rad[mask].tolist(), coh_list
+        return freq_list, spl_list, ir_samples, phase_rad[mask].tolist(), coh_list, xcorr_peak_ms
 
     def _compute_fr(
         self,
@@ -636,7 +658,7 @@ class MeasurementEngine:
         freq_max: int,
         sample_rate: int,
         cal_curve: list[tuple[float, float]] | None = None,
-    ) -> tuple[list[float], list[float], list[float], list[float], list[float] | None]:
+    ) -> tuple[list[float], list[float], list[float], list[float], list[float] | None, float]:
         """Wrapper that extracts numpy arrays from PyTTa SignalObj inputs."""
         x = sweep.timeSignal[:, 0]
         y = recording.timeSignal[:, 0]
@@ -645,12 +667,10 @@ class MeasurementEngine:
 
 # ── IR onset detection constants ──────────────────────────────────────────────
 
-IR_ONSET_SKIP_S: float = 0.002
-"""Seconds to blank at the start of the IR before onset detection.
+IR_ONSET_BAND_HZ: tuple[float, float] = (15.0, 200.0)
+"""Bandpass range for IR onset detection (fallback when xcorr_peak_ms unavailable).
 
-Wiener deconvolution leaves a DC artifact near t=0. The shortest realistic
-sub-to-mic path in a home theater room is ~0.7 m (~2 ms), so no real IR
-onset lives before this point.
+Used only for legacy stored sessions that lack cross-correlation timing.
 """
 
 IR_ONSET_THRESHOLD_DB: float = -20.0
@@ -666,12 +686,17 @@ def detect_ir_onset(
     ir: "np.ndarray",
     sample_rate: int,
     search_window_ms: float = 50.0,
+    xcorr_peak_ms: float | None = None,
 ) -> dict:
     """Detect the onset of an impulse response, returning peak timing and level.
 
-    Skips the first IR_ONSET_SKIP_S seconds to avoid the Wiener deconvolution
-    DC artifact, then finds the first sample within IR_ONSET_THRESHOLD_DB of
-    the absolute peak.
+    Primary path: uses cross-correlation peak timing (xcorr_peak_ms) computed
+    during deconvolution. Cross-correlation (C = IFFT(conj(X)·Y)) has no
+    division, so it doesn't suffer from the DC artifact that Wiener
+    deconvolution creates near t=0.
+
+    Fallback (legacy sessions without xcorr_peak_ms): bandpass filters the
+    deconvolved IR to the sub's operating range to suppress the DC artifact.
 
     Returns:
         {peak_time_ms, peak_sign, spl_db, sample_rate}
@@ -680,13 +705,28 @@ def detect_ir_onset(
 
     search_samples = max(1, int(search_window_ms / 1000.0 * sample_rate))
     search_samples = min(search_samples, len(ir))
-    window = ir[:search_samples]
+
+    if xcorr_peak_ms is not None:
+        # Primary path: cross-correlation timing (no DC artifact).
+        peak_idx = min(int(xcorr_peak_ms / 1000.0 * sample_rate), search_samples - 1)
+        peak_sign = 1 if ir[peak_idx] >= 0.0 else -1
+        spl_db = float(20.0 * np.log10(np.abs(ir[peak_idx]) + 1e-12))
+        return {
+            "peak_time_ms": xcorr_peak_ms,
+            "peak_sign": peak_sign,
+            "spl_db": round(spl_db, 1),
+            "sample_rate": sample_rate,
+        }
+
+    # Fallback: bandpass the deconvolved IR to suppress DC artifact.
+    from scipy.signal import butter, sosfiltfilt
+
+    window = ir[:search_samples].copy()
+    lo, hi = IR_ONSET_BAND_HZ
+    sos = butter(2, [lo, hi], btype="band", fs=sample_rate, output="sos")
+    window = sosfiltfilt(sos, window)
 
     abs_window = np.abs(window)
-
-    skip_samples = max(1, int(IR_ONSET_SKIP_S * sample_rate))
-    abs_window[:skip_samples] = 0.0
-
     max_idx = int(np.argmax(abs_window))
 
     onset_ratio = 10.0 ** (IR_ONSET_THRESHOLD_DB / 20.0)  # 0.1 for -20 dB
@@ -728,7 +768,10 @@ def compute_session_metadata(
     # ── IR peak analysis (replaces analyze_ir) ────────────────────────────
     if fr.impulse_response:
         ir_arr = np.array(fr.impulse_response, dtype=np.float64)
-        metadata["ir"] = detect_ir_onset(ir_arr, sample_rate, search_window_ms)
+        metadata["ir"] = detect_ir_onset(
+            ir_arr, sample_rate, search_window_ms,
+            xcorr_peak_ms=fr.xcorr_peak_ms,
+        )
 
     # ── Decay analysis (replaces analyze_decay) ──────────────────────────
     if fr.impulse_response:

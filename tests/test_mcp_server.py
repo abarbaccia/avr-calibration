@@ -1703,6 +1703,7 @@ def _make_session_with_ir(session_id: int, peak_time_s: float = 0.005,
 
     mock_fr = MagicMock()
     mock_fr.sample_rate = sample_rate
+    mock_fr.xcorr_peak_ms = round(peak_time_s * 1000.0, 3)
 
     session = MagicMock()
     session.id = session_id

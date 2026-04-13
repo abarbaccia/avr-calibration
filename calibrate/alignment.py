@@ -95,8 +95,12 @@ def extract_ir(
     X = np.fft.rfft(sweep_arr, n=n)
     Y = np.fft.rfft(rec_arr, n=n)
 
-    # Frequency-domain deconvolution with regularisation to avoid division by zero
-    H = Y / (X + 1e-12)
+    # Wiener-style deconvolution: H = Y·conj(X) / (|X|² + ε)
+    # Epsilon is proportional to peak signal power (not a fixed constant)
+    # to avoid amplifying noise where the sweep has little energy.
+    X_power = np.abs(X) ** 2
+    epsilon = max(float(np.max(X_power)) * 1e-6, 1e-20)
+    H = Y * np.conj(X) / (X_power + epsilon)
     ir = np.fft.irfft(H, n=n)
 
     # Onset detection within the search window: find the first sample within

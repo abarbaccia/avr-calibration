@@ -93,6 +93,31 @@ from .drivers.registry import load_avr_driver, load_dsp_driver
 
 log = logging.getLogger(__name__)
 
+
+def _biquad_response(freq: float, filter_type: str, fc: float,
+                     gain_db: float = 0.0, q: float = 1.0) -> float:
+    """Exact biquad magnitude response at *freq* Hz via z-domain evaluation.
+
+    Uses the RBJ Audio EQ Cookbook coefficients from dsp.py, evaluated at the
+    miniDSP's internal sample rate. Shared by simulate_eq and optimize_q.
+    """
+    import cmath
+    import math
+
+    from .dsp import SAMPLE_RATE_HZ, freq_gain_q_to_biquad
+
+    if fc <= 0 or freq <= 0:
+        return 0.0
+    bq = freq_gain_q_to_biquad(freq=fc, gain_db=gain_db, q=q, filter_type=filter_type)
+    z = cmath.exp(1j * 2.0 * math.pi * freq / SAMPLE_RATE_HZ)
+    zi = 1.0 / z
+    num = bq["b0"] + bq["b1"] * zi + bq["b2"] * zi * zi
+    den = 1.0 + bq["a1"] * zi + bq["a2"] * zi * zi
+    if abs(den) < 1e-30:
+        return 0.0
+    return 20.0 * math.log10(abs(num / den))
+
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 MCP_PORT: int = int(os.environ.get("MCP_PORT", "8765"))
@@ -716,43 +741,11 @@ async def _tool_simulate_eq(
         if not fr or not fr.frequencies:
             return _err(f"session {session_id} has no frequency response data")
 
-        def peaking_response(fc: float, gain_db: float, q: float, freq: float) -> float:
-            if q <= 0 or fc <= 0:
-                return 0.0
-            w = freq / fc
-            A = 10.0 ** (gain_db / 40.0)
-            w2 = w * w
-            num_real = 1.0 - w2
-            num_imag = w * A / q
-            den_real = 1.0 - w2
-            den_imag = w / (A * q)
-            num_mag_sq = num_real ** 2 + num_imag ** 2
-            den_mag_sq = den_real ** 2 + den_imag ** 2
-            if den_mag_sq < 1e-30:
-                return 0.0
-            return 10.0 * math.log10(num_mag_sq / den_mag_sq)
-
         def hpf_response(fc: float, order: int, freq: float) -> float:
             if fc <= 0 or freq <= 0:
                 return 0.0
             ratio = fc / freq
             return -10.0 * order * math.log10(1.0 + ratio ** 2)
-
-        def shelf_response(fc: float, gain_db: float, q: float, freq: float,
-                           shelf_type: str = "low_shelf") -> float:
-            """Compute exact shelf filter response using biquad math from dsp.py."""
-            if fc <= 0 or freq <= 0:
-                return 0.0
-            from .dsp import freq_gain_q_to_biquad, SAMPLE_RATE_HZ
-            import cmath
-            bq = freq_gain_q_to_biquad(freq=fc, gain_db=gain_db, q=q, filter_type=shelf_type)
-            z = cmath.exp(1j * 2.0 * math.pi * freq / SAMPLE_RATE_HZ)
-            zi = 1.0 / z
-            num = bq["b0"] + bq["b1"] * zi + bq["b2"] * zi * zi
-            den = 1.0 + bq["a1"] * zi + bq["a2"] * zi * zi
-            if abs(den) < 1e-30:
-                return 0.0
-            return 20.0 * math.log10(abs(num / den))
 
         # Compute filter effect at each frequency
         predicted_fr: list[dict] = []
@@ -766,7 +759,7 @@ async def _tool_simulate_eq(
                 gain = float(filt.get("gain_db", 0))
                 q = float(filt.get("q", 1.0))
                 if ftype == "peaking":
-                    total_correction += peaking_response(fc, gain, q, f)
+                    total_correction += _biquad_response(f, "peaking", fc, gain, q)
                 elif ftype == "hpf":
                     # Skip: the measurement already includes whatever HPF was
                     # active on the miniDSP during the sweep.  Adding the HPF
@@ -774,7 +767,7 @@ async def _tool_simulate_eq(
                     # predicted bass levels to be far too low.
                     pass
                 elif ftype in ("low_shelf", "high_shelf"):
-                    total_correction += shelf_response(fc, gain, q, f, shelf_type=ftype)
+                    total_correction += _biquad_response(f, ftype, fc, gain, q)
             predicted_fr.append({
                 "freq_hz": round(f, 1),
                 "original_db": round(measured, 1),
@@ -839,22 +832,6 @@ async def _tool_optimize_q(
         # Compute the "flat" target (average SPL in band) as reference
         avg_spl = sum(s for _, s in band_data) / len(band_data)
 
-        def peaking_response(fc: float, gain_db: float, q: float, freq: float) -> float:
-            if q <= 0 or fc <= 0:
-                return 0.0
-            w = freq / fc
-            A = 10.0 ** (gain_db / 40.0)
-            w2 = w * w
-            num_real = 1.0 - w2
-            num_imag = w * A / q
-            den_real = 1.0 - w2
-            den_imag = w / (A * q)
-            num_mag_sq = num_real ** 2 + num_imag ** 2
-            den_mag_sq = den_real ** 2 + den_imag ** 2
-            if den_mag_sq < 1e-30:
-                return 0.0
-            return 10.0 * math.log10(num_mag_sq / den_mag_sq)
-
         # Search Q values from 0.5 to 10 in steps of 0.1
         best_q = 1.0
         best_rms = float("inf")
@@ -863,7 +840,7 @@ async def _tool_optimize_q(
         for q in q_candidates:
             errors_sq = []
             for f, measured in band_data:
-                correction = peaking_response(freq_hz, target_gain_db, q, f)
+                correction = _biquad_response(f, "peaking", freq_hz, target_gain_db, q)
                 corrected = measured + correction
                 error = corrected - avg_spl
                 errors_sq.append(error ** 2)
@@ -879,9 +856,9 @@ async def _tool_optimize_q(
             optimal_q=best_q,
             predicted_rms_in_band=round(best_rms, 2),
             band_hz=[round(band_lo, 1), round(band_hi, 1)],
-            effect_at_center_db=round(peaking_response(freq_hz, target_gain_db, best_q, freq_hz), 1),
-            effect_at_band_lo_db=round(peaking_response(freq_hz, target_gain_db, best_q, band_lo), 1),
-            effect_at_band_hi_db=round(peaking_response(freq_hz, target_gain_db, best_q, band_hi), 1),
+            effect_at_center_db=round(_biquad_response(freq_hz, "peaking", freq_hz, target_gain_db, best_q), 1),
+            effect_at_band_lo_db=round(_biquad_response(band_lo, "peaking", freq_hz, target_gain_db, best_q), 1),
+            effect_at_band_hi_db=round(_biquad_response(band_hi, "peaking", freq_hz, target_gain_db, best_q), 1),
         )
     except Exception as exc:
         return _err(f"optimize_q failed: {exc}")
@@ -1250,8 +1227,9 @@ async def _tool_design_fir(
                 fir_td_mp = minimum_phase(fir_td[:num_taps * 2], method="homomorphic", n_fft=n_fft)
                 fir_td = fir_td_mp[:num_taps]
             except Exception:
-                # Fallback: just truncate
-                fir_td = fir_td[:num_taps]
+                # Fallback: truncate + window to reduce spectral leakage
+                log.warning("minimum_phase() failed, falling back to windowed truncation")
+                fir_td = fir_td[:num_taps] * np.hanning(num_taps)
             pre_ringing_ms = 0.0
         else:  # mixed
             # Mixed: minimum phase below focus, linear above
@@ -1261,7 +1239,8 @@ async def _tool_design_fir(
                 fir_td_mp = minimum_phase(fir_td[:num_taps * 2], method="homomorphic", n_fft=n_fft)
                 fir_td = fir_td_mp[:num_taps]
             except Exception:
-                fir_td = fir_td[:num_taps]
+                log.warning("minimum_phase() failed, falling back to windowed truncation")
+                fir_td = fir_td[:num_taps] * np.hanning(num_taps)
             pre_ringing_ms = 0.0
 
         # Normalize so peak <= 1.0
@@ -1860,8 +1839,9 @@ async def _tool_analyze_ir(
         from .measurement import detect_ir_onset
 
         sample_rate = session.start_fr.sample_rate if session.start_fr else 48000
+        xcorr_ms = session.start_fr.xcorr_peak_ms if session.start_fr else None
         ir_arr = np.array(ir, dtype=np.float64)
-        onset = detect_ir_onset(ir_arr, sample_rate, search_window_ms)
+        onset = detect_ir_onset(ir_arr, sample_rate, search_window_ms, xcorr_peak_ms=xcorr_ms)
 
         return _ok(
             session_id=session.id,
