@@ -30,41 +30,69 @@ Run a calibration recipe by reading it and executing each step via MCP tools.
 
 ```
 1. Call `get_config` to read the user's hardware setup.
-2. Show a visual signal chain derived from get_config.
-   Build the diagram dynamically from the config — do not hardcode labels or counts.
 
-   Signal chain diagram format (populate from config):
+2. Show a HARDWARE LAYOUT diagram — all physical boxes and connections.
+   Build dynamically from config — do not hardcode labels, counts, or speaker models.
+
+   The diagram has a top-to-bottom flow:
+   - Top: Pi 5 (controller)
+   - Middle: Denon AVR + miniDSP DSP (processing)
+   - Bottom: Speakers (grouped by what drives them) → room → UMIK → back to Pi
+
+   Template (populate ALL fields from config):
 
    ```
-   Denon X3800H ──HDMI LFE──▶ miniDSP 2x4 HD
-                                │
-                      ┌─────────┴─────────┐
-                      ▼                   ▼
-                 Input PEQ           (shared to all)
-                 [N] slots
-                      │
-          ┌───────────┼───────────┐───────────┐
-          ▼           ▼           ▼           ▼
-      Output 0    Output 1    Output 2    Output 3
-      [label]     [label]     [label]     [label]
-      [type]      [type]      [type]      [type]
-      [N] PEQ     [N] PEQ     [N] PEQ     [N] PEQ
-      [N] FIR     [N] FIR     [N] FIR     [N] FIR
-          │           │           │           │
-          ▼           ▼           ▼           ▼
-       [driver]    [driver]    [driver]    [driver]
-                                          
-                      ◀─── UMIK mic ◀─── room
+                            ┌──────────────┐
+                            │     Pi 5     │
+                            └──┬──┬──┬──▲──┘
+                   USB ctrl/   │  │  │  │ USB
+                   audio       │  │  │  │ recording
+                       ┌───────┘  │  │  │
+                       │    HDMI──┘  │  │
+                       │       Net───┘  │
+                       ▼                │
+   ┌───────────────────────────┐        │
+   │      miniDSP 2x4 HD      │        │
+   │                           │        │
+   │ Input PEQ [N, shared]     │        │
+   │                           │        │
+   │ Out 0: [label or unused]  │        │
+   │ Out 1: PEQ[N]→FIR[N]     │─┐      │
+   │ Out 2: PEQ[N]→FIR[N]     │─│─┐    │
+   │ Out 3: MUTED during cal   │─│─│─┐  │
+   └────────────▲──────────────┘ │ │ │  │
+                │[AVR→DSP conn]  │ │ │  │
+   ┌────────────┴──────────────┐ │ │ │  │
+   │      [AVR model]          │ │ │ │  │
+   │      [room correction]    │ │ │ │  │
+   └────────────┬──────────────┘ │ │ │  │
+                │[AVR→speakers]  │ │ │  │
+                ▼                ▼ ▼ ▼  │
+   ┌─────────────────┐ ┌──────────────────┐
+   │ [speakers from   │ │ [subs from       │
+   │  config.speakers]│ │  output_slots]   │
+   │ L/C/R: model     │ │ [shakers from    │
+   │ SL/SR: model     │ │  output_slots]   │
+   │ Atmos: model(xN) │ └────────┬─────────┘
+   └────────┬─────────┘          │
+            │                    │
+            ▼                    ▼
+   ┌──────────────────────────────────┐
+   │              room                │
+   └───────────────┬──────────────────┘
+                   │
+            ┌──────▼──────┐
+            │  [mic name] │── USB ──▶ Pi
+            └─────────────┘
    ```
 
-   Read labels, types, PEQ slot counts from:
+   Populate from:
    - config.minidsp.output_slots → per-output label and type (sub/shaker/unused)
-   - config.eq_capabilities.output_peq → PEQ slots per sub output
-   - config.eq_capabilities.input_peq → shared input PEQ slots
-   - config.eq_capabilities.fir_capable, fir_max_taps_per_output,
-     fir_shared_tap_pool, fir_sample_rate_hz → FIR capability
-
-   Mark shaker outputs as "MUTED during cal". Mark unused outputs as dimmed/skipped.
+   - config.eq_capabilities → PEQ slot counts, FIR tap counts per output
+   - config.speakers → speaker groups with positions and models
+   - config.mic.name → mic model
+   - config.denon → AVR info
+   Mark shaker outputs as "MUTED during cal". Mark unused outputs as "(unused)".
 
 3. List all .md files in recipes/core/ using Glob.
 4. Read the first few lines of each recipe to get the Goal section.
@@ -76,6 +104,11 @@ Run a calibration recipe by reading it and executing each step via MCP tools.
 
 7. If $ARGUMENTS names a valid recipe, pre-select it but still confirm.
 8. Let the user pick or accept the recommendation.
+
+9. After recipe selection, read the recipe's "## Measurement Signal Path" section
+   and build the ACTIVE SIGNAL PATH diagram from config. The recipe tells you which
+   config fields determine the path (e.g. `playback_route`, `speakers`, `output_slots`).
+   Show only the boxes and connections that are active for this recipe's measurement mode.
 ```
 
 ### Step 2 — Pre-flight check

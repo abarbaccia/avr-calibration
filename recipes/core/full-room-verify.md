@@ -21,6 +21,21 @@ are made via AVR settings or by re-running the appropriate calibration recipe.
 
 **No filters are written by this recipe.** All analysis is read-only.
 
+## Measurement Signal Path
+
+This recipe requires the FULL listening chain — the AVR and all its processing
+must be in the measurement loop so we capture what the user actually hears.
+
+If `config.measurement.playback_route` is `"usb"`, warn the user that verification
+needs the AVR in the loop and ask them to confirm the signal path is correct, or
+switch to HDMI playback.
+
+Build the diagram dynamically from `get_config`:
+- Show Pi → AVR → miniDSP (LFE) → sub outputs → room → mic → Pi
+- Show Pi → AVR → speakers (from `config.speakers`) → room → mic → Pi
+- ALL speakers contribute — subs via miniDSP, mains/surrounds/atmos via AVR speaker outputs
+- Populate labels from config (speaker models, sub names, mic model, AVR model)
+
 ## Pre-flight
 
 ### 0.1 System check

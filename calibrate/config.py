@@ -52,6 +52,7 @@ DEFAULT_CONFIG: dict = {
         "sub_outputs": [0, 1],
         "ir_search_window_ms": 50.0,
     },
+    "speakers": [],
 }
 
 CONFIG_TEMPLATE = """\
@@ -157,6 +158,10 @@ class Config:
         if typed:
             return typed
         return self.measurement.get("sub_outputs", [0, 1])
+
+    @property
+    def speakers(self) -> list[dict]:
+        return self._data.get("speakers", [])
 
     @property
     def shaker_outputs(self) -> list[int]:

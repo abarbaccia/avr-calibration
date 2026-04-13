@@ -16,44 +16,17 @@ Adapts automatically to the hardware:
 
 ## Measurement Signal Path
 
-During calibration, the signal path is different from normal listening. Show the
-user how sweeps flow during measurement. Build this diagram dynamically from
-`get_config` — do not hardcode labels or counts.
+Show the active signal path for this recipe based on `get_config`. The path depends
+on `config.measurement.playback_route`:
 
-```
-Pi (sweep generator)
-    │
-    ▼ USB audio
-miniDSP 2x4 HD
-    │
-    ├── Input PEQ [N slots] ── shared to all outputs
-    │
-    ├── Output 0: [label] ── PEQ [N] ── FIR [N taps] ── [driver or "unused"]
-    ├── Output 1: [label] ── PEQ [N] ── FIR [N taps] ── [driver]
-    ├── Output 2: [label] ── PEQ [N] ── FIR [N taps] ── [driver]
-    └── Output 3: [label] ── PEQ [N] ── FIR [N taps] ── [driver or "MUTED"]
-                                                              │
-                                                         ┌────┘
-                                                         ▼
-                                                       room
-                                                         │
-                                                         ▼
-                                                     UMIK mic
-                                                         │
-                                                         ▼ USB audio
-                                                     Pi (recording)
-```
+- **`"usb"`**: Pi → USB audio → miniDSP → sub outputs → room → mic → Pi.
+  The AVR is not in the measurement loop.
+- **`"hdmi"`**: Pi → HDMI → AVR → miniDSP (via LFE) → sub outputs → room → mic → Pi.
+  The AVR and its processing are in the loop.
 
-Populate from config:
-- `config.minidsp.output_slots` → labels and types (sub/shaker/unused)
-- `config.eq_capabilities` → PEQ slot counts, FIR tap counts
-- Mark shaker outputs as "MUTED during cal"
-- Mark unused outputs as "unused"
-- Show the input source (USB or analog from AVR) based on config
-
-This diagram shows the user what hardware is in the loop and what DSP processing
-each sub's signal passes through. It's the testing path, not the production
-listening path (which would include the AVR, HDMI, etc.).
+Build the diagram dynamically — show only the boxes and connections that are active
+for the configured playback route. Populate labels from config (sub names, mic model,
+AVR model, DSP output slots). Mark shaker outputs as muted, unused as skipped.
 
 ## Configuration
 
