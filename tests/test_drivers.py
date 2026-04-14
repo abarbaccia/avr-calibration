@@ -775,6 +775,158 @@ async def test_reapply_volatile_output_state_holds_lock():
     assert all(lock_was_held), "lock must be held during every CLI call in reapply"
 
 
+# ── DenonSweepContext ──────────────────────────────────────────────────────────
+
+from calibrate.drivers.denon import DenonSweepContext
+
+
+def _denon_sweep_config(pure_direct: bool = True, settle_ms: int = 5000):
+    """Build a minimal Config mock for DenonSweepContext.from_config()."""
+    cfg = MagicMock()
+    cfg.measurement = {
+        "playback_route": "hdmi",
+        "denon_sweep_input": "Videocore",
+        "denon_sweep_volume": -10.0,
+        "denon_settle_ms": settle_ms,
+        "denon_pure_direct": pure_direct,
+    }
+    cfg.denon = {"host": "192.168.1.209"}
+    return cfg
+
+
+def test_denon_sweep_from_config_returns_none_for_usb():
+    """from_config() returns None when playback_route == 'usb'."""
+    cfg = _denon_sweep_config()
+    cfg.measurement["playback_route"] = "usb"
+    assert DenonSweepContext.from_config(cfg) is None
+
+
+def test_denon_sweep_from_config_returns_context_for_hdmi():
+    """from_config() returns a DenonSweepContext when HDMI configured."""
+    cfg = _denon_sweep_config()
+    ctx = DenonSweepContext.from_config(cfg)
+    assert isinstance(ctx, DenonSweepContext)
+
+
+def test_denon_sweep_from_config_pure_direct_default_true():
+    """from_config() defaults to pure_direct=True."""
+    cfg = _denon_sweep_config()
+    del cfg.measurement["denon_pure_direct"]  # not in config → default
+    ctx = DenonSweepContext.from_config(cfg)
+    assert ctx._pure_direct is True
+
+
+def test_denon_sweep_from_config_pure_direct_false():
+    """from_config() respects denon_pure_direct=False."""
+    cfg = _denon_sweep_config(pure_direct=False)
+    ctx = DenonSweepContext.from_config(cfg)
+    assert ctx._pure_direct is False
+
+
+def test_denon_sweep_from_config_settle_ms_default():
+    """from_config() uses 5000ms default when denon_settle_ms not set."""
+    cfg = _denon_sweep_config()
+    del cfg.measurement["denon_settle_ms"]
+    ctx = DenonSweepContext.from_config(cfg)
+    assert ctx._settle_ms == 5000
+
+
+def test_denon_sweep_from_config_returns_none_no_host():
+    """from_config() returns None when denon.host is not set."""
+    cfg = _denon_sweep_config()
+    cfg.denon = {"host": None}
+    assert DenonSweepContext.from_config(cfg) is None
+
+
+def test_denon_sweep_from_config_returns_none_no_sweep_input():
+    """from_config() returns None when denon_sweep_input is not set."""
+    cfg = _denon_sweep_config()
+    cfg.measurement["denon_sweep_input"] = None
+    assert DenonSweepContext.from_config(cfg) is None
+
+
+def _make_sweep_receiver(volume=-28.0, sound_mode="DTS SURROUND"):
+    """Build a denonavr mock receiver with all async methods needed by DenonSweepContext."""
+    mock_mod, mock_receiver = _make_denonavr_mock(volume=volume)
+    mock_receiver.input_func = "SHIELD"
+    mock_receiver.async_set_input_func = AsyncMock()
+    mock_receiver.async_set_volume = AsyncMock()
+    mock_receiver.soundmode = MagicMock()
+    mock_receiver.soundmode.sound_mode = sound_mode
+    mock_receiver.soundmode.async_set_sound_mode = AsyncMock()
+    return mock_mod, mock_receiver
+
+
+@pytest.mark.asyncio
+async def test_denon_sweep_enter_sets_pure_direct():
+    """With pure_direct=True, __aenter__ calls async_set_sound_mode(PURE DIRECT)."""
+    mock_mod, mock_receiver = _make_sweep_receiver()
+
+    with patch.dict(sys.modules, {"denonavr": mock_mod}):
+        with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
+            ctx = DenonSweepContext(
+                host="192.168.1.209", sweep_input="Videocore",
+                sweep_volume=-10.0, settle_ms=100, pure_direct=True,
+            )
+            await ctx.__aenter__()
+
+    mock_receiver.soundmode.async_set_sound_mode.assert_called_once_with("PURE DIRECT")
+
+
+@pytest.mark.asyncio
+async def test_denon_sweep_enter_skips_pure_direct():
+    """With pure_direct=False, __aenter__ does NOT call async_set_sound_mode."""
+    mock_mod, mock_receiver = _make_sweep_receiver()
+
+    with patch.dict(sys.modules, {"denonavr": mock_mod}):
+        with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
+            ctx = DenonSweepContext(
+                host="192.168.1.209", sweep_input="Videocore",
+                sweep_volume=-10.0, settle_ms=100, pure_direct=False,
+            )
+            await ctx.__aenter__()
+
+    mock_receiver.soundmode.async_set_sound_mode.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_denon_sweep_exit_restores_sound_mode_when_pure_direct():
+    """With pure_direct=True, __aexit__ restores the saved sound mode."""
+    mock_mod, mock_receiver = _make_sweep_receiver()
+
+    with patch.dict(sys.modules, {"denonavr": mock_mod}):
+        with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
+            ctx = DenonSweepContext(
+                host="192.168.1.209", sweep_input="Videocore",
+                sweep_volume=-10.0, settle_ms=100, pure_direct=True,
+            )
+            await ctx.__aenter__()
+            mock_receiver.soundmode.async_set_sound_mode.reset_mock()
+
+            await ctx.__aexit__(None, None, None)
+
+    mock_receiver.soundmode.async_set_sound_mode.assert_called_once_with("DTS SURROUND")
+
+
+@pytest.mark.asyncio
+async def test_denon_sweep_exit_skips_sound_mode_restore_when_not_pure_direct():
+    """With pure_direct=False, __aexit__ does NOT restore sound mode."""
+    mock_mod, mock_receiver = _make_sweep_receiver()
+
+    with patch.dict(sys.modules, {"denonavr": mock_mod}):
+        with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
+            ctx = DenonSweepContext(
+                host="192.168.1.209", sweep_input="Videocore",
+                sweep_volume=-10.0, settle_ms=100, pure_direct=False,
+            )
+            await ctx.__aenter__()
+            mock_receiver.soundmode.async_set_sound_mode.reset_mock()
+
+            await ctx.__aexit__(None, None, None)
+
+    mock_receiver.soundmode.async_set_sound_mode.assert_not_called()
+
+
 # ── Registry ───────────────────────────────────────────────────────────────────
 
 def _mock_config(avr_driver: str = "denon", dsp_driver: str = "minidsp",

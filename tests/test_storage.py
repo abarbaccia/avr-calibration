@@ -584,6 +584,32 @@ class TestCalibrationRuns:
         assert store.get_session(sid) is not None
         assert store.get_run_detail(run_id) is not None
 
+    def test_save_run_with_validation_type(self, store):
+        """save_run accepts run_type='validation'."""
+        run_id = store.save_run("full-room-verify", "none", run_type="validation")
+        detail = store.get_run_detail(run_id)
+        assert detail["run_type"] == "validation"
+
+    def test_save_run_default_type_is_calibration(self, store):
+        """save_run defaults to run_type='calibration'."""
+        run_id = store.save_run("harman-bass", "harman")
+        detail = store.get_run_detail(run_id)
+        assert detail["run_type"] == "calibration"
+
+    def test_update_run_with_sessions(self, store):
+        """update_run stores sessions list for validation runs."""
+        run_id = store.save_run("full-room-verify", "none", run_type="validation")
+        sessions = [
+            {"session_id": 321, "label": "Left Pure Direct"},
+            {"session_id": 322, "label": "Center Pure Direct"},
+        ]
+        store.update_run(run_id, converged=True, iterations_run=0, sessions=sessions)
+        detail = store.get_run_detail(run_id)
+        import json
+        stored_sessions = json.loads(detail["sessions"])
+        assert len(stored_sessions) == 2
+        assert stored_sessions[0]["session_id"] == 321
+
 
 # ── _row_to_session — corrupt end_fr / filters_applied / impulse_response ────
 

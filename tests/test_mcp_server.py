@@ -72,6 +72,12 @@ from calibrate.mcp_server import (
     _tool_simulate_eq,
     _tool_trigger_measurement,
     _tool_unmute_output,
+    _tool_evaluate_transfer_function,
+    _tool_per_filter_contribution,
+    _tool_interpolate_optimal_gain,
+    _tool_sensitivity_analysis,
+    _tool_fit_correction_filter,
+    _tool_predict_rms,
 )
 from calibrate.drivers.base import DriverError
 
@@ -602,12 +608,16 @@ async def test_trigger_measurement_with_denon_context() -> None:
     mock_ctx_instance.__aenter__ = AsyncMock(return_value=mock_ctx_instance)
     mock_ctx_instance.__aexit__ = AsyncMock(return_value=False)
 
+    mock_dsp_local = AsyncMock()
+
     with (
         patch.dict(sys.modules, {"sounddevice": mock_sd}),
         patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
         patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
+        patch.object(sut, "_dsp", mock_dsp_local),
+        patch("calibrate.drivers.minidsp._get_source_via_cli", new_callable=AsyncMock, return_value="Analog"),
     ):
         MockCtx.from_config.return_value = mock_ctx_instance
         result = await _tool_trigger_measurement()
@@ -2411,6 +2421,162 @@ async def test_call_tool_compute_deviation_dispatch() -> None:
     assert "converged" in data
 
 
+# ── anchor_target ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_anchor_target_basic() -> None:
+    """Anchor places reference so max boost = max_boost_db at the limiting freq."""
+    from calibrate.mcp_server import _tool_anchor_target
+
+    freqs = [25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 120.0]
+    # Response tilts down at low freq — 25 Hz needs the most boost
+    spls = [-20.0, -16.0, -12.0, -10.0, -9.0, -8.0, -8.0, -8.0]
+    session = _make_deviation_session(1, freqs, spls)
+    offsets = [
+        {"freq_hz": 20, "offset_db": 10},
+        {"freq_hz": 25, "offset_db": 9},
+        {"freq_hz": 31.5, "offset_db": 7},
+        {"freq_hz": 40, "offset_db": 5},
+        {"freq_hz": 50, "offset_db": 3},
+        {"freq_hz": 63, "offset_db": 1.5},
+        {"freq_hz": 80, "offset_db": 0},
+        {"freq_hz": 100, "offset_db": 0},
+        {"freq_hz": 120, "offset_db": 0},
+    ]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.get_session.return_value = session
+        result = await _tool_anchor_target(
+            session_id=1, target_offsets=offsets, max_boost_db=6.0,
+            port_rolloff_hz=20.0,  # include 25 Hz
+        )
+    assert result["ok"]
+    # 25 Hz: measured=-20, offset=9 → headroom=-29. ref = -29+6 = -23
+    assert abs(result["reference_spl"] - (-23.0)) < 0.1
+    assert result["max_boost_db"] == 6.0
+    assert result["limiting_freq_hz"] == 25.0
+    # Anchored points should have absolute SPL values
+    assert len(result["anchored_points"]) == len(offsets)
+    # 80 Hz anchor = ref + 0 = -23
+    p80 = next(p for p in result["anchored_points"] if p["freq"] == 80)
+    assert abs(p80["spl"] - (-23.0)) < 0.1
+    # 25 Hz anchor = ref + 9 = -14
+    p25 = next(p for p in result["anchored_points"] if p["freq"] == 25)
+    assert abs(p25["spl"] - (-14.0)) < 0.1
+
+
+@pytest.mark.asyncio
+async def test_anchor_target_excludes_nulls() -> None:
+    """Deep nulls are excluded from anchor calculation."""
+    from calibrate.mcp_server import _tool_anchor_target
+
+    freqs = [30.0, 40.0, 50.0, 63.0, 80.0, 100.0]
+    # 80 Hz is a deep null at -40 dB; everything else around -10 dB
+    spls = [-10.0, -10.0, -10.0, -10.0, -40.0, -10.0]
+    session = _make_deviation_session(1, freqs, spls)
+    offsets = [
+        {"freq_hz": 25, "offset_db": 0},
+        {"freq_hz": 120, "offset_db": 0},
+    ]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.get_session.return_value = session
+        result = await _tool_anchor_target(
+            session_id=1, target_offsets=offsets, null_threshold_db=15.0
+        )
+    assert result["ok"]
+    # The null at -40 dB (30 dB below avg ~-15) should be excluded
+    assert result["excluded_null_points"] >= 1
+    # Reference should NOT be driven by the null
+    # Without null: min headroom = -10 - 0 = -10, ref = -10 + 6 = -4
+    assert result["reference_spl"] > -10.0
+
+
+@pytest.mark.asyncio
+async def test_anchor_target_excludes_rolloff() -> None:
+    """Frequencies below port_rolloff_hz are excluded."""
+    from calibrate.mcp_server import _tool_anchor_target
+
+    freqs = [22.0, 25.0, 30.0, 40.0, 50.0, 63.0, 80.0]
+    spls = [-30.0, -25.0, -10.0, -10.0, -10.0, -10.0, -10.0]
+    session = _make_deviation_session(1, freqs, spls)
+    offsets = [
+        {"freq_hz": 20, "offset_db": 10},
+        {"freq_hz": 80, "offset_db": 0},
+    ]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.get_session.return_value = session
+        result = await _tool_anchor_target(
+            session_id=1, target_offsets=offsets, port_rolloff_hz=28.0
+        )
+    assert result["ok"]
+    assert result["excluded_rolloff_points"] >= 2  # 22, 25 Hz
+
+
+@pytest.mark.asyncio
+async def test_anchor_target_session_not_found() -> None:
+    """Missing session → error."""
+    from calibrate.mcp_server import _tool_anchor_target
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.get_session.return_value = None
+        result = await _tool_anchor_target(
+            session_id=99,
+            target_offsets=[{"freq_hz": 80, "offset_db": 0}],
+        )
+    assert not result["ok"]
+    assert "not found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_anchor_target_error_summary() -> None:
+    """Error summary shows boost/cut needed at each target frequency."""
+    from calibrate.mcp_server import _tool_anchor_target
+
+    freqs = [25.0, 40.0, 63.0, 80.0, 100.0]
+    spls = [-12.0, -8.0, -8.0, -8.0, -8.0]
+    session = _make_deviation_session(1, freqs, spls)
+    offsets = [
+        {"freq_hz": 25, "offset_db": 5},
+        {"freq_hz": 80, "offset_db": 0},
+        {"freq_hz": 100, "offset_db": 0},
+    ]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.get_session.return_value = session
+        result = await _tool_anchor_target(
+            session_id=1, target_offsets=offsets, max_boost_db=6.0
+        )
+    assert result["ok"]
+    assert len(result["error_summary"]) == 3
+    for entry in result["error_summary"]:
+        assert "freq_hz" in entry
+        assert "error_db" in entry
+        assert "action" in entry
+        assert entry["action"] in ("boost", "cut", "ok")
+
+
+@pytest.mark.asyncio
+async def test_call_tool_anchor_target_dispatch() -> None:
+    """call_tool('anchor_target') dispatches correctly."""
+    from calibrate.mcp_server import call_tool
+
+    freqs = [30.0, 50.0, 80.0, 100.0]
+    spls = [-10.0, -10.0, -10.0, -10.0]
+    session = _make_deviation_session(1, freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.get_session.return_value = session
+        texts = await call_tool("anchor_target", {
+            "session_id": 1,
+            "target_offsets": [
+                {"freq_hz": 25, "offset_db": 5},
+                {"freq_hz": 80, "offset_db": 0},
+            ],
+        })
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "reference_spl" in data
+    assert "anchored_points" in data
+
+
 # ── compare_sessions ─────────────────────────────────────────────────────────
 
 
@@ -3246,3 +3412,483 @@ async def test_call_tool_design_fir_dispatch() -> None:
     data = json.loads(texts[0].text)
     assert data["ok"]
     assert "coefficients" in data
+
+
+# ── LLM filter-design math tools ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_evaluate_transfer_function_basic() -> None:
+    """Peaking filter has max effect at centre frequency, less at edges."""
+    filters = [{"type": "peaking", "freq": 80.0, "gain_db": -6.0, "q": 2.0}]
+    result = await _tool_evaluate_transfer_function(
+        filters=filters, query_freqs=[40.0, 80.0, 120.0],
+    )
+    assert result["ok"]
+    assert result["num_filters"] == 1
+    assert result["num_freqs"] == 3
+    # Centre frequency gets the strongest cut
+    centre = result["results"][1]
+    assert centre["freq_hz"] == 80.0
+    assert centre["total_db"] < -5.0  # close to -6
+    # Edges get less
+    assert abs(result["results"][0]["total_db"]) < abs(centre["total_db"])
+    assert abs(result["results"][2]["total_db"]) < abs(centre["total_db"])
+
+
+@pytest.mark.asyncio
+async def test_evaluate_transfer_function_hpf_skipped() -> None:
+    """HPF contributes 0 dB (measurement already includes it)."""
+    filters = [
+        {"type": "hpf", "freq": 18.0, "gain_db": 0, "q": 0.707},
+        {"type": "peaking", "freq": 50.0, "gain_db": -3.0, "q": 2.0},
+    ]
+    result = await _tool_evaluate_transfer_function(
+        filters=filters, query_freqs=[50.0],
+    )
+    assert result["ok"]
+    pf = result["results"][0]["per_filter"]
+    assert pf[0]["contribution_db"] == 0.0  # HPF
+    assert pf[1]["contribution_db"] < -2.0  # peaking
+
+
+@pytest.mark.asyncio
+async def test_evaluate_transfer_function_multiple_filters_stack() -> None:
+    """Two overlapping cuts should sum."""
+    filters = [
+        {"type": "peaking", "freq": 60.0, "gain_db": -4.0, "q": 1.0},
+        {"type": "peaking", "freq": 70.0, "gain_db": -4.0, "q": 1.0},
+    ]
+    result = await _tool_evaluate_transfer_function(
+        filters=filters, query_freqs=[65.0],
+    )
+    assert result["ok"]
+    total = result["results"][0]["total_db"]
+    # Both filters contribute at 65 Hz — total should be more negative than either alone
+    assert total < -4.0
+
+
+@pytest.mark.asyncio
+async def test_per_filter_contribution_basic() -> None:
+    """Per-filter contribution shows baseline, correction, and predicted."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [75.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+
+    filters = [{"type": "peaking", "freq": 50.0, "gain_db": -5.0, "q": 2.0}]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_per_filter_contribution(
+            filters=filters, session_id=1, query_freqs=[50.0, 80.0],
+        )
+    assert result["ok"]
+    assert result["num_freqs"] == 2
+    # At 50 Hz, the peaking filter should have strong contribution
+    r50 = result["results"][0]
+    assert r50["baseline_db"] == 75.0
+    assert r50["per_filter"][0]["contribution_db"] < -4.0
+    assert r50["predicted_db"] < 71.0
+    # At 80 Hz, less effect
+    r80 = result["results"][1]
+    assert abs(r80["per_filter"][0]["contribution_db"]) < abs(r50["per_filter"][0]["contribution_db"])
+
+
+@pytest.mark.asyncio
+async def test_per_filter_contribution_default_freqs() -> None:
+    """Omitting query_freqs uses sixth-octave centres."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [75.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+
+    filters = [{"type": "peaking", "freq": 50.0, "gain_db": -3.0, "q": 2.0}]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_per_filter_contribution(
+            filters=filters, session_id=1,
+        )
+    assert result["ok"]
+    assert result["num_freqs"] > 5  # sixth-octave gives ~12 bands
+
+
+@pytest.mark.asyncio
+async def test_per_filter_contribution_session_not_found() -> None:
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = []
+        result = await _tool_per_filter_contribution(
+            filters=[], session_id=999,
+        )
+    assert not result["ok"]
+
+
+@pytest.mark.asyncio
+async def test_interpolate_optimal_gain_two_points() -> None:
+    """Two-point linear interpolation finds exact zero crossing."""
+    result = await _tool_interpolate_optimal_gain(
+        freq=80.0, q=4.0, filter_type="peaking",
+        measured_errors=[
+            {"gain_applied": -6.0, "error_measured": -2.8},
+            {"gain_applied": -3.0, "error_measured": 4.5},
+        ],
+    )
+    assert result["ok"]
+    # With -6 → -2.8 and -3 → +4.5, the zero crossing is between -6 and -3
+    optimal = result["optimal_gain_db"]
+    assert -6.0 < optimal < -3.0
+    assert abs(result["predicted_error_db"]) < 0.01
+
+
+@pytest.mark.asyncio
+async def test_interpolate_optimal_gain_three_points() -> None:
+    """Three points with least-squares fit."""
+    result = await _tool_interpolate_optimal_gain(
+        freq=50.0, q=2.0, filter_type="peaking",
+        measured_errors=[
+            {"gain_applied": -5.0, "error_measured": -4.6},
+            {"gain_applied": -2.5, "error_measured": 1.2},
+            {"gain_applied": 0.0, "error_measured": 4.4},
+        ],
+    )
+    assert result["ok"]
+    assert -5.0 < result["optimal_gain_db"] < 0.0
+    assert result["n_points"] == 3
+
+
+@pytest.mark.asyncio
+async def test_interpolate_optimal_gain_insufficient_data() -> None:
+    """Fewer than 2 points returns error."""
+    result = await _tool_interpolate_optimal_gain(
+        freq=80.0, q=4.0, filter_type="peaking",
+        measured_errors=[{"gain_applied": -5.0, "error_measured": -2.0}],
+    )
+    assert not result["ok"]
+
+
+@pytest.mark.asyncio
+async def test_sensitivity_analysis_basic() -> None:
+    """Sensitivity analysis returns gradients for non-HPF filters."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    # Create a response that's 5 dB above flat target
+    spls = [80.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+
+    filters = [
+        {"type": "hpf", "freq": 18, "gain_db": 0, "q": 0.707},
+        {"type": "peaking", "freq": 65.0, "gain_db": -5.0, "q": 1.0},
+    ]
+    target = {
+        "points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}],
+        "band": [20, 120],
+    }
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_sensitivity_analysis(
+            filters=filters, session_id=1, target_curve=target,
+        )
+    assert result["ok"]
+    assert result["baseline_rms"] > 0
+    assert len(result["sensitivities"]) == 2
+    # HPF should be skipped
+    assert result["sensitivities"][0]["skipped"] is True
+    # Peaking should have gradient values
+    peaking = result["sensitivities"][1]
+    assert "d_rms_d_gain" in peaking
+    assert "d_rms_d_freq" in peaking
+    assert "d_rms_d_q" in peaking
+
+
+@pytest.mark.asyncio
+async def test_sensitivity_analysis_session_not_found() -> None:
+    target = {"points": [{"freq": 20, "spl": 75}, {"freq": 120, "spl": 75}], "band": [20, 120]}
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = []
+        result = await _tool_sensitivity_analysis(
+            filters=[], session_id=999, target_curve=target,
+        )
+    assert not result["ok"]
+
+
+@pytest.mark.asyncio
+async def test_fit_correction_filter_finds_cut() -> None:
+    """Fit finds a cut filter for a response that's above target."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    # 5 dB peak at 60 Hz
+    spls = [75.0 + 5.0 * np.exp(-((f - 60) ** 2) / 200) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+
+    target = {
+        "points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}],
+        "band": [20, 120],
+    }
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_fit_correction_filter(
+            session_id=1, target_curve=target,
+            freq_range=[40.0, 80.0],
+        )
+    assert result["ok"]
+    assert result["rms_after"] < result["rms_before"]
+    bf = result["best_filter"]
+    assert bf["type"] == "peaking"
+    # Filter should be near 60 Hz and a cut
+    assert 50.0 < bf["freq"] < 75.0
+    assert bf["gain_db"] < 0
+
+
+@pytest.mark.asyncio
+async def test_fit_correction_filter_session_not_found() -> None:
+    target = {"points": [{"freq": 20, "spl": 75}, {"freq": 120, "spl": 75}], "band": [20, 120]}
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = []
+        result = await _tool_fit_correction_filter(
+            session_id=999, target_curve=target, freq_range=[20, 120],
+        )
+    assert not result["ok"]
+
+
+@pytest.mark.asyncio
+async def test_fit_correction_filter_respects_constraints() -> None:
+    """max_boost_db constraint prevents the optimizer from boosting above limit."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    # 5 dB dip at 60 Hz — would need a boost to fix
+    spls = [75.0 - 5.0 * np.exp(-((f - 60) ** 2) / 200) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+
+    target = {
+        "points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}],
+        "band": [20, 120],
+    }
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_fit_correction_filter(
+            session_id=1, target_curve=target,
+            freq_range=[40.0, 80.0],
+            constraints={"max_boost_db": 3.0},
+        )
+    assert result["ok"]
+    if "best_filter" in result:
+        assert result["best_filter"]["gain_db"] <= 3.0
+
+
+@pytest.mark.asyncio
+async def test_predict_rms_basic() -> None:
+    """predict_rms returns predicted deviation for proposed filters."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    # Flat at 80 dB
+    spls = [80.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+
+    # Target: flat at 75 dB → need 5 dB of cut
+    target = {
+        "points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}],
+        "band": [20, 120],
+    }
+    # No filters → RMS should be ~5 dB
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_predict_rms(
+            filters=[], session_id=1, target_curve=target,
+        )
+    assert result["ok"]
+    assert 4.5 < result["predicted_rms"] < 5.5
+
+
+@pytest.mark.asyncio
+async def test_predict_rms_with_correction() -> None:
+    """Applying a broadband cut should reduce predicted RMS."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [80.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+
+    target = {
+        "points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}],
+        "band": [20, 120],
+    }
+    # Broadband cut at 65 Hz — should reduce the 5 dB overshoot
+    filters = [{"type": "peaking", "freq": 65.0, "gain_db": -5.0, "q": 0.5}]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_predict_rms(
+            filters=filters, session_id=1, target_curve=target,
+        )
+    assert result["ok"]
+    assert result["predicted_rms"] < 5.0  # improved from ~5 dB
+
+
+@pytest.mark.asyncio
+async def test_predict_rms_convergence() -> None:
+    """Perfect correction converges."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [75.5] * len(freqs)  # 0.5 dB above target
+    session = _make_fr_session(freqs, spls)
+
+    target = {
+        "points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}],
+        "band": [20, 120],
+    }
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_predict_rms(
+            filters=[], session_id=1, target_curve=target,
+            convergence_threshold=1.0,
+        )
+    assert result["ok"]
+    assert result["converged"] is True
+    assert result["predicted_rms"] < 1.0
+
+
+@pytest.mark.asyncio
+async def test_predict_rms_session_not_found() -> None:
+    target = {"points": [{"freq": 20, "spl": 75}, {"freq": 120, "spl": 75}], "band": [20, 120]}
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = []
+        result = await _tool_predict_rms(
+            filters=[], session_id=999, target_curve=target,
+        )
+    assert not result["ok"]
+
+
+@pytest.mark.asyncio
+async def test_predict_rms_returns_summary() -> None:
+    """predict_rms returns per-band summary."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [80.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+
+    target = {
+        "points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}],
+        "band": [20, 120],
+    }
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_predict_rms(
+            filters=[], session_id=1, target_curve=target,
+        )
+    assert result["ok"]
+    assert len(result["summary"]) > 5
+    for band in result["summary"]:
+        assert "freq_hz" in band
+        assert "predicted_db" in band
+        assert "target_db" in band
+        assert "error_db" in band
+
+
+# ── Dispatcher tests for new tools ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_call_tool_evaluate_transfer_function_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+    texts = await call_tool("evaluate_transfer_function", {
+        "filters": [{"type": "peaking", "freq": 50, "gain_db": -3, "q": 2}],
+        "query_freqs": [50.0],
+    })
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert data["num_freqs"] == 1
+
+
+@pytest.mark.asyncio
+async def test_call_tool_per_filter_contribution_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls = [75.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        texts = await call_tool("per_filter_contribution", {
+            "filters": [{"type": "peaking", "freq": 50, "gain_db": -3, "q": 2}],
+            "session_id": 1,
+            "query_freqs": [50.0],
+        })
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_interpolate_optimal_gain_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+    texts = await call_tool("interpolate_optimal_gain", {
+        "freq": 80.0, "q": 4.0, "filter_type": "peaking",
+        "measured_errors": [
+            {"gain_applied": -6, "error_measured": -3},
+            {"gain_applied": -3, "error_measured": 4},
+        ],
+    })
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "optimal_gain_db" in data
+
+
+@pytest.mark.asyncio
+async def test_call_tool_sensitivity_analysis_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls = [80.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        texts = await call_tool("sensitivity_analysis", {
+            "filters": [{"type": "peaking", "freq": 65, "gain_db": -5, "q": 1}],
+            "session_id": 1,
+            "target_curve": {
+                "points": [{"freq": 20, "spl": 75}, {"freq": 120, "spl": 75}],
+                "band": [20, 120],
+            },
+        })
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "sensitivities" in data
+
+
+@pytest.mark.asyncio
+async def test_call_tool_fit_correction_filter_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls = [80.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        texts = await call_tool("fit_correction_filter", {
+            "session_id": 1,
+            "target_curve": {
+                "points": [{"freq": 20, "spl": 75}, {"freq": 120, "spl": 75}],
+                "band": [20, 120],
+            },
+            "freq_range": [40, 80],
+        })
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_predict_rms_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls = [80.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        texts = await call_tool("predict_rms", {
+            "session_id": 1,
+            "filters": [{"type": "peaking", "freq": 65, "gain_db": -5, "q": 0.7}],
+            "target_curve": {
+                "points": [{"freq": 20, "spl": 75}, {"freq": 120, "spl": 75}],
+                "band": [20, 120],
+            },
+        })
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "predicted_rms" in data

@@ -123,8 +123,9 @@ class DenonSweepContext:
             host=host,
             sweep_input=sweep_input,
             sweep_volume=float(config.measurement.get("denon_sweep_volume", -10.0)),
-            settle_ms=config.measurement.get("denon_settle_ms", 800),
+            settle_ms=config.measurement.get("denon_settle_ms", 5000),
             manage_volume=manage_volume,
+            pure_direct=bool(config.measurement.get("denon_pure_direct", True)),
         )
 
     def __init__(
@@ -132,8 +133,9 @@ class DenonSweepContext:
         host: str,
         sweep_input: str,
         sweep_volume: float = -10.0,
-        settle_ms: int = 800,
+        settle_ms: int = 5000,
         manage_volume: bool = True,
+        pure_direct: bool = True,
     ) -> None:
         if manage_volume and sweep_volume > self.MAX_SWEEP_VOLUME_DB:
             raise ValueError(
@@ -144,6 +146,7 @@ class DenonSweepContext:
         self._sweep_volume = sweep_volume
         self._settle_ms = settle_ms
         self._manage_volume = manage_volume
+        self._pure_direct = pure_direct
         self._receiver = None
         self._saved_input: str | None = None
         self._saved_volume: float | None = None
@@ -155,9 +158,7 @@ class DenonSweepContext:
         self._saved_input = self._receiver.input_func
         self._saved_volume = self._receiver.volume
 
-        # Save and switch sound mode to Pure Direct for clean signal path.
-        # Pure Direct disables all processing (Audyssey, Dynamic EQ, tone)
-        # but still passes the LFE channel to sub pre-outs.
+        # Save sound mode so we can restore it on exit.
         try:
             self._saved_sound_mode = self._receiver.soundmode.sound_mode
             log.info("Denon sweep: saved sound mode: %s", self._saved_sound_mode)
@@ -165,19 +166,23 @@ class DenonSweepContext:
             log.warning("Could not read sound mode: %s", exc)
 
         log.info(
-            "Denon sweep: switching to input=%s %sPure Direct (was %s / %s / %s)",
+            "Denon sweep: switching to input=%s %s%s(was %s / %s / %s)",
             self._sweep_input,
             f"volume={self._sweep_volume:.1f} dB " if self._manage_volume else "",
+            "Pure Direct " if self._pure_direct else "(keeping current sound mode) ",
             self._saved_input, self._saved_volume, self._saved_sound_mode,
         )
         await self._receiver.async_set_input_func(self._sweep_input)
         if self._manage_volume:
             await self._receiver.async_set_volume(self._sweep_volume)
 
-        try:
-            await self._receiver.soundmode.async_set_sound_mode("PURE DIRECT")
-        except Exception as exc:
-            log.warning("Could not set Pure Direct: %s", exc)
+        if self._pure_direct:
+            try:
+                await self._receiver.soundmode.async_set_sound_mode("PURE DIRECT")
+            except Exception as exc:
+                log.warning("Could not set Pure Direct: %s", exc)
+        else:
+            log.info("Denon sweep: pure_direct=False, keeping sound mode: %s", self._saved_sound_mode)
 
         await asyncio.sleep(self._settle_ms / 1000.0)
         return self
@@ -190,8 +195,8 @@ class DenonSweepContext:
                 "Denon sweep: restoring input=%s volume=%s sound_mode=%s",
                 self._saved_input, self._saved_volume, self._saved_sound_mode,
             )
-            # Timeout each restore call to prevent hanging if Denon is unresponsive
-            if self._saved_sound_mode is not None:
+            # Only restore sound mode if we changed it (pure_direct=True)
+            if self._pure_direct and self._saved_sound_mode is not None:
                 await asyncio.wait_for(
                     self._receiver.soundmode.async_set_sound_mode(self._saved_sound_mode),
                     timeout=5.0,

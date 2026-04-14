@@ -112,3 +112,95 @@ class TestUpdateConfig:
         data = yaml.safe_load(p.read_text())
         assert data["minidsp"]["host"] == "10.0.0.3"
         assert data["minidsp"]["port"] == 5380
+
+
+# ── New config defaults ──────────────────────────────────────────────────────
+
+class TestNewConfigDefaults:
+    def test_denon_settle_ms_default_is_5000(self):
+        """denon_settle_ms defaults to 5000 (HDMI HDCP needs 3-5s)."""
+        cfg = Config(DEFAULT_CONFIG.copy())
+        assert cfg.measurement.get("denon_settle_ms") == 5000
+
+    def test_denon_pure_direct_default_true(self):
+        """denon_pure_direct defaults to True for backward compat."""
+        cfg = Config(DEFAULT_CONFIG.copy())
+        assert cfg.measurement.get("denon_pure_direct") is True
+
+    def test_mic_device_index_default_none(self):
+        """mic_device_index defaults to None (find by name)."""
+        cfg = Config(DEFAULT_CONFIG.copy())
+        assert cfg.measurement.get("mic_device_index") is None
+
+    def test_hdmi_device_index_default_none(self):
+        """hdmi_device_index defaults to None (find by name)."""
+        cfg = Config(DEFAULT_CONFIG.copy())
+        assert cfg.measurement.get("hdmi_device_index") is None
+
+    def test_usb_device_index_default_none(self):
+        """usb_device_index defaults to None (find by name)."""
+        cfg = Config(DEFAULT_CONFIG.copy())
+        assert cfg.measurement.get("usb_device_index") is None
+
+    def test_master_gain_hdmi_db_default_none(self):
+        """master_gain_hdmi_db defaults to None (don't change)."""
+        cfg = Config(DEFAULT_CONFIG.copy())
+        assert cfg.measurement.get("master_gain_hdmi_db") is None
+
+
+# ── HDMI channel map ─────────────────────────────────────────────────────────
+
+class TestHdmiChannelMap:
+    def test_default_cea861_mapping(self):
+        """Default channel map follows CEA-861 5.1 layout."""
+        cfg = Config(DEFAULT_CONFIG.copy())
+        m = cfg.hdmi_channel_map
+        assert m["left"] == 1
+        assert m["right"] == 2
+        assert m["lfe"] == 3
+        assert m["center"] == 4
+        assert m["surround_left"] == 5
+        assert m["surround_right"] == 6
+
+    def test_hdmi_channel_for_exact_key(self):
+        """hdmi_channel_for resolves exact role names."""
+        cfg = Config(DEFAULT_CONFIG.copy())
+        assert cfg.hdmi_channel_for("lfe") == 3
+        assert cfg.hdmi_channel_for("center") == 4
+        assert cfg.hdmi_channel_for("left") == 1
+
+    def test_hdmi_channel_for_alias(self):
+        """hdmi_channel_for resolves common aliases."""
+        cfg = Config(DEFAULT_CONFIG.copy())
+        assert cfg.hdmi_channel_for("sub") == 3
+        assert cfg.hdmi_channel_for("subwoofer") == 3
+        assert cfg.hdmi_channel_for("sw") == 3
+        assert cfg.hdmi_channel_for("fl") == 1
+        assert cfg.hdmi_channel_for("fr") == 2
+        assert cfg.hdmi_channel_for("fc") == 4
+        assert cfg.hdmi_channel_for("c") == 4
+        assert cfg.hdmi_channel_for("sl") == 5
+        assert cfg.hdmi_channel_for("sr") == 6
+
+    def test_hdmi_channel_for_case_insensitive(self):
+        """hdmi_channel_for is case-insensitive."""
+        cfg = Config(DEFAULT_CONFIG.copy())
+        assert cfg.hdmi_channel_for("LFE") == 3
+        assert cfg.hdmi_channel_for("Center") == 4
+        assert cfg.hdmi_channel_for("FL") == 1
+
+    def test_hdmi_channel_for_unknown_returns_none(self):
+        """hdmi_channel_for returns None for unknown roles."""
+        cfg = Config(DEFAULT_CONFIG.copy())
+        assert cfg.hdmi_channel_for("height_left") is None
+        assert cfg.hdmi_channel_for("nonexistent") is None
+
+    def test_hdmi_channel_map_user_override(self, tmp_path):
+        """User can override the channel map in config.yaml."""
+        p = tmp_path / "config.yaml"
+        p.write_text(yaml.dump({
+            "hdmi_channel_map": {"left": 1, "right": 2, "lfe": 4, "center": 3}
+        }))
+        cfg = Config.load(p)
+        assert cfg.hdmi_channel_for("lfe") == 4
+        assert cfg.hdmi_channel_for("center") == 3

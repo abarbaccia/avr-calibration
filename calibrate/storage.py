@@ -205,6 +205,14 @@ class SessionStore:
                 conn.execute(
                     "ALTER TABLE calibration_runs ADD COLUMN device_state TEXT DEFAULT NULL"
                 )
+            if "run_type" not in run_cols:
+                conn.execute(
+                    "ALTER TABLE calibration_runs ADD COLUMN run_type TEXT DEFAULT 'calibration'"
+                )
+            if "sessions" not in run_cols:
+                conn.execute(
+                    "ALTER TABLE calibration_runs ADD COLUMN sessions TEXT DEFAULT NULL"
+                )
 
     # ── Sessions ─────────────────────────────────────────────────────────────
 
@@ -390,19 +398,23 @@ class SessionStore:
         recipe_name: str,
         target: str,
         device_state: dict | None = None,
+        run_type: str = "calibration",
     ) -> int:
         """Create a new calibration run record. Returns the run id.
 
         *device_state* captures the AVR/DSP hardware state at the start of the
         run (volume, preset, input, EQ state) so it can be reviewed later.
+
+        *run_type* is "calibration" (default) or "validation" — validation runs
+        don't iterate or converge, they record a set of measurement sessions.
         """
         ts = datetime.now(timezone.utc).isoformat()
         ds_json = json.dumps(device_state) if device_state else None
         with self._connect() as conn:
             cur = conn.execute(
-                "INSERT INTO calibration_runs (timestamp, recipe_name, target, device_state)"
-                " VALUES (?, ?, ?, ?)",
-                (ts, recipe_name, target, ds_json),
+                "INSERT INTO calibration_runs (timestamp, recipe_name, target, device_state, run_type)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (ts, recipe_name, target, ds_json, run_type),
             )
             return cur.lastrowid
 
@@ -415,16 +427,22 @@ class SessionStore:
         final_rms: float | None = None,
         error: str = "",
         target_curve_data: dict | None = None,
+        sessions: list[dict] | None = None,
     ) -> None:
-        """Update a calibration run with final results."""
+        """Update a calibration run with final results.
+
+        *sessions* is a list of {"session_id": N, "label": "..."} dicts for
+        validation runs that record multiple measurement sessions.
+        """
         with self._connect() as conn:
             conn.execute(
                 "UPDATE calibration_runs"
                 " SET converged=?, iterations_run=?, baseline_rms=?, final_rms=?, error=?,"
-                "     target_curve_data=?"
+                "     target_curve_data=?, sessions=?"
                 " WHERE id=?",
                 (int(converged), iterations_run, baseline_rms, final_rms, error or None,
-                 json.dumps(target_curve_data) if target_curve_data else None, run_id),
+                 json.dumps(target_curve_data) if target_curve_data else None,
+                 json.dumps(sessions) if sessions else None, run_id),
             )
 
     def save_iteration(

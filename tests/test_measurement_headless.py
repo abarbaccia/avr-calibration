@@ -211,3 +211,78 @@ class TestMeasureHeadless:
             await engine.measure()
 
         assert call_order.index("validate") < call_order.index("compute")
+
+    @pytest.mark.asyncio
+    async def test_mic_device_index_overrides_name_search(self):
+        """When mic_device_index is set, uses that index directly instead of name search."""
+        cfg = make_config(mic_device_index=3)
+        engine, _, mock_sd, _, _, mock_strategy = self._setup_mocks(config=cfg)
+        mock_sd.query_devices.return_value = [
+            {"name": "Built-in Mic", "max_input_channels": 1},
+            {"name": "UMIK-1", "max_input_channels": 1},
+            {"name": "USB Audio", "max_input_channels": 0},
+            {"name": "Direct UMIK", "max_input_channels": 1},
+        ]
+        mock_sd.default.device = (0, 2)
+
+        with patch("calibrate.drivers.playback.playback_for_route", return_value=mock_strategy):
+            await engine.measure()
+
+        # Should use index 3 directly, not search for "UMIK" (which would give index 1)
+        assert mock_sd.default.device[0] == 3
+
+    @pytest.mark.asyncio
+    async def test_hdmi_device_index_overrides_name_search(self):
+        """When hdmi_device_index is set, uses that index for HDMI output."""
+        cfg = make_config(playback_route="hdmi", hdmi_device_index=5)
+        engine, _, mock_sd, _, _, mock_strategy = self._setup_mocks(config=cfg)
+        mock_sd.query_devices.return_value = [
+            {"name": "Built-in Mic", "max_input_channels": 1},
+            {"name": "UMIK-1", "max_input_channels": 1},
+            {"name": "hdmi plugin", "max_output_channels": 8},
+            {"name": "hw:0,0", "max_output_channels": 8},
+            {"name": "default", "max_output_channels": 2},
+            {"name": "exact hdmi", "max_output_channels": 6},
+        ]
+        mock_sd.default.device = (1, 0)
+
+        with patch("calibrate.drivers.playback.playback_for_route", return_value=mock_strategy):
+            await engine.measure()
+
+        # Should use index 5 directly
+        assert mock_sd.default.device == (1, 5)
+
+    @pytest.mark.asyncio
+    async def test_usb_device_index_overrides_name_search(self):
+        """When usb_device_index is set, uses that index for USB output."""
+        cfg = make_config(playback_route="usb", usb_device_index=2)
+        engine, _, mock_sd, _, _, mock_strategy = self._setup_mocks(config=cfg)
+        mock_sd.query_devices.return_value = [
+            {"name": "UMIK-1", "max_input_channels": 1},
+            {"name": "Built-in Speaker", "max_output_channels": 2},
+            {"name": "USB DAC", "max_output_channels": 2},
+        ]
+        mock_sd.default.device = (0, 1)
+
+        with patch("calibrate.drivers.playback.playback_for_route", return_value=mock_strategy):
+            await engine.measure()
+
+        # Should use index 2 directly
+        assert mock_sd.default.device == (0, 2)
+
+    @pytest.mark.asyncio
+    async def test_name_search_fallback_when_no_device_index(self):
+        """When device indices are None, falls back to name substring matching."""
+        cfg = make_config(playback_route="usb")
+        engine, _, mock_sd, _, _, mock_strategy = self._setup_mocks(config=cfg)
+        mock_sd.query_devices.return_value = [
+            {"name": "UMIK-1", "max_input_channels": 1},
+            {"name": "miniDSP 2x4 HD", "max_output_channels": 2, "max_input_channels": 0},
+        ]
+        mock_sd.default.device = (0, 0)
+
+        with patch("calibrate.drivers.playback.playback_for_route", return_value=mock_strategy):
+            await engine.measure()
+
+        # UMIK at index 0, miniDSP at index 1 (by name search)
+        assert mock_sd.default.device == (0, 1)

@@ -412,47 +412,69 @@ class MeasurementEngine:
             try:
                 import sounddevice as sd
                 devices = sd.query_devices()
-                umik_idx = _find_umik_device(devices, name_substring=mic_name)
+
+                # Input device: prefer explicit index, fall back to name search
+                mic_idx_cfg = cfg.get("mic_device_index")
+                if mic_idx_cfg is not None:
+                    umik_idx = int(mic_idx_cfg)
+                    log.info("Input device (by index): %s (index %d)", devices[umik_idx]["name"], umik_idx)
+                else:
+                    umik_idx = _find_umik_device(devices, name_substring=mic_name)
+                    if umik_idx is not None:
+                        log.info("Input device (by name): %s (index %d)", devices[umik_idx]["name"], umik_idx)
                 if umik_idx is not None:
                     out_idx = int(sd.default.device[1])
                     sd.default.device = (umik_idx, out_idx)
-                    log.info("Input device: %s (index %d)", devices[umik_idx]["name"], umik_idx)
             except ImportError:
                 pass
 
-            # Select output device based on route
+            # Select output device based on route — prefer explicit index, fall back to name search
             if route == "hdmi":
                 try:
                     import sounddevice as sd
                     devices = sd.query_devices()
-                    hdmi_name = cfg.get("hdmi_playback_device") or "hdmi"
-                    candidates = [
-                        (idx, dev) for idx, dev in enumerate(devices)
-                        if dev["max_output_channels"] > 0 and hdmi_name.lower() in dev["name"].lower()
-                    ]
-                    # Sort: exact name match first, then shorter names (plugins) before hardware
-                    candidates.sort(key=lambda x: (x[1]["name"].lower() != hdmi_name.lower(), len(x[1]["name"])))
-                    if candidates:
-                        idx, dev = candidates[0]
+                    hdmi_idx_cfg = cfg.get("hdmi_device_index")
+                    if hdmi_idx_cfg is not None:
+                        idx = int(hdmi_idx_cfg)
                         in_idx = int(sd.default.device[0])
                         sd.default.device = (in_idx, idx)
-                        log.info("Output device (HDMI): %s (index %d)", dev["name"], idx)
+                        log.info("Output device (HDMI by index): %s (index %d)", devices[idx]["name"], idx)
+                    else:
+                        hdmi_name = cfg.get("hdmi_playback_device") or "hdmi"
+                        candidates = [
+                            (idx, dev) for idx, dev in enumerate(devices)
+                            if dev["max_output_channels"] > 0 and hdmi_name.lower() in dev["name"].lower()
+                        ]
+                        # Sort: exact name match first, then shorter names (plugins) before hardware
+                        candidates.sort(key=lambda x: (x[1]["name"].lower() != hdmi_name.lower(), len(x[1]["name"])))
+                        if candidates:
+                            idx, dev = candidates[0]
+                            in_idx = int(sd.default.device[0])
+                            sd.default.device = (in_idx, idx)
+                            log.info("Output device (HDMI by name): %s (index %d)", dev["name"], idx)
                 except ImportError:
                     pass
             elif route == "usb":
                 try:
                     import sounddevice as sd
                     devices = sd.query_devices()
-                    usb_name = cfg.get("playback_device") or "miniDSP"
-                    candidates = [
-                        (idx, dev) for idx, dev in enumerate(devices)
-                        if dev.get("max_output_channels", 0) > 0 and usb_name.lower() in dev["name"].lower()
-                    ]
-                    if candidates:
-                        idx, dev = candidates[0]
+                    usb_idx_cfg = cfg.get("usb_device_index")
+                    if usb_idx_cfg is not None:
+                        idx = int(usb_idx_cfg)
                         in_idx = int(sd.default.device[0])
                         sd.default.device = (in_idx, idx)
-                        log.info("Output device (USB): %s (index %d)", dev["name"], idx)
+                        log.info("Output device (USB by index): %s (index %d)", devices[idx]["name"], idx)
+                    else:
+                        usb_name = cfg.get("playback_device") or "miniDSP"
+                        candidates = [
+                            (idx, dev) for idx, dev in enumerate(devices)
+                            if dev.get("max_output_channels", 0) > 0 and usb_name.lower() in dev["name"].lower()
+                        ]
+                        if candidates:
+                            idx, dev = candidates[0]
+                            in_idx = int(sd.default.device[0])
+                            sd.default.device = (in_idx, idx)
+                            log.info("Output device (USB by name): %s (index %d)", dev["name"], idx)
                 except ImportError:
                     pass
 

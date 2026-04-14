@@ -660,6 +660,178 @@ async def _tool_compute_deviation(
         return _err(f"compute_deviation failed: {exc}")
 
 
+async def _tool_anchor_target(
+    session_id: int,
+    target_offsets: list[dict],
+    band: list[float] | None = None,
+    max_boost_db: float = 6.0,
+    null_threshold_db: float = 15.0,
+    port_rolloff_hz: float = 28.0,
+) -> dict:
+    """Compute the optimal reference SPL for a target curve against a baseline measurement.
+
+    Given a set of target offsets (freq_hz, offset_db relative to reference) and a
+    measured frequency response, find the reference_spl that minimizes the total
+    correction needed while keeping max boost within the safety limit.
+
+    Algorithm:
+    1. Interpolate target offsets at each measurement frequency
+    2. Exclude nulls (> null_threshold_db below band average) and below-port rolloff
+    3. At each valid frequency: headroom = measured_spl - offset
+       (the reference_spl that would require zero correction at this point)
+    4. reference_spl = min(headroom) + max_boost_db
+       (places the reference so the hardest-to-reach frequency needs exactly max_boost_db)
+    5. Return the anchored target curve with absolute SPL values
+
+    Returns anchored_points, reference_spl, max_boost_needed, error summary at key
+    frequencies, and excluded zones.
+    """
+    from .storage import SessionStore
+    import math
+
+    try:
+        store = SessionStore()
+        session = store.get_session(session_id)
+        if session is None:
+            return _err(f"session {session_id} not found")
+
+        fr = session.start_fr
+        if not fr or not fr.frequencies:
+            return _err(f"session {session_id} has no frequency response data")
+
+        if not target_offsets:
+            return _err("target_offsets must be a non-empty list of {freq_hz, offset_db}")
+
+        # Parse and sort target offset points
+        offsets_sorted = sorted(target_offsets, key=lambda p: p["freq_hz"])
+        off_freqs = [p["freq_hz"] for p in offsets_sorted]
+        off_vals = [p["offset_db"] for p in offsets_sorted]
+
+        # Determine band range
+        if band:
+            band_lo, band_hi = float(band[0]), float(band[1])
+        else:
+            band_lo, band_hi = off_freqs[0], off_freqs[-1]
+
+        def interpolate_offset(freq_hz: float) -> float | None:
+            """Log-frequency interpolation of target offset."""
+            if freq_hz < off_freqs[0] or freq_hz > off_freqs[-1]:
+                return None
+            for i in range(len(off_freqs) - 1):
+                f0, v0 = off_freqs[i], off_vals[i]
+                f1, v1 = off_freqs[i + 1], off_vals[i + 1]
+                if f0 <= freq_hz <= f1:
+                    if f1 == f0:
+                        return v0
+                    t = math.log(freq_hz / f0) / math.log(f1 / f0)
+                    return v0 + t * (v1 - v0)
+            return off_vals[-1]
+
+        # Filter FR to band range
+        pairs = [
+            (f, s) for f, s in zip(fr.frequencies, fr.spl) if band_lo <= f <= band_hi
+        ]
+        if not pairs:
+            return _err(f"no FR data in band {band_lo}-{band_hi} Hz")
+
+        # Band average for null detection
+        measured_spls = [s for _, s in pairs]
+        band_avg = sum(measured_spls) / len(measured_spls)
+
+        # Compute headroom at each valid frequency
+        headroom_values: list[tuple[float, float, float, float]] = (
+            []
+        )  # (freq, measured, offset, headroom)
+        excluded_null: list[float] = []
+        excluded_rolloff: list[float] = []
+
+        for freq, measured in pairs:
+            offset = interpolate_offset(freq)
+            if offset is None:
+                continue
+
+            is_null = measured < (band_avg - null_threshold_db)
+            is_rolloff = freq < port_rolloff_hz
+
+            if is_null:
+                excluded_null.append(round(freq, 1))
+            elif is_rolloff:
+                excluded_rolloff.append(round(freq, 1))
+            else:
+                # headroom = measured - offset
+                # This is the reference_spl at which this frequency needs 0 correction
+                headroom = measured - offset
+                headroom_values.append((freq, measured, offset, headroom))
+
+        if not headroom_values:
+            return _err("no valid frequency points after excluding nulls and rolloff")
+
+        # Reference = min(headroom) + max_boost
+        min_headroom = min(h for _, _, _, h in headroom_values)
+        limiting_freq = next(
+            freq for freq, _, _, h in headroom_values if h == min_headroom
+        )
+        reference_spl = min_headroom + max_boost_db
+
+        # Build anchored target curve (absolute SPL at each offset point)
+        anchored_points = []
+        for p in offsets_sorted:
+            anchored_points.append(
+                {
+                    "freq": p["freq_hz"],
+                    "spl": round(reference_spl + p["offset_db"], 2),
+                }
+            )
+
+        # Build error summary at each target offset frequency
+        error_summary = []
+        for p in offsets_sorted:
+            target_freq = p["freq_hz"]
+            target_spl = reference_spl + p["offset_db"]
+            # Find nearest measured point
+            closest = min(pairs, key=lambda pair: abs(pair[0] - target_freq))
+            meas_freq, meas_spl = closest
+            error = target_spl - meas_spl  # positive = boost needed, negative = cut needed
+            error_summary.append(
+                {
+                    "freq_hz": round(target_freq, 1),
+                    "target_spl": round(target_spl, 1),
+                    "measured_spl": round(meas_spl, 1),
+                    "error_db": round(error, 1),
+                    "action": "boost" if error > 0.5 else ("cut" if error < -0.5 else "ok"),
+                }
+            )
+
+        # Null zone ranges
+        null_zones: list[dict] = []
+        if excluded_null:
+            zone_start = excluded_null[0]
+            zone_end = excluded_null[0]
+            for f in excluded_null[1:]:
+                if f - zone_end < 3.0:
+                    zone_end = f
+                else:
+                    null_zones.append({"lo_hz": zone_start, "hi_hz": zone_end})
+                    zone_start = zone_end = f
+            null_zones.append({"lo_hz": zone_start, "hi_hz": zone_end})
+
+        return _ok(
+            session_id=session_id,
+            reference_spl=round(reference_spl, 2),
+            max_boost_db=round(max_boost_db, 1),
+            limiting_freq_hz=round(limiting_freq, 1),
+            band_avg_spl=round(band_avg, 1),
+            anchored_points=anchored_points,
+            error_summary=error_summary,
+            excluded_null_points=len(excluded_null),
+            excluded_rolloff_points=len(excluded_rolloff),
+            null_zones=null_zones,
+            valid_points=len(headroom_values),
+        )
+    except Exception as exc:
+        return _err(f"anchor_target failed: {exc}")
+
+
 def _generate_band_centres(
     resolution: str, lo_hz: float, hi_hz: float
 ) -> list[float]:
@@ -826,6 +998,615 @@ async def _tool_simulate_eq(
         )
     except Exception as exc:
         return _err(f"simulate_eq failed: {exc}")
+
+
+# ── LLM filter-design math tools ─────────────────────────────────────────────
+# These tools provide DATA and SIMULATION — the LLM provides JUDGMENT.
+# They help the LLM iterate faster by exposing biquad math, per-filter
+# contribution analysis, sensitivity gradients, and optimal gain interpolation.
+
+
+async def _tool_evaluate_transfer_function(
+    filters: list[dict],
+    query_freqs: list[float],
+) -> dict:
+    """Evaluate combined PEQ transfer function at specific frequencies.
+
+    Pure math — no measurement data needed. Returns the combined magnitude
+    in dB at each query frequency, plus per-filter breakdown. Use this to
+    quickly check filter interaction before running a full simulation.
+    """
+    try:
+        results = []
+        for freq in query_freqs:
+            total_db = 0.0
+            per_filter = []
+            for filt in filters:
+                ftype = filt.get("type", "peaking")
+                fc = float(filt.get("freq", 0))
+                gain = float(filt.get("gain_db", 0))
+                q = float(filt.get("q", 1.0))
+                if ftype == "hpf":
+                    contribution = 0.0  # HPF already in measurement
+                elif ftype in ("peaking", "low_shelf", "high_shelf"):
+                    contribution = _biquad_response(freq, ftype, fc, gain, q)
+                else:
+                    contribution = 0.0
+                total_db += contribution
+                per_filter.append({
+                    "type": ftype,
+                    "freq": fc,
+                    "gain_db": gain,
+                    "q": q,
+                    "contribution_db": round(contribution, 2),
+                })
+            results.append({
+                "freq_hz": round(freq, 1),
+                "total_db": round(total_db, 2),
+                "per_filter": per_filter,
+            })
+        return _ok(
+            num_filters=len(filters),
+            num_freqs=len(query_freqs),
+            results=results,
+        )
+    except Exception as exc:
+        return _err(f"evaluate_transfer_function failed: {exc}")
+
+
+async def _tool_per_filter_contribution(
+    filters: list[dict],
+    session_id: int,
+    query_freqs: list[float] | None = None,
+) -> dict:
+    """Show each filter's individual contribution at specific frequencies.
+
+    Loads a measurement session and shows how each filter affects the
+    predicted SPL at each query frequency. The LLM can see which filter
+    is responsible for an over-cut and adjust surgically.
+
+    If query_freqs is omitted, uses sixth-octave centres in 20-120 Hz.
+    """
+    from .storage import SessionStore
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        session = next((s for s in sessions if s.id == session_id), None)
+        if session is None:
+            return _err(f"session {session_id} not found")
+
+        fr = session.start_fr
+        if not fr or not fr.frequencies:
+            return _err(f"session {session_id} has no frequency response data")
+
+        if query_freqs is None:
+            query_freqs = _generate_band_centres("sixth_octave", 20.0, 120.0)
+
+        # Find closest measured SPL for each query frequency
+        import bisect
+        results = []
+        for qf in query_freqs:
+            # Binary search for closest frequency in measured data
+            idx = bisect.bisect_left(fr.frequencies, qf)
+            if idx >= len(fr.frequencies):
+                idx = len(fr.frequencies) - 1
+            elif idx > 0 and abs(fr.frequencies[idx - 1] - qf) < abs(fr.frequencies[idx] - qf):
+                idx -= 1
+            baseline_db = fr.spl[idx]
+
+            total_correction = 0.0
+            per_filter = []
+            for filt in filters:
+                ftype = filt.get("type", "peaking")
+                fc = float(filt.get("freq", 0))
+                gain = float(filt.get("gain_db", 0))
+                q = float(filt.get("q", 1.0))
+                if ftype == "hpf":
+                    c = 0.0
+                elif ftype in ("peaking", "low_shelf", "high_shelf"):
+                    c = _biquad_response(qf, ftype, fc, gain, q)
+                else:
+                    c = 0.0
+                total_correction += c
+                per_filter.append({
+                    "type": ftype,
+                    "freq": fc,
+                    "gain_db": gain,
+                    "q": q,
+                    "contribution_db": round(c, 2),
+                })
+
+            results.append({
+                "freq_hz": round(qf, 1),
+                "baseline_db": round(baseline_db, 1),
+                "total_correction_db": round(total_correction, 2),
+                "predicted_db": round(baseline_db + total_correction, 1),
+                "per_filter": per_filter,
+            })
+
+        return _ok(
+            session_id=session_id,
+            num_filters=len(filters),
+            num_freqs=len(results),
+            results=results,
+        )
+    except Exception as exc:
+        return _err(f"per_filter_contribution failed: {exc}")
+
+
+async def _tool_interpolate_optimal_gain(
+    freq: float,
+    q: float,
+    filter_type: str,
+    measured_errors: list[dict],
+) -> dict:
+    """Interpolate the optimal gain for a filter from prior iteration data.
+
+    Takes a list of {gain_applied, error_measured} pairs from prior iterations
+    and fits a line to find where error = 0. Returns the predicted optimal gain.
+
+    With 2 points: linear interpolation (exact zero-crossing).
+    With 3+ points: least-squares linear fit (handles nonlinearity better).
+    """
+    import math
+
+    try:
+        if len(measured_errors) < 2:
+            return _err("need at least 2 data points (gain_applied, error_measured)")
+
+        gains = [float(e["gain_applied"]) for e in measured_errors]
+        errors = [float(e["error_measured"]) for e in measured_errors]
+        n = len(gains)
+
+        # Linear least-squares fit: error = a * gain + b
+        sum_g = sum(gains)
+        sum_e = sum(errors)
+        sum_ge = sum(g * e for g, e in zip(gains, errors))
+        sum_g2 = sum(g * g for g in gains)
+
+        denom = n * sum_g2 - sum_g * sum_g
+        if abs(denom) < 1e-12:
+            return _err("degenerate data — all gain values are identical")
+
+        a = (n * sum_ge - sum_g * sum_e) / denom  # slope
+        b = (sum_e * sum_g2 - sum_g * sum_ge) / denom  # intercept
+
+        # Optimal gain: where error = 0 → a * gain + b = 0 → gain = -b/a
+        if abs(a) < 1e-12:
+            return _err("flat relationship — gain changes don't affect error at this frequency")
+
+        optimal_gain = -b / a
+
+        # Residual standard error for confidence
+        residuals = [e - (a * g + b) for g, e in zip(gains, errors)]
+        rss = sum(r * r for r in residuals)
+        residual_se = math.sqrt(rss / max(n - 2, 1))
+
+        # Predicted error at optimal gain (should be ~0)
+        predicted_error = a * optimal_gain + b
+
+        return _ok(
+            optimal_gain_db=round(optimal_gain, 2),
+            predicted_error_db=round(predicted_error, 3),
+            slope=round(a, 4),
+            intercept=round(b, 4),
+            residual_se=round(residual_se, 3),
+            n_points=n,
+            filter_info={"freq": freq, "q": q, "type": filter_type},
+        )
+    except Exception as exc:
+        return _err(f"interpolate_optimal_gain failed: {exc}")
+
+
+async def _tool_sensitivity_analysis(
+    filters: list[dict],
+    session_id: int,
+    target_curve: dict,
+    perturbation_db: float = 0.5,
+) -> dict:
+    """Compute sensitivity of RMS to each filter parameter.
+
+    Perturbs each filter's gain, frequency, and Q, computes the
+    resulting RMS change, and returns partial derivatives. Tells the
+    LLM which parameters matter most for convergence.
+    """
+    from .storage import SessionStore
+    import math
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        session = next((s for s in sessions if s.id == session_id), None)
+        if session is None:
+            return _err(f"session {session_id} not found")
+
+        fr = session.start_fr
+        if not fr or not fr.frequencies:
+            return _err(f"session {session_id} has no FR data")
+
+        points = target_curve.get("points", [])
+        if not points:
+            return _err("target_curve must include 'points'")
+        band = target_curve.get("band", [20, 120])
+        band_lo, band_hi = float(band[0]), float(band[1])
+
+        target_sorted = sorted(points, key=lambda p: p["freq"])
+
+        def interp_target(freq_hz):
+            if freq_hz < target_sorted[0]["freq"] or freq_hz > target_sorted[-1]["freq"]:
+                return None
+            for i in range(len(target_sorted) - 1):
+                f0, s0 = target_sorted[i]["freq"], target_sorted[i]["spl"]
+                f1, s1 = target_sorted[i + 1]["freq"], target_sorted[i + 1]["spl"]
+                if f0 <= freq_hz <= f1:
+                    if f1 == f0:
+                        return s0
+                    t = math.log(freq_hz / f0) / math.log(f1 / f0)
+                    return s0 + t * (s1 - s0)
+            return target_sorted[-1]["spl"]
+
+        # Pairs within band
+        pairs = [(f, s) for f, s in zip(fr.frequencies, fr.spl) if band_lo <= f <= band_hi]
+        if not pairs:
+            return _err("no FR data in band")
+
+        def compute_rms(filt_list):
+            errors = []
+            for f, measured in pairs:
+                target = interp_target(f)
+                if target is None:
+                    continue
+                correction = 0.0
+                for filt in filt_list:
+                    ftype = filt.get("type", "peaking")
+                    fc = float(filt.get("freq", 0))
+                    g = float(filt.get("gain_db", 0))
+                    q = float(filt.get("q", 1.0))
+                    if ftype in ("peaking", "low_shelf", "high_shelf"):
+                        correction += _biquad_response(f, ftype, fc, g, q)
+                predicted = measured + correction
+                errors.append(predicted - target)
+            if not errors:
+                return 999.0
+            return math.sqrt(sum(e ** 2 for e in errors) / len(errors))
+
+        baseline_rms = compute_rms(filters)
+
+        sensitivities = []
+        for i, filt in enumerate(filters):
+            ftype = filt.get("type", "peaking")
+            if ftype == "hpf":
+                sensitivities.append({
+                    "index": i,
+                    "type": ftype,
+                    "freq": float(filt.get("freq", 0)),
+                    "skipped": True,
+                    "reason": "HPF not perturbed",
+                })
+                continue
+
+            fc = float(filt.get("freq", 0))
+            gain = float(filt.get("gain_db", 0))
+            q = float(filt.get("q", 1.0))
+
+            # Perturb gain
+            f_plus = [dict(f) for f in filters]
+            f_plus[i] = {**f_plus[i], "gain_db": gain + perturbation_db}
+            f_minus = [dict(f) for f in filters]
+            f_minus[i] = {**f_minus[i], "gain_db": gain - perturbation_db}
+            d_rms_d_gain = (compute_rms(f_plus) - compute_rms(f_minus)) / (2 * perturbation_db)
+
+            # Perturb frequency (by 1 Hz)
+            freq_delta = 1.0
+            f_plus = [dict(f) for f in filters]
+            f_plus[i] = {**f_plus[i], "freq": fc + freq_delta}
+            f_minus = [dict(f) for f in filters]
+            f_minus[i] = {**f_minus[i], "freq": max(1.0, fc - freq_delta)}
+            d_rms_d_freq = (compute_rms(f_plus) - compute_rms(f_minus)) / (2 * freq_delta)
+
+            # Perturb Q (by 0.1)
+            q_delta = 0.1
+            f_plus = [dict(f) for f in filters]
+            f_plus[i] = {**f_plus[i], "q": q + q_delta}
+            f_minus = [dict(f) for f in filters]
+            f_minus[i] = {**f_minus[i], "q": max(0.1, q - q_delta)}
+            d_rms_d_q = (compute_rms(f_plus) - compute_rms(f_minus)) / (2 * q_delta)
+
+            sensitivities.append({
+                "index": i,
+                "type": ftype,
+                "freq": fc,
+                "gain_db": gain,
+                "q": q,
+                "d_rms_d_gain": round(d_rms_d_gain, 4),
+                "d_rms_d_freq": round(d_rms_d_freq, 4),
+                "d_rms_d_q": round(d_rms_d_q, 4),
+            })
+
+        return _ok(
+            session_id=session_id,
+            baseline_rms=round(baseline_rms, 3),
+            perturbation_db=perturbation_db,
+            sensitivities=sensitivities,
+        )
+    except Exception as exc:
+        return _err(f"sensitivity_analysis failed: {exc}")
+
+
+async def _tool_fit_correction_filter(
+    session_id: int,
+    target_curve: dict,
+    freq_range: list[float],
+    constraints: dict | None = None,
+) -> dict:
+    """Find the optimal single PEQ filter to minimize RMS in a frequency range.
+
+    The LLM decides WHICH region to correct and any constraints. This tool
+    does the numerical optimization to find the best (freq, gain, Q).
+
+    constraints: {max_boost_db, min_q, max_q, filter_type}
+    """
+    from .storage import SessionStore
+    import math
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        session = next((s for s in sessions if s.id == session_id), None)
+        if session is None:
+            return _err(f"session {session_id} not found")
+
+        fr = session.start_fr
+        if not fr or not fr.frequencies:
+            return _err(f"session {session_id} has no FR data")
+
+        points = target_curve.get("points", [])
+        if not points:
+            return _err("target_curve must include 'points'")
+
+        range_lo, range_hi = float(freq_range[0]), float(freq_range[1])
+        target_sorted = sorted(points, key=lambda p: p["freq"])
+
+        def interp_target(freq_hz):
+            if freq_hz < target_sorted[0]["freq"] or freq_hz > target_sorted[-1]["freq"]:
+                return None
+            for i in range(len(target_sorted) - 1):
+                f0, s0 = target_sorted[i]["freq"], target_sorted[i]["spl"]
+                f1, s1 = target_sorted[i + 1]["freq"], target_sorted[i + 1]["spl"]
+                if f0 <= freq_hz <= f1:
+                    if f1 == f0:
+                        return s0
+                    t = math.log(freq_hz / f0) / math.log(f1 / f0)
+                    return s0 + t * (s1 - s0)
+            return target_sorted[-1]["spl"]
+
+        # Build error pairs in the target range
+        error_pairs = []
+        for f, measured in zip(fr.frequencies, fr.spl):
+            if f < range_lo or f > range_hi:
+                continue
+            target = interp_target(f)
+            if target is None:
+                continue
+            error_pairs.append((f, measured, target, measured - target))
+
+        if not error_pairs:
+            return _err(f"no data in range {range_lo}-{range_hi} Hz")
+
+        # RMS before correction
+        rms_before = math.sqrt(sum(e[3] ** 2 for e in error_pairs) / len(error_pairs))
+
+        # Constraints
+        c = constraints or {}
+        max_boost = float(c.get("max_boost_db", 6.0))
+        min_q = float(c.get("min_q", 0.5))
+        max_q = float(c.get("max_q", 10.0))
+        ftype = c.get("filter_type", "peaking")
+
+        # Grid search + refinement (scipy optional, grid is robust)
+        best_rms = rms_before
+        best_params = None
+
+        # Grid: freq from range_lo to range_hi, gain from -15 to max_boost, Q from min_q to max_q
+        freq_steps = 20
+        gain_steps = 15
+        q_steps = 10
+
+        for fi in range(freq_steps + 1):
+            fc = range_lo * (range_hi / range_lo) ** (fi / freq_steps)  # log-spaced
+            for gi in range(gain_steps + 1):
+                gain = -15.0 + (15.0 + max_boost) * gi / gain_steps
+                for qi in range(q_steps + 1):
+                    q = min_q + (max_q - min_q) * qi / q_steps
+
+                    # Compute RMS with this filter
+                    errors = []
+                    for f, measured, target, _ in error_pairs:
+                        correction = _biquad_response(f, ftype, fc, gain, q)
+                        errors.append(measured + correction - target)
+                    rms = math.sqrt(sum(e ** 2 for e in errors) / len(errors))
+
+                    if rms < best_rms:
+                        best_rms = rms
+                        best_params = {"freq": round(fc, 1), "gain_db": round(gain, 1), "q": round(q, 1)}
+
+        if best_params is None:
+            return _ok(
+                session_id=session_id,
+                message="no filter improves the response in this range",
+                rms_before=round(rms_before, 3),
+            )
+
+        # Refine with finer grid around best params
+        fc0, g0, q0 = best_params["freq"], best_params["gain_db"], best_params["q"]
+        freq_span = (range_hi / range_lo) ** (1.0 / freq_steps) * fc0 - fc0
+        gain_span = (15.0 + max_boost) / gain_steps
+        q_span = (max_q - min_q) / q_steps
+
+        for fi in range(11):
+            fc = fc0 + freq_span * (fi - 5) / 5
+            if fc < range_lo or fc > range_hi:
+                continue
+            for gi in range(11):
+                gain = g0 + gain_span * (gi - 5) / 5
+                if gain > max_boost:
+                    continue
+                for qi in range(11):
+                    q = q0 + q_span * (qi - 5) / 5
+                    if q < min_q or q > max_q:
+                        continue
+                    errors = []
+                    for f, measured, target, _ in error_pairs:
+                        correction = _biquad_response(f, ftype, fc, gain, q)
+                        errors.append(measured + correction - target)
+                    rms = math.sqrt(sum(e ** 2 for e in errors) / len(errors))
+                    if rms < best_rms:
+                        best_rms = rms
+                        best_params = {"freq": round(fc, 1), "gain_db": round(gain, 1), "q": round(q, 1)}
+
+        return _ok(
+            session_id=session_id,
+            freq_range=[range_lo, range_hi],
+            rms_before=round(rms_before, 3),
+            rms_after=round(best_rms, 3),
+            rms_improvement=round(rms_before - best_rms, 3),
+            best_filter={
+                "type": ftype,
+                **best_params,
+            },
+        )
+    except Exception as exc:
+        return _err(f"fit_correction_filter failed: {exc}")
+
+
+async def _tool_predict_rms(
+    filters: list[dict],
+    session_id: int,
+    target_curve: dict,
+    null_threshold_db: float = 15.0,
+    port_rolloff_hz: float = 28.0,
+    convergence_threshold: float = 1.5,
+) -> dict:
+    """Predict RMS deviation after applying filters — simulate_eq + compute_deviation in one call.
+
+    Combines filter simulation with target curve comparison. Returns predicted
+    RMS, convergence status, and per-band errors without touching hardware.
+    """
+    from .storage import SessionStore
+    import math
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        session = next((s for s in sessions if s.id == session_id), None)
+        if session is None:
+            return _err(f"session {session_id} not found")
+
+        fr = session.start_fr
+        if not fr or not fr.frequencies:
+            return _err(f"session {session_id} has no FR data")
+
+        points = target_curve.get("points", [])
+        if not points:
+            return _err("target_curve must include 'points'")
+        band = target_curve.get("band", [20, 120])
+        band_lo, band_hi = float(band[0]), float(band[1])
+
+        target_sorted = sorted(points, key=lambda p: p["freq"])
+
+        def interp_target(freq_hz):
+            if freq_hz < target_sorted[0]["freq"] or freq_hz > target_sorted[-1]["freq"]:
+                return None
+            for i in range(len(target_sorted) - 1):
+                f0, s0 = target_sorted[i]["freq"], target_sorted[i]["spl"]
+                f1, s1 = target_sorted[i + 1]["freq"], target_sorted[i + 1]["spl"]
+                if f0 <= freq_hz <= f1:
+                    if f1 == f0:
+                        return s0
+                    t = math.log(freq_hz / f0) / math.log(f1 / f0)
+                    return s0 + t * (s1 - s0)
+            return target_sorted[-1]["spl"]
+
+        # Simulate EQ and compute deviation in one pass
+        predicted_pairs = []
+        for f, measured in zip(fr.frequencies, fr.spl):
+            if f < band_lo or f > band_hi:
+                continue
+            correction = 0.0
+            for filt in filters:
+                ftype = filt.get("type", "peaking")
+                fc = float(filt.get("freq", 0))
+                gain = float(filt.get("gain_db", 0))
+                q = float(filt.get("q", 1.0))
+                if ftype in ("peaking", "low_shelf", "high_shelf"):
+                    correction += _biquad_response(f, ftype, fc, gain, q)
+            predicted_pairs.append((f, measured + correction))
+
+        if not predicted_pairs:
+            return _err("no data in band")
+
+        # Compute band average for null detection
+        pred_spls = [s for _, s in predicted_pairs]
+        band_avg = sum(pred_spls) / len(pred_spls)
+
+        # Classify and compute errors
+        included_errors = []
+        excluded_null = 0
+        excluded_rolloff = 0
+
+        for f, predicted in predicted_pairs:
+            target = interp_target(f)
+            if target is None:
+                continue
+            is_null = predicted < (band_avg - null_threshold_db)
+            is_rolloff = f < port_rolloff_hz
+            if is_null:
+                excluded_null += 1
+            elif is_rolloff:
+                excluded_rolloff += 1
+            else:
+                included_errors.append(predicted - target)
+
+        if not included_errors:
+            return _err("no usable points after exclusions")
+
+        rms = math.sqrt(sum(e ** 2 for e in included_errors) / len(included_errors))
+        mean_error = sum(included_errors) / len(included_errors)
+        converged = rms < convergence_threshold
+
+        # Generate band summary
+        band_centres = _generate_band_centres("sixth_octave", band_lo, band_hi)
+        summary = []
+        for centre in band_centres:
+            factor = 2 ** (1 / 12)  # sixth-octave half-bandwidth
+            lo = centre / factor
+            hi = centre * factor
+            band_entries = [(f, s) for f, s in predicted_pairs if lo <= f < hi]
+            if band_entries:
+                avg_pred = sum(s for _, s in band_entries) / len(band_entries)
+                target_at = interp_target(centre)
+                if target_at is not None:
+                    summary.append({
+                        "freq_hz": round(centre, 1),
+                        "predicted_db": round(avg_pred, 1),
+                        "target_db": round(target_at, 1),
+                        "error_db": round(avg_pred - target_at, 1),
+                    })
+
+        return _ok(
+            session_id=session_id,
+            predicted_rms=round(rms, 2),
+            converged=converged,
+            convergence_threshold=convergence_threshold,
+            mean_error_db=round(mean_error, 2),
+            included_points=len(included_errors),
+            excluded_null_points=excluded_null,
+            excluded_rolloff_points=excluded_rolloff,
+            summary=summary,
+        )
+    except Exception as exc:
+        return _err(f"predict_rms failed: {exc}")
 
 
 async def _tool_optimize_q(
@@ -1385,11 +2166,44 @@ async def _tool_trigger_measurement(
 
         cfg = _config()
         engine = MeasurementEngine(cfg)
+        route = cfg.measurement.get("playback_route", "usb")
         denon_ctx = DenonSweepContext.from_config(cfg)
 
         if denon_ctx:
-            async with denon_ctx:
-                fr = await engine.measure()
+            # HDMI route: ensure miniDSP is on Analog source and manage master gain.
+            saved_source = None
+            saved_gain = None
+            try:
+                from .drivers.minidsp import _get_source_via_cli
+                current_source = await _get_source_via_cli()
+                if current_source.lower() != "analog":
+                    log.info("HDMI route: switching miniDSP source %s→Analog", current_source)
+                    saved_source = current_source
+                    await _dsp.set_source("Analog")  # type: ignore[union-attr]
+
+                hdmi_gain = cfg.measurement.get("master_gain_hdmi_db")
+                if hdmi_gain is not None:
+                    from .adapters.minidsp import _get_status_via_cli
+                    status = await _get_status_via_cli()
+                    saved_gain = status.get("master", {}).get("volume", 0.0)
+                    log.info("HDMI route: setting master gain %.1f dB (was %.1f dB)", hdmi_gain, saved_gain)
+                    await _dsp.set_master_gain(float(hdmi_gain))  # type: ignore[union-attr]
+
+                async with denon_ctx:
+                    fr = await engine.measure()
+            finally:
+                if saved_gain is not None:
+                    log.info("HDMI route: restoring master gain to %.1f dB", saved_gain)
+                    try:
+                        await _dsp.set_master_gain(saved_gain)  # type: ignore[union-attr]
+                    except Exception as exc:
+                        log.warning("Failed to restore master gain: %s", exc)
+                if saved_source is not None:
+                    log.info("HDMI route: restoring miniDSP source to %s", saved_source)
+                    try:
+                        await _dsp.set_source(saved_source)  # type: ignore[union-attr]
+                    except Exception as exc:
+                        log.warning("Failed to restore miniDSP source: %s", exc)
         else:
             # USB mode: use persistent sweep session (enters once, stays active).
             await _ensure_sweep_session()
@@ -1430,6 +2244,138 @@ async def _tool_trigger_measurement(
         )
     except Exception as exc:
         return _err(f"measurement failed: {exc}")
+
+
+async def _tool_play_and_measure_fft(
+    channel_assignments: dict,
+    duration_s: float = 2.0,
+    amplitude: float = 0.5,
+    fft_size: int = 8192,
+) -> dict:
+    """Synthesize multitone, play via HDMI, record from UMIK, return FFT analysis."""
+    import numpy as np
+
+    try:
+        from .headroom import analyze_fft, build_multichannel_buffer
+        from .drivers.playback import MultichannelPlayback
+        from .measurement import _find_umik_device
+
+        cfg = _config()
+        sample_rate = cfg.measurement.get("sample_rate", 48000)
+
+        # Parse channel_assignments: keys may be strings from JSON
+        parsed: dict[int, list[float]] = {}
+        all_freqs: list[float] = []
+        for ch_str, freqs in channel_assignments.items():
+            ch = int(ch_str)
+            parsed[ch] = [float(f) for f in freqs]
+            all_freqs.extend(parsed[ch])
+
+        if not parsed:
+            return _err("channel_assignments is empty")
+
+        n_channels = max(parsed.keys())
+        # HDMI requires standard channel counts
+        standard_counts = [2, 6, 8]
+        n_channels = next(c for c in standard_counts if c >= n_channels)
+
+        buf = build_multichannel_buffer(
+            parsed, duration_s, sample_rate, amplitude, n_channels,
+        )
+
+        # Device detection
+        import sounddevice as sd
+        devices = sd.query_devices()
+
+        mic_idx = cfg.measurement.get("mic_device_index")
+        if mic_idx is None:
+            mic_name = cfg.mic.get("name", "UMIK")
+            mic_idx = _find_umik_device(devices, name_substring=mic_name)
+        if mic_idx is None:
+            return _err("UMIK microphone not found — check USB connection")
+
+        hdmi_idx = cfg.measurement.get("hdmi_device_index")
+        if hdmi_idx is None:
+            # Auto-detect HDMI output
+            candidates = [
+                (i, d) for i, d in enumerate(devices)
+                if d["max_output_channels"] > 0 and "hdmi" in d["name"].lower()
+            ]
+            candidates.sort(key=lambda x: (x[1]["name"].lower() != "hdmi", len(x[1]["name"])))
+            if candidates:
+                hdmi_idx = candidates[0][0]
+        if hdmi_idx is None:
+            return _err("No HDMI output device found")
+
+        player = MultichannelPlayback()
+        recording, n_recorded = await asyncio.get_event_loop().run_in_executor(
+            None, player.play_and_record, buf, sample_rate, mic_idx, hdmi_idx,
+        )
+
+        if len(recording) == 0:
+            return _err("Recording is empty — no audio captured")
+
+        result = analyze_fft(recording, sample_rate, all_freqs, fft_size)
+
+        peak_dbfs = 20.0 * np.log10(np.max(np.abs(recording)) + 1e-12)
+        return _ok(
+            duration_s=duration_s,
+            sample_rate=sample_rate,
+            recording_peak_dbfs=round(float(peak_dbfs), 1),
+            **result,
+        )
+
+    except Exception as exc:
+        log.exception("play_and_measure_fft failed")
+        return _err(f"play_and_measure_fft error: {exc}")
+
+
+async def _tool_assign_headroom_tones(
+    speaker_passbands: dict,
+    tones_per_speaker: int = 4,
+    min_spacing_hz: float = 30.0,
+    min_frequency_hz: float = 200.0,
+) -> dict:
+    """Assign non-overlapping multitone clusters to speakers."""
+    try:
+        from .headroom import assign_tone_clusters
+
+        cfg = _config()
+
+        # Parse passbands: {role: {low_hz, high_hz}} → {role: (low, high)}
+        parsed: dict[str, tuple[float, float]] = {}
+        for role, band in speaker_passbands.items():
+            parsed[role] = (float(band["low_hz"]), float(band["high_hz"]))
+
+        assignments = assign_tone_clusters(
+            parsed,
+            tones_per_speaker=tones_per_speaker,
+            min_inter_speaker_spacing_hz=min_spacing_hz,
+            min_frequency_hz=min_frequency_hz,
+        )
+
+        # Build both role-keyed and channel-keyed outputs
+        role_assignments = {}
+        channel_assignments: dict[str, list[float]] = {}
+        for role, tones in assignments.items():
+            ch = cfg.hdmi_channel_for(role)
+            role_assignments[role] = {
+                "hdmi_channel": ch,
+                "tones_hz": tones,
+            }
+            if ch is not None:
+                channel_assignments[str(ch)] = tones
+
+        return _ok(
+            assignments=role_assignments,
+            channel_assignments=channel_assignments,
+        )
+
+    except ValueError as exc:
+        return _err(f"Cannot assign tones: {exc}")
+    except Exception as exc:
+        log.exception("assign_headroom_tones failed")
+        return _err(f"assign_headroom_tones error: {exc}")
 
 
 async def _tool_calibrate_level(
@@ -1702,13 +2648,18 @@ async def _tool_save_calibration_run(
     recipe_name: str,
     target: str,
     device_state: dict | None = None,
+    run_type: str = "calibration",
 ) -> dict:
-    """Create a new calibration run record with optional equipment state snapshot."""
+    """Create a new calibration run record with optional equipment state snapshot.
+
+    *run_type*: "calibration" (default, iterative EQ loop) or "validation"
+    (read-only measurement sessions, no convergence criteria).
+    """
     from .storage import SessionStore
 
     try:
         store = SessionStore()
-        run_id = store.save_run(recipe_name, target, device_state=device_state)
+        run_id = store.save_run(recipe_name, target, device_state=device_state, run_type=run_type)
         return _ok(run_id=run_id)
     except Exception as exc:
         return _err(f"save_calibration_run failed: {exc}")
@@ -1722,8 +2673,13 @@ async def _tool_update_calibration_run(
     final_rms: float | None = None,
     error: str = "",
     target_curve_data: dict | None = None,
+    sessions: list[dict] | None = None,
 ) -> dict:
-    """Update a calibration run with final results."""
+    """Update a calibration run with final results.
+
+    For validation runs, pass *sessions* — a list of
+    {"session_id": N, "label": "..."} recording each measurement taken.
+    """
     from .storage import SessionStore
 
     try:
@@ -1736,6 +2692,7 @@ async def _tool_update_calibration_run(
             final_rms=final_rms,
             error=error,
             target_curve_data=target_curve_data,
+            sessions=sessions,
         )
         return _ok(run_id=run_id, updated=True)
     except Exception as exc:
@@ -2492,6 +3449,14 @@ _TOOLS: list[Tool] = [
                         "input routing, and EQ state alongside the run."
                     ),
                 },
+                "run_type": {
+                    "type": "string",
+                    "enum": ["calibration", "validation"],
+                    "description": (
+                        "'calibration' (default) for iterative EQ runs, "
+                        "'validation' for read-only measurement sessions."
+                    ),
+                },
             },
             "required": ["recipe_name", "target"],
         },
@@ -2532,6 +3497,14 @@ _TOOLS: list[Tool] = [
                 "target_curve_data": {
                     "type": "object",
                     "description": "Full target curve data used during calibration",
+                },
+                "sessions": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": (
+                        "For validation runs: list of {session_id, label} dicts "
+                        "recording each measurement taken."
+                    ),
                 },
             },
             "required": ["run_id", "converged", "iterations_run"],
@@ -3024,6 +3997,68 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="anchor_target",
+        description=(
+            "Compute the optimal reference SPL for anchoring a target curve against a baseline "
+            "measurement. Given target offsets (relative dB at each frequency) and a measured FR, "
+            "finds the reference_spl that keeps max required boost within the safety limit. "
+            "Returns the anchored target curve with absolute SPL values, per-frequency error summary, "
+            "and null zone identification. Call this before designing input PEQ filters for a target curve."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "integer",
+                    "description": "Baseline measurement session ID to anchor against",
+                },
+                "target_offsets": {
+                    "type": "array",
+                    "description": (
+                        "Target curve as relative offsets. Each item: {freq_hz, offset_db}. "
+                        "offset_db is relative to the reference frequency (e.g. 80 Hz = 0 dB). "
+                        "Example for Cinema Bass: [{freq_hz:20,offset_db:10},{freq_hz:25,offset_db:9},...,{freq_hz:80,offset_db:0}]"
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "freq_hz": {"type": "number"},
+                            "offset_db": {"type": "number"},
+                        },
+                        "required": ["freq_hz", "offset_db"],
+                    },
+                },
+                "band": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": (
+                        "[lo_hz, hi_hz] — frequency range to evaluate. "
+                        "Defaults to the target offset frequency range."
+                    ),
+                },
+                "max_boost_db": {
+                    "type": "number",
+                    "description": "Maximum allowed boost in dB. Default: 6.0 (SafetyValidator limit).",
+                },
+                "null_threshold_db": {
+                    "type": "number",
+                    "description": (
+                        "Frequencies where measured SPL is this many dB below the band average "
+                        "are classified as nulls and excluded. Default: 15."
+                    ),
+                },
+                "port_rolloff_hz": {
+                    "type": "number",
+                    "description": (
+                        "Frequencies below this are excluded as below-port rolloff. "
+                        "Default: 28 Hz."
+                    ),
+                },
+            },
+            "required": ["session_id", "target_offsets"],
+        },
+    ),
+    Tool(
         name="compare_sessions",
         description=(
             "Compare frequency responses between two measurement sessions. "
@@ -3215,6 +4250,319 @@ _TOOLS: list[Tool] = [
             "required": ["session_id"],
         },
     ),
+    # ── LLM filter-design math tools ─────────────────────────────────────────
+    Tool(
+        name="evaluate_transfer_function",
+        description=(
+            "Evaluate combined PEQ transfer function at specific frequencies. "
+            "Pure math — no measurement data. Returns per-filter breakdown showing "
+            "each filter's contribution in dB at each query frequency. Use to check "
+            "filter interaction before running a full simulation."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": "array",
+                    "description": "PEQ filter set to evaluate",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string", "enum": ["peaking", "low_shelf", "high_shelf", "hpf"]},
+                            "freq": {"type": "number"},
+                            "gain_db": {"type": "number"},
+                            "q": {"type": "number"},
+                        },
+                        "required": ["type", "freq", "gain_db", "q"],
+                    },
+                },
+                "query_freqs": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "Frequencies (Hz) at which to evaluate the transfer function",
+                },
+            },
+            "required": ["filters", "query_freqs"],
+        },
+    ),
+    Tool(
+        name="per_filter_contribution",
+        description=(
+            "Show each filter's individual contribution at specific frequencies, "
+            "relative to a measurement session baseline. Returns baseline SPL, "
+            "per-filter correction, and predicted SPL at each frequency. Use to "
+            "identify which filter is responsible for an over-cut or under-cut."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": "array",
+                    "description": "PEQ filter set to analyze",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string"},
+                            "freq": {"type": "number"},
+                            "gain_db": {"type": "number"},
+                            "q": {"type": "number"},
+                        },
+                    },
+                },
+                "session_id": {
+                    "type": "integer",
+                    "description": "Baseline measurement session ID",
+                },
+                "query_freqs": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "Frequencies to evaluate. Omit for sixth-octave centres 20-120 Hz.",
+                },
+            },
+            "required": ["filters", "session_id"],
+        },
+    ),
+    Tool(
+        name="interpolate_optimal_gain",
+        description=(
+            "Interpolate the optimal gain for a filter from prior iteration data. "
+            "Given 2+ (gain_applied, error_measured) pairs, fits a line and finds "
+            "where error = 0. Eliminates guess-and-check iteration cycles."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "freq": {"type": "number", "description": "Filter centre frequency"},
+                "q": {"type": "number", "description": "Filter Q"},
+                "filter_type": {"type": "string", "description": "Filter type (peaking, low_shelf, etc.)"},
+                "measured_errors": {
+                    "type": "array",
+                    "description": "Array of {gain_applied, error_measured} from prior iterations",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "gain_applied": {"type": "number", "description": "Gain in dB that was applied"},
+                            "error_measured": {"type": "number", "description": "Error in dB that was measured"},
+                        },
+                        "required": ["gain_applied", "error_measured"],
+                    },
+                },
+            },
+            "required": ["freq", "q", "filter_type", "measured_errors"],
+        },
+    ),
+    Tool(
+        name="sensitivity_analysis",
+        description=(
+            "Compute sensitivity of RMS to each filter parameter. Perturbs gain, "
+            "frequency, and Q of each filter and reports ∂RMS/∂param. Tells you "
+            "which parameters matter most — focus adjustments on high-sensitivity params."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": "array",
+                    "description": "Current PEQ filter set",
+                    "items": {"type": "object"},
+                },
+                "session_id": {
+                    "type": "integer",
+                    "description": "Baseline measurement session ID",
+                },
+                "target_curve": {
+                    "type": "object",
+                    "description": "Target curve with points and band",
+                    "properties": {
+                        "points": {"type": "array", "items": {"type": "object"}},
+                        "band": {"type": "array", "items": {"type": "number"}},
+                    },
+                },
+                "perturbation_db": {
+                    "type": "number",
+                    "description": "Perturbation size in dB for gain (default: 0.5)",
+                },
+            },
+            "required": ["filters", "session_id", "target_curve"],
+        },
+    ),
+    Tool(
+        name="fit_correction_filter",
+        description=(
+            "Find the optimal single PEQ filter to minimize RMS error in a frequency "
+            "range. You decide WHICH region and constraints; this tool does the "
+            "numerical optimization to find the best (freq, gain, Q). Returns the "
+            "filter parameters and predicted RMS improvement."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "integer",
+                    "description": "Measurement session to optimize against",
+                },
+                "target_curve": {
+                    "type": "object",
+                    "description": "Target curve with points",
+                    "properties": {
+                        "points": {"type": "array", "items": {"type": "object"}},
+                        "band": {"type": "array", "items": {"type": "number"}},
+                    },
+                },
+                "freq_range": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "[lo_hz, hi_hz] — frequency range to optimize within",
+                },
+                "constraints": {
+                    "type": "object",
+                    "description": "Optional: {max_boost_db, min_q, max_q, filter_type}",
+                    "properties": {
+                        "max_boost_db": {"type": "number"},
+                        "min_q": {"type": "number"},
+                        "max_q": {"type": "number"},
+                        "filter_type": {"type": "string"},
+                    },
+                },
+            },
+            "required": ["session_id", "target_curve", "freq_range"],
+        },
+    ),
+    Tool(
+        name="predict_rms",
+        description=(
+            "Predict RMS deviation after applying filters — simulate_eq + compute_deviation "
+            "in one call. Returns predicted RMS, convergence status, and per-band errors "
+            "without touching hardware. Use to quickly evaluate candidate filter sets."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "integer",
+                    "description": "Baseline measurement session",
+                },
+                "filters": {
+                    "type": "array",
+                    "description": "Proposed PEQ filters",
+                    "items": {"type": "object"},
+                },
+                "target_curve": {
+                    "type": "object",
+                    "description": "Target curve with points and band",
+                    "properties": {
+                        "points": {"type": "array", "items": {"type": "object"}},
+                        "band": {"type": "array", "items": {"type": "number"}},
+                    },
+                },
+                "convergence_threshold": {
+                    "type": "number",
+                    "description": "RMS threshold for convergence (default: 1.5)",
+                },
+                "null_threshold_db": {
+                    "type": "number",
+                    "description": "Null detection threshold (default: 15)",
+                },
+                "port_rolloff_hz": {
+                    "type": "number",
+                    "description": "Below-port rolloff exclusion (default: 28)",
+                },
+            },
+            "required": ["session_id", "filters", "target_curve"],
+        },
+    ),
+    Tool(
+        name="play_and_measure_fft",
+        description=(
+            "Play multitone clusters via HDMI multichannel while recording from UMIK, "
+            "then return per-frequency SPL and THD. Used for headroom/amp clipping testing.\n\n"
+            "Each call represents one volume step — the LLM manages the volume stepping "
+            "loop via set_volume. The tool synthesizes tones, plays them, records "
+            "simultaneously, and extracts per-tone SPL + THD via Welch FFT."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "channel_assignments": {
+                    "type": "object",
+                    "description": (
+                        "HDMI channel (1-based, as string key) → list of tone frequencies in Hz. "
+                        "E.g. {\"1\": [500, 800, 1200], \"2\": [530, 830, 1230]}. "
+                        "Each channel gets a unique multitone cluster for FFT isolation."
+                    ),
+                    "additionalProperties": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                    },
+                },
+                "duration_s": {
+                    "type": "number",
+                    "description": "Playback + recording duration per step in seconds (default: 2.0)",
+                    "default": 2.0,
+                },
+                "amplitude": {
+                    "type": "number",
+                    "description": "Peak amplitude 0-1 for tone synthesis (default: 0.5)",
+                    "default": 0.5,
+                },
+                "fft_size": {
+                    "type": "integer",
+                    "description": (
+                        "FFT window size for Welch analysis (default: 8192). "
+                        "8192 @ 48kHz = 5.86Hz resolution."
+                    ),
+                    "default": 8192,
+                },
+            },
+            "required": ["channel_assignments"],
+        },
+    ),
+    Tool(
+        name="assign_headroom_tones",
+        description=(
+            "Assign non-overlapping multitone clusters to speakers for headroom testing. "
+            "Given each speaker's flat passband, assigns 3-5 tones per speaker with "
+            "constraints: minimum inter-speaker spacing (30Hz default), no tone below 200Hz, "
+            "no harmonic cross-talk between speakers.\n\n"
+            "Returns assignments in the format expected by play_and_measure_fft."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "speaker_passbands": {
+                    "type": "object",
+                    "description": (
+                        "Speaker role → passband. E.g. "
+                        "{\"left\": {\"low_hz\": 80, \"high_hz\": 18000}, "
+                        "\"center\": {\"low_hz\": 100, \"high_hz\": 18000}}"
+                    ),
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "low_hz": {"type": "number"},
+                            "high_hz": {"type": "number"},
+                        },
+                    },
+                },
+                "tones_per_speaker": {
+                    "type": "integer",
+                    "description": "Number of tones per speaker (default: 4)",
+                    "default": 4,
+                },
+                "min_spacing_hz": {
+                    "type": "number",
+                    "description": "Minimum gap between tones on different speakers in Hz (default: 30)",
+                    "default": 30.0,
+                },
+                "min_frequency_hz": {
+                    "type": "number",
+                    "description": "Absolute minimum tone frequency in Hz (default: 200)",
+                    "default": 200.0,
+                },
+            },
+            "required": ["speaker_passbands"],
+        },
+    ),
 ]
 
 
@@ -3283,6 +4631,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             recipe_name=arguments["recipe_name"],
             target=arguments["target"],
             device_state=arguments.get("device_state"),
+            run_type=arguments.get("run_type", "calibration"),
         )
     elif name == "update_calibration_run":
         result = await _tool_update_calibration_run(
@@ -3293,6 +4642,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             final_rms=float(arguments["final_rms"]) if arguments.get("final_rms") is not None else None,
             error=arguments.get("error", ""),
             target_curve_data=arguments.get("target_curve_data"),
+            sessions=arguments.get("sessions"),
         )
     elif name == "save_calibration_iteration":
         result = await _tool_save_calibration_iteration(
@@ -3378,6 +4728,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             resolution=arguments.get("resolution", "sixth_octave"),
             convergence_threshold=float(arguments.get("convergence_threshold", 1.5)),
         )
+    elif name == "anchor_target":
+        result = await _tool_anchor_target(
+            session_id=int(arguments["session_id"]),
+            target_offsets=arguments["target_offsets"],
+            band=arguments.get("band"),
+            max_boost_db=float(arguments.get("max_boost_db", 6.0)),
+            null_threshold_db=float(arguments.get("null_threshold_db", 15.0)),
+            port_rolloff_hz=float(arguments.get("port_rolloff_hz", 28.0)),
+        )
     elif name == "compare_sessions":
         result = await _tool_compare_sessions(
             session_a=int(arguments["session_a"]),
@@ -3419,6 +4778,62 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             num_taps=int(arguments.get("num_taps", 1024)),
             phase_mode=arguments.get("phase_mode", "minimum"),
             freq_focus_hz=arguments.get("freq_focus_hz"),
+        )
+    # ── LLM filter-design math tools ────────────────────────────────────────
+    elif name == "evaluate_transfer_function":
+        result = await _tool_evaluate_transfer_function(
+            filters=arguments.get("filters", []),
+            query_freqs=arguments.get("query_freqs", []),
+        )
+    elif name == "per_filter_contribution":
+        result = await _tool_per_filter_contribution(
+            filters=arguments.get("filters", []),
+            session_id=int(arguments["session_id"]),
+            query_freqs=arguments.get("query_freqs"),
+        )
+    elif name == "interpolate_optimal_gain":
+        result = await _tool_interpolate_optimal_gain(
+            freq=float(arguments["freq"]),
+            q=float(arguments["q"]),
+            filter_type=arguments["filter_type"],
+            measured_errors=arguments["measured_errors"],
+        )
+    elif name == "sensitivity_analysis":
+        result = await _tool_sensitivity_analysis(
+            filters=arguments.get("filters", []),
+            session_id=int(arguments["session_id"]),
+            target_curve=arguments["target_curve"],
+            perturbation_db=float(arguments.get("perturbation_db", 0.5)),
+        )
+    elif name == "fit_correction_filter":
+        result = await _tool_fit_correction_filter(
+            session_id=int(arguments["session_id"]),
+            target_curve=arguments["target_curve"],
+            freq_range=arguments["freq_range"],
+            constraints=arguments.get("constraints"),
+        )
+    elif name == "predict_rms":
+        result = await _tool_predict_rms(
+            filters=arguments.get("filters", []),
+            session_id=int(arguments["session_id"]),
+            target_curve=arguments["target_curve"],
+            null_threshold_db=float(arguments.get("null_threshold_db", 15.0)),
+            port_rolloff_hz=float(arguments.get("port_rolloff_hz", 28.0)),
+            convergence_threshold=float(arguments.get("convergence_threshold", 1.5)),
+        )
+    elif name == "play_and_measure_fft":
+        result = await _tool_play_and_measure_fft(
+            channel_assignments=arguments["channel_assignments"],
+            duration_s=float(arguments.get("duration_s", 2.0)),
+            amplitude=float(arguments.get("amplitude", 0.5)),
+            fft_size=int(arguments.get("fft_size", 8192)),
+        )
+    elif name == "assign_headroom_tones":
+        result = await _tool_assign_headroom_tones(
+            speaker_passbands=arguments["speaker_passbands"],
+            tones_per_speaker=int(arguments.get("tones_per_speaker", 4)),
+            min_spacing_hz=float(arguments.get("min_spacing_hz", 30.0)),
+            min_frequency_hz=float(arguments.get("min_frequency_hz", 200.0)),
         )
     # Legacy aliases for backwards compatibility with cached sessions
     elif name == "mute_sub_outputs":
