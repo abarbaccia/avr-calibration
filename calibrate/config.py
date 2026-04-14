@@ -45,12 +45,35 @@ DEFAULT_CONFIG: dict = {
         "playback_route": "usb",
         "denon_sweep_input": None,
         "denon_sweep_volume": -10.0,
-        "denon_settle_ms": 800,
+        "denon_settle_ms": 5000,
+        "denon_pure_direct": True,
         "sweep_channel": "lfe",
         "playback_device": "miniDSP",
         "hdmi_playback_device": None,
+        "mic_device_index": None,
+        "hdmi_device_index": None,
+        "usb_device_index": None,
+        "master_gain_hdmi_db": None,
         "sub_outputs": [0, 1],
         "ir_search_window_ms": 50.0,
+    },
+    "hdmi_channel_map": {
+        "left": 1,
+        "right": 2,
+        "lfe": 3,
+        "center": 4,
+        "surround_left": 5,
+        "surround_right": 6,
+    },
+    "headroom": {
+        "start_volume_db": -30.0,
+        "max_volume_db": -10.0,
+        "step_db": 1.0,
+        "hold_duration_s": 2.0,
+        "tones_per_speaker": 4,
+        "min_tone_spacing_hz": 30.0,
+        "min_tone_frequency_hz": 200.0,
+        "amplitude": 0.5,
     },
     "speakers": [],
     "connections": [],
@@ -94,12 +117,27 @@ measurement:
   denon_sweep_input: null       # Denon input to switch to during HDMI sweep
                                 # Run: python -c "import asyncio, denonavr; r=denonavr.DenonAVR('YOUR_IP'); asyncio.run(r.async_setup()); asyncio.run(r.async_update()); print(r.input_func_list)"
   denon_sweep_volume: -10.0    # dB — default starting volume (max 0 dB / reference)
-  denon_settle_ms: 800         # ms to wait after Denon input/volume change
+  denon_settle_ms: 5000        # ms to wait after Denon input/volume change (HDMI needs 3-5s for HDCP)
+  denon_pure_direct: true      # true = force Pure Direct during sweep; false = keep current sound mode
   sweep_channel: "lfe"         # "lfe" = LFE/subwoofer channel, "left"/"right" = main
   playback_device: "miniDSP"   # substring matched against USB audio device names
   hdmi_playback_device: null   # HDMI audio device name; null = system default
+  mic_device_index: null       # ALSA device index for UMIK mic; null = find by name
+  hdmi_device_index: null      # ALSA device index for HDMI output; null = find by name
+  usb_device_index: null       # ALSA device index for USB/miniDSP output; null = find by name
+  master_gain_hdmi_db: null    # miniDSP master gain for HDMI route; null = don't change
   sub_outputs: [0, 1]          # miniDSP output indices for each sub (0-indexed)
   ir_search_window_ms: 50.0    # IR peak search window; 50 ms = 17 m at 343 m/s
+
+# HDMI channel map — CEA-861 standard 5.1 layout (1-based channel indices)
+# Override if your sink uses a different mapping.
+hdmi_channel_map:
+  left: 1
+  right: 2
+  lfe: 3
+  center: 4
+  surround_left: 5
+  surround_right: 6
 """
 
 
@@ -140,6 +178,10 @@ class Config:
         return self._data.get("connections", {})
 
     @property
+    def headroom(self) -> dict:
+        return self._data.get("headroom", {})
+
+    @property
     def eq_capabilities(self) -> dict:
         return self._data.get("eq_capabilities", {})
 
@@ -163,6 +205,32 @@ class Config:
     @property
     def speakers(self) -> list[dict]:
         return self._data.get("speakers", [])
+
+    @property
+    def hdmi_channel_map(self) -> dict[str, int]:
+        """HDMI channel map: speaker role → 1-based channel index."""
+        return self._data.get("hdmi_channel_map", {
+            "left": 1, "right": 2, "lfe": 3,
+            "center": 4, "surround_left": 5, "surround_right": 6,
+        })
+
+    def hdmi_channel_for(self, role: str) -> int | None:
+        """Resolve a speaker role name to a 1-based HDMI channel index.
+
+        Accepts exact keys ("lfe"), common aliases ("sub", "subwoofer"),
+        and case-insensitive matching. Returns None if not found.
+        """
+        aliases = {
+            "sub": "lfe", "subwoofer": "lfe", "sw": "lfe",
+            "fl": "left", "front_left": "left",
+            "fr": "right", "front_right": "right",
+            "fc": "center", "front_center": "center", "c": "center",
+            "sl": "surround_left", "rl": "surround_left", "rear_left": "surround_left",
+            "sr": "surround_right", "rr": "surround_right", "rear_right": "surround_right",
+        }
+        key = role.lower().strip()
+        key = aliases.get(key, key)
+        return self.hdmi_channel_map.get(key)
 
     @property
     def shaker_outputs(self) -> list[int]:

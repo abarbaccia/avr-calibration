@@ -229,6 +229,104 @@ class HDMIPlayback:
         return sweep_1d, rec_1d
 
 
+class MultichannelPlayback:
+    """Play pre-built numpy multichannel buffers via HDMI + record from UMIK.
+
+    Unlike HDMIPlayback (which accepts PyTTa SignalObj for sweep deconvolution),
+    this class accepts pre-built int16 numpy arrays for steady-state multitone
+    playback.  Used by the headroom / amp clipping test.
+    """
+
+    PRE_DELAY_S: float = 0.5
+    POST_DELAY_S: float = 0.5
+
+    def play_and_record(
+        self,
+        output_buffer,  # np.ndarray int16, shape (n_samples, n_channels)
+        sample_rate: int,
+        in_device: int | None = None,
+        out_device: int | None = None,
+    ) -> tuple:
+        """Play multichannel buffer via HDMI and record from UMIK.
+
+        Returns (recording, n_recorded) where recording is a float64 1D array.
+        """
+        import time as _time
+
+        import numpy as np
+        import sounddevice as sd
+
+        n_samples, n_channels = output_buffer.shape
+
+        if in_device is None:
+            in_device = int(sd.default.device[0])
+        if out_device is None:
+            out_device = int(sd.default.device[1])
+
+        pre_samples = int(self.PRE_DELAY_S * sample_rate)
+        post_samples = int(self.POST_DELAY_S * sample_rate)
+        rec_n = pre_samples + n_samples + post_samples
+        rec_buf = np.zeros((rec_n, 1), dtype=np.float32)
+        rec_pos = [0]
+
+        def _rec_callback(indata, frames, time_info, status):
+            end = min(rec_pos[0] + frames, rec_n)
+            count = end - rec_pos[0]
+            if count > 0:
+                rec_buf[rec_pos[0]:end] = indata[:count, :1]
+            rec_pos[0] = end
+
+        in_stream = sd.InputStream(
+            device=in_device, samplerate=sample_rate,
+            channels=1, dtype="float32", callback=_rec_callback,
+        )
+        out_stream = sd.OutputStream(
+            device=out_device, samplerate=sample_rate,
+            channels=n_channels, dtype="int16",
+        )
+
+        try:
+            in_stream.start()
+            _time.sleep(self.PRE_DELAY_S)
+            out_stream.start()
+            out_stream.write(output_buffer)
+            out_stream.stop()
+            out_stream.close()
+            _time.sleep(self.POST_DELAY_S)
+            in_stream.stop()
+            in_stream.close()
+        except Exception as exc:
+            for s in (in_stream, out_stream):
+                try:
+                    s.stop()
+                except Exception:
+                    pass
+                try:
+                    s.close()
+                except Exception:
+                    pass
+            raise RuntimeError(f"Audio device error: {exc}") from exc
+
+        n_recorded = rec_pos[0]
+        # Trim to playback-aligned region (skip pre-delay, keep up to n_samples)
+        start = pre_samples
+        end = min(start + n_samples, n_recorded)
+        recording = rec_buf[start:end, 0].astype(np.float64)
+
+        if len(recording) > 0:
+            peak = float(np.max(np.abs(recording)))
+            log.info(
+                "MultichannelPlayback: n_samples=%d n_ch=%d rec_n=%d "
+                "n_recorded=%d peak=%.1f dBFS",
+                n_samples, n_channels, rec_n, n_recorded,
+                20 * np.log10(peak + 1e-12),
+            )
+        else:
+            log.warning("MultichannelPlayback: recording is empty")
+
+        return recording, n_recorded
+
+
 def playback_for_route(route: str) -> PlaybackStrategy:
     """Factory: return the right playback strategy for the configured route."""
     if route == "hdmi":
