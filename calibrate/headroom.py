@@ -245,6 +245,11 @@ def assign_tone_clusters(
 ) -> dict[str, list[float]]:
     """Assign non-overlapping multitone clusters to speakers within their flat passbands.
 
+    Uses interleaved placement: divides the frequency range into
+    ``tones_per_speaker`` regions, then within each region assigns one tone per
+    speaker with ``min_inter_speaker_spacing_hz`` between them. This guarantees
+    separation even when all speakers share the same passband.
+
     Constraints:
     - All tones within each speaker's passband [low_hz, high_hz]
     - No tone below min_frequency_hz
@@ -270,6 +275,8 @@ def assign_tone_clusters(
     if not speakers:
         return {}
 
+    n_speakers = len(speakers)
+
     # Clamp passbands to min_frequency_hz
     bands = {}
     for spk in speakers:
@@ -283,73 +290,72 @@ def assign_tone_clusters(
             )
         bands[spk] = (low, high)
 
-    assignments: dict[str, list[float]] = {}
-    all_assigned: list[tuple[str, float]] = []  # (speaker, freq)
+    # Find the common usable range (intersection of all passbands)
+    global_low = max(b[0] for b in bands.values())
+    global_high = min(b[1] for b in bands.values())
 
-    for spk in speakers:
-        low, high = bands[spk]
-        bandwidth = high - low
-        n = tones_per_speaker
+    # Width needed per frequency region: n_speakers tones * spacing
+    region_width = n_speakers * min_inter_speaker_spacing_hz
+    total_range = global_high - global_low
 
-        # Space tones evenly within the passband with margins
-        margin = min_inter_speaker_spacing_hz / 2
-        usable_low = low + margin
-        usable_high = high - margin
+    if total_range < region_width * tones_per_speaker:
+        # Not enough room for ideal spacing — pack tighter
+        log.warning(
+            "Passband %.0f-%.0fHz too narrow for %d speakers x %d tones "
+            "at %.0fHz spacing; packing tighter",
+            global_low, global_high, n_speakers, tones_per_speaker,
+            min_inter_speaker_spacing_hz,
+        )
 
-        if usable_high <= usable_low:
-            # Fallback: use full band
-            usable_low = low
-            usable_high = high
+    # Divide the usable range into tones_per_speaker frequency regions.
+    # Each region holds one tone per speaker, spaced apart.
+    margin = region_width / 2
+    usable_low = global_low + margin
+    usable_high = global_high - margin
 
-        if n == 1:
-            candidates = [round((usable_low + usable_high) / 2, 1)]
-        else:
-            step = (usable_high - usable_low) / (n - 1)
-            candidates = [round(usable_low + i * step, 1) for i in range(n)]
+    if usable_high <= usable_low:
+        usable_low = global_low
+        usable_high = global_high
 
-        # Verify inter-speaker spacing against previously assigned tones
-        final_tones = []
-        for tone in candidates:
-            ok = True
-            for other_spk, other_freq in all_assigned:
-                if other_spk == spk:
-                    continue
-                if abs(tone - other_freq) < min_inter_speaker_spacing_hz:
-                    # Nudge away
-                    if tone > other_freq:
-                        tone = round(other_freq + min_inter_speaker_spacing_hz + 1, 1)
-                    else:
-                        tone = round(other_freq - min_inter_speaker_spacing_hz - 1, 1)
+    if tones_per_speaker == 1:
+        region_centers = [(usable_low + usable_high) / 2]
+    else:
+        step = (usable_high - usable_low) / (tones_per_speaker - 1)
+        region_centers = [usable_low + i * step for i in range(tones_per_speaker)]
 
-            # Clamp to passband
+    # Within each region, assign one tone per speaker offset by spacing
+    assignments: dict[str, list[float]] = {spk: [] for spk in speakers}
+    all_tones: list[tuple[str, float]] = []
+
+    for center in region_centers:
+        # Center the speaker group around the region center
+        group_start = center - (n_speakers - 1) * min_inter_speaker_spacing_hz / 2
+        for idx, spk in enumerate(speakers):
+            tone = round(group_start + idx * min_inter_speaker_spacing_hz, 1)
+            low, high = bands[spk]
             tone = max(low, min(high, tone))
 
-            # Check harmonic avoidance
-            for other_spk, other_freq in all_assigned:
+            # Check harmonic avoidance against all previously assigned tones
+            for other_spk, other_freq in all_tones:
                 if other_spk == spk:
                     continue
                 for h in range(2, n_harmonics_avoid + 2):
                     if abs(tone * h - other_freq) < harmonic_guard_hz:
-                        ok = False
+                        tone = round(tone + harmonic_guard_hz + 1, 1)
+                        tone = max(low, min(high, tone))
                         break
                     if abs(other_freq * h - tone) < harmonic_guard_hz:
-                        ok = False
+                        tone = round(tone + harmonic_guard_hz + 1, 1)
+                        tone = max(low, min(high, tone))
                         break
-                if not ok:
-                    # Try small offset
-                    tone = round(tone + harmonic_guard_hz + 1, 1)
-                    tone = max(low, min(high, tone))
-                    ok = True  # Accept nudged version
 
-            final_tones.append(tone)
-            all_assigned.append((spk, tone))
-
-        assignments[spk] = final_tones
+            assignments[spk].append(tone)
+            all_tones.append((spk, tone))
 
     # Validate: check no two tones from different speakers are within spacing
     violations = []
-    for i, (spk_a, freq_a) in enumerate(all_assigned):
-        for spk_b, freq_b in all_assigned[i + 1:]:
+    for i, (spk_a, freq_a) in enumerate(all_tones):
+        for spk_b, freq_b in all_tones[i + 1:]:
             if spk_a != spk_b and abs(freq_a - freq_b) < min_inter_speaker_spacing_hz:
                 violations.append((spk_a, freq_a, spk_b, freq_b))
 
