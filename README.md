@@ -112,7 +112,7 @@ Once connected:
 
 ## Contributing
 
-The most valuable contribution is a recipe. If you have a calibration philosophy — cuts-only, cinema bass maximalist, multi-seat averaging, "pre-EQ the subs before Audyssey" — write it up in plain English and open a PR. The system executes it with the same measurement pipeline and safety guarantees. See [`recipes/TEMPLATE.md`](recipes/TEMPLATE.md).
+The most valuable contribution is a recipe. If you have a calibration philosophy — cuts-only, cinema bass maximalist, multi-seat averaging, "pre-EQ the subs before Audyssey" — tell Claude to write it up and open a PR for you. See [`recipes/TEMPLATE.md`](recipes/TEMPLATE.md).
 
 Other ways to contribute:
 - **Hardware drivers** — support for new AVRs, DSPs, or mics
