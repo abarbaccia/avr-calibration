@@ -44,7 +44,7 @@ It's not a batch process. It's a conversation with something that understands yo
   change at this point.
 ```
 
-## Four layers
+## Five layers
 
 ```
  ════════════ PHILOSOPHY ════════════
@@ -62,10 +62,18 @@ It's not a batch process. It's a conversation with something that understands yo
             │
             │  MCP tool calls
             ▼
+ ════════════ TOOLS ════════════
+ MCP server — measurement, analytics, and
+ simulation. Phase decomposition, coherence,
+ FIR design, EQ simulation, safety validation.
+ Data and math — no decisions.
+            │
+            │  plugin drivers
+            ▼
  ════════════ HARDWARE ════════════
- avr-calibration service (Pi, Docker)
- MCP tools, safety validator, AVR/DSP/mic
- drivers. Data and simulation — no decisions.
+ Protocol drivers — Denon AVR (denonavr),
+ miniDSP 2x4 HD (minidsp-rs CLI), UMIK mic
+ (PyTTa). Hardware I/O and sequencing.
             │
             │  signal path
             ▼
@@ -79,7 +87,9 @@ It's not a batch process. It's a conversation with something that understands yo
 
 **Intelligence** — the LLM reads the recipe and drives a closed loop: measure, decompose into fixable vs unfixable, simulate corrections, apply, re-measure, converge. It reasons about what's outside DSP too — sub placement, room treatment, hardware limits — because those are usually higher-impact than another filter.
 
-**Hardware** — MCP tools provide data and simulation; the LLM provides judgment. A `SafetyValidator` enforces hard limits on every DSP write in code, not prompts. Plugin architecture — adding hardware means writing a driver, not changing anything above.
+**Tools** — MCP tools provide data and simulation; the LLM provides judgment. `measure` takes a sweep; `analyze_phase` decomposes into fixable vs cancellation; `simulate_eq` predicts the result of a proposed filter set; `design_fir` computes coefficients for time-domain corrections. A `SafetyValidator` enforces hard limits on every DSP write in code, not prompts.
+
+**Hardware** — plugin drivers that speak hardware protocols. Each driver owns the sequencing and error handling for one device — Denon sweep context (set input, play, restore), minidsp-rs CLI (PEQ writes with 300ms pacing), PyTTa (sweep/deconvolution with UMIK cal). Adding hardware means writing a driver, not changing anything above.
 
 **Physical** — the room and everything in it. No amount of EQ fixes a cancellation null. The system's most impactful recommendations usually live here.
 
@@ -103,21 +113,19 @@ Plugin-based — each driver is independent. Adding hardware means writing a dri
 
 ## Quick start
 
-```bash
-# 1. Deploy to Pi
-bash <(curl -sL https://raw.githubusercontent.com/abarbaccia/avr-calibration/main/deploy/install.sh)
+Open [Claude Code](https://claude.ai/claude-code) and paste:
 
-# 2. Edit config with your hardware
-nano /home/pi/.avr-calibration/config.yaml
-
-# 3. Add MCP server to Claude Code (.claude/mcp.json)
-# { "mcpServers": { "avr-calibration": { "type": "sse", "url": "http://<pi-ip>:8765/sse" } } }
-
-# 4. Calibrate
-# > calibrate the subs to Harman bass target
+```
+Help me set up avr-calibration: https://github.com/abarbaccia/avr-calibration
 ```
 
-[Full setup guide →](docs/mcp-setup.md)
+Claude reads the [setup guide](docs/setup-guide.md), asks what hardware you have, figures out where to run the service, deploys it, and verifies the connection. The whole setup is a conversation — no assumptions about what you already have.
+
+Once connected:
+
+```
+> calibrate the subs to Harman bass target
+```
 
 ## Contributing
 
