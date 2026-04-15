@@ -4,68 +4,27 @@ A PhD acoustic engineer in your listening room — powered by an LLM, fed by a d
 
 It's not a batch process — it's a conversation with something that understands your room.
 
-```
-> help me calibrate the room and improve the acoustics
+> **help me calibrate the room**
+>
+> What are you optimizing for — music, movies, or both? Harman bass adds a low-end shelf most people prefer for cinema. Cuts-only is more conservative for music purists.
 
-  A few questions first. What are you optimizing for — music,
-  movies, or both? Harman bass target adds a gentle low-end shelf
-  that most people prefer for cinema. Cuts-only is more conservative
-  and works well for music purists. I can also do a flat target
-  if you just want accuracy. What sounds right?
+> **movies. let's do Harman**
+>
+> Running bass-calibration recipe. Sub 2 arrives 2.3 ms early — applying delay. 38 Hz mode is +9 dB, minimum-phase — cutting with PEQ. 62 Hz null is cancellation, skipping…
 
-> movies mostly. let's do Harman
+> **the bass sounds muddy and I'm losing "thump" at loud volumes**
+>
+> The 38 Hz mode rings for 1200 ms — that smears transients. A corner bass trap would halve it; I can also tighten it with a FIR filter right now. The punch loss at volume is different — let me run a headroom test at -15, -12, and -9 dB to check for amp clipping.
 
-  Running bass-calibration recipe with Harman target. Phase 1:
-  time-aligning subs… Sub 2 arrives 2.3 ms early — applying
-  2.3 ms delay. Phase 2: per-sub EQ. 38 Hz mode is +9 dB on
-  sub 1, minimum-phase — cutting with PEQ. 62 Hz null is
-  cancellation, skipping…
+> **what are the biggest problems in my room?**
+>
+> 1. **38 Hz mode** (+9 dB, 1200 ms decay) — the boom on explosions. FIR cuts ringing in half.
+> 2. **65 Hz null** (-14 dB) — cancellation between subs. EQ can't fix this. Move sub 2 off the wall midpoint.
+> 3. **23-28 Hz rolloff** — 6 dB below target, near the port tuning limit. Physical sub limitation.
 
-> the bass sounds muddy and I'm missing the "thump" at loud volumes
-
-  Two things going on. The 38 Hz mode rings for 1200 ms — that
-  smears transients and makes everything sound muddy. A 2" rigid
-  fiberglass panel in the front corner would cut that in half.
-  I can also tighten it with a FIR filter right now — want me to
-  design one and A/B it? Second: you're losing punch at loud
-  volumes. Let me run a headroom test — I'll sweep at -15, -12,
-  and -9 dB and check for clipping or compression in the amp.
-  That'll tell us if it's the room or the hardware.
-
-> what are the biggest problem areas in my room?
-
-  Three things, ranked by impact:
-  1. 38 Hz mode (+9 dB, T60 of 1200 ms) — this is the boom you
-     hear on explosions. FIR can cut the ringing time in half.
-  2. 65 Hz null (-14 dB) — cancellation between your two subs.
-     EQ can't fix this. Moving sub 2 off the side wall midpoint
-     would fill it.
-  3. 23-28 Hz rolloff — you're 6 dB below Harman target here.
-     Port tuning limits the sub below 22 Hz, so this is close to
-     the physical limit. A sealed sub or larger ported sub would
-     extend it. Want me to measure each problem in detail?
-
-> should I put my second sub nearfield behind the couch?
-
-  Maybe — let's measure instead of guess. Sub crawl: put the sub
-  at the listening position, I measure from 3-4 candidate spots.
-  Takes about 10 minutes. The smoothest response wins. Ready?
-
-> do I need a bigger amp?
-
-  No. Your calibrated level is -15 dB, Denon clips at -8 dB —
-  7 dB of headroom. The 65 Hz null costing you 12 dB is cancellation
-  between subs. That's placement, not power.
-
-> would adding a third sub help?
-
-  It would, but you'd get 80% of the benefit for free first.
-  The 65 Hz null is your biggest problem — it's cancellation
-  between your two subs at the side wall midpoint. Moving sub 2
-  eighteen inches toward the corner fills that null without buying
-  anything. Want me to run a sub crawl to find the optimal spot?
-  After that we can talk about whether a third sub is still worth it.
-```
+> **would adding a third sub help?**
+>
+> Yes, but move sub 2 first — eighteen inches toward the corner fills the 65 Hz null for free. That's 80% of the benefit. Sub crawl takes 10 minutes. Third sub conversation after.
 
 ## Five layers
 
@@ -79,11 +38,12 @@ It's not a batch process — it's a conversation with something that understands
             │  guides decisions
             ▼
  ════════════ INTELLIGENCE ════════════
- Claude Code — executes the recipe, reasons
- about your room, designs filters, recommends
- physical changes. All decisions live here.
+ Claude Code — decides what to fix, how to
+ fix it, and when to stop. Designs filters,
+ recommends physical changes, skips what
+ EQ can't solve. All judgment lives here.
             │
-            │  MCP tool calls
+            │  calls tools
             ▼
  ════════════ TOOLS ════════════
  MCP server — measurement, analytics, and
@@ -91,14 +51,14 @@ It's not a batch process — it's a conversation with something that understands
  FIR design, EQ simulation, safety validation.
  Data and math — no decisions.
             │
-            │  plugin drivers
+            │  drives hardware
             ▼
  ════════════ HARDWARE ════════════
  Protocol drivers — Denon AVR (denonavr),
  miniDSP 2x4 HD (minidsp-rs CLI), UMIK mic
  (PyTTa). Hardware I/O and sequencing.
             │
-            │  signal path
+            │  shapes the room
             ▼
  ════════════ PHYSICAL ════════════
  Your room — subs, speakers, treatments.
@@ -122,7 +82,7 @@ Every measurement, filter decision, and outcome is captured. Across sessions, th
 
 The second calibration is better than the first. After you move a sub on its recommendation, it already knows your room's mode structure and starts from better assumptions. After you add a bass trap, it knows which mode to recheck. It's building a cumulative understanding that a fresh-start tool never has.
 
-## Supported hardware
+## Supported hardware (so far)
 
 | Component | Supported | Role |
 |-----------|-----------|------|
