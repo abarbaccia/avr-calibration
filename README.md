@@ -2,7 +2,7 @@
 
 A PhD acoustic engineer in your listening room — powered by an LLM, fed by a digital twin of your hardware and room.
 
-This system builds a living model of your space: room modes, decay times, sub interactions, phase behavior, hardware limits. Then it puts an LLM in the role of calibration engineer — one that reads that model, applies DSP corrections for what EQ can fix, and tells you what to physically change about the rest.
+This system builds a living model of your space: hardware setup, signal chain, room modes, decay times, sub interactions, phase behavior, hardware limits. Then it puts an LLM in the role of calibration engineer — one that reads that model, applies DSP corrections for what EQ can fix, and tells you what to physically change about the rest.
 
 ### Ask it hard questions
 
