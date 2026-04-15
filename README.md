@@ -93,6 +93,7 @@ The second calibration is better than the first. After you move a sub on its rec
 
 | Component | Supported | Role |
 |-----------|-----------|------|
+| Intelligence | Claude Code | Orchestration, reasoning, filter design |
 | AVR | Denon / Marantz | Volume, input, sweep playback |
 | DSP | miniDSP 2x4 HD | PEQ, FIR, delay, routing |
 | Mic | UMIK-1 / UMIK-2 | Measurement (USB) |
