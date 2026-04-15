@@ -4,17 +4,30 @@ A PhD acoustic engineer in your listening room — powered by an LLM, fed by a d
 
 This system builds a living model of your space: hardware setup, signal chain, room modes, decay times, sub interactions, phase behavior, hardware limits. Then it puts an LLM in the role of calibration engineer — one that reads that model, applies DSP corrections for what EQ can fix, and tells you what to physically change about the rest.
 
-### Ask it hard questions
+### Give it feedback
 
 It's not a batch process. It's a conversation with something that understands your room.
 
 ```
-> why does the bass sound muddy from the couch but clean near the door?
+> the bass sounds boomy on action movies but music is fine
 
-  Your 47 Hz room mode has a T60 of 1660 ms — it rings for almost
-  two seconds. The couch is at a pressure maximum for that mode.
-  FIR shortened it to 709 ms but a corner bass trap would cut it
-  further. This isn't an EQ problem anymore.
+  Your cinema bass curve boosts +10 dB at 20 Hz. That's hitting
+  the 23 Hz room mode hard — T60 is 1528 ms, so explosions
+  excite it and it rings for over a second. Two options: switch
+  to Harman bass (+6 dB, gentler slope) or I can add a narrow
+  FIR correction at 23 Hz. Want me to simulate both and compare?
+```
+
+### Ask it hard questions
+
+```
+> should I put my second sub nearfield behind the couch?
+
+  Maybe — but let's measure instead of guess. I'll run a sub
+  crawl: put the sub at the listening position, then I'll measure
+  from 3-4 candidate spots (front wall, side wall, nearfield,
+  current position). Takes about 10 minutes. The smoothest
+  response wins. Ready?
 
 > do I need a bigger amp?
 
