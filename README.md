@@ -1,180 +1,128 @@
 # avr-calibration
 
-AI-first home theater calibration — closed-loop bass optimization via Claude Code + MCP.
+A PhD acoustic engineer in your listening room — powered by an LLM, fed by a digital twin of your hardware and room.
 
-Tired of endless manual loops with REW, miniDSP, UMIK-1? This closes the loop: **measure → AI analyzes → apply EQ changes → re-measure → converge**.
+This system builds a living model of your space: room modes, decay times, sub interactions, phase behavior, hardware limits. Then it puts an LLM in the role of calibration engineer — one that reads that model, applies DSP corrections for what EQ can fix, and tells you what to physically change about the rest.
 
-The primary interface is Claude Code talking directly to your hardware through an MCP server. No browser clicks required for calibration.
+### Ask it hard questions
 
-## How it works
+It's not a batch process. It's a conversation with something that understands your room.
 
 ```
-Claude Code (your laptop)
-    │
-    │  MCP tools (trigger sweep, read EQ, apply corrections)
-    ▼
-Pi 5 — avr-calibration service (Docker)
-    ├── UMIK-1 (USB) — headless log sweep via sounddevice + PyTTa
-    ├── Denon X3800H — auto power on/off, input switch, volume control
-    ├── miniDSP 2x4 HD — EQ reads and writes via minidsp CLI (WebSocket)
-    └── SQLite — measurement history
+> why does the bass sound muddy from the couch but clean near the door?
+
+  Your 47 Hz room mode has a T60 of 1660 ms — it rings for almost
+  two seconds. The couch is at a pressure maximum for that mode.
+  FIR shortened it to 709 ms but a corner bass trap would cut it
+  further. This isn't an EQ problem anymore.
+
+> do I need a bigger amp?
+
+  No. The Denon clips at -8 dB all-channels-driven, but your
+  calibrated level is -15 dB — 7 dB of headroom. The 65 Hz null
+  costing you 12 dB is cancellation between subs. That's placement,
+  not power. Moving sub 2 off the wall midpoint fixes it for free.
+
+> what would a third sub actually do for me?
+
+  Fill the 65 Hz null (quarter-wavelength offset from the side
+  wall) and smooth seat-to-seat variance by 4-6 dB. Biggest
+  upgrade after repositioning sub 2. More impactful than any DSP
+  change at this point.
 ```
 
-Claude reads your frequency response, compares against the Harman target curve, proposes EQ corrections within safety limits, applies them, and re-measures. You stay in the loop — writes require your confirmation.
+## Four layers
 
-## Hardware
+```
+ ════════════ PHILOSOPHY ════════════
+ Recipes — plain English calibration approaches.
+ Harman bass, cinema BEQ, cuts-only purist,
+ multi-seat averaging. Community knowledge
+ you can read, fork, and contribute to.
+            │
+            │  guides decisions
+            ▼
+ ════════════ INTELLIGENCE ════════════
+ Claude Code — executes the recipe, reasons
+ about your room, designs filters, recommends
+ physical changes. All decisions live here.
+            │
+            │  MCP tool calls
+            ▼
+ ════════════ HARDWARE ════════════
+ avr-calibration service (Pi, Docker)
+ MCP tools, safety validator, AVR/DSP/mic
+ drivers. Data and simulation — no decisions.
+            │
+            │  signal path
+            ▼
+ ════════════ PHYSICAL ════════════
+ Your room — subs, speakers, treatments.
+ What the system measures and what the best
+ recommendations usually change.
+```
 
-- **Pi 5** (recommended) or Pi Zero 2 W — runs the service permanently in your rack
-- **Denon X3800H** (or other Denon/Marantz AVR with denonavr support)
-- **miniDSP 2x4 HD** — subwoofer EQ and routing
-- **UMIK-1 or UMIK-2** — connected to the Pi via USB
-- Subwoofer(s) — initially tuned for SVS PB12-NSD
+**Philosophy** — [Recipes](recipes/core/) are human-readable markdown that encode a calibration approach. The [bass calibration](recipes/core/bass-calibration.md) recipe runs five phases: time-align subs, flatten per-sub response, reduce ringing with FIR, shape to a [target curve](recipes/curves/), then a retrospective with physical recommendations ranked by impact. Anyone can [write a recipe](recipes/TEMPLATE.md) — different philosophy, same measurement rigor and safety guarantees.
+
+**Intelligence** — the LLM reads the recipe and drives a closed loop: measure, decompose into fixable vs unfixable, simulate corrections, apply, re-measure, converge. It reasons about what's outside DSP too — sub placement, room treatment, hardware limits — because those are usually higher-impact than another filter.
+
+**Hardware** — MCP tools provide data and simulation; the LLM provides judgment. A `SafetyValidator` enforces hard limits on every DSP write in code, not prompts. Plugin architecture — adding hardware means writing a driver, not changing anything above.
+
+**Physical** — the room and everything in it. No amount of EQ fixes a cancellation null. The system's most impactful recommendations usually live here.
+
+## The digital twin
+
+Every measurement, filter decision, and outcome is captured. Across sessions, the system accumulates a model of your specific room: which modes respond to FIR, which nulls are placement problems, where your amp clips, what positions have been tried.
+
+The second calibration is better than the first. After you move a sub on its recommendation, it already knows your room's mode structure and starts from better assumptions. After you add a bass trap, it knows which mode to recheck. It's building a cumulative understanding that a fresh-start tool never has.
+
+## Supported hardware
+
+| Component | Supported | Role |
+|-----------|-----------|------|
+| AVR | Denon / Marantz | Volume, input, sweep playback |
+| DSP | miniDSP 2x4 HD | PEQ, FIR, delay, routing |
+| Mic | UMIK-1 / UMIK-2 | Measurement (USB) |
+| Compute | Raspberry Pi 5 | Headless service |
+
+Plugin-based — each driver is independent. Adding hardware means writing a driver, not changing calibration logic.
 
 ## Quick start
 
-### 1. Deploy to Pi
-
 ```bash
-# One command: installs Docker, pulls image, starts service
+# 1. Deploy to Pi
 bash <(curl -sL https://raw.githubusercontent.com/abarbaccia/avr-calibration/main/deploy/install.sh)
+
+# 2. Edit config with your hardware
+nano /home/pi/.avr-calibration/config.yaml
+
+# 3. Add MCP server to Claude Code (.claude/mcp.json)
+# { "mcpServers": { "avr-calibration": { "type": "sse", "url": "http://<pi-ip>:8765/sse" } } }
+
+# 4. Calibrate
+# > calibrate the subs to Harman bass target
 ```
 
-Edit `/home/pi/.avr-calibration/config.yaml` with your hardware details:
+[Full setup guide →](docs/mcp-setup.md)
 
-```yaml
-denon:
-  host: "192.168.1.209"
-minidsp:
-  host: "localhost"
-  port: 5380
-mic:
-  name: "UMIK"
-measurement:
-  denon_sweep_input: "Videocore"   # must match Denon's exact name — see tip below
-  denon_sweep_volume: -25.0
-```
+## Contributing
 
-> **Finding your Denon input name:** Input names vary by AVR and user renaming. Check what yours are called:
-> ```bash
-> curl -sk https://<pi-ip>:8000/api/equipment/denon | python3 -m json.tool | grep -A20 inputs
-> ```
+The most valuable contribution is a recipe. If you have a calibration philosophy — cuts-only, cinema bass maximalist, multi-seat averaging, "pre-EQ the subs before Audyssey" — write it up in plain English and open a PR. The system executes it with the same measurement pipeline and safety guarantees. See [`recipes/TEMPLATE.md`](recipes/TEMPLATE.md).
 
-### 2. Connect Claude Code via MCP
-
-Add to your MCP config (`.claude/mcp.json` in this repo, or `~/.claude/mcp.json` globally):
-
-```json
-{
-  "mcpServers": {
-    "avr-calibration": {
-      "type": "sse",
-      "url": "http://<pi-ip>:8765/sse"
-    }
-  }
-}
-```
-
-Then just talk to Claude Code:
-
-```
-measure the room and apply Harman bass corrections
-```
-
-Claude will sweep, analyze, propose EQ changes, and apply them — asking before any write.
-
-See [docs/mcp-setup.md](docs/mcp-setup.md) for the full MCP setup guide.
-
-## MCP tools
-
-| Tool | Description |
-|------|-------------|
-| `measure` | Trigger a sweep via UMIK, saves session |
-| `get_measurement_history` | Fetch FR data for recent sessions |
-| `read_eq` | Read current miniDSP EQ filter state |
-| `apply_eq` | Write EQ filters to DSP output(s) (SafetyValidator enforced) |
-| `apply_input_eq` | Write EQ filters to the shared DSP input channel |
-| `get_calibration_runs` | List calibration run history |
-| `check_system` | Pre-flight: verify Denon, miniDSP, and mic are reachable |
-| `get_device_state` | Current AVR + DSP hardware state |
-| `set_volume` | Set AVR master volume |
-| `calibrate_level` | Auto-calibrate sweep volume by SNR |
-| `mute_output` | Mute DSP outputs (for solo sub measurement) |
-| `unmute_output` | Unmute DSP outputs |
-| `set_delay` | Set per-output delay in ms (sub time alignment) |
-| `set_polarity` | Set per-output polarity inversion |
-| `set_output_gain` | Set per-output gain trim in dB |
-| `get_output_state` | Per-output gain, delay, polarity, and FIR tap count |
-| `analyze_ir` | Extract IR peak time, polarity, and SPL for alignment |
-| `analyze_decay` | Analyze room-mode T60 decay; identify ringing frequencies |
-| `apply_fir` | Write FIR coefficients to a DSP output |
-| `clear_fir` | Clear FIR on a DSP output (reset to passthrough) |
-| `configure_matrix` | Configure DSP routing matrix |
-| `fetch_recipe` | Load a calibration recipe by name |
-| `get_config` | Return current config.yaml |
-| `set_config` | Deep-merge updates into config.yaml |
-| `discover_avr` | SSDP scan to find Denon/Marantz AVRs on the network |
-
-## Headless measurement API
+Other ways to contribute:
+- **Hardware drivers** — support for new AVRs, DSPs, or mics
+- **Target curves** — add a JSON file to [`recipes/curves/`](recipes/curves/)
+- **Bug reports** — especially around hardware edge cases (every AVR is different)
 
 ```bash
-# Trigger a sweep from anywhere on the network
-curl -sk -X POST https://<pi-ip>:8000/api/measure \
-  -H 'Content-Type: application/json' \
-  -d '{"label": "post-eq"}'
-# → {"session_id": 4, "status": "ok"}
-```
-
-The endpoint automatically: validates your configured Denon input against the live input list, powers on the Denon if off, switches input and volume, records the sweep, then restores original state.
-
-## Safety limits (SVS PB12-NSD)
-
-All EQ writes go through `SafetyValidator` before reaching the miniDSP:
-
-| Limit | Value |
-|-------|-------|
-| Minimum boost frequency | 25 Hz |
-| Max boost per band | +6 dB |
-| Max cumulative boost (1/3 oct) | +9 dB |
-| Max change per iteration | +3 dB/band |
-| Infrasonic HPF | 18 Hz, 4th-order Butterworth (always on) |
-
-Cuts have no floor — they're always safe.
-
-## Web UI
-
-Available at `https://<pi-ip>:8000` — history viewer, frequency response charts, Harman target overlay, before/after EQ comparison, PNG export.
-
-## Development
-
-```bash
-uv venv .venv && source .venv/bin/activate
-uv sync --extra dev
-
-# Run tests (100% coverage is the goal)
+uv venv .venv && source .venv/bin/activate && uv sync --extra dev
 uv run python -m pytest tests/ -v
-
-# CLI
-calibrate --help
-calibrate check        # verify all hardware is reachable
 ```
 
-## Deployment
+## Support the project
 
-Docker image built by GitHub Actions on every push:
-- Branch push → `ghcr.io/abarbaccia/avr-calibration:<branch-name>`
-- Main push → also tagged `:latest`
-- Targets: `linux/arm64` (Pi 5), `linux/arm/v7` (Pi Zero 2 W), `linux/amd64`
+If this saved you hours of manual calibration or helped you understand your room, consider supporting development:
 
-**Hotfix deploy** (seconds, no rebuild):
-```bash
-./deploy/hotfix.sh                    # auto-detects modified calibrate/ files
-./deploy/hotfix.sh calibrate/web.py   # specific file
-```
+[GitHub Sponsors →](https://github.com/sponsors/abarbaccia)
 
-**Pull new image after CI:**
-```bash
-sudo docker pull ghcr.io/abarbaccia/avr-calibration:latest
-sudo systemctl restart avr-calibration
-```
-
-See [docs/deployment/pi-zero-w.md](docs/deployment/pi-zero-w.md) for the full setup guide.
+The project is and will remain open source. Your support helps fund hardware testing (every AVR and DSP model behaves differently) and LLM tokens for writing new code.
