@@ -1,4 +1,4 @@
-# avr-calibration
+# CODA — Calibration Orchestrator & Digital Acoustician
 
 A PhD acoustic engineer in your listening room — powered by an LLM, fed by a digital twin of your hardware and room, guided by AV community recipes and best practices.
 
