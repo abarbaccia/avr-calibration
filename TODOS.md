@@ -1,5 +1,14 @@
 # TODOS
 
+## Backlog — Deep Research (not scheduled)
+
+### TODO-FLASH-1: Atomic preset persist via native-app protocol
+**What:** Reverse-engineer the opcode sequence the native miniDSP Windows/Mac app uses to commit a full preset (matrix, output gains, master gain, source, PEQ, delays, polarity) to flash in one atomic write. Expose as MCP tool `persist_preset(slot)`.
+**Why:** `minidsp-rs` CLI writes are incremental; some land in flash-backed memory (PEQ/delays/polarity) and some in volatile DSP registers (matrix, output gains, master, input gain, source). After a calibration run, the "fine trim" state is lost on power cycle. Native app avoids this because it ships a complete preset blob.
+**How:** USB wire capture of the native app → isolate the commit-to-flash command → implement in minidsp-rs (ideally upstream PR) or a separate Python helper. Test on non-critical slot first. Bricking risk if wrong.
+**Effort:** L — 1-2 days if protocol is partially public, more if not.
+**Priority:** P3 — low, manual save-in-app workflow is acceptable for now.
+
 ## Deferred from /autoplan (2026-04-01) — Pi 5 Headless Readiness
 
 ### TODO-P5-1: PyTTa measurement quality validation vs. REW

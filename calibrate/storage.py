@@ -213,6 +213,16 @@ class SessionStore:
                 conn.execute(
                     "ALTER TABLE calibration_runs ADD COLUMN sessions TEXT DEFAULT NULL"
                 )
+            if "full_state_snapshot" not in run_cols:
+                conn.execute(
+                    "ALTER TABLE calibration_runs ADD COLUMN full_state_snapshot TEXT DEFAULT NULL"
+                )
+
+            iter_cols = {row[1] for row in conn.execute("PRAGMA table_info(calibration_iterations)")}
+            if "full_state_snapshot" not in iter_cols:
+                conn.execute(
+                    "ALTER TABLE calibration_iterations ADD COLUMN full_state_snapshot TEXT DEFAULT NULL"
+                )
 
     # ── Sessions ─────────────────────────────────────────────────────────────
 
@@ -410,11 +420,13 @@ class SessionStore:
         """
         ts = datetime.now(timezone.utc).isoformat()
         ds_json = json.dumps(device_state) if device_state else None
+        snapshot = self.snapshot_full_dsp_state()
         with self._connect() as conn:
             cur = conn.execute(
-                "INSERT INTO calibration_runs (timestamp, recipe_name, target, device_state, run_type)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (ts, recipe_name, target, ds_json, run_type),
+                "INSERT INTO calibration_runs"
+                " (timestamp, recipe_name, target, device_state, run_type, full_state_snapshot)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (ts, recipe_name, target, ds_json, run_type, snapshot),
             )
             return cur.lastrowid
 
@@ -434,15 +446,16 @@ class SessionStore:
         *sessions* is a list of {"session_id": N, "label": "..."} dicts for
         validation runs that record multiple measurement sessions.
         """
+        snapshot = self.snapshot_full_dsp_state()
         with self._connect() as conn:
             conn.execute(
                 "UPDATE calibration_runs"
                 " SET converged=?, iterations_run=?, baseline_rms=?, final_rms=?, error=?,"
-                "     target_curve_data=?, sessions=?"
+                "     target_curve_data=?, sessions=?, full_state_snapshot=?"
                 " WHERE id=?",
                 (int(converged), iterations_run, baseline_rms, final_rms, error or None,
                  json.dumps(target_curve_data) if target_curve_data else None,
-                 json.dumps(sessions) if sessions else None, run_id),
+                 json.dumps(sessions) if sessions else None, snapshot, run_id),
             )
 
     def save_iteration(
@@ -457,12 +470,14 @@ class SessionStore:
         safety_error: str = "",
     ) -> int:
         """Save one iteration of a calibration run. Returns the iteration row id."""
+        snapshot = self.snapshot_full_dsp_state()
         with self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO calibration_iterations"
                 " (run_id, iteration, rms_before, rms_after,"
-                "  filters_proposed, filters_applied, safety_ok, safety_error)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "  filters_proposed, filters_applied, safety_ok, safety_error,"
+                "  full_state_snapshot)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     iteration,
@@ -472,18 +487,27 @@ class SessionStore:
                     json.dumps(filters_applied),
                     int(safety_ok),
                     safety_error or None,
+                    snapshot,
                 ),
             )
             return cur.lastrowid
 
     def get_runs(self, limit: int = 20) -> list[dict]:
-        """Return recent calibration runs, most recent first."""
+        """Return recent calibration runs, most recent first.
+
+        Excludes `full_state_snapshot` (can be large); fetch via get_run_detail.
+        """
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM calibration_runs ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        results = []
+        for r in rows:
+            d = dict(r)
+            d.pop("full_state_snapshot", None)
+            results.append(d)
+        return results
 
     def get_run_detail(self, run_id: int) -> dict | None:
         """Return a calibration run with all its iterations, or None if not found."""
@@ -511,10 +535,14 @@ class SessionStore:
                         d[key] = []
                 else:
                     d[key] = []
+            if d.get("full_state_snapshot"):
+                try:
+                    d["full_state_snapshot"] = json.loads(d["full_state_snapshot"])
+                except (json.JSONDecodeError, TypeError):
+                    d["full_state_snapshot"] = None
             iterations.append(d)
 
-        # Parse JSON columns
-        for json_col in ("target_curve_data", "device_state"):
+        for json_col in ("target_curve_data", "device_state", "full_state_snapshot"):
             if run.get(json_col):
                 try:
                     run[json_col] = json.loads(run[json_col])
@@ -627,6 +655,16 @@ class SessionStore:
         """Clear all active DSP state (e.g. on factory reset)."""
         with self._connect() as conn:
             conn.execute("DELETE FROM active_dsp_state")
+
+    def snapshot_full_dsp_state(self) -> str:
+        """Return a JSON blob capturing the full active DSP state for archival.
+
+        Used by calibration runs/iterations to record the complete signal-chain
+        state (input EQ, per-output EQ, delays, polarities, gains) at a point
+        in time — so prior runs can be restored from archive, not just from
+        the latest active_dsp_state (which is overwritten per-key).
+        """
+        return json.dumps(self.get_active_dsp())
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 

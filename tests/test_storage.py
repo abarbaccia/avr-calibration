@@ -610,6 +610,44 @@ class TestCalibrationRuns:
         assert len(stored_sessions) == 2
         assert stored_sessions[0]["session_id"] == 321
 
+    def test_full_state_snapshot_captured_on_save_run(self, store):
+        store.set_active_dsp("input_eq", {"filters": [{"freq": 50.0, "gain_db": -3.0}]})
+        store.set_active_dsp("output_0_gain", {"gain_db": 1.1})
+        run_id = store.save_run("harman-bass", "harman")
+        detail = store.get_run_detail(run_id)
+        snap = detail["full_state_snapshot"]
+        assert isinstance(snap, dict)
+        assert snap["output_0_gain"]["gain_db"] == 1.1
+        assert snap["input_eq"]["filters"][0]["freq"] == 50.0
+
+    def test_full_state_snapshot_captured_on_iteration(self, store):
+        run_id = store.save_run("harman-bass", "harman")
+        store.set_active_dsp("output_2_delay", {"delay_ms": 2.83})
+        store.save_iteration(
+            run_id, iteration=1, rms_before=8.3, rms_after=6.1,
+            filters_proposed=[], filters_applied=[], safety_ok=True,
+        )
+        detail = store.get_run_detail(run_id)
+        iter_snap = detail["iterations"][0]["full_state_snapshot"]
+        assert isinstance(iter_snap, dict)
+        assert iter_snap["output_2_delay"]["delay_ms"] == 2.83
+
+    def test_full_state_snapshot_refreshed_on_update_run(self, store):
+        run_id = store.save_run("harman-bass", "harman")
+        store.set_active_dsp("output_0_gain", {"gain_db": 2.5})
+        store.update_run(run_id, converged=True, iterations_run=1,
+                         baseline_rms=8.3, final_rms=1.8)
+        detail = store.get_run_detail(run_id)
+        assert detail["full_state_snapshot"]["output_0_gain"]["gain_db"] == 2.5
+
+    def test_get_runs_excludes_snapshot_blob(self, store):
+        """List view strips full_state_snapshot to keep responses small."""
+        store.set_active_dsp("output_0_gain", {"gain_db": 1.1})
+        store.save_run("harman-bass", "harman")
+        runs = store.get_runs()
+        assert len(runs) == 1
+        assert "full_state_snapshot" not in runs[0]
+
 
 # ── _row_to_session — corrupt end_fr / filters_applied / impulse_response ────
 
