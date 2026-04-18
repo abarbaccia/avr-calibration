@@ -154,8 +154,9 @@ Mute any non-sub outputs (e.g. shakers) during calibration.
 ### 0.0 Reset ALL DSP state
 
 Before any measurements, reset the entire DSP to a known zero state.
-`read_eq` and `get_output_state` only track in-memory changes since the MCP server
-started — hardware flash retains settings from prior sessions. Always write explicitly.
+The miniDSP is write-only — there is no way to read current hardware state. Prior
+sessions leave settings in flash, and `get_output_state` only tracks what this MCP
+server has written since it started. Always write explicitly.
 
 For **every output** (0-3, including unused/shaker):
 1. `set_delay(output_index, 0)` — clear any leftover alignment delays
@@ -320,7 +321,28 @@ For each sub:
 2. Mute other subs, measure solo
 3. Check if response is flatter (variance < 3 dB across the frequency range)
 4. If not, iterate: read current EQ, design additional corrections, merge,
-   simulate, apply. Maximum 3 iterations per sub.
+   simulate, apply. Maximum 5 iterations per sub.
+
+**Keep iterating while PEQ slots remain and peaks exceed ~1.5 dB above local average.**
+Check `config.eq_capabilities.peq_slots_per_output` and compare to the number of
+filters applied so far. If slots are free and there are still peaks > 1.5 dB above
+the band average:
+- Re-measure each sub solo (post-PEQ) to see residual peaks
+- Design additional narrow cuts at those peaks (use `optimize_q` with narrow band
+  constraints to avoid bleed into adjacent dips)
+- Simulate the delta filters only (not the full chain) against the post-PEQ session,
+  since the existing filters are already baked into that measurement
+- Apply the full chain (existing + new) with `simulation_verified=true`
+
+Stop when any of these is true:
+- Remaining peaks are all within 1.5 dB of local average (diminishing returns)
+- PEQ slots are exhausted
+- Additional filters are creating notches by overlapping with adjacent cuts
+- You've hit 5 iterations
+
+**Rationale:** most miniDSP-class hardware has 10+ PEQ slots per output. Stopping
+at 2-3 filters when 7 more are available leaves flatness on the table. But every
+narrow cut also narrows the passband between adjacent dips — watch for that.
 
 ### 2.6 Combined verification
 
@@ -639,4 +661,8 @@ port tuning, the driver is mechanically loaded and the risk is thermal only.
 - `get_output_state` — per-output gain, delay, polarity, FIR taps
 - `get_measurement_history` — FR data (use `format="compact"` for bass)
 - `compare_sessions` — per-band delta between two measurements
-- `read_eq` / `read_input_eq` — current PEQ state
+
+> **PEQ is write-only.** The miniDSP cannot be queried for its current filter set.
+> Track the filters YOU applied in this conversation — that's the source of truth.
+> When iterating, carry the full merged filter set in context and pass it to
+> `apply_eq` each time (never call with just a delta).
