@@ -565,6 +565,29 @@ Numbered list ordered by expected impact, in plain language:
 2. EQ improvements (slot optimization, different curve, tighter convergence)
 3. Re-run calibration after changes
 
+## Phase 6 — Cleanup (restore listening state)
+
+Always run ALL of these after the retrospective — even if calibration failed
+or was aborted. Calibration attenuates master gain and may leave the USB input
+selected; forgetting to restore means the user sits down to silence (or a
+barely-audible system) and blames the calibration.
+
+1. `unmute_output` on every output that was muted during calibration
+   (especially shakers and any unused outputs from Phase 0).
+2. `end_sweep_session` — restores the miniDSP source to its pre-calibration
+   state (typically Analog) so the AVR's analog output reaches the subs again.
+3. **Restore miniDSP master gain to 0 dB** via `set_master_gain(0)`.
+   `calibrate_level` in Phase 0 sets master gain to a low value (often
+   -40 to -50 dB) for safe sweep playback. `end_sweep_session` does NOT
+   restore this — it is a separate attenuation. If you skip this step the
+   user's normal listening will be 40+ dB quieter than expected.
+4. If the recipe switched `playback_route` or `active_input` mid-run (e.g.
+   USB for sweeps, HDMI for listening), restore them via `set_config` and
+   re-run `configure_matrix` so the correct input reaches the subs.
+5. Call `get_device_state` and verify: master_gain = 0, source = Analog
+   (or user's preferred source), no outputs muted. Report the state to
+   the user as the final line of the calibration run.
+
 ## Convergence
 
 | Criterion | Threshold | Tool |
