@@ -916,7 +916,9 @@ function updateHero(session) {
 
   if (!session) return;
 
-  const rms = session.harman_delta_db;
+  const rc = session.run_context;
+  const useRun = rc && rc.converged === true && rc.final_rms != null;
+  const rms = useRun ? rc.final_rms : session.harman_delta_db;
   if (rms != null) {
     val.textContent = rms.toFixed(1);
     ring.className = 'score-ring ' + (rms <= 2 ? 'optimal' : rms <= 4 ? 'good' : 'poor');
@@ -928,7 +930,8 @@ function updateHero(session) {
       else if (diff < 0) trendHtml = ' <span class="trend-up">\u2193 ' + Math.abs(diff).toFixed(1) + '</span>';
       else trendHtml = ' <span class="trend-down">\u2191 ' + diff.toFixed(1) + '</span>';
     }
-    label.innerHTML = (rms <= 2 ? 'Optimal' : rms <= 4 ? 'Good' : 'Needs work') + trendHtml;
+    const statusText = useRun ? 'Converged' : (rms <= 2 ? 'Optimal' : rms <= 4 ? 'Good' : 'Needs work');
+    label.innerHTML = statusText + trendHtml;
   } else {
     val.textContent = '--';
     ring.className = 'score-ring none';
@@ -938,7 +941,10 @@ function updateHero(session) {
   const ts = session.timestamp.slice(0,19).replace('T',' ');
   const info = classifyLabel(session.label);
   detail.textContent = 'Session #' + session.id + ' \u2014 ' + ts;
-  ctx.textContent = info.desc + (rms != null && storedTarget ? ' \u2014 vs ' + (storedTarget.type || 'Target') : '');
+  const ctxSuffix = useRun
+    ? ' \u2014 Run #' + rc.run_id + ' (' + rc.target + ')'
+    : (rms != null && storedTarget ? ' \u2014 vs ' + (storedTarget.type || 'Target') : '');
+  ctx.textContent = info.desc + ctxSuffix;
 }
 
 // ── System status (hardware bar) ────────────────────────────────────────────
@@ -1690,6 +1696,7 @@ async def list_sessions() -> list[dict]:
             "timestamp": run_start,
             "iterations_run": run.get("iterations_run") or 0,
             "converged": run.get("converged"),
+            "final_rms": run.get("final_rms"),
         })
 
     result = []
@@ -1723,6 +1730,8 @@ async def list_sessions() -> list[dict]:
                         "run_id": rw["run_id"],
                         "recipe_name": rw["recipe_name"],
                         "target": rw["target"],
+                        "converged": bool(rw["converged"]) if rw["converged"] is not None else None,
+                        "final_rms": rw["final_rms"],
                     }
                     break
             except (ValueError, TypeError):
