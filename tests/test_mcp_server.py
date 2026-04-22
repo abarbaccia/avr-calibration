@@ -3878,6 +3878,44 @@ async def test_resolve_target_unknown_returns_empty_list() -> None:
 
 
 @pytest.mark.asyncio
+async def test_set_routing_parses_string_keys_and_dispatches_to_default_dsp(
+    mock_dsp,
+) -> None:
+    """set_routing accepts the JSON string-key shape and forwards ints to the driver."""
+    from calibrate.mcp_server import _tool_set_routing
+
+    # JSON object keys arrive as strings; the tool must coerce to int before
+    # calling the driver so shadow indices match.
+    result = await _tool_set_routing(
+        {"2": {"1": True, "2": True, "3": True}}
+    )
+    assert result["ok"], result
+    mock_dsp.set_routing.assert_awaited_once()
+    (call_arg,) = mock_dsp.set_routing.await_args.args
+    assert call_arg == {2: {1: True, 2: True, 3: True}}
+    # Response echoes the normalised (int-keyed) routing for confirmation.
+    assert result["routing"] == {2: {1: True, 2: True, 3: True}}
+
+
+@pytest.mark.asyncio
+async def test_set_routing_rejects_non_object_row(mock_dsp) -> None:
+    from calibrate.mcp_server import _tool_set_routing
+
+    result = await _tool_set_routing({"0": "not a dict"})
+    assert not result["ok"]
+    assert "must be an object" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_set_routing_rejects_non_integer_keys(mock_dsp) -> None:
+    from calibrate.mcp_server import _tool_set_routing
+
+    result = await _tool_set_routing({"left": {"0": True}})
+    assert not result["ok"]
+    assert "invalid routing shape" in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_apply_eq_target_resolves_via_graph(
     mock_dsp, valid_filters,
 ) -> None:

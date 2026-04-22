@@ -1455,7 +1455,7 @@ async def test_camilladsp_apply_eq_updates_shadow_and_pushes_pipeline() -> None:
     # Pipeline references the filter names on the right output channels.
     out0_step = next(
         s for s in cfg["pipeline"]
-        if s.get("type") == "Filter" and s.get("channel") == 0
+        if s.get("type") == "Filter" and s.get("channels") == [0]
     )
     assert "cal_out0_peq_0" in out0_step["names"]
     assert "cal_out0_peq_2" in out0_step["names"]
@@ -1550,7 +1550,7 @@ async def test_camilladsp_apply_input_eq_writes_to_all_inputs_by_default() -> No
     step_types = [s.get("type") for s in cfg["pipeline"]]
     mixer_idx = step_types.index("Mixer")
     assert any(
-        s.get("type") == "Filter" and s.get("channel") in (0, 1)
+        s.get("type") == "Filter" and s.get("channels") in ([0], [1])
         and "cal_in0_peq_0" in s.get("names", [])
         for s in cfg["pipeline"][:mixer_idx]
     )
@@ -1700,7 +1700,7 @@ async def test_camilladsp_apply_fir_writes_conv_filter_with_inline_values() -> N
     # FIR name should appear in the per-output Filter step.
     out0_step = next(
         s for s in cfg["pipeline"]
-        if s.get("type") == "Filter" and s.get("channel") == 0
+        if s.get("type") == "Filter" and s.get("channels") == [0]
     )
     assert "cal_out0_fir" in out0_step["names"]
 
@@ -1717,7 +1717,7 @@ async def test_camilladsp_clear_fir_removes_conv_filter_from_pipeline() -> None:
     assert "cal_out0_fir" not in cfg["filters"]
     out0_step = next(
         s for s in cfg["pipeline"]
-        if s.get("type") == "Filter" and s.get("channel") == 0
+        if s.get("type") == "Filter" and s.get("channels") == [0]
     )
     assert "cal_out0_fir" not in out0_step["names"]
 
@@ -1761,6 +1761,42 @@ def test_camilladsp_config_samples_devices_block_from_constructor_args() -> None
     assert devices["chunksize"] == 2048
     assert devices["capture"]["channels"] == 2
     assert devices["playback"]["channels"] == 10
+
+
+def test_camilladsp_default_format_uses_camilladsp_spelling() -> None:
+    """CamillaDSP 2.x+ accepts S32_LE (underscore), not S32LE — regression guard.
+
+    Shipped once as S32LE and was rejected by the daemon with
+    `devices: unknown variant 'S32LE'`. Keep the test pinned so a future
+    rename doesn't silently revert.
+    """
+    driver = CamillaDSPDriver()
+    cfg = driver._build_config()
+    assert cfg["devices"]["capture"]["format"] == "S32_LE"
+    assert cfg["devices"]["playback"]["format"] == "S32_LE"
+
+
+def test_camilladsp_pipeline_filter_steps_use_channels_list() -> None:
+    """CamillaDSP 2.x+ pipeline Filter steps use `channels: [N]` (plural list).
+
+    Shipped once as `channel: N` (scalar, singular) and was rejected by the
+    daemon with `pipeline: unknown field 'channel'`. Regression guard against
+    reverting to the pre-2.x schema.
+    """
+    driver = CamillaDSPDriver(output_channels=4, input_channels=2)
+    cfg = driver._build_config()
+    filter_steps = [s for s in cfg["pipeline"] if s.get("type") == "Filter"]
+    # Default shadow has no input-side PEQ, so only output-side filter steps.
+    assert filter_steps, "at least one Filter step expected (per-output processing)"
+    for step in filter_steps:
+        assert "channels" in step, f"step {step!r} missing `channels` key"
+        assert "channel" not in step, f"step {step!r} still uses singular `channel`"
+        assert isinstance(step["channels"], list), (
+            f"step {step!r}: channels must be a list, got {type(step['channels']).__name__}"
+        )
+        assert all(isinstance(c, int) for c in step["channels"]), (
+            f"step {step!r}: channels entries must be int, got {step['channels']!r}"
+        )
 
 
 @pytest.mark.asyncio

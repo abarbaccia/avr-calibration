@@ -61,13 +61,13 @@ _DEFAULT_CAPTURE_DEVICE: dict[str, Any] = {
     "type": "Alsa",
     "device": "hw:Loopback,1,0",
     "channels": 2,
-    "format": "S32LE",
+    "format": "S32_LE",
 }
 _DEFAULT_PLAYBACK_DEVICE: dict[str, Any] = {
     "type": "Alsa",
     "device": "hw:USB,0,0",
     "channels": 10,
-    "format": "S32LE",
+    "format": "S32_LE",
 }
 
 
@@ -546,7 +546,12 @@ class CamillaDSPDriver(DSPDriver):
         }
 
     def _build_pipeline(self) -> list[dict]:
-        """Emit pipeline steps: input PEQ → mixer → per-output processing."""
+        """Emit pipeline steps: input PEQ → mixer → per-output processing.
+
+        CamillaDSP 2.x+ pipeline Filter steps use ``channels: [N]`` (list, plural)
+        rather than ``channel: N`` (scalar, singular) — the list form lets a
+        single step apply identical filters to several channels at once.
+        """
         steps: list[dict] = []
 
         # Input-side PEQ, per input channel (pre-mixer).
@@ -555,7 +560,7 @@ class CamillaDSPDriver(DSPDriver):
             if not specs:
                 continue
             names = [f"cal_in{inp_idx}_peq_{i}" for i in range(len(specs))]
-            steps.append({"type": "Filter", "channel": inp_idx, "names": names})
+            steps.append({"type": "Filter", "channels": [inp_idx], "names": names})
 
         # Mixer step — always present so the router sees the channel count change.
         steps.append({"type": "Mixer", "name": "cal_matrix"})
@@ -570,7 +575,7 @@ class CamillaDSPDriver(DSPDriver):
             names.extend(f"cal_out{out_idx}_peq_{i}" for i in range(eq_count))
             names.append(f"cal_out{out_idx}_delay")
             names.append(f"cal_out{out_idx}_gain")
-            steps.append({"type": "Filter", "channel": out_idx, "names": names})
+            steps.append({"type": "Filter", "channels": [out_idx], "names": names})
 
         return steps
 
