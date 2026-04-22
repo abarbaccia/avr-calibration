@@ -276,7 +276,7 @@ class TestRunAll:
             patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
         ):
             results = await checker.run_all()
-        minidsp = next(r for r in results if r.name == "miniDSP")
+        minidsp = next(r for r in results if r.name == "miniDSP 2x4 HD")
         assert not minidsp.passed
         assert "boom" in minidsp.error
 
@@ -290,7 +290,25 @@ class TestRunAll:
             patch.object(checker, "check_signal_path_sync", side_effect=RuntimeError("err")),
         ):
             results = await checker.run_all()
-        assert [r.name for r in results] == ["Config", "Microphone", "miniDSP", "Denon AVR", "Signal Path"]
+        # DSP label now comes from the configured driver — "miniDSP 2x4 HD" for
+        # dsp_driver: minidsp (the test fixture default).
+        assert [r.name for r in results] == [
+            "Config", "Microphone", "miniDSP 2x4 HD", "Denon AVR", "Signal Path",
+        ]
+
+    async def test_result_names_camilladsp_label(self, config):
+        """dsp_driver: camilladsp → label reads 'CamillaDSP' in the preflight output."""
+        config._data["dsp_driver"] = "camilladsp"
+        checker = PreflightChecker(config)
+        with (
+            patch.object(checker, "check_config", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_mic", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_minidsp_combined", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_denon_and_playback", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_signal_path_sync", side_effect=RuntimeError("err")),
+        ):
+            results = await checker.run_all()
+        assert results[2].name == "CamillaDSP"
 
     async def test_partial_failure(self, config):
         checker = PreflightChecker(config)

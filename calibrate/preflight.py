@@ -1,4 +1,10 @@
-"""Hardware pre-flight checks — verify mic, miniDSP, and Denon AVR are reachable."""
+"""Hardware pre-flight checks — verify mic, DSP, and AVR reachability.
+
+The DSP check is driver-agnostic: it goes through ``DSPDriver.get_state()``
+so swapping ``dsp_driver: camilladsp`` in config.yaml automatically swaps
+the check to target the CamillaDSP daemon instead of minidspd. Only the
+user-facing display name and the error-recovery hints vary by driver.
+"""
 
 import asyncio
 import os
@@ -9,6 +15,25 @@ from .config import Config
 
 HIDRAW_DEVICE: str = "/dev/hidraw0"
 """Expected HID device node for the miniDSP 2x4 HD."""
+
+
+# Display names + daemon-start hints per DSP driver. Used by the preflight check
+# to produce readable output regardless of which DSP is configured.
+_DSP_DISPLAY_NAMES: dict[str, str] = {
+    "minidsp": "miniDSP 2x4 HD",
+    "camilladsp": "CamillaDSP",
+}
+_DSP_DAEMON_NAMES: dict[str, str] = {
+    "minidsp": "minidspd",
+    "camilladsp": "camilladsp",
+}
+_DSP_START_HINTS: dict[str, str] = {
+    "minidsp": "Start the daemon: run 'minidspd' in a separate terminal",
+    "camilladsp": (
+        "Start the CamillaDSP daemon on the configured host:port "
+        "(e.g. `camilladsp -p 1234 /path/to/config.yml` as a systemd unit)"
+    ),
+}
 
 
 @dataclass
@@ -42,10 +67,13 @@ class PreflightChecker:
         Equipment checks:
             [Config]  [Microphone]  [miniDSP (USB+daemon)]  [Denon AVR + Playback]  [Signal Path]
         """
+        dsp_label = _DSP_DISPLAY_NAMES.get(
+            self.config.dsp_driver_name, self.config.dsp_driver_name
+        )
         checks = [
             ("Config", self.check_config()),
             ("Microphone", self.check_mic()),
-            ("miniDSP", self.check_minidsp_combined()),
+            (dsp_label, self.check_minidsp_combined()),
             ("Denon AVR", self.check_denon_and_playback()),
             ("Signal Path", self.check_signal_path_sync()),
         ]
@@ -135,19 +163,37 @@ class PreflightChecker:
             )
 
     async def check_minidsp(self) -> CheckResult:
-        """Check that the DSP daemon is reachable via DSPDriver.get_state()."""
+        """Check that the configured DSP daemon is reachable via DSPDriver.get_state().
+
+        Driver-agnostic despite the legacy name: display name, daemon name,
+        and start hint are all looked up from the configured driver
+        (``dsp_driver: minidsp`` / ``dsp_driver: camilladsp`` / etc.).
+        """
         from .drivers.base import DriverError
         from .drivers.registry import load_dsp_driver
 
-        host, port = self.config.minidsp_host_port
+        dsp_name = self.config.dsp_driver_name
+        display = _DSP_DISPLAY_NAMES.get(dsp_name, dsp_name)
+        daemon = _DSP_DAEMON_NAMES.get(dsp_name, dsp_name)
+        start_hint = _DSP_START_HINTS.get(
+            dsp_name, f"Start the {daemon} daemon and ensure it's reachable."
+        )
+        # Connection target — miniDSP reads from minidsp.*, CamillaDSP from camilladsp.*
+        if dsp_name == "camilladsp":
+            cam = self.config.camilladsp
+            host = cam.get("host", "127.0.0.1")
+            port = int(cam.get("port", 1234))
+        else:
+            host, port = self.config.minidsp_host_port
+
         driver = load_dsp_driver(self.config)
 
         try:
             await driver.get_state()
             return CheckResult(
-                name="miniDSP",
+                name=display,
                 passed=True,
-                detail=f"miniDSP 2x4 HD at {host}:{port}",
+                detail=f"{display} at {host}:{port}",
             )
 
         except DriverError as exc:
@@ -157,20 +203,20 @@ class PreflightChecker:
             # "daemon unreachable".
             if "timeout" in str(exc).lower():
                 return CheckResult(
-                    name="miniDSP",
+                    name=display,
                     passed=False,
-                    detail=f"Timeout connecting to minidspd at {host}:{port}",
-                    error="minidspd may be starting — wait a moment and retry",
+                    detail=f"Timeout connecting to {daemon} at {host}:{port}",
+                    error=f"{daemon} may be starting — wait a moment and retry",
                 )
             return CheckResult(
-                name="miniDSP",
+                name=display,
                 passed=False,
-                detail=f"Cannot reach minidspd at {host}:{port}",
-                error="Start the daemon: run 'minidspd' in a separate terminal",
+                detail=f"Cannot reach {daemon} at {host}:{port}",
+                error=start_hint,
             )
         except Exception as exc:
             return CheckResult(
-                name="miniDSP",
+                name=display,
                 passed=False,
                 detail="",
                 error=str(exc),
@@ -353,39 +399,40 @@ class PreflightChecker:
         )
 
     async def check_minidsp_combined(self) -> CheckResult:
-        """Combined check: minidspd HTTP daemon is the authoritative test.
+        """Combined DSP check: daemon reachability + driver-specific USB diagnostic.
 
-        minidspd claims the miniDSP device via libusb/usbfs, which intentionally
-        detaches hid-generic, so /dev/hidraw0 does NOT exist while the daemon is
-        healthy. The hidraw check is only used as a diagnostic when the daemon is
-        unreachable — it distinguishes "miniDSP not plugged in at all" from
-        "miniDSP connected but daemon is not running".
+        For ``dsp_driver: minidsp`` the hidraw check is a useful diagnostic
+        when the daemon is unreachable — minidspd claims the miniDSP via
+        libusb/usbfs (detaching hid-generic), so ``/dev/hidraw0`` only exists
+        while the daemon is **down**; its presence with a dead daemon means
+        "plugged in but daemon not running." For other DSP drivers (CamillaDSP
+        talks over plain TCP to its own daemon), the USB hidraw diagnostic
+        doesn't apply and the daemon check stands alone.
         """
         daemon_result = await self.check_minidsp()
 
         if daemon_result.passed:
-            return CheckResult(
-                name="miniDSP",
-                passed=True,
-                detail=daemon_result.detail,
-            )
+            return daemon_result
 
-        # Daemon failed — run hidraw check to give a better error message.
+        # CamillaDSP (and other non-miniDSP drivers): the daemon result is
+        # authoritative on its own — no USB diagnostic to layer on top.
+        if self.config.dsp_driver_name != "minidsp":
+            return daemon_result
+
+        # miniDSP-specific diagnostic path: layer hidraw info onto the error.
         hidraw_result = await self.check_hidraw()
 
         if hidraw_result.passed:
-            # Device is physically present but daemon is not running.
             return CheckResult(
-                name="miniDSP",
+                name=daemon_result.name,
                 passed=False,
                 detail=f"USB device found ({hidraw_result.detail}) but daemon unreachable: {daemon_result.detail}",
                 error=daemon_result.error,
             )
 
-        # Both failed — USB device not detected at all.
         daemon_note = f"; also: {daemon_result.error}" if daemon_result.error else ""
         return CheckResult(
-            name="miniDSP",
+            name=daemon_result.name,
             passed=False,
             detail=f"USB: {hidraw_result.detail or 'not found'}; daemon: {daemon_result.detail or 'not reachable'}",
             error=f"{hidraw_result.error}{daemon_note}",

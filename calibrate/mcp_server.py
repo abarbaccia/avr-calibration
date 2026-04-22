@@ -5478,9 +5478,16 @@ def create_app() -> Starlette:
         # correct instead of claiming everything is zero.
         if hasattr(_dsp, "rehydrate_from_active_state"):
             try:
+                import asyncio as _asyncio
                 from .storage import SessionStore
                 active_state = SessionStore().get_active_dsp()
-                _dsp.rehydrate_from_active_state(active_state)
+                # MinidspDriver's rehydrate is sync (hardware holds flashed
+                # filters — no reconciliation push needed). CamillaDSPDriver's
+                # is async (pushes shadow to the daemon so the pipeline
+                # reflects the rehydrated state). Await either shape.
+                result = _dsp.rehydrate_from_active_state(active_state)
+                if _asyncio.iscoroutine(result):
+                    await result
                 log.info("DSP shadow rehydrated from %d active_dsp_state keys", len(active_state))
             except Exception as exc:
                 log.warning("DSP rehydrate failed (shadow stays empty): %s", exc)
