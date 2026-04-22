@@ -548,6 +548,8 @@ async def test_trigger_measurement_engine_error() -> None:
 @pytest.mark.asyncio
 async def test_trigger_measurement_with_denon_context() -> None:
     """HDMI route → DenonSweepContext wraps engine.measure()."""
+    from calibrate.config import Config, DEFAULT_CONFIG
+
     mock_sd = MagicMock()
     mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
 
@@ -565,6 +567,13 @@ async def test_trigger_measurement_with_denon_context() -> None:
     mock_dsp_local = AsyncMock()
     mock_dsp_local.get_state = AsyncMock(return_value={"source": "Analog", "volume": 0.0})
 
+    # Force playback_route=hdmi so the test exercises the Denon path regardless
+    # of what the local ~/.avr-calibration/config.yaml happens to say.
+    hdmi_cfg_data = {k: (dict(v) if isinstance(v, dict) else v)
+                     for k, v in DEFAULT_CONFIG.items()}
+    hdmi_cfg_data["measurement"] = {**hdmi_cfg_data["measurement"],
+                                     "playback_route": "hdmi"}
+
     with (
         patch.dict(sys.modules, {"sounddevice": mock_sd}),
         patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
@@ -572,6 +581,7 @@ async def test_trigger_measurement_with_denon_context() -> None:
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
         patch.object(sut, "_dsp", mock_dsp_local),
+        patch.object(sut, "_config", return_value=Config(hdmi_cfg_data)),
     ):
         MockCtx.from_config.return_value = mock_ctx_instance
         result = await _tool_trigger_measurement()
