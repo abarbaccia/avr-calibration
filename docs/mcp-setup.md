@@ -51,6 +51,9 @@ measurement:
   denon_sweep_volume: -25.0      # master volume during sweep (restored after)
 ```
 
+> **Using CamillaDSP instead of miniDSP?** Set `dsp_driver: camilladsp` and
+> describe the driver contract + gotchas at [camilladsp-setup.md](./camilladsp-setup.md).
+
 > **Finding your exact Denon input name:** Input names depend on your AVR model and any renaming you've done in the Denon setup menu. The endpoint will return HTTP 503 with the available list if the configured name is wrong:
 > ```bash
 > curl -sk https://<pi-ip>:8000/api/equipment/denon | python3 -m json.tool | grep -A20 inputs

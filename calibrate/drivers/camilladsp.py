@@ -188,14 +188,17 @@ class CamillaDSPDriver(DSPDriver):
         self._max_peq_slots = max_peq_slots
         self._client = _CamillaWSClient(host, port)
 
-        # Default routing: input 0 → every output; other inputs muted. This is
-        # the LFE-broadcast default; override via set_routing() or set via the
-        # `camilladsp.routing` block at construction time.
+        # Default routing: input 0 → configured sub_outputs only; everything
+        # else silent. Broadcasting a sweep to every 18i20 analog output at
+        # full gain would blast any wired main/tweeter, so the driver starts
+        # in the minimum safe state. Callers expand the routing explicitly
+        # via set_routing() (or during setup from a camilladsp.routing block).
         self._routing: dict[int, dict[int, bool]] = {
-            0: {out: True for out in range(output_channels)},
+            inp: {out: False for out in range(output_channels)}
+            for inp in range(input_channels)
         }
-        for inp in range(1, input_channels):
-            self._routing[inp] = {out: False for out in range(output_channels)}
+        for out in self._sub_outputs:
+            self._routing[0][out] = True
 
         # Shadow state — each mutation rebuilds the pipeline from this.
         self._output_eq: dict[int, list[dict]] = {}   # output_index → filter specs
