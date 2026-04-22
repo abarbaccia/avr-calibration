@@ -427,39 +427,40 @@ class MinidspDriver(DSPDriver):
         persisted active_dsp_state dict makes `get_output_state` reflect what
         was actually written before the restart.
 
-        Expected key shapes (produced by `_persist_dsp_state` in mcp_server):
-        - ``output_eq_{idx}``   → {"filters": [...], "preset": N}
-        - ``input_eq``          → {"filters": [...], "preset": N}
-        - ``gain_{idx}``        → {"gain_db": X}
-        - ``delay_{idx}``       → {"delay_ms": X}
-        - ``polarity_{idx}``    → {"inverted": bool}
+        Accepts both key shapes (see ``calibrate.storage.parse_dsp_key``):
+          - namespaced: ``processor:<name>:output:<idx>:<field>`` (new)
+          - legacy:     ``output_eq_N`` / ``delay_N`` / ... (pre-migration)
 
         Unknown keys are ignored. FIR coefficients are not persisted in
         active_dsp_state and stay empty after rehydrate.
         """
+        from ..storage import parse_dsp_key
+
         for key, data in active_state.items():
+            parsed = parse_dsp_key(key)
+            if parsed is None:
+                continue
             try:
-                if key.startswith("output_eq_"):
-                    idx = int(key.removeprefix("output_eq_"))
-                    preset = int(data.get("preset", 0))
-                    filters = data.get("filters", [])
-                    if filters:
-                        self._eq_state[(preset, idx)] = filters
-                elif key == "input_eq":
+                if parsed["kind"] == "output":
+                    idx = parsed["output_index"]
+                    field = parsed["field"]
+                    if field == "eq":
+                        preset = int(data.get("preset", 0))
+                        filters = data.get("filters", [])
+                        if filters:
+                            self._eq_state[(preset, idx)] = filters
+                    elif field == "gain":
+                        self._output_gain[idx] = float(data["gain_db"])
+                    elif field == "delay":
+                        self._output_delay[idx] = float(data["delay_ms"])
+                    elif field == "polarity":
+                        self._output_polarity[idx] = bool(data["inverted"])
+                elif parsed["kind"] == "input" and parsed["field"] == "eq":
                     preset = int(data.get("preset", 0))
                     filters = data.get("filters", [])
                     if filters:
                         for inp in {self._active_input, self._usb_input}:
                             self._eq_state[("input", inp, preset)] = filters
-                elif key.startswith("gain_"):
-                    idx = int(key.removeprefix("gain_"))
-                    self._output_gain[idx] = float(data["gain_db"])
-                elif key.startswith("delay_"):
-                    idx = int(key.removeprefix("delay_"))
-                    self._output_delay[idx] = float(data["delay_ms"])
-                elif key.startswith("polarity_"):
-                    idx = int(key.removeprefix("polarity_"))
-                    self._output_polarity[idx] = bool(data["inverted"])
             except (KeyError, ValueError, TypeError) as exc:
                 log.warning("rehydrate_from_active_state: skipping key=%s: %s", key, exc)
 

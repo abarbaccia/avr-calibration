@@ -29,7 +29,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from .graph import TransducerProfile
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -134,15 +137,31 @@ def _is_boost(f: FilterSpec) -> bool:
 # ── Validator ──────────────────────────────────────────────────────────────────
 
 class SafetyValidator:
-    """Validates a list of FilterSpec objects against all hard safety limits.
+    """Validates a list of FilterSpec objects against hard safety limits.
 
-    Instantiate once and reuse::
+    Limits come from a ``TransducerProfile`` — the default matches the legacy
+    SVS PB12-NSD ported-sub constants, so existing callers that do
+    ``SafetyValidator()`` keep their current behaviour. Pass a different
+    profile for a different transducer model::
 
-        validator = SafetyValidator()
+        validator = SafetyValidator(profile)  # where profile is a TransducerProfile
 
-    Call ``validate(filters)`` before writing to miniDSP.  Optionally pass
+    Call ``validate(filters)`` before writing to the DSP.  Optionally pass
     ``previous_filters`` to enforce the per-iteration change limit.
     """
+
+    def __init__(self, profile: "TransducerProfile | None" = None) -> None:
+        # Late import: avoid circular dependency between safety.py and graph.py.
+        # graph.py imports nothing from safety.py; safety.py only needs
+        # TransducerProfile for its dataclass shape.
+        if profile is None:
+            from .graph import SVS_PB12_NSD_PROFILE
+            profile = SVS_PB12_NSD_PROFILE
+        self._profile = profile
+
+    @property
+    def profile(self) -> "TransducerProfile":
+        return self._profile
 
     def validate(
         self,
@@ -193,14 +212,15 @@ class SafetyValidator:
     def _check_boost_frequency_floor(
         self, filters: list[FilterSpec]
     ) -> ValidationResult:
-        """Reject any boost below MIN_BOOST_FREQ_HZ."""
+        """Reject any boost below the profile's min boost frequency."""
+        floor = self._profile.min_boost_freq_hz
         for f in filters:
             if f.type == "hpf":
                 continue
-            if _is_boost(f) and f.freq < MIN_BOOST_FREQ_HZ:
+            if _is_boost(f) and f.freq < floor:
                 return ValidationResult.failed(
                     f"boost at {f.freq:.1f} Hz is below minimum boost frequency "
-                    f"({MIN_BOOST_FREQ_HZ:.0f} Hz) — dangerous for a ported sub"
+                    f"({floor:.0f} Hz) for profile {self._profile.name!r}"
                 )
         return ValidationResult.passed()
 
@@ -209,30 +229,34 @@ class SafetyValidator:
     ) -> ValidationResult:
         """Reject any single band with gain above the frequency-dependent limit.
 
-        Below 30 Hz: +6 dB (port unloading protection for ported subs).
-        At/above 30 Hz: +8 dB (thermal limit only; SHARC DSP has no saturation concern).
+        Below the profile's threshold: the stricter ``max_boost_per_band_db``.
+        At/above the threshold: the looser ``max_boost_above_threshold_db``.
+        For non-ported transducers (``max_boost_above_threshold_db`` equal
+        to ``max_boost_per_band_db``) the two limits collapse into one.
         """
+        threshold = self._profile.freq_dependent_boost_threshold_hz
         for f in filters:
             if f.type == "hpf":
                 continue
             limit = (
-                MAX_BOOST_PER_BAND_DB
-                if f.freq < FREQ_DEPENDENT_BOOST_THRESHOLD_HZ
-                else MAX_BOOST_ABOVE_THRESHOLD_DB
+                self._profile.max_boost_per_band_db
+                if f.freq < threshold
+                else self._profile.max_boost_above_threshold_db
             )
             if f.gain_db > limit:
                 return ValidationResult.failed(
                     f"band at {f.freq:.1f} Hz requests +{f.gain_db:.1f} dB "
-                    f"(max per-band boost at {'<' if f.freq < FREQ_DEPENDENT_BOOST_THRESHOLD_HZ else '>='}"
-                    f"{FREQ_DEPENDENT_BOOST_THRESHOLD_HZ:.0f} Hz is +{limit:.0f} dB)"
+                    f"(profile {self._profile.name!r} max boost at "
+                    f"{'<' if f.freq < threshold else '>='}{threshold:.0f} Hz "
+                    f"is +{limit:.0f} dB)"
                 )
         return ValidationResult.passed()
 
     def _check_cumulative_boost(
         self, filters: list[FilterSpec]
     ) -> ValidationResult:
-        """Reject if any 1/3-octave band accumulates > MAX_CUMULATIVE_BOOST_DB."""
-        # Accumulate boost by 1/3-octave centre
+        """Reject if any 1/3-octave band accumulates past the profile's ceiling."""
+        ceiling = self._profile.max_cumulative_boost_db
         cumulative: dict[float, float] = {}
         for f in filters:
             if f.type == "hpf" or not _is_boost(f):
@@ -241,11 +265,11 @@ class SafetyValidator:
             cumulative[centre] = cumulative.get(centre, 0.0) + f.gain_db
 
         for centre, total in cumulative.items():
-            if total > MAX_CUMULATIVE_BOOST_DB:
+            if total > ceiling:
                 return ValidationResult.failed(
                     f"cumulative boost in {centre:.0f} Hz 1/3-octave band is "
-                    f"+{total:.1f} dB (max cumulative boost is "
-                    f"+{MAX_CUMULATIVE_BOOST_DB:.0f} dB)"
+                    f"+{total:.1f} dB (profile {self._profile.name!r} cumulative "
+                    f"ceiling is +{ceiling:.0f} dB)"
                 )
         return ValidationResult.passed()
 
@@ -265,7 +289,11 @@ class SafetyValidator:
         prevent drift-based bypasses where a correction algorithm shifts a
         filter from 50.0 Hz to 49.9 Hz to dodge the delta check.
         """
-        limit = MAX_CHANGE_SIMULATED_DB if simulation_verified else MAX_CHANGE_PER_ITER_DB
+        limit = (
+            self._profile.max_change_simulated_db
+            if simulation_verified
+            else self._profile.max_change_per_iter_db
+        )
 
         # Build a lookup: previous gain by 1/3-octave centre
         prev_by_band: dict[float, float] = {}
@@ -293,16 +321,21 @@ class SafetyValidator:
         return ValidationResult.passed()
 
     def _check_hpf_present(self, filters: list[FilterSpec]) -> ValidationResult:
-        """Verify a HPF at or below HPF_FREQ_HZ is present in the filter list.
+        """Verify a HPF at or below the profile's HPF frequency is present.
 
-        The infrasonic HPF is mandatory and cannot be omitted.  It protects the
-        subwoofer driver from large excursion at very low frequencies.
+        Skipped entirely when the profile's ``hpf_freq_hz`` is None — mains,
+        tweeters, and other non-ported transducers don't need an infrasonic
+        HPF. Ported subs (SVS default) always do.
         """
+        if self._profile.hpf_freq_hz is None:
+            return ValidationResult.passed()
+        ceiling = self._profile.hpf_freq_hz
+        order = self._profile.hpf_order
         for f in filters:
-            if f.type == "hpf" and f.freq <= HPF_FREQ_HZ:
+            if f.type == "hpf" and f.freq <= ceiling:
                 return ValidationResult.passed()
         return ValidationResult.failed(
-            f"mandatory infrasonic HPF at ≤{HPF_FREQ_HZ:.0f} Hz is missing — "
-            f"all filter sets must include a {HPF_ORDER}-order Butterworth HPF "
-            f"at {HPF_FREQ_HZ:.0f} Hz or lower"
+            f"mandatory infrasonic HPF at ≤{ceiling:.0f} Hz is missing — "
+            f"profile {self._profile.name!r} requires a {order}-order "
+            f"Butterworth HPF at {ceiling:.0f} Hz or lower"
         )

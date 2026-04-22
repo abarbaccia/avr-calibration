@@ -1012,6 +1012,16 @@ async def test_denon_sweep_exit_skips_sound_mode_restore_when_not_pure_direct():
 
 def _mock_config(avr_driver: str = "denon", dsp_driver: str = "minidsp",
                   processing_rate: int = 96_000):
+    """Build a mock Config whose `signal_graph` synthesises the expected processors.
+
+    The registry-based load_*_driver functions walk the graph to find which
+    drivers to instantiate, so the mock has to expose a real SignalGraph with
+    the correct processor nodes. We build one inline rather than stubbing it.
+    """
+    from calibrate.graph import (
+        Processor, SignalGraph, SVS_PB12_NSD_PROFILE,
+    )
+
     cfg = MagicMock()
     cfg.avr_driver_name = avr_driver
     cfg.dsp_driver_name = dsp_driver
@@ -1026,6 +1036,16 @@ def _mock_config(avr_driver: str = "denon", dsp_driver: str = "minidsp",
     cfg.sub_outputs = [0, 1]
     cfg.measurement = {"output_channel": 1}
     cfg.eq_capabilities = {"processing_rate": processing_rate}
+
+    processors = []
+    if avr_driver in {"denon"}:
+        processors.append(Processor(name=avr_driver, driver_ref=avr_driver, kind="avr"))
+    if dsp_driver in {"minidsp", "camilladsp"}:
+        processors.append(Processor(name=dsp_driver, driver_ref=dsp_driver, kind="dsp"))
+    cfg.signal_graph = SignalGraph(
+        processors=tuple(processors),
+        profiles=(SVS_PB12_NSD_PROFILE,),
+    )
     return cfg
 
 

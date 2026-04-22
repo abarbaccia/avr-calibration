@@ -14,6 +14,22 @@ Adapts automatically to the hardware:
 - **No FIR**: Skips Phase 3, proceeds directly to target curve PEQ
 - **FIR available**: Applies ringing reduction before target curve for a stable foundation
 
+## Addressing scopes — `target` vs `output_index`
+
+Every EQ tool accepts a scope by name. Read the graph once with
+`get_signal_graph` (or `get_config` — it's embedded), then use transducer and
+group names in preference to raw output indices:
+
+- `apply_eq(target="bass", filters=[...])` — broadcast to every sub in the
+  `bass` group. Equivalent to the legacy omit-`output_index` broadcast.
+- `apply_eq(target="sub_1", filters=[...])` — per-transducer by name.
+- `resolve_target("bass")` — get `{transducer, output_index, profile}` entries
+  when you need raw indices for tools that still take `output_index` only
+  (`set_delay`, `set_polarity`, `set_output_gain`, `mute_output`).
+
+Either path works throughout this recipe. New recipes should prefer `target`
+so per-transducer safety profiles are enforced automatically.
+
 ## Measurement Signal Path
 
 Show the active signal path for this recipe based on `get_config`. The path depends

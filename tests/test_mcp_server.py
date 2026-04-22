@@ -3829,3 +3829,227 @@ async def test_call_tool_predict_rms_dispatch() -> None:
     data = json.loads(texts[0].text)
     assert data["ok"]
     assert "predicted_rms" in data
+
+
+# ── Signal graph MCP tools ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_signal_graph_returns_summary_from_legacy_shim() -> None:
+    """get_signal_graph always returns a graph — even on legacy configs."""
+    from calibrate.mcp_server import _tool_get_signal_graph
+
+    result = await _tool_get_signal_graph()
+    assert result["ok"]
+    g = result["graph"]
+    assert "processors" in g
+    assert "transducers" in g
+    assert "groups" in g
+
+
+@pytest.mark.asyncio
+async def test_resolve_target_returns_transducers_for_group() -> None:
+    from calibrate.mcp_server import _tool_resolve_target
+
+    # Default legacy config synthesises a "bass" group with two subs.
+    result = await _tool_resolve_target("bass")
+    assert result["ok"]
+    assert len(result["resolved"]) == 2
+    assert all(r["role"] == "sub" for r in result["resolved"])
+
+
+@pytest.mark.asyncio
+async def test_resolve_target_unknown_returns_empty_list() -> None:
+    from calibrate.mcp_server import _tool_resolve_target
+
+    result = await _tool_resolve_target("no_such_thing")
+    assert result["ok"]
+    assert result["resolved"] == []
+
+
+@pytest.mark.asyncio
+async def test_apply_eq_target_resolves_via_graph(
+    mock_dsp, valid_filters,
+) -> None:
+    """apply_eq(target='bass') dispatches per resolved transducer."""
+    from calibrate.mcp_server import _tool_apply_eq
+
+    # Legacy config synthesises subs on the 'minidsp' processor.
+    with patch("calibrate.mcp_server._default_dsp_name", return_value="minidsp"):
+        result = await _tool_apply_eq(valid_filters, target="bass")
+
+    assert result["ok"], result
+    # bass resolves to two subs → apply_eq called once per transducer
+    assert mock_dsp.apply_eq.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_apply_eq_target_and_output_index_conflict_rejected(
+    mock_dsp, valid_filters,
+) -> None:
+    from calibrate.mcp_server import _tool_apply_eq
+
+    result = await _tool_apply_eq(valid_filters, output_index=0, target="bass")
+    assert not result["ok"]
+    assert "either target or output_index" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_apply_eq_unknown_target_rejected(mock_dsp, valid_filters) -> None:
+    from calibrate.mcp_server import _tool_apply_eq
+
+    with patch("calibrate.mcp_server._default_dsp_name", return_value="minidsp"):
+        result = await _tool_apply_eq(valid_filters, target="no_such_group")
+    assert not result["ok"]
+    assert "unknown target" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_apply_eq_target_rejects_transducer_on_foreign_processor(
+    mock_dsp, valid_filters,
+) -> None:
+    """Multi-DSP target dispatch is a known follow-up — should reject cleanly."""
+    from calibrate.mcp_server import _tool_apply_eq
+
+    # Default DSP name is 'minidsp' but the test target lives on 'camilla'.
+    from calibrate.graph import (
+        Processor, SignalGraph, SVS_PB12_NSD_PROFILE, Transducer, TransducerGroup,
+    )
+    alt_graph = SignalGraph(
+        processors=(
+            Processor(name="camilla", driver_ref="camilladsp", kind="dsp"),
+        ),
+        transducers=(
+            Transducer(name="sub_l", role="sub", processor_ref="camilla",
+                       output_index=0, safety_profile_ref="svs_pb12_nsd"),
+        ),
+        profiles=(SVS_PB12_NSD_PROFILE,),
+        groups=(TransducerGroup(name="bass", members=("sub_l",)),),
+    )
+
+    class _FakeCfg:
+        signal_graph = alt_graph
+
+    with patch("calibrate.mcp_server._config", return_value=_FakeCfg()), \
+         patch("calibrate.mcp_server._default_dsp_name", return_value="minidsp"):
+        result = await _tool_apply_eq(valid_filters, target="bass")
+    assert not result["ok"]
+    assert "different processor" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_apply_input_eq_target_validates_against_strictest_profile(
+    mock_dsp,
+) -> None:
+    """Input EQ with a named target uses the strictest profile in the scope."""
+    from calibrate.mcp_server import _tool_apply_input_eq
+    from calibrate.graph import (
+        Processor, SignalGraph, Transducer, TransducerGroup, TransducerProfile,
+        SVS_PB12_NSD_PROFILE,
+    )
+
+    tight_main = TransducerProfile(
+        name="tight_main", max_boost_per_band_db=2.0, min_boost_freq_hz=50.0,
+        hpf_freq_hz=None, max_cumulative_boost_db=4.0,
+    )
+    mixed_graph = SignalGraph(
+        processors=(Processor(name="dsp", driver_ref="minidsp", kind="dsp"),),
+        profiles=(SVS_PB12_NSD_PROFILE, tight_main),
+        transducers=(
+            Transducer(name="sub", role="sub", processor_ref="dsp",
+                       output_index=0, safety_profile_ref="svs_pb12_nsd"),
+            Transducer(name="main", role="main", processor_ref="dsp",
+                       output_index=1, safety_profile_ref="tight_main"),
+        ),
+        groups=(TransducerGroup(name="all", members=("sub", "main")),),
+    )
+
+    class _FakeCfg:
+        signal_graph = mixed_graph
+
+    # +5 dB would be fine for SVS (6 dB limit) but violates tight_main (2 dB).
+    # Strictest wins → rejected.
+    bad = [
+        {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
+        {"freq": 60.0, "gain_db": 5.0, "q": 1.0, "type": "peaking"},
+    ]
+    with patch("calibrate.mcp_server._config", return_value=_FakeCfg()):
+        result = await _tool_apply_input_eq(bad, target="all")
+    assert not result["ok"]
+    assert "SafetyValidator" in result["error"]
+    assert "tight_main" in result["error"]
+
+
+# ── Storage key migration ─────────────────────────────────────────────────────
+
+
+def test_storage_legacy_dsp_keys_migrate_to_namespaced() -> None:
+    """Flat legacy active_dsp_state keys are rewritten to processor-namespaced form."""
+    import tempfile
+    from pathlib import Path
+    from calibrate.storage import SessionStore
+
+    # Pre-seed a database with legacy flat keys using the raw sqlite API.
+    import sqlite3
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "test.db"
+        store = SessionStore(db_path=db)
+
+        # Seed legacy keys directly (bypasses dsp_key helper).
+        store.set_active_dsp("output_eq_0", {"filters": [], "preset": 0})
+        store.set_active_dsp("delay_1", {"delay_ms": 2.5})
+        store.set_active_dsp("input_eq", {"filters": [], "preset": 0})
+        store.set_active_dsp("target_curve", {"type": "harman"})
+
+        # Mutate directly to undo the namespacing the writer would have applied,
+        # simulating a pre-migration database.
+        with sqlite3.connect(db) as conn:
+            conn.execute("DELETE FROM active_dsp_state")
+            for k, d in [
+                ("output_eq_0", '{"filters":[],"preset":0}'),
+                ("delay_1", '{"delay_ms":2.5}'),
+                ("input_eq", '{"filters":[],"preset":0}'),
+                ("target_curve", '{"type":"harman"}'),
+            ]:
+                conn.execute(
+                    "INSERT INTO active_dsp_state (key, timestamp, data) VALUES (?,?,?)",
+                    (k, "2026-04-22T00:00:00Z", d),
+                )
+
+        # Open a fresh SessionStore on the same DB — migration runs in _migrate_schema.
+        store2 = SessionStore(db_path=db)
+        state = store2.get_active_dsp()
+        keys = set(state.keys())
+
+        # DSP-scoped keys are now namespaced. target_curve (non-DSP) is left flat.
+        assert any(k.startswith("processor:") and k.endswith(":output:0:eq") for k in keys)
+        assert any(k.startswith("processor:") and k.endswith(":output:1:delay") for k in keys)
+        assert any(k.startswith("processor:") and k.endswith(":input:eq") for k in keys)
+        assert "target_curve" in keys
+        # No legacy-shaped DSP keys should remain.
+        assert "output_eq_0" not in keys
+        assert "delay_1" not in keys
+        assert "input_eq" not in keys
+
+
+def test_parse_dsp_key_handles_both_shapes() -> None:
+    """parse_dsp_key tolerates namespaced and legacy keys during transient states."""
+    from calibrate.storage import parse_dsp_key
+
+    # Namespaced
+    assert parse_dsp_key("processor:minidsp:output:2:eq") == {
+        "processor": "minidsp", "kind": "output", "output_index": 2, "field": "eq",
+    }
+    assert parse_dsp_key("processor:camilla:input:eq") == {
+        "processor": "camilla", "kind": "input", "field": "eq",
+    }
+    # Legacy (processor=None)
+    assert parse_dsp_key("output_eq_3") == {
+        "processor": None, "kind": "output", "output_index": 3, "field": "eq",
+    }
+    assert parse_dsp_key("input_eq") == {
+        "processor": None, "kind": "input", "field": "eq",
+    }
+    # Non-DSP keys yield None
+    assert parse_dsp_key("target_curve") is None
+    assert parse_dsp_key("random_garbage") is None
