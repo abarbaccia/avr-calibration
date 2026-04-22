@@ -1685,6 +1685,41 @@ async def _tool_optimize_q(
         return _err(f"optimize_q failed: {exc}")
 
 
+def _classify_fixability(freq_hz: float, excess_gd_ms: float) -> tuple[str, bool]:
+    """Classify a band as fixable / partial / geometry from excess group delay.
+
+    The old fixed 5 ms threshold flagged essentially every room measurement
+    as "not fixable" because modal ringing at sub frequencies comfortably
+    exceeds 5 ms of excess group delay even when the underlying response is
+    minimum-phase-correctable. Scale instead with the period of the band:
+
+      fixable   — excess GD < max(10 ms, ¼ wavelength).
+                  PEQ handles the peak cleanly.
+      partial   — excess GD < max(25 ms, ½ wavelength).
+                  Modal ringing is significant; FIR shortens decay better than
+                  PEQ, but PEQ still reduces the peak.
+      geometry  — excess GD ≥ ½ wavelength, i.e. near-π phase offset.
+                  Likely cancellation at the mic; repositioning (sub placement,
+                  listening position, polarity/delay between subs) beats EQ.
+
+    The 10 ms / 25 ms floors protect against over-classifying mid/upper-bass
+    bands where a short wavelength makes the raw wavelength thresholds
+    unrealistically tight.
+
+    Returns (classification, fixable_bool) where fixable is True for both
+    "fixable" and "partial" — both respond to some combination of PEQ + FIR.
+    """
+    period_ms = 1000.0 / max(freq_hz, 1e-6)
+    fixable_threshold = max(10.0, 0.25 * period_ms)
+    geometry_threshold = max(25.0, 0.5 * period_ms)
+
+    if excess_gd_ms < fixable_threshold:
+        return "fixable", True
+    if excess_gd_ms < geometry_threshold:
+        return "partial", True
+    return "geometry", False
+
+
 async def _tool_analyze_phase(
     session_id: int,
     min_hz: float = 20.0,
@@ -1693,11 +1728,15 @@ async def _tool_analyze_phase(
     """Minimum-phase decomposition and fixability analysis.
 
     Separates measured response into minimum-phase (EQ-correctable) and
-    excess-phase (room geometry, not correctable) components. Returns per-1/3-octave:
-    - total error (measured deviation from flat)
-    - fixable portion (minimum-phase, addressable with PEQ/FIR)
-    - unfixable portion (excess phase, only repositioning helps)
-    - excess group delay (ms above minimum-phase)
+    excess-phase components. Each 1/3-octave band gets a three-tier
+    classification — see ``_classify_fixability`` for the thresholds:
+
+    - fixable   — minimum-phase, PEQ handles the peak cleanly
+    - partial   — modal ringing dominates; FIR shortens decay better than PEQ
+    - geometry  — near-π phase offset at the mic; cancellation — reposition
+
+    Returns per-band freq_hz, spl_db, min_phase_group_delay_ms,
+    excess_group_delay_ms, classification, fixable (bool).
     """
     from .storage import SessionStore
     import math
@@ -1796,21 +1835,23 @@ async def _tool_analyze_phase(
             if excess_gd_ms is not None:
                 egdm = (mp_gd_freqs >= lo) & (mp_gd_freqs < hi) if len(mp_gd_freqs) > 0 else np.array([])
                 if np.any(egdm):
-                    min_len = min(len(excess_gd_ms), np.sum(egdm))
                     excess_vals = excess_gd_ms[:len(mp_gd_freqs)][egdm]
                     if len(excess_vals) > 0:
                         avg_excess = float(np.mean(np.abs(excess_vals)))
                         entry["excess_group_delay_ms"] = round(avg_excess, 1)
-                        # Fixability: low excess GD = fixable, high = geometry problem
-                        # Threshold: >5ms excess GD at sub frequencies = significant cancellation
-                        entry["fixable"] = avg_excess < 5.0
+                        classification, fixable = _classify_fixability(centre, avg_excess)
+                        entry["classification"] = classification
+                        entry["fixable"] = fixable
                     else:
                         entry["excess_group_delay_ms"] = 0.0
+                        entry["classification"] = "fixable"
                         entry["fixable"] = True
                 else:
                     entry["excess_group_delay_ms"] = 0.0
+                    entry["classification"] = "fixable"
                     entry["fixable"] = True
             else:
+                entry["classification"] = None
                 entry["fixable"] = None  # No phase data, can't determine
 
             bands.append(entry)
@@ -1820,9 +1861,19 @@ async def _tool_analyze_phase(
             session_id=session_id,
             has_phase_data=has_phase,
             bands=bands,
-            note="fixable=True means EQ/FIR can correct this band. "
-                 "fixable=False means excess group delay indicates cancellation — "
-                 "repositioning the sub is more effective than EQ." if has_phase else
+            note=(
+                "classification uses a frequency-scaled excess-group-delay threshold "
+                "(¼-wavelength / ½-wavelength with 10 ms / 25 ms floors): "
+                "'fixable' = minimum-phase, PEQ handles the peak cleanly; "
+                "'partial' = modal ringing dominates — FIR shortens decay better than PEQ, "
+                "but PEQ still reduces the peak; "
+                "'geometry' = near-π phase offset, likely cancellation at the mic — "
+                "repositioning (sub placement, polarity/delay between subs) beats EQ. "
+                "fixable=True for 'fixable' and 'partial'; False for 'geometry'. "
+                "NOTE: on a solo-sub measurement, excess GD reflects room reflections; "
+                "on a combined measurement it also includes sub-to-sub phase mismatch "
+                "(use compare_sub_phase to distinguish)."
+            ) if has_phase else
                  "No phase data available — fixability cannot be determined. "
                  "SPL and minimum-phase group delay are still valid.",
         )
@@ -4160,9 +4211,12 @@ _TOOLS: list[Tool] = [
         description=(
             "Minimum-phase decomposition and fixability analysis. Separates the measured "
             "response into minimum-phase (EQ-correctable) and excess-phase (room geometry, "
-            "not correctable) components. Returns per-1/3-octave: fixable flag, excess group "
-            "delay, and minimum-phase group delay. Use BEFORE designing any filter to know "
-            "what's worth correcting and what requires repositioning instead."
+            "not correctable) components. Returns per-1/3-octave: classification "
+            "('fixable' / 'partial' / 'geometry'), fixable flag, excess group delay, "
+            "and minimum-phase group delay. Classification uses frequency-scaled "
+            "thresholds so sub frequencies aren't misclassified as geometry just "
+            "because their periods are long. Use BEFORE designing any filter to know "
+            "what's worth correcting with PEQ vs. FIR vs. repositioning."
         ),
         inputSchema={
             "type": "object",
