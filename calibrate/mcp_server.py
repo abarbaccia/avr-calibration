@@ -3468,6 +3468,42 @@ async def _tool_configure_matrix(active_input: int | None = None) -> dict:
         return _err(f"configure_matrix error: {exc}")
 
 
+async def _tool_set_routing(routing: dict) -> dict:
+    """Apply an arbitrary input→output routing matrix to the active DSP.
+
+    Generic variant of ``configure_matrix`` — not limited to 2 inputs / 4
+    outputs. ``routing`` is a partial matrix; rows not mentioned stay at
+    their current driver state. Values are booleans: True means the input
+    channel is routed (unmuted) to the output channel, False means muted.
+
+    JSON keys arrive as strings — converted to int here before the driver
+    call. Example payload::
+
+        {"routing": {"2": {"1": true, "2": true, "3": true}}}
+
+    …routes input channel 2 (0-indexed) to output channels 1, 2, 3 on the
+    default DSP, leaving every other cell unchanged.
+    """
+    try:
+        parsed: dict[int, dict[int, bool]] = {}
+        for inp, out_map in routing.items():
+            inp_i = int(inp)
+            if not isinstance(out_map, dict):
+                return _err(
+                    f"set_routing: value for input {inp!r} must be an object "
+                    f"of output→bool, got {type(out_map).__name__}"
+                )
+            parsed[inp_i] = {int(k): bool(v) for k, v in out_map.items()}
+        await _dsp.set_routing(parsed)  # type: ignore[union-attr]
+        return _ok(routing=parsed)
+    except DriverError as exc:
+        return _err(str(exc))
+    except (ValueError, TypeError) as exc:
+        return _err(f"set_routing: invalid routing shape: {exc}")
+    except Exception as exc:
+        return _err(f"set_routing error: {exc}")
+
+
 async def _tool_analyze_decay(
     session_id: int | None = None,
     t60_threshold_ms: float = 300.0,
@@ -4383,6 +4419,36 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="set_routing",
+        description=(
+            "Apply an arbitrary input→output routing matrix to the active DSP. "
+            "Generic variant of configure_matrix — not limited to 2 inputs / 4 "
+            "outputs (necessary for CamillaDSP + 18i20 with 20 inputs / 10 outputs). "
+            "The passed routing is MERGED onto the driver's current state: rows "
+            "not mentioned stay as-is. Values are booleans (true = routed/unmuted, "
+            "false = muted). Keys are 0-indexed channel numbers as strings in JSON. "
+            "Example: {routing: {'2': {'1': true, '2': true, '3': true}}} routes "
+            "analog input 3 (0-indexed 2) to outputs 2, 3, 4 on the 18i20."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "routing": {
+                    "type": "object",
+                    "description": (
+                        "Partial routing matrix: {input_index_str: "
+                        "{output_index_str: bool}}. Indices are 0-based."
+                    ),
+                    "additionalProperties": {
+                        "type": "object",
+                        "additionalProperties": {"type": "boolean"},
+                    },
+                },
+            },
+            "required": ["routing"],
+        },
+    ),
+    Tool(
         name="analyze_decay",
         description=(
             "Analyze room-mode T60 decay in the impulse response from a stored measurement. "
@@ -5254,6 +5320,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_configure_matrix(
             active_input=int(arguments["active_input"]) if "active_input" in arguments else None
         )
+    elif name == "set_routing":
+        result = await _tool_set_routing(arguments["routing"])
     elif name == "analyze_decay":
         result = await _tool_analyze_decay(
             session_id=int(arguments["session_id"]) if "session_id" in arguments else None,

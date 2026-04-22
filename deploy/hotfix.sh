@@ -81,9 +81,13 @@ $SSH "sudo systemctl stop ${SERVICE} 2>/dev/null || true
 
 echo "Starting hotfixed container..."
 # shellcheck disable=SC2029  # MOUNT_ARGS intentionally expands on local side
+# Host networking matches deploy/avr-calibration.service — lets the container
+# reach services on the Pi's loopback (CamillaDSP on 127.0.0.1:1234, minidspd,
+# etc.) without having to rebind those daemons to 0.0.0.0. Ports 8000 (web)
+# and 8765 (MCP SSE) are still reachable on the Pi's LAN IP via host net.
 $SSH "sudo docker run -d \
     --name ${CONTAINER} \
-    -p 8000:8000 -p 8765:8765 \
+    --network=host \
     --privileged \
     -v \$HOME/.avr-calibration:/data/.avr-calibration \
     -v \$HOME/.avr-calibration/entrypoint.sh:/entrypoint.sh:ro \
