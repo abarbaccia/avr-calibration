@@ -3112,7 +3112,7 @@ async def test_call_tool_optimize_q_dispatch() -> None:
 
 @pytest.mark.asyncio
 async def test_analyze_phase_with_phase_data() -> None:
-    """analyze_phase returns fixability when phase data is present."""
+    """analyze_phase returns classification + fixability when phase data is present."""
     import numpy as np
 
     freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
@@ -3132,6 +3132,8 @@ async def test_analyze_phase_with_phase_data() -> None:
         assert "spl_db" in band
         assert "min_phase_group_delay_ms" in band
         assert "fixable" in band
+        assert "classification" in band
+        assert band["classification"] in {"fixable", "partial", "geometry"}
 
 
 @pytest.mark.asyncio
@@ -3151,6 +3153,34 @@ async def test_analyze_phase_without_phase_data() -> None:
     assert result["has_phase_data"] is False
     for band in result["bands"]:
         assert band["fixable"] is None
+        assert band["classification"] is None
+
+
+def test_classify_fixability_tiers() -> None:
+    """_classify_fixability uses frequency-scaled thresholds with floors."""
+    from calibrate.mcp_server import _classify_fixability
+
+    # At 20 Hz, period = 50 ms → ¼λ = 12.5 ms, ½λ = 25 ms (both clamped at floors)
+    # floors are max(10, period/4) and max(25, period/2) → 12.5 and 25 at 20 Hz
+    cls, fx = _classify_fixability(20.0, 5.0)
+    assert cls == "fixable" and fx is True
+    cls, fx = _classify_fixability(20.0, 15.0)
+    assert cls == "partial" and fx is True
+    cls, fx = _classify_fixability(20.0, 30.0)
+    assert cls == "geometry" and fx is False
+
+    # At 80 Hz, period = 12.5 ms → thresholds hit the floors (10 ms, 25 ms)
+    cls, fx = _classify_fixability(80.0, 3.0)
+    assert cls == "fixable" and fx is True
+    cls, fx = _classify_fixability(80.0, 15.0)
+    assert cls == "partial" and fx is True
+    cls, fx = _classify_fixability(80.0, 40.0)
+    assert cls == "geometry" and fx is False
+
+    # Boundary: at 20 Hz, 5 ms excess GD would have been flagged geometry under the
+    # old fixed 5 ms threshold, but the new scaled threshold classifies it as fixable.
+    cls, fx = _classify_fixability(20.0, 5.0)
+    assert cls == "fixable" and fx is True
 
 
 @pytest.mark.asyncio
