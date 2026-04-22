@@ -135,28 +135,33 @@ class PreflightChecker:
             )
 
     async def check_minidsp(self) -> CheckResult:
-        """Check that minidspd is running and has a device connected via CLI."""
-        from .adapters.minidsp import _get_status_via_cli, MinidspApiError
+        """Check that the DSP daemon is reachable via DSPDriver.get_state()."""
+        from .drivers.base import DriverError
+        from .drivers.registry import load_dsp_driver
 
         host, port = self.config.minidsp_host_port
+        driver = load_dsp_driver(self.config)
 
         try:
-            await asyncio.wait_for(_get_status_via_cli(), timeout=5.0)
-
+            await driver.get_state()
             return CheckResult(
                 name="miniDSP",
                 passed=True,
                 detail=f"miniDSP 2x4 HD at {host}:{port}",
             )
 
-        except asyncio.TimeoutError:
-            return CheckResult(
-                name="miniDSP",
-                passed=False,
-                detail=f"Timeout connecting to minidspd at {host}:{port}",
-                error="minidspd may be starting — wait a moment and retry",
-            )
-        except MinidspApiError:
+        except DriverError as exc:
+            # Driver normalises timeouts and connection errors to DriverError;
+            # surface the original distinction via message text so the user gets
+            # a pointed hint ("wait" vs "start the daemon") rather than generic
+            # "daemon unreachable".
+            if "timeout" in str(exc).lower():
+                return CheckResult(
+                    name="miniDSP",
+                    passed=False,
+                    detail=f"Timeout connecting to minidspd at {host}:{port}",
+                    error="minidspd may be starting — wait a moment and retry",
+                )
             return CheckResult(
                 name="miniDSP",
                 passed=False,
@@ -281,7 +286,8 @@ class PreflightChecker:
         Skipped (passes) if signal_path is not configured in config.yaml.
         Warns if the live device source or preset differs from config.
         """
-        from .adapters.minidsp import _get_status_via_cli, MinidspApiError
+        from .drivers.base import DriverError
+        from .drivers.registry import load_dsp_driver
 
         sp = self.config.minidsp.get("signal_path")
         if not sp:
@@ -300,9 +306,10 @@ class PreflightChecker:
                 detail="no source/preset defined (skipped)",
             )
 
+        driver = load_dsp_driver(self.config)
         try:
-            status = await _get_status_via_cli()
-        except MinidspApiError as exc:
+            state = await driver.get_state()
+        except DriverError as exc:
             return CheckResult(
                 name="Signal Path",
                 passed=False,
@@ -317,9 +324,8 @@ class PreflightChecker:
                 error=f"Cannot reach miniDSP daemon: {exc}",
             )
 
-        master = status.get("master", {})
-        live_source = master.get("source")
-        live_preset = master.get("preset")
+        live_source = state.get("source")
+        live_preset = state.get("preset")
 
         mismatches = []
         if cfg_source is not None and live_source != cfg_source:

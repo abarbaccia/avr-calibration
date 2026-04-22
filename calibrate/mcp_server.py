@@ -14,7 +14,6 @@ Tools:
   get_device_state       — current AVR + DSP hardware status
   get_measurement_history — last N measurements from SessionStore (full FR data)
   get_fr_summary         — 1/3-octave downsampled FR (compact, for analysis)
-  read_eq                — current EQ state (in-memory, updated by apply_eq)
   apply_eq               — SafetyValidator → biquad conversion → DSP write
   set_volume             — AVR volume control
   measure                — trigger sweep measurement via UMIK + PyTTa
@@ -48,7 +47,6 @@ HARD RULE — Signal Path Writes Require Human Confirmation:
 
 Resources:
   measurements://latest  — most recent measurement session
-  eq://current           — current EQ filter state
 
 Usage (standalone, for development):
   python -m calibrate.mcp_server
@@ -99,7 +97,7 @@ def _biquad_response(freq: float, filter_type: str, fc: float,
     """Exact biquad magnitude response at *freq* Hz via z-domain evaluation.
 
     Uses the RBJ Audio EQ Cookbook coefficients from dsp.py, evaluated at the
-    miniDSP's internal sample rate. Shared by simulate_eq and optimize_q.
+    active DSP's processing sample rate. Shared by simulate_eq and optimize_q.
     """
     import cmath
     import math
@@ -108,8 +106,12 @@ def _biquad_response(freq: float, filter_type: str, fc: float,
 
     if fc <= 0 or freq <= 0:
         return 0.0
-    bq = freq_gain_q_to_biquad(freq=fc, gain_db=gain_db, q=q, filter_type=filter_type)
-    z = cmath.exp(1j * 2.0 * math.pi * freq / SAMPLE_RATE_HZ)
+    sample_rate = _dsp.capabilities.processing_rate if _dsp is not None else SAMPLE_RATE_HZ
+    bq = freq_gain_q_to_biquad(
+        freq=fc, gain_db=gain_db, q=q, filter_type=filter_type,
+        sample_rate=sample_rate,
+    )
+    z = cmath.exp(1j * 2.0 * math.pi * freq / sample_rate)
     zi = 1.0 / z
     num = bq["b0"] + bq["b1"] * zi + bq["b2"] * zi * zi
     den = 1.0 + bq["a1"] * zi + bq["a2"] * zi * zi
@@ -139,7 +141,7 @@ _dsp: DSPDriver | None = None
 # don't switch Analog→USB→Analog on every single sweep.  Enter on the first
 # measurement, exit explicitly via end_sweep_session or on server shutdown.
 
-_sweep_session = None  # MinidspSweepContext | None
+_sweep_session = None  # driver.sweep_context() result | None
 
 
 async def _ensure_sweep_session():
@@ -151,9 +153,11 @@ async def _ensure_sweep_session():
     if _sweep_session is not None and _sweep_session.active:
         return _sweep_session
 
-    from .drivers.minidsp import MinidspSweepContext
+    if _dsp is None:
+        return None
+
     cfg = _config()
-    session = MinidspSweepContext.from_config(cfg, driver=_dsp)
+    session = _dsp.sweep_context(cfg)
     if session is None:
         return None
 
@@ -238,7 +242,8 @@ async def _tool_get_measurement_history(
     min_hz: float | None = None,
     max_hz: float | None = None,
     decimation: int = 1,
-    fmt: str = "full",
+    fmt: str = "compact",
+    include_phase: bool = False,
 ) -> dict:
     """Return last *limit* measurement sessions from SessionStore.
 
@@ -247,8 +252,11 @@ async def _tool_get_measurement_history(
         min_hz: Low-frequency cutoff — only return data at or above this frequency.
         max_hz: High-frequency cutoff — only return data at or below this frequency.
         decimation: Keep every Nth point (1 = all points, 2 = every other, etc.).
-        fmt: Output format — "full" (separate freq_hz[]/spl_db[] arrays) or
-             "compact" (single "fr" string "freq1:spl1,freq2:spl2,...", much smaller).
+        fmt: Output format — "compact" (default; single "fr" string "freq:spl,...",
+             ~3x smaller) or "full" (separate freq_hz[]/spl_db[] arrays).
+        include_phase: When True and fmt="full", include phase_rad[] array.
+             Phase is only needed for sub alignment and analyze_phase — omit it
+             from the per-iteration EQ loop to save ~8K tokens per measurement.
     """
     from .storage import SessionStore
     try:
@@ -263,7 +271,7 @@ async def _tool_get_measurement_history(
                 freqs, spls = _filter_and_decimate_fr(
                     fr.frequencies, fr.spl, min_hz, max_hz, decimation
                 )
-                if fr.phase and fmt == "full":
+                if fr.phase and fmt == "full" and include_phase:
                     phase_freqs, phase_vals = _filter_and_decimate_fr(
                         fr.frequencies, fr.phase, min_hz, max_hz, decimation
                     )
@@ -410,26 +418,6 @@ async def _tool_get_fr_summary(
         return _ok(sessions=result, count=len(result))
     except Exception as exc:
         return _err(f"storage error: {exc}")
-
-
-async def _tool_read_eq() -> dict:
-    """Return current EQ filter state (in-memory, updated by apply_eq)."""
-    try:
-        preset = await _dsp.current_preset()  # type: ignore[union-attr]
-        filters = await _dsp.read_eq(preset)  # type: ignore[union-attr]
-        return _ok(preset=preset, filters=filters)
-    except DriverError as exc:
-        return _err(f"read_eq error: {exc}")
-
-
-async def _tool_read_input_eq() -> dict:
-    """Return current input EQ filter state (in-memory, updated by apply_input_eq)."""
-    try:
-        preset = await _dsp.current_preset()  # type: ignore[union-attr]
-        filters = await _dsp.read_input_eq(preset)  # type: ignore[union-attr]
-        return _ok(preset=preset, filters=filters, target="input")
-    except DriverError as exc:
-        return _err(f"read_input_eq error: {exc}")
 
 
 async def _tool_apply_eq(
@@ -1873,9 +1861,10 @@ async def _tool_analyze_phase(
                 "NOTE: on a solo-sub measurement, excess GD reflects room reflections; "
                 "on a combined measurement it also includes sub-to-sub phase mismatch "
                 "(use compare_sub_phase to distinguish)."
-            ) if has_phase else
-                 "No phase data available — fixability cannot be determined. "
-                 "SPL and minimum-phase group delay are still valid.",
+            ) if has_phase else (
+                "No phase data available — fixability cannot be determined. "
+                "SPL and minimum-phase group delay are still valid."
+            ),
         )
     except Exception as exc:
         return _err(f"analyze_phase failed: {exc}")
@@ -2028,10 +2017,20 @@ async def _tool_design_fir(
         import numpy as np
         from scipy.signal import minimum_phase, firwin
 
-        if num_taps < 64 or num_taps > 2048:
-            return _err(f"num_taps must be 64-2048 (got {num_taps})")
+        # Query the active driver for FIR limits; fall back to miniDSP constants
+        # when no DSP is attached (e.g. unit tests exercising the math only).
+        if _dsp is not None:
+            caps = _dsp.capabilities
+            if not caps.fir_capable:
+                return _err("active DSP does not support FIR")
+            fir_min = caps.fir_min_taps
+            fir_max = caps.fir_max_taps_per_output
+            fir_fs = caps.fir_sample_rate_hz
+        else:
+            fir_min, fir_max, fir_fs = 64, 2048, 96000
 
-        fir_fs = 96000  # miniDSP FIR runs at 96kHz
+        if num_taps < fir_min or num_taps > fir_max:
+            return _err(f"num_taps must be {fir_min}-{fir_max} (got {num_taps})")
 
         # Build target magnitude response at FIR sample rate
         freqs_measured = np.array(fr.frequencies)
@@ -2221,22 +2220,23 @@ async def _tool_trigger_measurement(
         denon_ctx = DenonSweepContext.from_config(cfg)
 
         if denon_ctx:
-            # HDMI route: ensure miniDSP is on Analog source and manage master gain.
+            # HDMI route: ensure DSP is on Analog source and manage master gain.
+            # Only perform source switching on DSPs that actually have sources;
+            # CamillaDSP has a single pipeline and reports valid_sources=∅.
             saved_source = None
             saved_gain = None
+            dsp_has_sources = bool(_dsp.capabilities.valid_sources)  # type: ignore[union-attr]
             try:
-                from .drivers.minidsp import _get_source_via_cli
-                current_source = await _get_source_via_cli()
-                if current_source.lower() != "analog":
-                    log.info("HDMI route: switching miniDSP source %s→Analog", current_source)
+                state = await _dsp.get_state()  # type: ignore[union-attr]
+                current_source = state.get("source", "") or ""
+                if dsp_has_sources and current_source.lower() != "analog":
+                    log.info("HDMI route: switching DSP source %s→Analog", current_source)
                     saved_source = current_source
                     await _dsp.set_source("Analog")  # type: ignore[union-attr]
 
                 hdmi_gain = cfg.measurement.get("master_gain_hdmi_db")
                 if hdmi_gain is not None:
-                    from .adapters.minidsp import _get_status_via_cli
-                    status = await _get_status_via_cli()
-                    saved_gain = status.get("master", {}).get("volume", 0.0)
+                    saved_gain = float(state.get("volume", 0.0) or 0.0)
                     log.info("HDMI route: setting master gain %.1f dB (was %.1f dB)", hdmi_gain, saved_gain)
                     await _dsp.set_master_gain(float(hdmi_gain))  # type: ignore[union-attr]
 
@@ -2250,11 +2250,11 @@ async def _tool_trigger_measurement(
                     except Exception as exc:
                         log.warning("Failed to restore master gain: %s", exc)
                 if saved_source is not None:
-                    log.info("HDMI route: restoring miniDSP source to %s", saved_source)
+                    log.info("HDMI route: restoring DSP source to %s", saved_source)
                     try:
                         await _dsp.set_source(saved_source)  # type: ignore[union-attr]
                     except Exception as exc:
-                        log.warning("Failed to restore miniDSP source: %s", exc)
+                        log.warning("Failed to restore DSP source: %s", exc)
         else:
             # USB mode: use persistent sweep session (enters once, stays active).
             await _ensure_sweep_session()
@@ -2791,6 +2791,27 @@ async def _tool_get_config() -> dict:
         sub_outputs = cfg.sub_outputs
         slots = list(range(2, 10))  # slots 2-9
 
+        # FIR limits come from the active driver so the same keys describe
+        # miniDSP (2048 taps @ 96 kHz, 4096 shared) or CamillaDSP (65536 taps @
+        # processing rate, no shared pool).
+        if _dsp is not None:
+            caps = _dsp.capabilities
+            fir_block = {
+                "fir_capable": caps.fir_capable,
+                "fir_min_taps": caps.fir_min_taps,
+                "fir_max_taps_per_output": caps.fir_max_taps_per_output,
+                "fir_shared_tap_pool": caps.fir_shared_tap_pool,
+                "fir_sample_rate_hz": caps.fir_sample_rate_hz,
+            }
+        else:
+            fir_block = {
+                "fir_capable": True,
+                "fir_min_taps": 64,
+                "fir_max_taps_per_output": 2048,
+                "fir_shared_tap_pool": 4096,
+                "fir_sample_rate_hz": 96000,
+            }
+
         eq_capabilities: dict = {
             "input_peq": {
                 "input_index": active_input,
@@ -2800,10 +2821,7 @@ async def _tool_get_config() -> dict:
                 "tool": "apply_input_eq",
             },
             "output_peq": [],
-            "fir_capable": True,
-            "fir_max_taps_per_output": 2048,
-            "fir_shared_tap_pool": 4096,
-            "fir_sample_rate_hz": 96000,
+            **fir_block,
         }
 
         for slot_cfg in cfg.minidsp.get("output_slots", []):
@@ -2918,7 +2936,11 @@ async def _tool_set_polarity(output_index: int, inverted: bool) -> dict:
 
 
 async def _tool_get_output_state() -> dict:
-    """Return per-output gain, delay, and polarity from in-memory driver tracking."""
+    """Return last-applied per-output gain, delay, polarity, FIR from driver cache.
+
+    minidspd has no GET endpoint for these parameters — this reflects only what
+    this MCP server has written since startup, not actual hardware readback.
+    """
     try:
         state = _dsp.get_output_state()  # type: ignore[union-attr]
         return _ok(outputs=state)
@@ -3190,37 +3212,24 @@ _TOOLS: list[Tool] = [
                     "type": "string",
                     "enum": ["full", "compact"],
                     "description": (
-                        "Output format. 'compact': FR data as 'freq:spl,...' string (~12 chars/point, "
-                        "recommended for filter design). 'full': separate freq_hz[] and spl_db[] arrays "
-                        "(verbose, may exceed token limits). Default: 'full'."
+                        "Output format. 'compact' (default): FR data as 'freq:spl,...' string "
+                        "(~12 chars/point, recommended for filter design). 'full': separate "
+                        "freq_hz[] and spl_db[] arrays (verbose, ~3x larger — only use if you "
+                        "need raw arrays for downstream numerical work)."
                     ),
-                    "default": "full",
+                    "default": "compact",
+                },
+                "include_phase": {
+                    "type": "boolean",
+                    "description": (
+                        "When true (and format='full'), include phase_rad[] array alongside "
+                        "freq_hz[]/spl_db[]. Default false — phase is only needed for sub "
+                        "alignment and analyze_phase, so it's excluded from the per-iteration "
+                        "EQ loop to save ~8K tokens per measurement."
+                    ),
+                    "default": False,
                 },
             },
-        },
-    ),
-    Tool(
-        name="read_eq",
-        description=(
-            "Return the current DSP EQ filter state. Tracked in-memory — "
-            "reflects filters applied via apply_eq() since the MCP server started. "
-            "Returns preset index and list of active filters with freq, gain_db, q, type."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {},
-        },
-    ),
-    Tool(
-        name="read_input_eq",
-        description=(
-            "Return the current DSP input EQ filter state. Tracked in-memory — "
-            "reflects filters applied via apply_input_eq() since the MCP server started. "
-            "Returns preset index and list of active input filters with freq, gain_db, q, type."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {},
         },
     ),
     Tool(
@@ -3791,10 +3800,10 @@ _TOOLS: list[Tool] = [
     Tool(
         name="apply_fir",
         description=(
-            "Write FIR filter coefficients to a single DSP output on the miniDSP 2x4 HD. "
+            "Write FIR filter coefficients to a single DSP output. "
             "Coefficients are floats normalized so the peak is <= 1.0. "
-            "The miniDSP FIR engine runs at 96000 Hz; max 2048 taps per output "
-            "(4096 shared across all 4 outputs). "
+            "Tap-count ceiling and FIR sample rate come from eq_capabilities "
+            "(fir_max_taps_per_output and fir_sample_rate_hz). "
             "Use after analyze_decay to shorten room-mode ringing that PEQ cannot fix — "
             "FIR corrects the time-domain decay; PEQ only reduces the peak magnitude. "
             "After writing, get_output_state will show fir_taps = len(coefficients)."
@@ -3811,7 +3820,8 @@ _TOOLS: list[Tool] = [
                     "items": {"type": "number"},
                     "description": (
                         "FIR filter coefficients as floats. "
-                        "Max 2048 taps. Must be at 96000 Hz. "
+                        "Length must be <= fir_max_taps_per_output from eq_capabilities. "
+                        "Sample rate must match fir_sample_rate_hz. "
                         "Normalize so peak abs value <= 1.0."
                     ),
                 },
@@ -4209,14 +4219,14 @@ _TOOLS: list[Tool] = [
     Tool(
         name="analyze_phase",
         description=(
-            "Minimum-phase decomposition and fixability analysis. Separates the measured "
-            "response into minimum-phase (EQ-correctable) and excess-phase (room geometry, "
-            "not correctable) components. Returns per-1/3-octave: classification "
-            "('fixable' / 'partial' / 'geometry'), fixable flag, excess group delay, "
-            "and minimum-phase group delay. Classification uses frequency-scaled "
-            "thresholds so sub frequencies aren't misclassified as geometry just "
-            "because their periods are long. Use BEFORE designing any filter to know "
-            "what's worth correcting with PEQ vs. FIR vs. repositioning."
+            "Minimum-phase decomposition and fixability analysis. Classifies each "
+            "1/3-octave band as 'fixable' (minimum-phase, PEQ handles peak), 'partial' "
+            "(modal ringing — FIR shortens decay better than PEQ, PEQ still reduces peak), "
+            "or 'geometry' (near-π phase offset, cancellation — reposition instead). "
+            "Thresholds are frequency-scaled (¼- and ½-wavelength with 10/25 ms floors). "
+            "fixable=True covers 'fixable' and 'partial'; False means 'geometry'. "
+            "Returns per-1/3-octave: classification, fixable, excess_group_delay_ms, "
+            "min_phase_group_delay_ms, spl_db. Use BEFORE designing filters."
         ),
         inputSchema={
             "type": "object",
@@ -4264,7 +4274,8 @@ _TOOLS: list[Tool] = [
             "(minimum/linear/mixed), tap count, and frequency focus. The tool computes "
             "coefficients and returns them with a predicted effect and pre-ringing estimate. "
             "Pass coefficients to apply_fir(output_index, coefficients) to write to hardware. "
-            "miniDSP 2x4 HD: max 2048 taps/output, 4096 shared, 96kHz sample rate."
+            "Read fir_min_taps, fir_max_taps_per_output, and fir_sample_rate_hz from "
+            "eq_capabilities in get_config — limits depend on the active DSP."
         ),
         inputSchema={
             "type": "object",
@@ -4288,7 +4299,7 @@ _TOOLS: list[Tool] = [
                 },
                 "num_taps": {
                     "type": "integer",
-                    "description": "Number of FIR taps (64-2048). More taps = better low-freq resolution but uses more DSP. Default: 1024.",
+                    "description": "Number of FIR taps. Must fall within [fir_min_taps, fir_max_taps_per_output] from eq_capabilities. More taps = better low-freq resolution but uses more DSP. Default: 1024.",
                 },
                 "phase_mode": {
                     "type": "string",
@@ -4638,12 +4649,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             min_hz=float(min_hz) if min_hz is not None else None,
             max_hz=float(max_hz) if max_hz is not None else None,
             decimation=int(arguments.get("decimation", 1)),
-            fmt=arguments.get("format", "full"),
+            fmt=arguments.get("format", "compact"),
+            include_phase=bool(arguments.get("include_phase", False)),
         )
-    elif name == "read_eq":
-        result = await _tool_read_eq()
-    elif name == "read_input_eq":
-        result = await _tool_read_input_eq()
     elif name == "apply_eq":
         output_index = arguments.get("output_index")
         if output_index is not None:
@@ -4928,14 +4936,6 @@ async def _read_resource(uri: str) -> str:
         except Exception as exc:
             return json.dumps({"error": str(exc)})
 
-    elif uri == "eq://current":
-        try:
-            preset = await _dsp.current_preset()  # type: ignore[union-attr]
-            filters = await _dsp.read_eq(preset)  # type: ignore[union-attr]
-            return json.dumps({"preset": preset, "filters": filters})
-        except Exception as exc:
-            return json.dumps({"error": str(exc)})
-
     return json.dumps({"error": f"unknown resource: {uri}"})
 
 
@@ -4946,12 +4946,6 @@ async def list_resources() -> list[Resource]:
             uri="measurements://latest",
             name="Latest Measurement",
             description="Most recent frequency response measurement session",
-            mimeType="application/json",
-        ),
-        Resource(
-            uri="eq://current",
-            name="Current EQ",
-            description="Current DSP EQ filter state (in-memory)",
             mimeType="application/json",
         ),
     ]
@@ -4986,6 +4980,20 @@ def create_app() -> Starlette:
             cfg.avr_driver_name,
             cfg.dsp_driver_name,
         )
+
+        # Rehydrate DSP driver shadow state from last-persisted active_dsp_state.
+        # minidspd has no readback — after restart, the hardware retains its
+        # flashed filters but the driver's in-memory shadow is empty. Load
+        # what was last written so get_output_state / apply_eq baselines are
+        # correct instead of claiming everything is zero.
+        if hasattr(_dsp, "rehydrate_from_active_state"):
+            try:
+                from .storage import SessionStore
+                active_state = SessionStore().get_active_dsp()
+                _dsp.rehydrate_from_active_state(active_state)
+                log.info("DSP shadow rehydrated from %d active_dsp_state keys", len(active_state))
+            except Exception as exc:
+                log.warning("DSP rehydrate failed (shadow stays empty): %s", exc)
 
         # Configure DSP input routing if active_input is set
         active_input = cfg.minidsp.get("active_input")

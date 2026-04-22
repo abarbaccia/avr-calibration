@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -201,9 +202,89 @@ async def test_minidsp_current_preset_defaults_to_zero_on_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_minidsp_read_eq_starts_empty() -> None:
+async def test_minidsp_eq_state_starts_empty() -> None:
     driver = MinidspDriver(host="localhost", port=5380)
-    assert await driver.read_eq(0) == []
+    assert driver._eq_state.get(0, []) == []
+
+
+def test_minidsp_rehydrate_empty_store_leaves_shadow_empty() -> None:
+    driver = MinidspDriver(host="localhost", port=5380)
+    driver.rehydrate_from_active_state({})
+    assert driver._eq_state == {}
+    assert driver._output_gain == {}
+    assert driver._output_delay == {}
+    assert driver._output_polarity == {}
+
+
+def test_minidsp_rehydrate_populates_all_shadow_state() -> None:
+    driver = MinidspDriver(
+        host="localhost", port=5380,
+        active_input=0, usb_input=1,
+    )
+    output_eq_filters = [
+        {"freq": 33.0, "gain_db": -3.5, "q": 9.2, "type": "peaking"},
+    ]
+    input_eq_filters = [
+        {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
+        {"freq": 45.0, "gain_db": 3.0, "q": 0.8, "type": "low_shelf"},
+    ]
+    active_state = {
+        "output_eq_0": {"filters": output_eq_filters, "preset": 0, "timestamp": "x"},
+        "output_eq_2": {"filters": output_eq_filters, "preset": 0, "timestamp": "x"},
+        "input_eq": {"filters": input_eq_filters, "preset": 0, "timestamp": "x"},
+        "gain_0": {"gain_db": -2.5, "timestamp": "x"},
+        "delay_2": {"delay_ms": 6.15, "timestamp": "x"},
+        "polarity_1": {"inverted": True, "timestamp": "x"},
+        "target_curve": {"type": "harman", "timestamp": "x"},  # ignored
+    }
+
+    driver.rehydrate_from_active_state(active_state)
+
+    assert driver._eq_state[(0, 0)] == output_eq_filters
+    assert driver._eq_state[(0, 2)] == output_eq_filters
+    # input EQ written to both active_input and usb_input
+    assert driver._eq_state[("input", 0, 0)] == input_eq_filters
+    assert driver._eq_state[("input", 1, 0)] == input_eq_filters
+    assert driver._output_gain[0] == -2.5
+    assert driver._output_delay[2] == 6.15
+    assert driver._output_polarity[1] is True
+
+
+def test_minidsp_rehydrate_skips_malformed_entries() -> None:
+    driver = MinidspDriver(host="localhost", port=5380)
+    active_state = {
+        "gain_0": {"missing_gain_db_field": True},
+        "delay_1": {"delay_ms": "not-a-float"},
+        "output_eq_bad": {"filters": [], "preset": 0},  # bad index
+        "gain_1": {"gain_db": 1.5},  # this one is valid
+    }
+    driver.rehydrate_from_active_state(active_state)
+    assert driver._output_gain == {1: 1.5}
+    assert driver._output_delay == {}
+
+
+def test_minidsp_rehydrate_shadow_survives_restart_round_trip(tmp_path: Path) -> None:
+    """Full round-trip: persist state via SessionStore, rehydrate fresh driver."""
+    from calibrate.storage import SessionStore
+
+    store = SessionStore(tmp_path / "round_trip.db")
+    store.set_active_dsp("gain_0", {"gain_db": -3.0})
+    store.set_active_dsp("delay_2", {"delay_ms": 4.25})
+    store.set_active_dsp("polarity_2", {"inverted": True})
+    store.set_active_dsp("output_eq_1", {
+        "filters": [{"freq": 50.0, "gain_db": -2.0, "q": 10.0, "type": "peaking"}],
+        "preset": 0,
+    })
+
+    # Simulate process restart — brand-new driver, load from store
+    driver = MinidspDriver(host="localhost", port=5380)
+    driver.rehydrate_from_active_state(store.get_active_dsp())
+
+    state = driver.get_output_state()
+    assert state[0]["gain_db"] == -3.0
+    assert state[2]["delay_ms"] == 4.25
+    assert state[2]["polarity_inverted"] is True
+    assert driver._eq_state[(0, 1)][0]["freq"] == 50.0
 
 
 @pytest.mark.asyncio
@@ -219,7 +300,7 @@ async def test_minidsp_apply_eq_valid_writes_hardware() -> None:
             # CLI called at least once per output (default sub_outputs=[0,1])
             assert mock_cli.call_count > 0
     # State should be updated after successful write
-    assert len(await driver.read_eq(0)) == len(filters)
+    assert len(driver._eq_state.get(0, [])) == len(filters)
 
 
 @pytest.mark.asyncio
@@ -273,7 +354,7 @@ async def test_minidsp_apply_eq_hardware_failure_no_state_update() -> None:
             await driver.apply_eq(0, filters)
 
     # State must be unchanged after failed write
-    assert await driver.read_eq(0) == []
+    assert driver._eq_state.get(0, []) == []
 
 
 @pytest.mark.asyncio
@@ -286,7 +367,7 @@ async def test_minidsp_apply_eq_updates_state_only_on_success() -> None:
     ]
     with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock):
         await driver.apply_eq(0, filters)
-    state = await driver.read_eq(0)
+    state = driver._eq_state.get(0, [])
     assert len(state) == len(filters)
     assert state[0]["freq"] == 18.0
     assert state[1]["freq"] == 80.0
@@ -937,6 +1018,13 @@ def _mock_config(avr_driver: str = "denon", dsp_driver: str = "minidsp",
     cfg.denon = {"host": "192.168.1.100"}
     cfg.minidsp = {"host": "localhost", "port": 5380}
     cfg.minidsp_host_port = ("localhost", 5380)
+    cfg.camilladsp = {
+        "host": "127.0.0.1", "port": 1234,
+        "samplerate": 48_000, "chunksize": 1024,
+        "input_channels": 2, "output_channels": 10,
+    }
+    cfg.sub_outputs = [0, 1]
+    cfg.measurement = {"output_channel": 1}
     cfg.eq_capabilities = {"processing_rate": processing_rate}
     return cfg
 
@@ -975,9 +1063,23 @@ def test_load_avr_driver_unknown_raises() -> None:
 
 
 def test_load_dsp_driver_unknown_raises() -> None:
-    cfg = _mock_config(dsp_driver="camilla")
+    cfg = _mock_config(dsp_driver="yamahadsp")
     with pytest.raises(ValueError, match="Unknown DSP driver"):
         load_dsp_driver(cfg)
+
+
+def test_load_dsp_driver_camilladsp() -> None:
+    """dsp_driver: camilladsp returns a CamillaDSPDriver wired from config.camilladsp."""
+    cfg = _mock_config(dsp_driver="camilladsp")
+    driver = load_dsp_driver(cfg)
+    assert isinstance(driver, CamillaDSPDriver)
+    assert driver._host == "127.0.0.1"
+    assert driver._port == 1234
+    assert driver._processing_rate == 48_000
+    assert driver._chunksize == 1024
+    assert driver._input_channels == 2
+    assert driver._output_channels == 10
+    assert driver._sub_outputs == [0, 1]
 
 
 # ── set_master_gain ────────────────────────────────────────────────────────────
@@ -1005,3 +1107,627 @@ async def test_minidsp_set_master_gain_clamps_below_minus127() -> None:
     with patch("calibrate.adapters.minidsp._run_minidsp_cli", new_callable=AsyncMock) as mock_cli:
         await driver.set_master_gain(-200.0)
     mock_cli.assert_awaited_once_with("gain", "--", "-127.0")
+
+
+# ── CamillaDSPDriver ───────────────────────────────────────────────────────────
+#
+# Partial driver — setup/close/get_state/set_master_gain are wired to the real
+# websocket protocol; pipeline-editor-dependent methods still raise
+# NotImplementedError until the 18i20 arrives and the edit layer lands. Tests
+# mock _CamillaWSClient.call to assert protocol shape without a live daemon.
+
+from calibrate.drivers.camilladsp import CamillaDSPDriver, _CamillaWSClient
+from calibrate.drivers.base import DriverError
+from calibrate.drivers.dsp_driver import DSPDriver as _DSPDriverBase
+
+
+def test_camilladsp_is_a_dsp_driver() -> None:
+    driver = CamillaDSPDriver()
+    assert isinstance(driver, _DSPDriverBase)
+
+
+def test_camilladsp_capabilities_reflect_single_pipeline_model() -> None:
+    driver = CamillaDSPDriver(processing_rate=48_000)
+    caps = driver.capabilities
+    assert caps.processing_rate == 48_000
+    assert caps.max_preset_index == -1       # no preset slots
+    assert caps.valid_sources == frozenset()  # no source switching
+    assert caps.max_delay_ms >= 100.0         # generous, not 30ms-cap
+    assert caps.max_peq_slots >= 8
+    # FIR: first-class on CamillaDSP, no shared pool, long taps supported.
+    assert caps.fir_capable is True
+    assert caps.fir_shared_tap_pool is None
+    assert caps.fir_max_taps_per_output >= 8192
+    assert caps.fir_sample_rate_hz == 48_000
+
+
+def test_minidsp_capabilities_pin_hardware_limits() -> None:
+    driver = MinidspDriver(host="localhost", port=5380)
+    caps = driver.capabilities
+    assert caps.max_delay_ms == 30.0
+    assert caps.max_preset_index == 3
+    assert "Analog" in caps.valid_sources
+    assert "Usb" in caps.valid_sources
+    assert caps.processing_rate == 96_000
+    assert caps.max_peq_slots == 8   # slots 2-9
+    # FIR: pinned to miniDSP 2x4 HD limits.
+    assert caps.fir_capable is True
+    assert caps.fir_max_taps_per_output == 2048
+    assert caps.fir_shared_tap_pool == 4096
+    assert caps.fir_sample_rate_hz == 96_000
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_preset_semantics_are_single_pipeline() -> None:
+    driver = CamillaDSPDriver()
+    assert await driver.current_preset() == 0
+    # set_preset is a documented no-op — calling any preset index must not raise
+    await driver.set_preset(0)
+    await driver.set_preset(3)
+
+
+def test_camilladsp_output_state_shape_matches_minidsp_contract() -> None:
+    driver = CamillaDSPDriver(output_channels=4)
+    state = driver.get_output_state()
+    assert set(state.keys()) == {0, 1, 2, 3}
+    for per_out in state.values():
+        assert set(per_out.keys()) == {
+            "gain_db", "delay_ms", "polarity_inverted", "fir_taps",
+        }
+        assert per_out == {
+            "gain_db": 0.0, "delay_ms": 0.0,
+            "polarity_inverted": False, "fir_taps": 0,
+        }
+
+
+# ── CamillaDSPDriver — wired methods (setup/close/get_state/set_master_gain) ──
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_setup_opens_ws_probes_version_and_pushes_config() -> None:
+    """setup connects the ws client, issues GetVersion, and pushes the initial pipeline."""
+    driver = CamillaDSPDriver()
+    driver._client.connect = AsyncMock()
+    driver._client.close = AsyncMock()
+    driver._client.call = AsyncMock(return_value="2.0.3")
+
+    await driver.setup()
+
+    driver._client.connect.assert_awaited_once()
+    # First call probes version; second call pushes the starting pipeline.
+    call_cmds = [c.args[0] for c in driver._client.call.await_args_list]
+    assert call_cmds[0] == "GetVersion"
+    assert call_cmds[1] == "SetConfig"
+    assert driver._client.call.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_setup_closes_ws_on_probe_failure() -> None:
+    """If GetVersion fails after connect, the socket must be closed before raising."""
+    driver = CamillaDSPDriver()
+    driver._client.connect = AsyncMock()
+    driver._client.close = AsyncMock()
+    driver._client.call = AsyncMock(side_effect=DriverError("protocol error"))
+
+    with pytest.raises(DriverError):
+        await driver.setup()
+
+    driver._client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_close_closes_ws() -> None:
+    driver = CamillaDSPDriver()
+    driver._client.close = AsyncMock()
+    await driver.close()
+    driver._client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_get_state_disconnected_returns_minimal_dict() -> None:
+    """get_state before setup must not raise — returns {connected: False}."""
+    driver = CamillaDSPDriver(host="example.invalid")
+    # _client.connected is False by default (no connect yet)
+    state = await driver.get_state()
+    assert state == {"connected": False, "host": "example.invalid"}
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_get_state_returns_full_shape_when_connected() -> None:
+    """Connected get_state calls GetState+GetVolume+GetMute+GetProcessingLoad."""
+    driver = CamillaDSPDriver()
+
+    # Fake a connected client with canned responses per command.
+    responses = {
+        "GetState": "Running",
+        "GetVolume": -12.0,
+        "GetMute": False,
+        "GetProcessingLoad": 0.08,
+    }
+    driver._client._ws = object()  # mark as connected without a real ws
+    driver._client.call = AsyncMock(side_effect=lambda cmd, *a, **kw: responses[cmd])
+
+    state = await driver.get_state()
+
+    assert state["connected"] is True
+    assert state["state"] == "Running"
+    assert state["volume"] == -12.0
+    assert state["mute"] is False
+    assert state["cpu_load"] == 0.08
+    # Protocol-compatibility fields are present but stubbed.
+    assert state["source"] is None
+    assert state["preset"] == 0
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_get_state_tolerates_missing_processing_load() -> None:
+    """Old daemons may not support GetProcessingLoad; cpu_load becomes None."""
+    driver = CamillaDSPDriver()
+
+    def _call(cmd, *a, **kw):
+        if cmd == "GetProcessingLoad":
+            raise DriverError("unknown command")
+        return {"GetState": "Running", "GetVolume": 0.0, "GetMute": False}[cmd]
+
+    driver._client._ws = object()
+    driver._client.call = AsyncMock(side_effect=_call)
+
+    state = await driver.get_state()
+    assert state["cpu_load"] is None
+    assert state["connected"] is True
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_set_master_gain_dispatches_setvolume() -> None:
+    driver = CamillaDSPDriver()
+    driver._client.call = AsyncMock(return_value=None)
+    await driver.set_master_gain(-9.5)
+    driver._client.call.assert_awaited_once_with("SetVolume", -9.5)
+
+
+# ── _CamillaWSClient ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_camilla_ws_client_call_returns_unwrapped_value() -> None:
+    """Ok response → the inner 'value' field is returned."""
+    client = _CamillaWSClient("127.0.0.1", 1234)
+    fake_ws = AsyncMock()
+    fake_ws.send = AsyncMock()
+    fake_ws.recv = AsyncMock(
+        return_value='{"GetVersion": {"result": "Ok", "value": "2.0.3"}}'
+    )
+    client._ws = fake_ws
+
+    result = await client.call("GetVersion")
+
+    assert result == "2.0.3"
+    # Request without args must serialise as the bare string command.
+    sent_payload = fake_ws.send.await_args.args[0]
+    assert sent_payload == '"GetVersion"'
+
+
+@pytest.mark.asyncio
+async def test_camilla_ws_client_call_sends_args_as_single_key_object() -> None:
+    client = _CamillaWSClient("127.0.0.1", 1234)
+    fake_ws = AsyncMock()
+    fake_ws.send = AsyncMock()
+    fake_ws.recv = AsyncMock(
+        return_value='{"SetVolume": {"result": "Ok"}}'
+    )
+    client._ws = fake_ws
+
+    await client.call("SetVolume", -10.0)
+
+    import json as _json
+    sent = _json.loads(fake_ws.send.await_args.args[0])
+    assert sent == {"SetVolume": -10.0}
+
+
+@pytest.mark.asyncio
+async def test_camilla_ws_client_call_raises_on_error_result() -> None:
+    client = _CamillaWSClient("127.0.0.1", 1234)
+    fake_ws = AsyncMock()
+    fake_ws.send = AsyncMock()
+    fake_ws.recv = AsyncMock(
+        return_value='{"SetVolume": {"result": "Error", "value": "out of range"}}'
+    )
+    client._ws = fake_ws
+
+    with pytest.raises(DriverError, match="out of range"):
+        await client.call("SetVolume", 999.0)
+
+
+@pytest.mark.asyncio
+async def test_camilla_ws_client_call_without_connect_raises() -> None:
+    client = _CamillaWSClient("127.0.0.1", 1234)
+    with pytest.raises(DriverError, match="not connected"):
+        await client.call("GetVersion")
+
+
+@pytest.mark.asyncio
+async def test_camilla_ws_client_call_rejects_wrong_response_key() -> None:
+    """Daemon bug / protocol drift — response for a different command is a hard fail."""
+    client = _CamillaWSClient("127.0.0.1", 1234)
+    fake_ws = AsyncMock()
+    fake_ws.send = AsyncMock()
+    fake_ws.recv = AsyncMock(
+        return_value='{"GetVolume": {"result": "Ok", "value": 0.0}}'
+    )
+    client._ws = fake_ws
+
+    with pytest.raises(DriverError, match="unexpected response shape"):
+        await client.call("GetVersion")
+
+
+# ── CamillaDSPDriver — pipeline editor (apply_eq / gain / delay / mute / FIR) ──
+#
+# All of these share the same test pattern: stub _client.call as an AsyncMock,
+# invoke the driver method, assert (1) the shadow state updated correctly and
+# (2) a SetConfig call was issued with a YAML payload that contains the
+# expected named blocks. We parse the YAML back to a dict to make assertions
+# structural rather than string-matching-dependent.
+
+
+def _stub_client(driver: "CamillaDSPDriver") -> AsyncMock:
+    """Replace the driver's ws client with an AsyncMock that swallows all calls."""
+    driver._client._ws = object()  # mark "connected" so get_state-style paths work
+    driver._client.call = AsyncMock(return_value=None)
+    return driver._client.call
+
+
+def _last_pushed_config(call_mock: AsyncMock) -> dict:
+    """Return the parsed config dict from the most recent SetConfig call."""
+    import yaml as _yaml
+    for mock_call in reversed(call_mock.await_args_list):
+        if mock_call.args and mock_call.args[0] == "SetConfig":
+            return _yaml.safe_load(mock_call.args[1])
+    raise AssertionError("no SetConfig call was recorded")
+
+
+# SafetyValidator requires a mandatory 18 Hz HPF in every filter set — include
+# it in test fixtures so apply_eq() exercises the happy path.
+_HPF_18HZ = {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"}
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_apply_eq_updates_shadow_and_pushes_pipeline() -> None:
+    driver = CamillaDSPDriver(sub_outputs=[0, 1], output_channels=4, input_channels=2)
+    call = _stub_client(driver)
+
+    filters = [
+        _HPF_18HZ,
+        {"freq": 45.0, "gain_db": -4.0, "q": 3.0, "type": "peaking"},
+        {"freq": 55.0, "gain_db": -2.5, "q": 2.0, "type": "peaking"},
+    ]
+    await driver.apply_eq(preset=0, filters=filters)
+
+    # Shadow state updated for every sub output.
+    assert [(f["freq"], f["type"]) for f in driver._output_eq[0]] == [
+        (18.0, "hpf"), (45.0, "peaking"), (55.0, "peaking"),
+    ]
+    assert driver._output_eq[1] == driver._output_eq[0]
+
+    cfg = _last_pushed_config(call)
+    # Filter blocks exist for both sub outputs, named slotwise. HPF is slot 0.
+    assert "cal_out0_peq_0" in cfg["filters"]   # HPF
+    assert "cal_out0_peq_1" in cfg["filters"]   # 45 Hz peak
+    assert "cal_out0_peq_2" in cfg["filters"]
+    assert "cal_out1_peq_0" in cfg["filters"]
+    # HPF maps to BiquadCombo Butterworth so it cascades as one filter.
+    hpf_block = cfg["filters"]["cal_out0_peq_0"]
+    assert hpf_block["type"] == "BiquadCombo"
+    assert hpf_block["parameters"]["type"] == "ButterworthHighpass"
+    assert hpf_block["parameters"]["order"] == 4
+    # Peaking: Biquad with freq/q/gain.
+    peq1 = cfg["filters"]["cal_out0_peq_1"]
+    assert peq1["type"] == "Biquad"
+    assert peq1["parameters"]["type"] == "Peaking"
+    assert peq1["parameters"]["freq"] == 45.0
+    assert peq1["parameters"]["gain"] == -4.0
+    assert peq1["parameters"]["q"] == 3.0
+
+    # Pipeline references the filter names on the right output channels.
+    out0_step = next(
+        s for s in cfg["pipeline"]
+        if s.get("type") == "Filter" and s.get("channel") == 0
+    )
+    assert "cal_out0_peq_0" in out0_step["names"]
+    assert "cal_out0_peq_2" in out0_step["names"]
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_apply_eq_targets_single_output() -> None:
+    driver = CamillaDSPDriver(sub_outputs=[0, 1], output_channels=4)
+    _stub_client(driver)
+
+    await driver.apply_eq(
+        preset=0,
+        filters=[_HPF_18HZ, {"freq": 50.0, "gain_db": -3.0, "q": 2.0, "type": "peaking"}],
+        output_index=1,
+    )
+
+    # Only output 1's shadow was touched; output 0 stays empty.
+    assert driver._output_eq.get(0) in (None, [])
+    assert len(driver._output_eq[1]) == 2
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_apply_eq_runs_safety_validator() -> None:
+    """+12 dB boost must be rejected by SafetyValidator — well above +6 dB cap."""
+    driver = CamillaDSPDriver()
+    _stub_client(driver)
+
+    with pytest.raises(DriverError, match="SafetyValidator"):
+        await driver.apply_eq(
+            preset=0,
+            filters=[_HPF_18HZ, {"freq": 40.0, "gain_db": 12.0, "q": 3.0, "type": "peaking"}],
+            output_index=0,
+        )
+    # Shadow must remain clean on safety rejection.
+    assert driver._output_eq.get(0) in (None, [])
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_apply_eq_missing_hpf_rejected() -> None:
+    """SafetyValidator requires the mandatory 18 Hz HPF in every filter set."""
+    driver = CamillaDSPDriver()
+    _stub_client(driver)
+    with pytest.raises(DriverError, match="HPF"):
+        await driver.apply_eq(
+            preset=0,
+            filters=[{"freq": 40.0, "gain_db": -3.0, "q": 2.0, "type": "peaking"}],
+            output_index=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_apply_eq_rejects_too_many_filters() -> None:
+    driver = CamillaDSPDriver(max_peq_slots=2)
+    _stub_client(driver)
+    many = [_HPF_18HZ] + [
+        {"freq": 40.0 + i, "gain_db": -1.0, "q": 2.0, "type": "peaking"} for i in range(3)
+    ]
+    with pytest.raises(DriverError, match="too many"):
+        await driver.apply_eq(preset=0, filters=many, output_index=0)
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_apply_eq_rolls_back_shadow_on_push_failure() -> None:
+    driver = CamillaDSPDriver(sub_outputs=[0], output_channels=4)
+    driver._client._ws = object()
+    driver._client.call = AsyncMock(side_effect=DriverError("daemon reload failed"))
+
+    with pytest.raises(DriverError, match="reload failed"):
+        await driver.apply_eq(
+            preset=0,
+            filters=[_HPF_18HZ, {"freq": 50.0, "gain_db": -3.0, "q": 2.0, "type": "peaking"}],
+            output_index=0,
+        )
+    assert driver._output_eq.get(0) in (None, [])
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_apply_input_eq_writes_to_all_inputs_by_default() -> None:
+    driver = CamillaDSPDriver(input_channels=2, output_channels=4)
+    call = _stub_client(driver)
+
+    await driver.apply_input_eq(
+        preset=0,
+        filters=[_HPF_18HZ, {"freq": 60.0, "gain_db": -2.0, "q": 1.4, "type": "peaking"}],
+    )
+    assert 0 in driver._input_eq and 1 in driver._input_eq
+
+    cfg = _last_pushed_config(call)
+    assert "cal_in0_peq_0" in cfg["filters"]
+    assert "cal_in1_peq_0" in cfg["filters"]
+    # Per-input Filter steps appear before the Mixer.
+    step_types = [s.get("type") for s in cfg["pipeline"]]
+    mixer_idx = step_types.index("Mixer")
+    assert any(
+        s.get("type") == "Filter" and s.get("channel") in (0, 1)
+        and "cal_in0_peq_0" in s.get("names", [])
+        for s in cfg["pipeline"][:mixer_idx]
+    )
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_apply_input_eq_honours_explicit_input_index() -> None:
+    driver = CamillaDSPDriver(input_channels=2)
+    _stub_client(driver)
+    await driver.apply_input_eq(
+        preset=0,
+        filters=[_HPF_18HZ, {"freq": 60.0, "gain_db": -2.0, "q": 1.4, "type": "peaking"}],
+        input_index=1,
+    )
+    assert 0 not in driver._input_eq
+    assert 1 in driver._input_eq
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_set_output_gain_updates_shadow_and_pushes() -> None:
+    driver = CamillaDSPDriver(output_channels=4)
+    call = _stub_client(driver)
+
+    await driver.set_output_gain(2, -3.5)
+    assert driver._output_gain[2] == -3.5
+
+    cfg = _last_pushed_config(call)
+    gain_block = cfg["filters"]["cal_out2_gain"]
+    assert gain_block["type"] == "Gain"
+    assert gain_block["parameters"]["gain"] == -3.5
+    assert gain_block["parameters"]["inverted"] is False
+    assert gain_block["parameters"]["mute"] is False
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_set_output_delay_updates_shadow_and_pushes() -> None:
+    driver = CamillaDSPDriver(output_channels=4)
+    call = _stub_client(driver)
+
+    await driver.set_output_delay(0, 2.25)
+    assert driver._output_delay[0] == 2.25
+
+    cfg = _last_pushed_config(call)
+    delay_block = cfg["filters"]["cal_out0_delay"]
+    assert delay_block["type"] == "Delay"
+    assert delay_block["parameters"]["delay"] == 2.25
+    assert delay_block["parameters"]["unit"] == "ms"
+    assert delay_block["parameters"]["subsample"] is True
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_set_output_polarity_flows_into_gain_block() -> None:
+    driver = CamillaDSPDriver(output_channels=4)
+    call = _stub_client(driver)
+
+    await driver.set_output_polarity(1, True)
+    assert driver._output_polarity[1] is True
+
+    cfg = _last_pushed_config(call)
+    # Polarity is implemented as `inverted` on the Gain block, not a separate filter.
+    assert cfg["filters"]["cal_out1_gain"]["parameters"]["inverted"] is True
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_mute_then_unmute_toggles_gain_mute_flag() -> None:
+    driver = CamillaDSPDriver(output_channels=4)
+    call = _stub_client(driver)
+
+    await driver.mute_outputs([0, 1])
+    assert driver._output_muted[0] is True
+    assert driver._output_muted[1] is True
+    cfg = _last_pushed_config(call)
+    assert cfg["filters"]["cal_out0_gain"]["parameters"]["mute"] is True
+    assert cfg["filters"]["cal_out1_gain"]["parameters"]["mute"] is True
+
+    await driver.unmute_outputs([0])
+    assert driver._output_muted[0] is False
+    assert driver._output_muted[1] is True  # untouched
+    cfg = _last_pushed_config(call)
+    assert cfg["filters"]["cal_out0_gain"]["parameters"]["mute"] is False
+    assert cfg["filters"]["cal_out1_gain"]["parameters"]["mute"] is True
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_set_routing_builds_mixer_mapping() -> None:
+    driver = CamillaDSPDriver(input_channels=2, output_channels=4, sub_outputs=[0, 1])
+    call = _stub_client(driver)
+
+    # Route input 0 → outputs 0,1 only; input 1 silent.
+    await driver.set_routing({
+        0: {0: True, 1: True, 2: False, 3: False},
+        1: {0: False, 1: False, 2: False, 3: False},
+    })
+    cfg = _last_pushed_config(call)
+    mapping = cfg["mixers"]["cal_matrix"]["mapping"]
+    by_dest = {m["dest"]: m["sources"] for m in mapping}
+    # outs 0/1 have exactly one source (input 0); outs 2/3 have none.
+    assert len(by_dest[0]) == 1 and by_dest[0][0]["channel"] == 0
+    assert len(by_dest[1]) == 1 and by_dest[1][0]["channel"] == 0
+    assert by_dest[2] == []
+    assert by_dest[3] == []
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_set_master_gain_does_not_push_pipeline() -> None:
+    """SetVolume bypasses the pipeline — no SetConfig call should be issued."""
+    driver = CamillaDSPDriver()
+    call = _stub_client(driver)
+    await driver.set_master_gain(-7.5)
+    cmds = [c.args[0] for c in call.await_args_list]
+    assert "SetVolume" in cmds
+    assert "SetConfig" not in cmds
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_apply_fir_writes_conv_filter_with_inline_values() -> None:
+    driver = CamillaDSPDriver(output_channels=4)
+    call = _stub_client(driver)
+    coeffs = [0.0, 0.5, 1.0, 0.5, 0.0]
+    await driver.apply_fir(0, coeffs)
+    assert driver._fir_state[0] == coeffs
+
+    cfg = _last_pushed_config(call)
+    fir = cfg["filters"]["cal_out0_fir"]
+    assert fir["type"] == "Conv"
+    assert fir["parameters"]["type"] == "Values"
+    assert fir["parameters"]["values"] == coeffs
+
+    # FIR name should appear in the per-output Filter step.
+    out0_step = next(
+        s for s in cfg["pipeline"]
+        if s.get("type") == "Filter" and s.get("channel") == 0
+    )
+    assert "cal_out0_fir" in out0_step["names"]
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_clear_fir_removes_conv_filter_from_pipeline() -> None:
+    driver = CamillaDSPDriver(output_channels=4)
+    _stub_client(driver)
+    await driver.apply_fir(0, [0.0, 1.0, 0.0])
+    call = driver._client.call  # retain the same mock
+
+    await driver.clear_fir(0)
+    cfg = _last_pushed_config(call)
+    assert "cal_out0_fir" not in cfg["filters"]
+    out0_step = next(
+        s for s in cfg["pipeline"]
+        if s.get("type") == "Filter" and s.get("channel") == 0
+    )
+    assert "cal_out0_fir" not in out0_step["names"]
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_apply_fir_rejects_too_many_taps() -> None:
+    driver = CamillaDSPDriver()
+    _stub_client(driver)
+    too_long = [0.0] * (driver.capabilities.fir_max_taps_per_output + 1)
+    with pytest.raises(DriverError, match="too many FIR taps"):
+        await driver.apply_fir(0, too_long)
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_apply_fir_rejects_empty_coefficients() -> None:
+    driver = CamillaDSPDriver()
+    _stub_client(driver)
+    with pytest.raises(DriverError, match="empty"):
+        await driver.apply_fir(0, [])
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_apply_fir_rejects_wrong_sample_rate() -> None:
+    driver = CamillaDSPDriver(processing_rate=48_000)
+    _stub_client(driver)
+    with pytest.raises(DriverError, match="sample rate"):
+        await driver.apply_fir(0, [0.0, 1.0, 0.0], sample_rate=96_000)
+
+
+def test_camilladsp_config_samples_devices_block_from_constructor_args() -> None:
+    """The emitted `devices` section reflects the capture/playback/rate/chunksize args."""
+    driver = CamillaDSPDriver(
+        output_channels=10,
+        input_channels=2,
+        processing_rate=96_000,
+        chunksize=2048,
+    )
+    cfg = driver._build_config()
+    devices = cfg["devices"]
+    assert devices["samplerate"] == 96_000
+    assert devices["chunksize"] == 2048
+    assert devices["capture"]["channels"] == 2
+    assert devices["playback"]["channels"] == 10
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_preset_semantics_are_still_single_pipeline() -> None:
+    """set_preset on CamillaDSP is documented as a no-op and must not push config."""
+    driver = CamillaDSPDriver()
+    call = _stub_client(driver)
+    await driver.set_preset(0)
+    await driver.set_preset(3)
+    # No SetConfig should have been emitted by set_preset.
+    assert not any(
+        c.args and c.args[0] == "SetConfig" for c in call.await_args_list
+    )

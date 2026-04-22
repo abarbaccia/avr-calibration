@@ -1,8 +1,9 @@
-"""DSP utilities — human-readable filter spec to miniDSP biquad coefficients.
+"""DSP utilities — human-readable filter spec to biquad coefficients.
 
-miniDSP 2x4 HD accepts raw biquad coefficients (b0, b1, b2, a1, a2) in the
-minidspd HTTP API.  This module converts human-readable filter specifications
-(frequency, gain, Q, type) to the biquad form miniDSP expects.
+Converts human-readable filter specifications (frequency, gain, Q, type) to
+Audio EQ Cookbook biquad coefficients (b0, b1, b2, a1, a2) normalised to a0=1.
+Callers pass the DSP's processing sample rate (see ``DSPCapabilities``); the
+default matches miniDSP 2x4 HD.
 
 Supported filter types:
   - ``peaking``    — parametric EQ peak/notch
@@ -14,11 +15,11 @@ Usage::
 
     from calibrate.dsp import freq_gain_q_to_biquad
 
-    biquad = freq_gain_q_to_biquad(freq=80.0, gain_db=-3.0, q=0.7, filter_type="peaking")
+    biquad = freq_gain_q_to_biquad(
+        freq=80.0, gain_db=-3.0, q=0.7, filter_type="peaking",
+        sample_rate=driver.capabilities.processing_rate,
+    )
     # → {"b0": ..., "b1": ..., "b2": ..., "a1": ..., "a2": ...}
-
-All functions operate at the sample rate of the miniDSP 2x4 HD (96 000 Hz).
-The biquad coefficients are in the minidspd normalised form where a0 = 1.
 
 References:
   Audio EQ Cookbook — Robert Bristow-Johnson
@@ -43,7 +44,13 @@ BiquadCoeffs = dict[str, float]
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 SAMPLE_RATE_HZ: int = 96_000
-"""miniDSP 2x4 HD internal sample rate."""
+"""Default DSP processing sample rate in Hz.
+
+Used only when the caller does not pass an explicit ``sample_rate``. Drivers
+should query their own rate via ``DSPDriver.capabilities.processing_rate`` and
+pass it through (miniDSP 2x4 HD: 96_000 Hz; CamillaDSP: whatever the YAML
+pipeline declares).
+"""
 
 DEFAULT_HPF_ORDER: int = 4
 """Default Butterworth HPF order (matches CLAUDE.md mandatory infrasonic HPF)."""
@@ -59,14 +66,16 @@ def freq_gain_q_to_biquad(
     sample_rate: int = SAMPLE_RATE_HZ,
     hpf_order: int = DEFAULT_HPF_ORDER,
 ) -> BiquadCoeffs:
-    """Convert a human-readable filter spec to miniDSP biquad coefficients.
+    """Convert a human-readable filter spec to Audio EQ Cookbook biquad coeffs.
 
     Args:
         freq:        Centre / corner frequency in Hz.
         gain_db:     Gain in dB.  Ignored for HPF/LPF.
         q:           Quality factor.  Ignored for HPF/LPF.
         filter_type: One of 'peaking', 'low_shelf', 'high_shelf', 'hpf'.
-        sample_rate: Sample rate in Hz (default: 96 000 Hz for miniDSP 2x4 HD).
+        sample_rate: DSP processing sample rate in Hz. Prefer passing
+                     ``driver.capabilities.processing_rate`` rather than
+                     relying on the default.
         hpf_order:   Butterworth order for HPF (default: 4).
 
     Returns:
@@ -97,8 +106,9 @@ def mandatory_hpf_biquads(
 ) -> list[BiquadCoeffs]:
     """Return the mandatory infrasonic HPF as a list of biquad sections.
 
-    A 4th-order Butterworth HPF is two cascaded 2nd-order sections.  miniDSP
-    PEQ slots each hold one biquad, so a 4th-order HPF occupies 2 slots.
+    A 4th-order Butterworth HPF is two cascaded 2nd-order sections. For PEQ
+    backends that hold one biquad per slot (e.g. miniDSP 2x4 HD), a 4th-order
+    HPF occupies 2 slots.
 
     Returns a list of BiquadCoeffs dicts, one per biquad section.
     """

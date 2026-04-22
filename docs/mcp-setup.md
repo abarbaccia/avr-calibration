@@ -101,7 +101,6 @@ Claude should call `get_current_eq` and describe the filter state. If it doesn't
 |------|-------------|
 | `measure` | Trigger a sweep via UMIK, saves session |
 | `get_measurement_history` | Fetch FR data for recent sessions |
-| `read_eq` | Read current miniDSP EQ filter state |
 | `apply_eq` | Write EQ filters to DSP output(s) (SafetyValidator enforced) |
 | `apply_input_eq` | Write EQ filters to the shared DSP input channel |
 | `get_calibration_runs` | List calibration run history |

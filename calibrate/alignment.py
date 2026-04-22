@@ -271,18 +271,18 @@ async def apply_delays(
     driver: "DSPDriver",
 ) -> None:
     """Phase 2 — write delay offsets to DSP outputs."""
-    from .adapters.minidsp import MAX_DELAY_MS
+    max_delay_ms = driver.capabilities.max_delay_ms
 
     for i, (delay_ms, result) in enumerate(zip(delay_offsets_ms, ir_results)):
         output_idx = sub_outputs[result.sub_index]
-        if delay_ms > MAX_DELAY_MS:
+        if delay_ms > max_delay_ms:
             log.warning(
                 "Computed delay %.2f ms for output %d exceeds hardware max %s ms — clamping",
                 delay_ms,
                 output_idx,
-                MAX_DELAY_MS,
+                max_delay_ms,
             )
-            delay_ms = MAX_DELAY_MS
+            delay_ms = max_delay_ms
         if delay_ms <= 0.0:
             continue  # reference sub — no delay needed
         try:

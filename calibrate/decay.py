@@ -5,10 +5,10 @@ applying Schroeder integration per frequency bin, and estimating T60 (time for
 energy to decay 60dB). Modes with T60 > 300ms are flagged for correction.
 
 FIR filters shorten these decays (time-domain correction); PEQ cuts the peak
-magnitude but cannot shorten the ringing duration. Whether FIR is available
-depends on the DSP device (check eq_capabilities.fir_capable from get_config).
-The miniDSP 2x4 HD supports FIR (2048 taps/output); use apply_fir for decay
-correction. On IIR-only devices, the suggested_q values drive narrow PEQ cuts.
+magnitude but cannot shorten the ringing duration. Whether FIR is available —
+and how many taps are on offer — depends on the DSP device. Read fir_capable
+and fir_max_taps_per_output from eq_capabilities (get_config) before designing
+a FIR. On IIR-only devices, the suggested_q values drive narrow PEQ cuts.
 """
 
 from __future__ import annotations

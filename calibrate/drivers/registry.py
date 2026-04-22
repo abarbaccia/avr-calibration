@@ -13,6 +13,7 @@ from __future__ import annotations
 from ..config import Config
 from .avr_driver import AVRDriver
 from .base import DriverError
+from .camilladsp import CamillaDSPDriver
 from .denon import DenonDriver
 from .dsp_driver import DSPDriver
 from .minidsp import MinidspDriver
@@ -23,6 +24,7 @@ _AVR_DRIVERS: dict[str, type[AVRDriver]] = {
 
 _DSP_DRIVERS: dict[str, type[DSPDriver]] = {
     "minidsp": MinidspDriver,
+    "camilladsp": CamillaDSPDriver,
 }
 
 
@@ -74,4 +76,22 @@ def load_dsp_driver(config: Config) -> DSPDriver:
             usb_input=usb_input,
             processing_rate=processing_rate,
         )
+    if cls is CamillaDSPDriver:
+        cam = config.camilladsp
+        kwargs: dict = {
+            "host": cam.get("host", "127.0.0.1"),
+            "port": int(cam.get("port", 1234)),
+            "sub_outputs": config.sub_outputs,
+            "output_channels": int(cam.get("output_channels", 10)),
+            "input_channels": int(cam.get("input_channels", 2)),
+            "processing_rate": int(cam.get("samplerate", 48_000)),
+            "chunksize": int(cam.get("chunksize", 1024)),
+        }
+        if cam.get("capture") is not None:
+            kwargs["capture_device"] = cam["capture"]
+        if cam.get("playback") is not None:
+            kwargs["playback_device"] = cam["playback"]
+        if cam.get("max_peq_slots") is not None:
+            kwargs["max_peq_slots"] = int(cam["max_peq_slots"])
+        return CamillaDSPDriver(**kwargs)
     return cls()  # type: ignore[call-arg]

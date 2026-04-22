@@ -124,7 +124,6 @@ Key MCP tools available on the `avr-calibration` server:
 - `measure` — take a sweep measurement, returns frequency response data
 - `apply_eq` — write PEQ filters to miniDSP (SafetyValidator enforced). Pass `simulation_verified=true` when the filter set was just confirmed by `simulate_eq` (relaxes per-iteration limit to +6 dB).
 - `apply_input_eq` — write shared input PEQ filters (same `simulation_verified` support)
-- `read_eq` / `read_input_eq` — read current EQ state
 - `mute_output` / `unmute_output` — mute/unmute specific DSP outputs
 - `set_delay` / `set_polarity` / `set_output_gain` — per-output DSP settings
 - `set_volume` / `set_master_gain` — AVR/DSP volume

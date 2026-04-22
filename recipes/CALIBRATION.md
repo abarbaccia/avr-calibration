@@ -97,10 +97,11 @@ Don't just add filters — also prune.
 
 ### 8. Iterative merge pattern
 When iterating on EQ:
-- Read current filter set (`read_eq` or `read_input_eq`)
+- Track the filter set YOU applied in conversation context — the miniDSP is
+  write-only, so there is no tool to read the current filters back
 - Run filter audit (rule 7)
 - Design only additional corrections needed
-- Merge into audited set
+- Merge into the audited set
 - Apply the FULL merged set — never just the delta
   (`apply_eq` replaces all slots; delta-only discards prior corrections)
 

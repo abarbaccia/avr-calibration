@@ -24,6 +24,10 @@ from ..adapters.minidsp import (
     ALIGNMENT_PEQ_SLOTS,
     FIR_MAX_TAPS_PER_OUTPUT,
     FIR_SAMPLE_RATE,
+    FIR_SHARED_TAP_POOL,
+    MAX_DELAY_MS,
+    MAX_PRESET_INDEX,
+    VALID_SOURCES,
     MinidspApiError,
     MinidspClient,
     _run_minidsp_cli,
@@ -31,7 +35,7 @@ from ..adapters.minidsp import (
 from ..dsp import freq_gain_q_to_biquad
 from ..safety import FilterSpec, SafetyValidator
 from .base import DriverError
-from .dsp_driver import DSPDriver
+from .dsp_driver import DSPCapabilities, DSPDriver
 
 
 def _driver_api(fn):
@@ -54,6 +58,21 @@ _BYPASS_BIQUAD: dict[str, Any] = {
 
 class MinidspDriver(DSPDriver):
     """DSPDriver for miniDSP 2x4 HD via minidspd REST API."""
+
+    @property
+    def capabilities(self) -> DSPCapabilities:
+        return DSPCapabilities(
+            max_delay_ms=MAX_DELAY_MS,
+            max_preset_index=MAX_PRESET_INDEX,
+            valid_sources=VALID_SOURCES,
+            processing_rate=self._processing_rate,
+            max_peq_slots=len(_AVAILABLE_SLOTS),
+            fir_capable=True,
+            fir_min_taps=64,
+            fir_max_taps_per_output=FIR_MAX_TAPS_PER_OUTPUT,
+            fir_shared_tap_pool=FIR_SHARED_TAP_POOL,
+            fir_sample_rate_hz=FIR_SAMPLE_RATE,
+        )
 
     def __init__(self, host: str, port: int, device_index: int = 0,
                  sub_outputs: list[int] | None = None,
@@ -105,15 +124,6 @@ class MinidspDriver(DSPDriver):
             return int(status.get("master", {}).get("preset", 0))
         except Exception:
             return 0
-
-    async def read_eq(self, preset: int) -> list[dict]:
-        """Return in-memory EQ state for *preset* ([] if never applied)."""
-        return list(self._eq_state.get(preset, []))
-
-    async def read_input_eq(self, preset: int) -> list[dict]:
-        """Return in-memory input EQ state for *preset* ([] if never applied)."""
-        key = ("input", self._active_input, preset)
-        return list(self._eq_state.get(key, []))
 
     def _parse_filter_specs(self, filters: list[dict]) -> list[FilterSpec]:
         """Parse raw filter dicts into FilterSpec objects."""
@@ -408,6 +418,51 @@ class MinidspDriver(DSPDriver):
             for idx in range(4)
         }
 
+    def rehydrate_from_active_state(self, active_state: dict[str, dict]) -> None:
+        """Rebuild in-memory shadow state from persisted active_dsp_state.
+
+        minidspd has no readback for PEQ/gain/delay/polarity — after a process
+        restart, the driver's in-memory shadow is empty while the hardware
+        retains the last-flashed values. Calling this on startup with the
+        persisted active_dsp_state dict makes `get_output_state` reflect what
+        was actually written before the restart.
+
+        Expected key shapes (produced by `_persist_dsp_state` in mcp_server):
+        - ``output_eq_{idx}``   → {"filters": [...], "preset": N}
+        - ``input_eq``          → {"filters": [...], "preset": N}
+        - ``gain_{idx}``        → {"gain_db": X}
+        - ``delay_{idx}``       → {"delay_ms": X}
+        - ``polarity_{idx}``    → {"inverted": bool}
+
+        Unknown keys are ignored. FIR coefficients are not persisted in
+        active_dsp_state and stay empty after rehydrate.
+        """
+        for key, data in active_state.items():
+            try:
+                if key.startswith("output_eq_"):
+                    idx = int(key.removeprefix("output_eq_"))
+                    preset = int(data.get("preset", 0))
+                    filters = data.get("filters", [])
+                    if filters:
+                        self._eq_state[(preset, idx)] = filters
+                elif key == "input_eq":
+                    preset = int(data.get("preset", 0))
+                    filters = data.get("filters", [])
+                    if filters:
+                        for inp in {self._active_input, self._usb_input}:
+                            self._eq_state[("input", inp, preset)] = filters
+                elif key.startswith("gain_"):
+                    idx = int(key.removeprefix("gain_"))
+                    self._output_gain[idx] = float(data["gain_db"])
+                elif key.startswith("delay_"):
+                    idx = int(key.removeprefix("delay_"))
+                    self._output_delay[idx] = float(data["delay_ms"])
+                elif key.startswith("polarity_"):
+                    idx = int(key.removeprefix("polarity_"))
+                    self._output_polarity[idx] = bool(data["inverted"])
+            except (KeyError, ValueError, TypeError) as exc:
+                log.warning("rehydrate_from_active_state: skipping key=%s: %s", key, exc)
+
     async def reapply_volatile_output_state(self) -> None:
         """Re-apply output gains and output PEQ after a source switch.
 
@@ -501,6 +556,15 @@ class MinidspDriver(DSPDriver):
     async def set_source(self, source: str) -> None:
         """Switch the miniDSP input source via CLI (Analog/Toslink/Usb)."""
         await self._client.switch_source(source)
+
+    def sweep_context(self, config):
+        """Return a MinidspSweepContext for the given config, or None if not USB route.
+
+        Caller (MCP server) enters once per calibration session and exits on
+        teardown. The context swaps the miniDSP source Analog→USB for sweep
+        playback, reconfigures routing, and restores on exit.
+        """
+        return MinidspSweepContext.from_config(config, driver=self)
 
     @_driver_api
     async def configure_active_input(self, active_input: int) -> None:
