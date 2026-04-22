@@ -1204,8 +1204,15 @@ def test_camilladsp_output_state_shape_matches_minidsp_contract() -> None:
 
 
 @pytest.mark.asyncio
-async def test_camilladsp_setup_opens_ws_probes_version_and_pushes_config() -> None:
-    """setup connects the ws client, issues GetVersion, and pushes the initial pipeline."""
+async def test_camilladsp_setup_opens_ws_probes_version_but_does_not_push() -> None:
+    """setup connects and probes version; it does NOT push a default pipeline.
+
+    A fresh install keeps whatever config the daemon was started with (e.g.
+    ``initial.yml``) until the first state mutation triggers a push. On
+    restart, ``rehydrate_from_active_state`` reconciles the daemon with the
+    persisted shadow — so a mid-session MCP restart doesn't wipe the running
+    calibration by pushing an empty pipeline out from under it.
+    """
     driver = CamillaDSPDriver()
     driver._client.connect = AsyncMock()
     driver._client.close = AsyncMock()
@@ -1214,11 +1221,9 @@ async def test_camilladsp_setup_opens_ws_probes_version_and_pushes_config() -> N
     await driver.setup()
 
     driver._client.connect.assert_awaited_once()
-    # First call probes version; second call pushes the starting pipeline.
+    # Only GetVersion — no SetConfig, no push of any kind.
     call_cmds = [c.args[0] for c in driver._client.call.await_args_list]
-    assert call_cmds[0] == "GetVersion"
-    assert call_cmds[1] == "SetConfig"
-    assert driver._client.call.await_count == 2
+    assert call_cmds == ["GetVersion"]
 
 
 @pytest.mark.asyncio
@@ -1769,3 +1774,96 @@ async def test_camilladsp_preset_semantics_are_still_single_pipeline() -> None:
     assert not any(
         c.args and c.args[0] == "SetConfig" for c in call.await_args_list
     )
+
+
+# ── CamillaDSPDriver — rehydrate_from_active_state ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_rehydrate_populates_shadow_from_namespaced_keys() -> None:
+    """rehydrate reads the namespaced active_dsp_state keys into shadow state."""
+    driver = CamillaDSPDriver(output_channels=4, input_channels=2, sub_outputs=[0, 1])
+    _stub_client(driver)
+
+    active_state = {
+        # Processor-namespaced keys — the shape that storage.dsp_output_key produces.
+        "processor:camilla:output:0:eq": {
+            "filters": [
+                {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
+                {"freq": 50.0, "gain_db": -3.0, "q": 2.0, "type": "peaking"},
+            ],
+            "preset": 0,
+        },
+        "processor:camilla:output:1:gain": {"gain_db": -2.5},
+        "processor:camilla:output:1:delay": {"delay_ms": 1.5},
+        "processor:camilla:output:0:polarity": {"inverted": True},
+        "processor:camilla:input:eq": {
+            "filters": [
+                {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
+            ],
+            "preset": 0,
+        },
+        # Non-DSP keys are ignored.
+        "target_curve": {"type": "harman"},
+    }
+
+    await driver.rehydrate_from_active_state(active_state)
+
+    # Output EQ slot-0 picked up both filters.
+    assert len(driver._output_eq[0]) == 2
+    # Gain, delay, polarity threaded through.
+    assert driver._output_gain[1] == -2.5
+    assert driver._output_delay[1] == 1.5
+    assert driver._output_polarity[0] is True
+    # Input EQ replicated onto every input channel (matches apply_input_eq shape).
+    assert 0 in driver._input_eq and 1 in driver._input_eq
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_rehydrate_pushes_when_shadow_has_content() -> None:
+    """rehydrate with persisted filters pushes the reconstructed config once."""
+    driver = CamillaDSPDriver(output_channels=4)
+    call = _stub_client(driver)
+
+    active_state = {
+        "processor:camilla:output:0:eq": {
+            "filters": [{"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"}],
+            "preset": 0,
+        },
+    }
+    await driver.rehydrate_from_active_state(active_state)
+
+    set_config_calls = [c for c in call.await_args_list
+                        if c.args and c.args[0] == "SetConfig"]
+    assert len(set_config_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_rehydrate_empty_state_does_not_push() -> None:
+    """Fresh install: empty active_dsp_state → no push → daemon keeps initial.yml."""
+    driver = CamillaDSPDriver()
+    call = _stub_client(driver)
+
+    await driver.rehydrate_from_active_state({})
+
+    assert not any(
+        c.args and c.args[0] == "SetConfig" for c in call.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_rehydrate_tolerates_legacy_flat_keys() -> None:
+    """Defensive: legacy flat keys (pre-migration) parse cleanly too."""
+    driver = CamillaDSPDriver(output_channels=4)
+    _stub_client(driver)
+
+    active_state = {
+        "output_eq_0": {
+            "filters": [{"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"}],
+            "preset": 0,
+        },
+        "gain_1": {"gain_db": -1.5},
+    }
+    await driver.rehydrate_from_active_state(active_state)
+    assert len(driver._output_eq[0]) == 1
+    assert driver._output_gain[1] == -1.5

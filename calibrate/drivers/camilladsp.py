@@ -238,7 +238,16 @@ class CamillaDSPDriver(DSPDriver):
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     async def setup(self) -> None:
-        """Open the websocket, confirm the daemon is alive, push the pipeline."""
+        """Open the websocket and confirm the daemon is alive.
+
+        Intentionally does **not** push a default pipeline. On a fresh install
+        the daemon retains whatever config it was started with (e.g. the
+        user's ``initial.yml``) until the first state mutation (apply_eq /
+        set_output_* / etc.) causes the driver to push its shadow. On a
+        restart, ``rehydrate_from_active_state`` repopulates the shadow from
+        persisted calibration state and pushes once — so a mid-session MCP
+        restart doesn't wipe the running calibration.
+        """
         async with self._lock:
             await self._client.connect()
             try:
@@ -247,10 +256,6 @@ class CamillaDSPDriver(DSPDriver):
                 await self._client.close()
                 raise
             log.info("CamillaDSP %s at %s:%d", version, self._host, self._port)
-            # Push the default pipeline so later mutations diff cleanly. If the
-            # daemon already had a hand-authored config, this replaces it — the
-            # driver owns the pipeline by design.
-            await self._push_config_locked()
 
     async def close(self) -> None:
         async with self._lock:
@@ -313,6 +318,77 @@ class CamillaDSPDriver(DSPDriver):
     def get_mute_state(self) -> dict[int, bool]:
         """Return tracked per-output mute state (only includes explicitly set outputs)."""
         return dict(self._output_muted)
+
+    def _has_pending_state(self) -> bool:
+        """True when shadow carries any calibration state worth pushing.
+
+        Used to decide whether a post-rehydrate push is necessary: a fresh
+        install with no prior state leaves the daemon's ``initial.yml`` alone;
+        a restarted session pushes the rehydrated filters once so the daemon
+        matches the shadow.
+        """
+        return bool(
+            self._output_eq or self._input_eq
+            or self._output_gain or self._output_delay
+            or self._output_polarity or self._output_muted
+            or any(v for v in self._fir_state.values())
+        )
+
+    async def rehydrate_from_active_state(
+        self, active_state: dict[str, dict],
+    ) -> None:
+        """Rebuild shadow from persisted active_dsp_state, then push to daemon.
+
+        Called by the MCP server lifespan after ``setup``. Accepts the
+        namespaced key shape ``processor:<name>:output:<idx>:<field>`` (and
+        the input variant). Legacy flat keys are migrated by the storage
+        layer before they reach this method, so parsing them here is purely
+        defensive.
+
+        The push at the end reconciles the daemon with the shadow — without
+        it a mid-session MCP restart would leave the daemon at its startup
+        config while the driver's shadow claims the last-applied filters are
+        live. Only pushes when the shadow has content; a fresh install with
+        empty ``active_dsp_state`` stays a pure no-op so the daemon's
+        initial.yml remains untouched.
+        """
+        from ..storage import parse_dsp_key
+
+        for key, data in active_state.items():
+            parsed = parse_dsp_key(key)
+            if parsed is None:
+                continue
+            try:
+                if parsed["kind"] == "output":
+                    idx = parsed["output_index"]
+                    field = parsed["field"]
+                    if field == "eq":
+                        filters = data.get("filters", [])
+                        if filters:
+                            self._output_eq[idx] = list(filters)
+                            self._eq_state[(0, idx)] = list(filters)
+                    elif field == "gain":
+                        self._output_gain[idx] = float(data["gain_db"])
+                    elif field == "delay":
+                        self._output_delay[idx] = float(data["delay_ms"])
+                    elif field == "polarity":
+                        self._output_polarity[idx] = bool(data["inverted"])
+                elif parsed["kind"] == "input" and parsed["field"] == "eq":
+                    filters = data.get("filters", [])
+                    if filters:
+                        # CamillaDSP has no active_input concept — every
+                        # input channel gets the shared filter set, matching
+                        # apply_input_eq's broadcast semantics.
+                        for inp in range(self._input_channels):
+                            self._input_eq[inp] = list(filters)
+                            self._eq_state[("input", inp, 0)] = list(filters)
+            except (KeyError, ValueError, TypeError) as exc:
+                log.warning("rehydrate_from_active_state: skipping key=%s: %s", key, exc)
+
+        if self._has_pending_state():
+            async with self._lock:
+                await self._push_config_locked()
+            log.info("CamillaDSP rehydrate: shadow restored and pushed to daemon")
 
     # ── pipeline construction ────────────────────────────────────────────────
 
