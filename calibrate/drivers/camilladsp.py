@@ -744,6 +744,20 @@ class CamillaDSPDriver(DSPDriver):
         async with self._lock:
             await self._client.call("SetVolume", float(gain_db))
 
+    def sweep_context(self, config):
+        """HDMI sweep neutralisation; no-op for USB direct (pipeline is always live).
+
+        CamillaDSP has no source switching (``valid_sources`` is empty), so the
+        HDMI context reduces to ``master_gain_hdmi_db`` management. Returns
+        ``None`` for the USB route — the pipeline already has the sweep signal
+        on its inputs; nothing to neutralise.
+        """
+        from .dsp_driver import DSPHDMISweepContext
+        route = config.measurement.get("playback_route", "usb")
+        if route == "hdmi":
+            return DSPHDMISweepContext(self, config)
+        return None
+
     # ── FIR ───────────────────────────────────────────────────────────────────
 
     async def apply_fir(

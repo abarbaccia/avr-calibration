@@ -333,6 +333,36 @@ class SignalGraph:
 
         return tuple(ordered)
 
+    def sweep_context_for_route(
+        self,
+        route: str,
+        targets: tuple[Transducer, ...],
+        config,
+        registry,
+    ) -> "_SweepContext":
+        """Compose sweep contexts keyed on ``playback_route`` rather than source.
+
+        ``"hdmi"`` includes the default AVR in the path; ``"usb"`` bypasses it.
+        This is the measurement-oriented entry point — source objects on the
+        graph are for reasoning about arbitrary injection points; the
+        measurement layer only cares whether the signal is decoded by the AVR
+        or arrives direct at the DSP.
+        """
+        processors: list[Processor] = []
+        if route == "hdmi":
+            avr = self.default_processor("avr")
+            if avr is not None:
+                processors.append(avr)
+
+        seen = {p.name for p in processors}
+        for t in targets:
+            p = self.processor_by_name(t.processor_ref)
+            if p is not None and p.name not in seen:
+                processors.append(p)
+                seen.add(p.name)
+
+        return self._compose_contexts(processors, config, registry)
+
     def sweep_context(
         self,
         source_name: str,
@@ -353,6 +383,12 @@ class SignalGraph:
         rather than imported to avoid a hard dependency from graph → drivers.
         """
         processors = self.processors_on_path(source_name, targets)
+        return self._compose_contexts(processors, config, registry)
+
+    def _compose_contexts(
+        self, processors: "list[Processor] | tuple[Processor, ...]", config, registry,
+    ) -> "_SweepContext":
+        """Collect each processor driver's sweep_context into an exit stack."""
         managers = []
         for proc in processors:
             drv = registry.get(proc.name)

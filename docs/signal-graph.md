@@ -90,17 +90,21 @@ named groups for scoped calibration.
 
 ## Known gaps (follow-ups)
 
-- **Per-tool target** — only `apply_eq` and `apply_input_eq` take `target`
-  today. `set_delay`, `set_polarity`, `set_output_gain`, `mute_output`, and
-  friends still accept only raw output indices. Recipes resolve via
-  `resolve_target` and pass the index.
-- **Sweep composer in measurements** — `graph.sweep_context(...)` exists
-  and is tested, but `_tool_trigger_measurement` still manually nests
-  `DenonSweepContext` + the DSP sweep session because the HDMI route also
-  manages `master_gain_hdmi_db`. Migrating that caller is a future cleanup.
-- **Multi-DSP target dispatch** — `apply_eq(target=...)` rejects targets
-  whose transducers live on a non-default DSP. When the 18i20 arrives
-  alongside the existing miniDSP, this gap turns into a hard requirement.
 - **AVR-side writes** — trims / distances / bass management still live on
   the Denon; the graph describes them but the `DenonDriver` doesn't yet
-  read or write them. Tracked as `TODO-CAMILLA-PREFLIGHT`.
+  read or write them. Tracked as `TODO-CAMILLA-PREFLIGHT`. Deferred until
+  the user can validate writes against live hardware.
+
+## Recently closed
+
+- ~~Per-tool `target` on EQ only~~ — `set_delay`, `set_polarity`,
+  `set_output_gain`, `mute_output`, and `unmute_output` now accept `target`
+  and dispatch across multiple processors.
+- ~~Manual Denon+DSP nest in `_tool_trigger_measurement`~~ — HDMI route
+  now goes through `graph.sweep_context_for_route`. The DSP's HDMI-mode
+  neutralisation (source=Analog, `master_gain_hdmi_db`) lives in a
+  driver-agnostic `DSPHDMISweepContext`.
+- ~~Multi-DSP target dispatch rejects cleanly~~ — `apply_eq` and
+  `apply_input_eq` now route each transducer to the driver that owns its
+  output, bucketing by processor where it matters (input EQ applies
+  per-processor against that bucket's strictest profile).

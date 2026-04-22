@@ -35,7 +35,7 @@ from ..adapters.minidsp import (
 from ..dsp import freq_gain_q_to_biquad
 from ..safety import FilterSpec, SafetyValidator
 from .base import DriverError
-from .dsp_driver import DSPCapabilities, DSPDriver
+from .dsp_driver import DSPCapabilities, DSPDriver, DSPHDMISweepContext
 
 
 def _driver_api(fn):
@@ -559,12 +559,16 @@ class MinidspDriver(DSPDriver):
         await self._client.switch_source(source)
 
     def sweep_context(self, config):
-        """Return a MinidspSweepContext for the given config, or None if not USB route.
+        """Return the appropriate sweep context for the configured playback route.
 
-        Caller (MCP server) enters once per calibration session and exits on
-        teardown. The context swaps the miniDSP source Analog→USB for sweep
-        playback, reconfigures routing, and restores on exit.
+        - ``playback_route: usb`` → ``MinidspSweepContext`` (Analog→USB source
+          switch + routing reconfig, entered once per calibration session).
+        - ``playback_route: hdmi`` → ``DSPHDMISweepContext`` (ensure source is
+          ``Analog`` + apply ``master_gain_hdmi_db`` for the measurement).
         """
+        route = config.measurement.get("playback_route", "usb")
+        if route == "hdmi":
+            return DSPHDMISweepContext(self, config)
         return MinidspSweepContext.from_config(config, driver=self)
 
     @_driver_api
