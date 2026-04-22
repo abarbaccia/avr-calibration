@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import AbstractAsyncContextManager
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..config import Config
 
 
 class AVRDriver(ABC):
@@ -61,3 +66,18 @@ class AVRDriver(ABC):
         protocol supports SSDP or mDNS discovery.
         """
         return []
+
+    def sweep_context(
+        self, config: "Config"
+    ) -> AbstractAsyncContextManager | None:
+        """Return an async context manager that neutralises the AVR for sweeps.
+
+        Mirrors ``DSPDriver.sweep_context``: enter at calibration start,
+        exit at end. A Denon driver returns a context that forces Pure
+        Direct + switches to the sweep input + saves/restores volume.
+        AVRs that don't need neutralisation (or aren't in the signal path
+        for this measurement) should return ``None``.
+
+        Default: return ``None``.
+        """
+        return None

@@ -87,7 +87,7 @@ from .drivers.avr_driver import AVRDriver
 from .drivers.base import DriverError
 from .drivers.denon import DenonSweepContext
 from .drivers.dsp_driver import DSPDriver
-from .drivers.registry import load_avr_driver, load_dsp_driver
+from .drivers.registry import load_avr_driver, load_drivers_from_graph, load_dsp_driver
 
 log = logging.getLogger(__name__)
 
@@ -135,6 +135,22 @@ RECIPES_DIR: Path = _REPO_RECIPES if _REPO_RECIPES.is_dir() else _APP_RECIPES
 
 _avr: AVRDriver | None = None
 _dsp: DSPDriver | None = None
+
+# Registry of all processor drivers keyed by processor name (from the signal
+# graph). The module-global ``_avr`` and ``_dsp`` stay as convenience singletons
+# pointing at the first entry of each kind, preserving every legacy call site.
+_drivers = None  # DriverRegistry | None
+
+
+def _default_dsp_name() -> str | None:
+    """Return the processor name of the active default DSP, or None.
+
+    Used for DSP-state storage keys so that multi-DSP installs don't collide
+    on flat keys like ``output_eq_0``.
+    """
+    if _drivers is None:
+        return None
+    return _drivers.default_dsp_name()
 
 # ── Persistent sweep session ─────────────────────────────────────────────────
 # Holds the miniDSP in USB source mode across multiple measurements so we
@@ -423,27 +439,104 @@ async def _tool_get_fr_summary(
 async def _tool_apply_eq(
     filters: list[dict],
     output_index: int | None = None,
+    target: str | None = None,
     simulation_verified: bool = False,
 ) -> dict:
     """Validate and apply EQ filters to DSP output(s).
 
-    If *output_index* is given, writes only to that single output (per-sub EQ).
-    Otherwise writes to all configured sub outputs (broadcast mode).
+    Resolution order:
+      - ``target`` (group / transducer / role name) → per-transducer apply
+      - ``output_index`` → single-output apply (legacy)
+      - both omitted → broadcast to all configured sub outputs (legacy)
+
+    Target path validates the filter set against the target transducer's
+    per-profile SafetyValidator at the MCP layer before reaching the driver;
+    the driver's own SVS-default validation runs as a second line of defence.
 
     Returns {ok: True} or {ok: False, error: "SafetyValidator: ..."} on rejection.
     """
+    if target is not None and output_index is not None:
+        return _err("apply_eq: pass either target or output_index, not both")
+
     try:
         preset = await _dsp.current_preset()  # type: ignore[union-attr]
+    except DriverError as exc:
+        return _err(str(exc))
+
+    from .storage import dsp_output_key
+    processor_name = _default_dsp_name() or "dsp"
+
+    # Target path: resolve to list of transducers on the default DSP.
+    if target is not None:
+        cfg = _config()
+        graph = cfg.signal_graph
+        transducers = graph.resolve_target(target)
+        if not transducers:
+            return _err(f"apply_eq: unknown target {target!r}")
+        # Multi-DSP dispatch isn't wired yet — every resolved transducer must
+        # live on the default DSP. Reject cleanly if not.
+        foreign = [t.name for t in transducers if t.processor_ref != processor_name]
+        if foreign:
+            return _err(
+                f"apply_eq: transducers {foreign} are on a different processor "
+                f"than the default DSP ({processor_name!r}); multi-DSP target "
+                f"dispatch is a known follow-up"
+            )
+        # Pre-validate at MCP layer using each transducer's profile — stricter
+        # than the driver's SVS default when the profile has tighter limits.
+        from .safety import FilterSpec, SafetyValidator
+        specs = [
+            FilterSpec(
+                freq=float(f["freq"]), gain_db=float(f["gain_db"]),
+                q=float(f.get("q", 0.707)), type=f["type"],
+            )
+            for f in filters
+        ]
+        for t in transducers:
+            validator = SafetyValidator(graph.profile_for(t))
+            result = validator.validate(
+                specs, previous_filters=None, simulation_verified=simulation_verified,
+            )
+            if not result.ok:
+                return _err(f"{result.error} [target={t.name!r}]")
+        # Apply per transducer, persist per transducer.
+        applied = 0
+        try:
+            for t in transducers:
+                await _dsp.apply_eq(  # type: ignore[union-attr]
+                    preset, filters, output_index=t.output_index,
+                    simulation_verified=simulation_verified,
+                )
+                _persist_dsp_state(
+                    dsp_output_key(processor_name, t.output_index, "eq"),
+                    {"filters": filters, "preset": preset, "transducer": t.name},
+                )
+                applied += 1
+            return _ok(
+                filters_applied=len(filters), preset=preset,
+                target=target,
+                transducers=[t.name for t in transducers],
+                outputs=[t.output_index for t in transducers],
+            )
+        except DriverError as exc:
+            return _err(f"{exc} (applied to {applied}/{len(transducers)} transducers)")
+
+    # Legacy paths: output_index or broadcast
+    try:
         await _dsp.apply_eq(preset, filters, output_index=output_index, simulation_verified=simulation_verified)  # type: ignore[union-attr]
-        # Persist to SQLite so the web dashboard can show active DSP state
         if output_index is not None:
-            _persist_dsp_state(f"output_eq_{output_index}", {"filters": filters, "preset": preset})
+            _persist_dsp_state(
+                dsp_output_key(processor_name, output_index, "eq"),
+                {"filters": filters, "preset": preset},
+            )
         else:
-            # Broadcast mode — persist for all sub outputs
             cfg = _config()
             for slot in cfg.minidsp.get("output_slots", []):
                 if slot.get("type") == "sub":
-                    _persist_dsp_state(f"output_eq_{slot['index']}", {"filters": filters, "preset": preset})
+                    _persist_dsp_state(
+                        dsp_output_key(processor_name, slot["index"], "eq"),
+                        {"filters": filters, "preset": preset},
+                    )
         return _ok(filters_applied=len(filters), preset=preset,
                     output_index=output_index)
     except DriverError as exc:
@@ -453,26 +546,62 @@ async def _tool_apply_eq(
 async def _tool_apply_input_eq(
     filters: list[dict],
     target_curve: dict | None = None,
+    target: str | None = None,
     simulation_verified: bool = False,
 ) -> dict:
     """Validate and apply EQ filters to the DSP input channel.
 
     Applies shared EQ (e.g. Harman target curve) to the active input,
-    affecting all outputs equally. Uses the same SafetyValidator as output EQ.
+    affecting all outputs equally. When ``target`` names a group or
+    transducer, the filter set is validated against the **strictest** profile
+    among the downstream transducers — an input filter is shared across
+    outputs, so it must be safe for the weakest driver in the chain.
 
-    Optional *target_curve* persists the optimization target for dashboard display:
-      {"type": "harman", "reference_spl": 72.5, "band": [20, 200],
-       "points": [{"freq": 20, "spl": 78.5}, ...]}
+    Optional *target_curve* persists the optimization target for dashboard display.
 
     Returns {ok: True} or {ok: False, error: "SafetyValidator: ..."} on rejection.
     """
     try:
         preset = await _dsp.current_preset()  # type: ignore[union-attr]
+    except DriverError as exc:
+        return _err(str(exc))
+
+    # Per-profile strictness: if target is given, pick the strictest profile
+    # from the resolved transducers and validate at MCP layer before dispatch.
+    if target is not None:
+        cfg = _config()
+        graph = cfg.signal_graph
+        transducers = graph.resolve_target(target)
+        if not transducers:
+            return _err(f"apply_input_eq: unknown target {target!r}")
+        profile = graph.strictest_profile(transducers)
+        from .safety import FilterSpec, SafetyValidator
+        specs = [
+            FilterSpec(
+                freq=float(f["freq"]), gain_db=float(f["gain_db"]),
+                q=float(f.get("q", 0.707)), type=f["type"],
+            )
+            for f in filters
+        ]
+        validator = SafetyValidator(profile)
+        result = validator.validate(
+            specs, previous_filters=None, simulation_verified=simulation_verified,
+        )
+        if not result.ok:
+            return _err(f"{result.error} [target={target!r}, strictest={profile.name!r}]")
+
+    try:
         await _dsp.apply_input_eq(preset, filters, simulation_verified=simulation_verified)  # type: ignore[union-attr]
-        _persist_dsp_state("input_eq", {"filters": filters, "preset": preset})
+        from .storage import dsp_input_key
+        processor_name = _default_dsp_name() or "dsp"
+        _persist_dsp_state(
+            dsp_input_key(processor_name, "eq"),
+            {"filters": filters, "preset": preset},
+        )
         if target_curve:
+            # target_curve is a calibration intent, not processor state — keep flat.
             _persist_dsp_state("target_curve", target_curve)
-        return _ok(filters_applied=len(filters), preset=preset, target="input")
+        return _ok(filters_applied=len(filters), preset=preset, target=target or "input")
     except DriverError as exc:
         return _err(str(exc))
 
@@ -2853,9 +2982,43 @@ async def _tool_get_config() -> dict:
                 pass  # EQ state is best-effort
 
         data["eq_capabilities"] = eq_capabilities
+        # Always include the resolved graph — recipes read this to discover
+        # transducer/group names without a second round-trip.
+        data["signal_graph"] = cfg.signal_graph.summary()
         return _ok(config=data)
     except Exception as exc:
         return _err(f"config error: {exc}")
+
+
+async def _tool_get_signal_graph() -> dict:
+    """Return a compact signal-graph summary for LLM reasoning."""
+    try:
+        cfg = _config()
+        return _ok(graph=cfg.signal_graph.summary())
+    except Exception as exc:
+        return _err(f"get_signal_graph error: {exc}")
+
+
+async def _tool_resolve_target(target: str) -> dict:
+    """Resolve a group/transducer/role string to the concrete transducer list."""
+    try:
+        cfg = _config()
+        graph = cfg.signal_graph
+        transducers = graph.resolve_target(target)
+        resolved = [
+            {
+                "transducer": t.name,
+                "role": t.role,
+                "processor": t.processor_ref,
+                "output_index": t.output_index,
+                "profile": t.safety_profile_ref,
+                "position": t.position,
+            }
+            for t in transducers
+        ]
+        return _ok(target=target, resolved=resolved)
+    except Exception as exc:
+        return _err(f"resolve_target error: {exc}")
 
 
 async def _tool_set_config(updates: dict) -> dict:
@@ -2915,7 +3078,11 @@ async def _tool_set_delay(output_index: int, delay_ms: float) -> dict:
     """Set delay for a single DSP output in milliseconds."""
     try:
         await _dsp.set_output_delay(output_index, delay_ms)  # type: ignore[union-attr]
-        _persist_dsp_state(f"delay_{output_index}", {"delay_ms": delay_ms})
+        from .storage import dsp_output_key
+        _persist_dsp_state(
+            dsp_output_key(_default_dsp_name() or "dsp", output_index, "delay"),
+            {"delay_ms": delay_ms},
+        )
         return _ok(output_index=output_index, delay_ms=delay_ms)
     except DriverError as exc:
         return _err(str(exc))
@@ -2927,7 +3094,11 @@ async def _tool_set_polarity(output_index: int, inverted: bool) -> dict:
     """Set polarity for a single DSP output (inverted=True flips phase)."""
     try:
         await _dsp.set_output_polarity(output_index, inverted)  # type: ignore[union-attr]
-        _persist_dsp_state(f"polarity_{output_index}", {"inverted": inverted})
+        from .storage import dsp_output_key
+        _persist_dsp_state(
+            dsp_output_key(_default_dsp_name() or "dsp", output_index, "polarity"),
+            {"inverted": inverted},
+        )
         return _ok(output_index=output_index, inverted=inverted)
     except DriverError as exc:
         return _err(str(exc))
@@ -3022,7 +3193,11 @@ async def _tool_set_output_gain(output_index: int, gain_db: float) -> dict:
     """Set gain for a single DSP output in dB."""
     try:
         await _dsp.set_output_gain(output_index, gain_db)  # type: ignore[union-attr]
-        _persist_dsp_state(f"gain_{output_index}", {"gain_db": gain_db})
+        from .storage import dsp_output_key
+        _persist_dsp_state(
+            dsp_output_key(_default_dsp_name() or "dsp", output_index, "gain"),
+            {"gain_db": gain_db},
+        )
         return _ok(output_index=output_index, gain_db=gain_db)
     except DriverError as exc:
         return _err(str(exc))
@@ -3235,12 +3410,14 @@ _TOOLS: list[Tool] = [
     Tool(
         name="apply_eq",
         description=(
-            "Apply EQ filters to DSP output(s). By default writes to all sub outputs "
-            "(broadcast mode). Pass output_index to target a single output for per-sub EQ. "
-            "Filters are validated by SafetyValidator before any hardware write — "
-            "unsafe filters return {ok: false, error: 'SafetyValidator: ...'} rather than "
-            "throwing. Each filter: {freq: Hz, gain_db: dB, q: float, type: 'peaking'|"
-            "'low_shelf'|'high_shelf'|'hpf'}. A mandatory 18Hz HPF must always be included."
+            "Apply EQ filters to DSP output(s). Target a scope by name via `target` — "
+            "a group name ('bass', 'front_soundstage'), a transducer name ('sub_left', "
+            "'left_main'), or a role ('sub', 'main'). Pass `output_index` instead for raw "
+            "output dispatch (legacy). Omit both for the legacy broadcast-to-all-subs "
+            "behaviour. Filters are validated by SafetyValidator with the target's "
+            "per-transducer profile; unsafe filters return {ok: false, "
+            "error: 'SafetyValidator: ...'}. Each filter: {freq, gain_db, q, type}. "
+            "A mandatory HPF (default 18 Hz) must be included when the profile requires one."
         ),
         inputSchema={
             "type": "object",
@@ -3262,11 +3439,20 @@ _TOOLS: list[Tool] = [
                         "required": ["freq", "gain_db", "q", "type"],
                     },
                 },
+                "target": {
+                    "type": "string",
+                    "description": (
+                        "Named scope — group ('bass'), transducer ('sub_left'), or "
+                        "role ('sub'). Resolves via the signal graph. Mutually exclusive "
+                        "with output_index; omit both for legacy broadcast-to-subs."
+                    ),
+                },
                 "output_index": {
                     "type": "integer",
                     "description": (
-                        "Target a single DSP output index (0-3) for per-sub EQ. "
-                        "If omitted, writes to all configured sub outputs."
+                        "Raw DSP output index. Legacy path; prefer `target` for new "
+                        "recipes. If omitted (and target omitted), writes to all "
+                        "configured sub outputs."
                     ),
                 },
                 "simulation_verified": {
@@ -3622,11 +3808,53 @@ _TOOLS: list[Tool] = [
         name="get_config",
         description=(
             "Return the current config.yaml as a dict. Includes all sections: "
-            "denon, minidsp, mic, sub, measurement, connections."
+            "denon, minidsp, mic, sub, measurement, connections. Also includes "
+            "the resolved signal_graph (synthesised from legacy fields when no "
+            "explicit `signal_graph:` block is in config.yaml) so recipes can "
+            "discover transducer names, groups, and profiles in one call."
         ),
         inputSchema={
             "type": "object",
             "properties": {},
+        },
+    ),
+    Tool(
+        name="get_signal_graph",
+        description=(
+            "Return a compact summary of the signal graph: sources, processors, "
+            "transducers (name, role, processor, output_index, profile, position), "
+            "groups, and safety profiles. Read this once at the start of a recipe "
+            "to discover scope names ('bass', 'front_soundstage', 'left_main') that "
+            "can be passed as `target` to apply_eq / apply_input_eq. Legacy installs "
+            "without a signal_graph in config.yaml still return a synthesised graph "
+            "so callers never have to branch on 'is there a graph or not.'"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {},
+        },
+    ),
+    Tool(
+        name="resolve_target",
+        description=(
+            "Resolve a scope string to the list of transducers it covers. Accepts "
+            "a group name ('bass'), a transducer name ('sub_left'), or a role "
+            "('sub'). Returns an array of {transducer, processor, output_index, "
+            "profile, position}. Use this before calling tools that don't yet "
+            "accept a `target` parameter (set_delay, set_polarity, set_output_gain, "
+            "mute_output, unmute_output) — resolve to concrete output indices, "
+            "then pass those to the per-output tools. An empty return means the "
+            "target didn't match any group, transducer, or role."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Group, transducer, or role name.",
+                },
+            },
+            "required": ["target"],
         },
     ),
     Tool(
@@ -4659,12 +4887,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_apply_eq(
             arguments.get("filters", []),
             output_index=output_index,
+            target=arguments.get("target"),
             simulation_verified=bool(arguments.get("simulation_verified", False)),
         )
     elif name == "apply_input_eq":
         result = await _tool_apply_input_eq(
             arguments.get("filters", []),
             target_curve=arguments.get("target_curve"),
+            target=arguments.get("target"),
             simulation_verified=bool(arguments.get("simulation_verified", False)),
         )
     elif name in ("set_volume", "avr_set_volume", "set_denon_volume"):
@@ -4719,6 +4949,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         )
     elif name == "get_config":
         result = await _tool_get_config()
+    elif name == "get_signal_graph":
+        result = await _tool_get_signal_graph()
+    elif name == "resolve_target":
+        result = await _tool_resolve_target(str(arguments["target"]))
     elif name == "set_config":
         result = await _tool_set_config(arguments["updates"])
     elif name == "discover_avr":
@@ -4969,16 +5203,16 @@ def create_app() -> Starlette:
     @asynccontextmanager
     async def lifespan(app: Starlette):
         """Load drivers on startup; start transports; tear down on shutdown."""
-        global _avr, _dsp
+        global _avr, _dsp, _drivers
         cfg = _config()
-        _avr = load_avr_driver(cfg)
-        _dsp = load_dsp_driver(cfg)
-        await _avr.setup()
-        await _dsp.setup()
+        _drivers = load_drivers_from_graph(cfg)
+        _dsp = _drivers.default_dsp()
+        _avr = _drivers.default_avr()
+        for name, drv in _drivers.all():
+            await drv.setup()
         log.info(
-            "Drivers loaded: avr=%s dsp=%s",
-            cfg.avr_driver_name,
-            cfg.dsp_driver_name,
+            "Drivers loaded: %s",
+            ", ".join(f"{name}={type(drv).__name__}" for name, drv in _drivers.all()),
         )
 
         # Rehydrate DSP driver shadow state from last-persisted active_dsp_state.

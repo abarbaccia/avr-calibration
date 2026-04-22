@@ -84,6 +84,16 @@ class DenonDriver(AVRDriver):
         except Exception:
             return []
 
+    def sweep_context(self, config):
+        """Return a DenonSweepContext when HDMI route is configured, else None.
+
+        Delegates to the existing standalone ``DenonSweepContext.from_config``
+        so the composer in ``SignalGraph.sweep_context`` can treat all
+        processors uniformly — DSP and AVR both expose ``sweep_context``
+        through their driver.
+        """
+        return DenonSweepContext.from_config(config)
+
 
 class DenonSweepContext:
     """Async context manager for Denon sweep lifecycle.

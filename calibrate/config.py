@@ -37,6 +37,7 @@ DEFAULT_CONFIG: dict = {
         "playback": None,
         "max_peq_slots": 16,
     },
+    "signal_graph": None,
     "mic": {
         "name": "UMIK",
     },
@@ -199,6 +200,21 @@ class Config:
     @property
     def camilladsp(self) -> dict:
         return self._data.get("camilladsp", {})
+
+    @property
+    def signal_graph(self):
+        """Return the parsed SignalGraph, synthesising from legacy config if absent.
+
+        Every install has a graph — the absence of a ``signal_graph:`` block
+        in YAML just means "synthesise one from the legacy single-DSP fields."
+        That keeps MCP tools, safety, storage, and the sweep composer uniform;
+        they never have to branch on "is there a graph or not."
+        """
+        from .graph import SignalGraph
+        block = self._data.get("signal_graph")
+        if block:
+            return SignalGraph.from_dict(block)
+        return SignalGraph.from_legacy(self)
 
     @property
     def mic(self) -> dict:

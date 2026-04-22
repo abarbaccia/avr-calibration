@@ -28,6 +28,98 @@ logger = logging.getLogger(__name__)
 
 from .measurement import FrequencyResponse
 
+
+# ── Active DSP state key helpers ───────────────────────────────────────────────
+#
+# Keys live in one flat `active_dsp_state` column keyed by string. With the
+# signal-graph abstraction, the same output index on two different processors
+# needs distinct keys — so we namespace. The legacy flat shape (``output_eq_0``,
+# ``delay_1``, ``input_eq``, ``gain_2``, ``polarity_3``) is migrated once on
+# first open to the namespaced shape ``processor:<name>:output:<idx>:<field>``.
+# Readers should prefer `parse_dsp_key` so they tolerate both shapes during
+# transient states.
+
+
+def dsp_output_key(processor: str, output_index: int, field: str) -> str:
+    """Canonical key for a per-output DSP state entry."""
+    return f"processor:{processor}:output:{output_index}:{field}"
+
+
+def dsp_input_key(processor: str, field: str = "eq") -> str:
+    """Canonical key for a per-input DSP state entry (typically shared input EQ)."""
+    return f"processor:{processor}:input:{field}"
+
+
+def parse_dsp_key(key: str) -> dict | None:
+    """Parse a namespaced or legacy DSP key into components.
+
+    Returns a dict with some subset of ``{processor, kind, output_index, field}``
+    on success; returns ``None`` for non-DSP keys (e.g. ``"target_curve"``).
+
+    Tolerates both shapes:
+      - namespaced: ``processor:<name>:output:<idx>:<field>`` /
+                    ``processor:<name>:input:<field>``
+      - legacy:     ``output_eq_N`` / ``delay_N`` / ``polarity_N`` /
+                    ``gain_N`` / ``input_eq``
+    """
+    if key.startswith("processor:"):
+        parts = key.split(":")
+        if len(parts) == 5 and parts[2] == "output":
+            try:
+                return {
+                    "processor": parts[1],
+                    "kind": "output",
+                    "output_index": int(parts[3]),
+                    "field": parts[4],
+                }
+            except ValueError:
+                return None
+        if len(parts) == 4 and parts[2] == "input":
+            return {
+                "processor": parts[1],
+                "kind": "input",
+                "field": parts[3],
+            }
+        return None
+
+    # Legacy shapes — processor is unknown at this layer; callers map via the
+    # registry's default DSP name.
+    legacy_fields = {
+        "output_eq_": ("output", "eq"),
+        "delay_":     ("output", "delay"),
+        "polarity_":  ("output", "polarity"),
+        "gain_":      ("output", "gain"),
+    }
+    for prefix, (kind, field) in legacy_fields.items():
+        if key.startswith(prefix):
+            try:
+                return {
+                    "processor": None,
+                    "kind": kind,
+                    "output_index": int(key.removeprefix(prefix)),
+                    "field": field,
+                }
+            except ValueError:
+                return None
+    if key == "input_eq":
+        return {"processor": None, "kind": "input", "field": "eq"}
+    return None
+
+
+def _legacy_to_namespaced(old_key: str, processor: str) -> str | None:
+    """Return the migrated key for an old flat key, or None if it doesn't match.
+
+    ``target_curve`` and other non-processor keys are left alone (return None).
+    """
+    parsed = parse_dsp_key(old_key)
+    if parsed is None or parsed["processor"] is not None:
+        return None
+    if parsed["kind"] == "output":
+        return dsp_output_key(processor, parsed["output_index"], parsed["field"])
+    if parsed["kind"] == "input":
+        return dsp_input_key(processor, parsed["field"])
+    return None
+
 DB_PATH = Path.home() / ".avr-calibration" / "history.db"
 
 _SCHEMA = """\
@@ -223,6 +315,48 @@ class SessionStore:
                 conn.execute(
                     "ALTER TABLE calibration_iterations ADD COLUMN full_state_snapshot TEXT DEFAULT NULL"
                 )
+
+        self._migrate_legacy_active_dsp_keys()
+
+    def _migrate_legacy_active_dsp_keys(self) -> None:
+        """Rewrite flat active_dsp_state keys into processor-namespaced form.
+
+        One-shot — runs until there are no more legacy keys left. Uses the
+        current config's default DSP processor name; if the config can't be
+        loaded (tests, corrupted install), the migration skips cleanly and
+        readers fall back to the legacy-key path via ``parse_dsp_key``.
+        """
+        with self._connect() as conn:
+            legacy_rows = conn.execute(
+                "SELECT key FROM active_dsp_state WHERE key NOT LIKE 'processor:%'"
+            ).fetchall()
+            if not legacy_rows:
+                return
+
+            try:
+                from .config import Config
+                graph = Config.load().signal_graph
+                default_dsp = graph.default_processor("dsp")
+                if default_dsp is None:
+                    return
+                processor_name = default_dsp.name
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.warning(
+                    "active_dsp_state migration skipped (config unreadable): %s", exc
+                )
+                return
+
+            for row in legacy_rows:
+                old_key = row["key"]
+                new_key = _legacy_to_namespaced(old_key, processor_name)
+                if not new_key or new_key == old_key:
+                    continue
+                conn.execute(
+                    "INSERT OR REPLACE INTO active_dsp_state (key, timestamp, data) "
+                    "SELECT ?, timestamp, data FROM active_dsp_state WHERE key=?",
+                    (new_key, old_key),
+                )
+                conn.execute("DELETE FROM active_dsp_state WHERE key=?", (old_key,))
 
     # ── Sessions ─────────────────────────────────────────────────────────────
 
