@@ -3871,11 +3871,15 @@ async def test_resolve_target_unknown_returns_empty_list() -> None:
 async def test_apply_eq_target_resolves_via_graph(
     mock_dsp, valid_filters,
 ) -> None:
-    """apply_eq(target='bass') dispatches per resolved transducer."""
+    """apply_eq(target='bass') dispatches through the graph to the target's driver."""
+    from calibrate.drivers.registry import DriverRegistry
     from calibrate.mcp_server import _tool_apply_eq
 
-    # Legacy config synthesises subs on the 'minidsp' processor.
-    with patch("calibrate.mcp_server._default_dsp_name", return_value="minidsp"):
+    # Legacy config synthesises subs on the 'minidsp' processor. Route the
+    # mocked driver through the registry so the dispatch picks it up.
+    registry = DriverRegistry(drivers={"minidsp": mock_dsp})
+    with patch("calibrate.mcp_server._default_dsp_name", return_value="minidsp"), \
+         patch("calibrate.mcp_server._drivers", registry):
         result = await _tool_apply_eq(valid_filters, target="bass")
 
     assert result["ok"], result
@@ -3905,36 +3909,55 @@ async def test_apply_eq_unknown_target_rejected(mock_dsp, valid_filters) -> None
 
 
 @pytest.mark.asyncio
-async def test_apply_eq_target_rejects_transducer_on_foreign_processor(
-    mock_dsp, valid_filters,
+async def test_apply_eq_target_dispatches_across_multiple_dsps(
+    valid_filters,
 ) -> None:
-    """Multi-DSP target dispatch is a known follow-up — should reject cleanly."""
+    """A group spanning two processors dispatches to each processor's driver."""
+    from calibrate.drivers.registry import DriverRegistry
     from calibrate.mcp_server import _tool_apply_eq
-
-    # Default DSP name is 'minidsp' but the test target lives on 'camilla'.
     from calibrate.graph import (
         Processor, SignalGraph, SVS_PB12_NSD_PROFILE, Transducer, TransducerGroup,
     )
-    alt_graph = SignalGraph(
+
+    cross_graph = SignalGraph(
         processors=(
+            Processor(name="mini", driver_ref="minidsp", kind="dsp"),
             Processor(name="camilla", driver_ref="camilladsp", kind="dsp"),
         ),
-        transducers=(
-            Transducer(name="sub_l", role="sub", processor_ref="camilla",
-                       output_index=0, safety_profile_ref="svs_pb12_nsd"),
-        ),
         profiles=(SVS_PB12_NSD_PROFILE,),
-        groups=(TransducerGroup(name="bass", members=("sub_l",)),),
+        transducers=(
+            Transducer(name="sub_l", role="sub", processor_ref="mini",
+                       output_index=0, safety_profile_ref="svs_pb12_nsd"),
+            Transducer(name="sub_r", role="sub", processor_ref="camilla",
+                       output_index=1, safety_profile_ref="svs_pb12_nsd"),
+        ),
+        groups=(TransducerGroup(name="bass", members=("sub_l", "sub_r")),),
     )
 
     class _FakeCfg:
-        signal_graph = alt_graph
+        signal_graph = cross_graph
+
+    mini = AsyncMock()
+    mini.current_preset.return_value = 0
+    camilla = AsyncMock()
+    camilla.current_preset.return_value = 0
+    registry = DriverRegistry(drivers={"mini": mini, "camilla": camilla})
 
     with patch("calibrate.mcp_server._config", return_value=_FakeCfg()), \
-         patch("calibrate.mcp_server._default_dsp_name", return_value="minidsp"):
+         patch("calibrate.mcp_server._drivers", registry):
         result = await _tool_apply_eq(valid_filters, target="bass")
-    assert not result["ok"]
-    assert "different processor" in result["error"]
+
+    assert result["ok"], result
+    # Each DSP's apply_eq is called exactly once, with its transducer's output_index.
+    mini.apply_eq.assert_awaited_once()
+    camilla.apply_eq.assert_awaited_once()
+    mini_kwargs = mini.apply_eq.await_args.kwargs
+    camilla_kwargs = camilla.apply_eq.await_args.kwargs
+    assert mini_kwargs["output_index"] == 0
+    assert camilla_kwargs["output_index"] == 1
+    # Response payload names the dispatch.
+    applied_procs = {a["processor"] for a in result["applied"]}
+    assert applied_procs == {"mini", "camilla"}
 
 
 @pytest.mark.asyncio
@@ -3942,6 +3965,7 @@ async def test_apply_input_eq_target_validates_against_strictest_profile(
     mock_dsp,
 ) -> None:
     """Input EQ with a named target uses the strictest profile in the scope."""
+    from calibrate.drivers.registry import DriverRegistry
     from calibrate.mcp_server import _tool_apply_input_eq
     from calibrate.graph import (
         Processor, SignalGraph, Transducer, TransducerGroup, TransducerProfile,
@@ -3967,17 +3991,221 @@ async def test_apply_input_eq_target_validates_against_strictest_profile(
     class _FakeCfg:
         signal_graph = mixed_graph
 
+    registry = DriverRegistry(drivers={"dsp": mock_dsp})
+
     # +5 dB would be fine for SVS (6 dB limit) but violates tight_main (2 dB).
     # Strictest wins → rejected.
     bad = [
         {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
         {"freq": 60.0, "gain_db": 5.0, "q": 1.0, "type": "peaking"},
     ]
-    with patch("calibrate.mcp_server._config", return_value=_FakeCfg()):
+    with patch("calibrate.mcp_server._config", return_value=_FakeCfg()), \
+         patch("calibrate.mcp_server._drivers", registry):
         result = await _tool_apply_input_eq(bad, target="all")
     assert not result["ok"]
     assert "SafetyValidator" in result["error"]
     assert "tight_main" in result["error"]
+
+
+def _default_config_cfg():
+    """Return a Config using DEFAULT_CONFIG — bypasses the user's on-disk config."""
+    from calibrate.config import Config, DEFAULT_CONFIG
+    # Deep-copy via dict constructor so tests can mutate without touching DEFAULT_CONFIG.
+    return Config({k: (dict(v) if isinstance(v, dict) else v) for k, v in DEFAULT_CONFIG.items()})
+
+
+@pytest.mark.asyncio
+async def test_set_delay_target_dispatches_per_transducer() -> None:
+    """set_delay(target='bass') applies the same delay to every sub via its driver."""
+    import calibrate.mcp_server as sut
+    from calibrate.drivers.registry import DriverRegistry
+
+    drv = AsyncMock()
+    registry = DriverRegistry(drivers={"minidsp": drv})
+
+    with patch.object(sut, "_drivers", registry), \
+         patch.object(sut, "_config", return_value=_default_config_cfg()):
+        result = await sut._tool_set_delay(delay_ms=2.5, target="bass")
+
+    assert result["ok"], result
+    # Two subs synthesised by legacy shim (DEFAULT_CONFIG: outputs 0, 1 typed sub).
+    assert drv.set_output_delay.await_count == 2
+    call_outputs = {c.args[0] for c in drv.set_output_delay.await_args_list}
+    assert call_outputs == {0, 1}
+
+
+@pytest.mark.asyncio
+async def test_set_polarity_target_dispatches_per_transducer() -> None:
+    import calibrate.mcp_server as sut
+    from calibrate.drivers.registry import DriverRegistry
+
+    drv = AsyncMock()
+    registry = DriverRegistry(drivers={"minidsp": drv})
+
+    with patch.object(sut, "_drivers", registry), \
+         patch.object(sut, "_config", return_value=_default_config_cfg()):
+        result = await sut._tool_set_polarity(inverted=True, target="bass")
+
+    assert result["ok"]
+    assert drv.set_output_polarity.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_set_output_gain_target_dispatches_per_transducer() -> None:
+    import calibrate.mcp_server as sut
+    from calibrate.drivers.registry import DriverRegistry
+
+    drv = AsyncMock()
+    registry = DriverRegistry(drivers={"minidsp": drv})
+
+    with patch.object(sut, "_drivers", registry), \
+         patch.object(sut, "_config", return_value=_default_config_cfg()):
+        result = await sut._tool_set_output_gain(gain_db=-3.0, target="bass")
+
+    assert result["ok"]
+    assert drv.set_output_gain.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_mute_output_target_dispatches_per_driver() -> None:
+    """mute_output(target='bass') groups transducers by driver and calls once per driver."""
+    import calibrate.mcp_server as sut
+    from calibrate.drivers.registry import DriverRegistry
+
+    drv = AsyncMock()
+    registry = DriverRegistry(drivers={"minidsp": drv})
+
+    with patch.object(sut, "_drivers", registry), \
+         patch.object(sut, "_config", return_value=_default_config_cfg()):
+        result = await sut._tool_mute_output(target="bass")
+
+    assert result["ok"]
+    # Both subs are on the same driver → one batched mute_outputs call.
+    drv.mute_outputs.assert_awaited_once()
+    assert set(drv.mute_outputs.await_args.args[0]) == {0, 1}
+
+
+@pytest.mark.asyncio
+async def test_set_delay_target_and_output_index_conflict_rejected() -> None:
+    import calibrate.mcp_server as sut
+    from calibrate.drivers.registry import DriverRegistry
+
+    with patch.object(sut, "_drivers", DriverRegistry()):
+        result = await sut._tool_set_delay(delay_ms=1.0, output_index=0, target="bass")
+    assert not result["ok"]
+    assert "either target or output_index" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_trigger_measurement_hdmi_uses_graph_sweep_context() -> None:
+    """HDMI route with _drivers populated composes AVR + DSP contexts via the graph."""
+    import calibrate.mcp_server as sut
+    from calibrate.drivers.registry import DriverRegistry
+    from calibrate.drivers.dsp_driver import DSPCapabilities
+
+    # Mock Denon and DSP drivers; each returns a recording context.
+    denon_events: list[str] = []
+    dsp_events: list[str] = []
+
+    class _RecCtx:
+        def __init__(self, name: str, events: list[str]) -> None:
+            self.name = name
+            self._events = events
+        async def __aenter__(self):
+            self._events.append(f"enter:{self.name}")
+            return self
+        async def __aexit__(self, *_):
+            self._events.append(f"exit:{self.name}")
+
+    denon_drv = MagicMock()
+    denon_drv.sweep_context = MagicMock(return_value=_RecCtx("denon", denon_events))
+    dsp_drv = MagicMock()
+    dsp_drv.sweep_context = MagicMock(return_value=_RecCtx("dsp", dsp_events))
+    dsp_drv.capabilities = DSPCapabilities(
+        max_delay_ms=30, max_preset_index=3,
+        valid_sources=frozenset({"Analog", "Usb"}),
+        processing_rate=96000, max_peq_slots=8, fir_capable=True,
+        fir_min_taps=64, fir_max_taps_per_output=2048,
+        fir_shared_tap_pool=4096, fir_sample_rate_hz=96000,
+    )
+
+    registry = DriverRegistry(drivers={"denon": denon_drv, "minidsp": dsp_drv})
+
+    # Legacy shim synthesises denon+minidsp processor names, so the registry
+    # keyed on those names is what the graph will look up.
+    mock_sd = MagicMock()
+    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
+    mock_fr = MagicMock()
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(return_value=mock_fr)
+    mock_store = MagicMock()
+    mock_store.save_measurement.return_value = 42
+
+    # Force the route to HDMI for this test (user's dev config may have it
+    # set already; patch the Config.load to return a predictable state).
+    from calibrate.config import Config, DEFAULT_CONFIG
+    test_data = {**DEFAULT_CONFIG}
+    test_data["measurement"] = {**DEFAULT_CONFIG["measurement"], "playback_route": "hdmi"}
+
+    with (
+        patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
+        patch("calibrate.storage.SessionStore", return_value=mock_store),
+        patch.object(sut, "_drivers", registry),
+        patch.object(sut, "_config", return_value=Config(test_data)),
+    ):
+        result = await sut._tool_trigger_measurement()
+
+    assert result["ok"], result
+    # Graph composer entered AVR first, then DSP; exited in reverse order.
+    assert denon_events == ["enter:denon", "exit:denon"]
+    assert dsp_events == ["enter:dsp", "exit:dsp"]
+
+
+@pytest.mark.asyncio
+async def test_apply_input_eq_target_dispatches_per_processor(valid_filters) -> None:
+    """A group spanning two processors calls apply_input_eq on each driver."""
+    from calibrate.drivers.registry import DriverRegistry
+    from calibrate.mcp_server import _tool_apply_input_eq
+    from calibrate.graph import (
+        Processor, SignalGraph, Transducer, TransducerGroup,
+        SVS_PB12_NSD_PROFILE,
+    )
+
+    cross_graph = SignalGraph(
+        processors=(
+            Processor(name="mini", driver_ref="minidsp", kind="dsp"),
+            Processor(name="camilla", driver_ref="camilladsp", kind="dsp"),
+        ),
+        profiles=(SVS_PB12_NSD_PROFILE,),
+        transducers=(
+            Transducer(name="sub_l", role="sub", processor_ref="mini",
+                       output_index=0, safety_profile_ref="svs_pb12_nsd"),
+            Transducer(name="sub_r", role="sub", processor_ref="camilla",
+                       output_index=1, safety_profile_ref="svs_pb12_nsd"),
+        ),
+        groups=(TransducerGroup(name="bass", members=("sub_l", "sub_r")),),
+    )
+
+    class _FakeCfg:
+        signal_graph = cross_graph
+
+    mini = AsyncMock()
+    mini.current_preset.return_value = 0
+    camilla = AsyncMock()
+    camilla.current_preset.return_value = 0
+    registry = DriverRegistry(drivers={"mini": mini, "camilla": camilla})
+
+    with patch("calibrate.mcp_server._config", return_value=_FakeCfg()), \
+         patch("calibrate.mcp_server._drivers", registry):
+        result = await _tool_apply_input_eq(valid_filters, target="bass")
+
+    assert result["ok"], result
+    mini.apply_input_eq.assert_awaited_once()
+    camilla.apply_input_eq.assert_awaited_once()
+    procs = {a["processor"] for a in result["applied"]}
+    assert procs == {"mini", "camilla"}
 
 
 # ── Storage key migration ─────────────────────────────────────────────────────

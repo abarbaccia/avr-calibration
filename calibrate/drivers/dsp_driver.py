@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
@@ -9,6 +10,77 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..config import Config
+
+log = logging.getLogger(__name__)
+
+
+class DSPHDMISweepContext:
+    """Driver-agnostic HDMI-mode neutralisation for DSP sweeps.
+
+    When the calibration signal arrives through the HDMI route (AVR decoding
+    → DSP → subs), the DSP has to be in a known-transparent configuration:
+    its source routed to the AVR input (``"Analog"`` on miniDSP; not
+    applicable to CamillaDSP which has no source switching), and an optional
+    HDMI-specific master gain in force for the duration of the measurement.
+
+    This context abstracts both concerns. Drivers with ``valid_sources`` in
+    their capabilities get the source switched + restored; drivers without
+    (CamillaDSP) skip that half. Master gain is only touched when
+    ``measurement.master_gain_hdmi_db`` is set.
+
+    The same context object is safe for both miniDSP and CamillaDSP —
+    behaviour derives from each driver's declared capabilities plus the
+    config, not from any driver-specific branching here.
+    """
+
+    def __init__(self, driver, config: "Config") -> None:
+        self._driver = driver
+        self._config = config
+        self._saved_source: str | None = None
+        self._saved_gain: float | None = None
+
+    @property
+    def active(self) -> bool:
+        return self._saved_source is not None or self._saved_gain is not None
+
+    async def __aenter__(self):
+        caps = self._driver.capabilities
+        state = await self._driver.get_state()
+        current_source = state.get("source", "") or ""
+
+        # Source-side neutralisation — only DSPs that report sources need this.
+        if caps.valid_sources and current_source.lower() != "analog":
+            self._saved_source = current_source
+            log.info("HDMI sweep: switching DSP source %s→Analog", current_source)
+            await self._driver.set_source("Analog")
+
+        # Master gain — applies uniformly to any DSP that has a SetVolume
+        # equivalent (miniDSP gain CLI, CamillaDSP SetVolume).
+        hdmi_gain = self._config.measurement.get("master_gain_hdmi_db")
+        if hdmi_gain is not None:
+            self._saved_gain = float(state.get("volume", 0.0) or 0.0)
+            log.info(
+                "HDMI sweep: master gain %.1f dB (was %.1f dB)",
+                float(hdmi_gain), self._saved_gain,
+            )
+            await self._driver.set_master_gain(float(hdmi_gain))
+        return self
+
+    async def __aexit__(self, *_):
+        if self._saved_gain is not None:
+            try:
+                await self._driver.set_master_gain(self._saved_gain)
+                log.info("HDMI sweep: restored master gain to %.1f dB", self._saved_gain)
+            except Exception as exc:
+                log.warning("HDMI sweep: failed to restore master gain: %s", exc)
+            self._saved_gain = None
+        if self._saved_source is not None:
+            try:
+                await self._driver.set_source(self._saved_source)
+                log.info("HDMI sweep: restored DSP source to %s", self._saved_source)
+            except Exception as exc:
+                log.warning("HDMI sweep: failed to restore DSP source: %s", exc)
+            self._saved_source = None
 
 
 @dataclass(frozen=True)
