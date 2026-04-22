@@ -29,9 +29,10 @@ None.
 
 Call these MCP tools in parallel:
 - `get_device_state` — current AVR + DSP hardware state
-- `read_eq` — current EQ filter state
 - `get_measurement_history` with limit=3 — recent measurements
-- `get_calibration_runs` with limit=3 — recent calibration runs
+- `get_calibration_runs` with limit=3 — recent calibration runs (the latest run's
+  `full_state_snapshot` is the authoritative record of EQ/delay/gain state; the
+  miniDSP itself is write-only)
 
 ### Step 2 — Report current EQ
 

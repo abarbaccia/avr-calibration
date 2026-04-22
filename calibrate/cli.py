@@ -322,8 +322,6 @@ def signal_path_apply(config_path: Path | None, source: str | None, preset: int 
     Reads source/preset from config.yaml unless overridden by --source/--preset.
     Always applies the routing matrix from config if defined.
     """
-    from .adapters.minidsp import VALID_SOURCES, MAX_PRESET_INDEX
-
     path = config_path or CONFIG_PATH
     if not path.exists():
         click.echo(f"No config found at {path}. Run 'calibrate check' first.", err=True)
@@ -335,14 +333,15 @@ def signal_path_apply(config_path: Path | None, source: str | None, preset: int 
     effective_source = source or sp.get("source")
     effective_preset = preset if preset is not None else sp.get("preset")
 
-    if effective_source is not None and effective_source not in VALID_SOURCES:
-        click.echo(click.style(f"Error: source must be one of {sorted(VALID_SOURCES)}", fg="red"), err=True)
-        sys.exit(1)
-    if effective_preset is not None and not (0 <= effective_preset <= MAX_PRESET_INDEX):
-        click.echo(click.style(f"Error: preset must be 0-{MAX_PRESET_INDEX}", fg="red"), err=True)
-        sys.exit(1)
-
     driver = load_dsp_driver(cfg)
+    caps = driver.capabilities
+
+    if effective_source is not None and effective_source not in caps.valid_sources:
+        click.echo(click.style(f"Error: source must be one of {sorted(caps.valid_sources)}", fg="red"), err=True)
+        sys.exit(1)
+    if effective_preset is not None and not (0 <= effective_preset <= caps.max_preset_index):
+        click.echo(click.style(f"Error: preset must be 0-{caps.max_preset_index}", fg="red"), err=True)
+        sys.exit(1)
 
     async def _apply() -> None:
         if effective_preset is not None:

@@ -146,7 +146,7 @@ check below. Report as a checklist with pass/fail for each item.
 
 ### Safety checks
 - [ ] Every `apply_eq` / `apply_input_eq` mention includes mandatory 18Hz HPF
-- [ ] Iterative steps use merge pattern (read_eq -> audit -> merge -> apply full set)
+- [ ] Iterative steps use merge pattern (track applied filters in context -> audit -> merge -> apply full set)
 - [ ] Target curve anchor excludes nulls (>15dB below average)
 - [ ] Target curve anchor excludes below-port frequencies
 - [ ] Does NOT re-anchor between iterations

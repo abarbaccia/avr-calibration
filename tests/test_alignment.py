@@ -20,9 +20,33 @@ from calibrate.alignment import (
     measure_sub_ir,
     MUTE_GAIN_DB,
 )
+from calibrate.drivers.dsp_driver import DSPCapabilities
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+
+def _fake_driver(max_delay_ms: float = 30.0) -> AsyncMock:
+    """AsyncMock DSPDriver with a realistic DSPCapabilities attached.
+
+    Tests that exercise apply_delays/set_output_delay need capabilities.max_delay_ms
+    to be a real float — the bare AsyncMock returns a MagicMock for that attribute,
+    which breaks ordered comparisons.
+    """
+    driver = AsyncMock()
+    driver.capabilities = DSPCapabilities(
+        max_delay_ms=max_delay_ms,
+        max_preset_index=3,
+        valid_sources=frozenset({"Analog", "Toslink", "Usb"}),
+        processing_rate=96_000,
+        max_peq_slots=8,
+        fir_capable=True,
+        fir_min_taps=64,
+        fir_max_taps_per_output=2048,
+        fir_shared_tap_pool=4096,
+        fir_sample_rate_hz=96_000,
+    )
+    return driver
 
 def _make_sweep(duration_s: float = 0.5, sample_rate: int = 48000) -> list[float]:
     """Minimal log sweep for testing (same formula as MeasurementEngine)."""
@@ -308,7 +332,7 @@ async def test_apply_delays_normal() -> None:
     """Positive delay → set_output_delay called for the lagging sub."""
     from calibrate.alignment import apply_delays
 
-    client = AsyncMock()
+    client = _fake_driver()
     results = [
         SubIRResult(sub_index=0, peak_time_s=0.010, peak_sign=1, polarity_inverted=False, spl_db=-20.0),
         SubIRResult(sub_index=1, peak_time_s=0.012, peak_sign=1, polarity_inverted=False, spl_db=-20.0),
@@ -319,17 +343,17 @@ async def test_apply_delays_normal() -> None:
 
 @pytest.mark.asyncio
 async def test_apply_delays_exceeds_max_clamped() -> None:
-    """Delay exceeding hardware max is clamped to MAX_DELAY_MS."""
+    """Delay exceeding hardware max is clamped to driver.capabilities.max_delay_ms."""
     from calibrate.alignment import apply_delays
-    from calibrate.adapters.minidsp import MAX_DELAY_MS
 
-    client = AsyncMock()
+    max_delay_ms = 30.0
+    client = _fake_driver(max_delay_ms=max_delay_ms)
     results = [
         SubIRResult(sub_index=0, peak_time_s=0.0, peak_sign=1, polarity_inverted=False, spl_db=-20.0),
     ]
-    huge_delay = MAX_DELAY_MS + 100.0
+    huge_delay = max_delay_ms + 100.0
     await apply_delays([huge_delay], results, [0], client)
-    client.set_output_delay.assert_called_once_with(0, MAX_DELAY_MS)
+    client.set_output_delay.assert_called_once_with(0, max_delay_ms)
 
 
 @pytest.mark.asyncio
@@ -337,7 +361,7 @@ async def test_apply_delays_zero_skipped() -> None:
     """Zero delay (reference sub) → set_output_delay not called."""
     from calibrate.alignment import apply_delays
 
-    client = AsyncMock()
+    client = _fake_driver()
     results = [
         SubIRResult(sub_index=0, peak_time_s=0.012, peak_sign=1, polarity_inverted=False, spl_db=-20.0),
     ]
@@ -350,7 +374,7 @@ async def test_apply_delays_client_failure_logged() -> None:
     """set_output_delay failure → warning logged, no exception raised."""
     from calibrate.alignment import apply_delays
 
-    client = AsyncMock()
+    client = _fake_driver()
     client.set_output_delay.side_effect = Exception("write error")
     results = [
         SubIRResult(sub_index=0, peak_time_s=0.010, peak_sign=1, polarity_inverted=False, spl_db=-20.0),

@@ -6,7 +6,6 @@ No real network, hardware, or file access required.
 Covers:
   - get_device_state: connected + unreachable for both drivers
   - get_measurement_history: returns sessions, handles empty, handles storage error
-  - read_eq: returns in-memory state (flat on startup, updated after apply_eq)
   - apply_eq: valid filters → driver.apply_eq called
   - apply_eq: DriverError propagated as {ok: false}
   - set_volume: success and failure cases
@@ -23,7 +22,7 @@ Covers:
   - fetch_recipe: path traversal via ".." → rejected
   - fetch_recipe: path traversal via symlink → rejected
   - MCP tool dispatch: unknown tool name → error
-  - resources: measurements://latest, eq://current
+  - resources: measurements://latest
 """
 
 from __future__ import annotations
@@ -63,8 +62,6 @@ from calibrate.mcp_server import (
     _tool_get_output_state,
     _tool_mute_output,
     _tool_optimize_q,
-    _tool_read_eq,
-    _tool_read_input_eq,
     _tool_set_delay,
     _tool_set_master_gain,
     _tool_set_output_gain,
@@ -113,13 +110,7 @@ def mock_hdmi_config():
 
 @pytest.fixture
 def mock_dsp():
-    """Patch _dsp with an AsyncMock DSPDriver.
-
-    apply_eq is stateful: it stores filters in _eq_state so read_eq
-    reflects what was applied (mirrors MinidspDriver behaviour in tests).
-    """
-    _eq_state: dict[int, list[dict]] = {}
-
+    """Patch _dsp with an AsyncMock DSPDriver."""
     dsp = AsyncMock()
     dsp.current_preset.return_value = 0
     dsp.get_state.return_value = {
@@ -131,22 +122,14 @@ def mock_dsp():
         "mute": False,
     }
 
-    async def read_eq(preset: int) -> list[dict]:
-        return list(_eq_state.get(preset, []))
-
     async def apply_eq(preset: int, filters: list[dict], output_index: int | None = None, simulation_verified: bool = False) -> None:
-        _eq_state[preset] = list(filters)
+        return None
 
     async def apply_input_eq(preset: int, filters: list[dict], input_index: int | None = None, simulation_verified: bool = False) -> None:
-        _eq_state[("input", preset)] = list(filters)
+        return None
 
-    async def read_input_eq(preset: int) -> list[dict]:
-        return list(_eq_state.get(("input", preset), []))
-
-    dsp.read_eq.side_effect = read_eq
     dsp.apply_eq.side_effect = apply_eq
     dsp.apply_input_eq.side_effect = apply_input_eq
-    dsp.read_input_eq.side_effect = read_input_eq
 
     with patch("calibrate.mcp_server._dsp", dsp):
         yield dsp
@@ -224,7 +207,7 @@ async def test_get_measurement_history_returns_sessions() -> None:
         mock_store = MagicMock()
         mock_store.list_sessions.return_value = [mock_session]
         mock_store_cls.return_value = mock_store
-        result = await _tool_get_measurement_history(limit=5)
+        result = await _tool_get_measurement_history(limit=5, fmt="full")
 
     assert result["ok"]
     assert result["count"] == 1
@@ -358,26 +341,6 @@ async def test_get_fr_summary_empty() -> None:
     assert result["count"] == 0
 
 
-# ── read_eq ────────────────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_read_eq_starts_flat(mock_dsp) -> None:
-    result = await _tool_read_eq()
-    assert result["ok"]
-    assert result["filters"] == []
-
-
-@pytest.mark.asyncio
-async def test_read_eq_reflects_applied_state(mock_dsp, valid_filters) -> None:
-    """After apply_eq, read_eq should return the applied filters."""
-    apply_result = await _tool_apply_eq(valid_filters)
-    assert apply_result["ok"], apply_result
-
-    read_result = await _tool_read_eq()
-    assert read_result["ok"]
-    assert len(read_result["filters"]) == len(valid_filters)
-
-
 # ── apply_eq ───────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -447,15 +410,6 @@ async def test_apply_eq_generic_exception_returns_error(mock_dsp, valid_filters)
     result = await _tool_apply_eq(valid_filters)
     assert not result["ok"]
     assert "apply_eq error" in result["error"]
-
-
-@pytest.mark.asyncio
-async def test_apply_eq_updates_reflected_in_read_eq(mock_dsp, valid_filters) -> None:
-    """State from apply_eq is reflected by read_eq (driver is stateful)."""
-    await _tool_apply_eq(valid_filters)
-    read_result = await _tool_read_eq()
-    assert read_result["ok"]
-    assert len(read_result["filters"]) == len(valid_filters)
 
 
 # ── avr_set_volume / set_denon_volume ──────────────────────────────────────────
@@ -609,6 +563,7 @@ async def test_trigger_measurement_with_denon_context() -> None:
     mock_ctx_instance.__aexit__ = AsyncMock(return_value=False)
 
     mock_dsp_local = AsyncMock()
+    mock_dsp_local.get_state = AsyncMock(return_value={"source": "Analog", "volume": 0.0})
 
     with (
         patch.dict(sys.modules, {"sounddevice": mock_sd}),
@@ -617,7 +572,6 @@ async def test_trigger_measurement_with_denon_context() -> None:
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
         patch.object(sut, "_dsp", mock_dsp_local),
-        patch("calibrate.drivers.minidsp._get_source_via_cli", new_callable=AsyncMock, return_value="Analog"),
     ):
         MockCtx.from_config.return_value = mock_ctx_instance
         result = await _tool_trigger_measurement()
@@ -733,6 +687,7 @@ async def test_calibrate_level_usb_predict_verify() -> None:
     Target 78 dB SPL. Correction = +20 → gain = -10.
     Verify IR peak = 78 dB SPL. 2 sweeps."""
     mock_dsp = AsyncMock()
+    mock_dsp.sweep_context = MagicMock(return_value=None)
 
     probe_fr = _make_fr(58.0)  # 58 dB SPL at -30 gain
     verify_fr = _make_fr(78.0)  # 78 dB SPL — on target
@@ -744,7 +699,6 @@ async def test_calibrate_level_usb_predict_verify() -> None:
         patch.object(sut, "_dsp", mock_dsp),
         patch.object(sut, "_config", return_value=_make_usb_cfg()),
         patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
-        patch("calibrate.drivers.minidsp.MinidspSweepContext.from_config", return_value=None),
         patch("calibrate.config.update_config") as mock_update,
         patch("asyncio.sleep"),
     ):
@@ -763,6 +717,7 @@ async def test_calibrate_level_usb_predict_verify() -> None:
 async def test_calibrate_level_usb_verify_still_hot_backs_off() -> None:
     """USB mode: verify IR peak >3 dB above target → backs off."""
     mock_dsp = AsyncMock()
+    mock_dsp.sweep_context = MagicMock(return_value=None)
 
     probe_fr = _make_fr(90.0)  # 90 dB SPL
     verify_fr = _make_fr(85.0)  # 85 dB > 78+3 → backs off
@@ -774,7 +729,6 @@ async def test_calibrate_level_usb_verify_still_hot_backs_off() -> None:
         patch.object(sut, "_dsp", mock_dsp),
         patch.object(sut, "_config", return_value=_make_usb_cfg()),
         patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
-        patch("calibrate.drivers.minidsp.MinidspSweepContext.from_config", return_value=None),
         patch("calibrate.config.update_config"),
         patch("asyncio.sleep"),
     ):
@@ -792,6 +746,7 @@ async def test_calibrate_level_usb_verify_still_hot_backs_off() -> None:
 async def test_calibrate_level_usb_gain_clamped_to_zero() -> None:
     """USB mode: computed gain would exceed 0 dB → clamped."""
     mock_dsp = AsyncMock()
+    mock_dsp.sweep_context = MagicMock(return_value=None)
 
     probe_fr = _make_fr(40.0)  # very quiet
     verify_fr = _make_fr(70.0)
@@ -803,7 +758,6 @@ async def test_calibrate_level_usb_gain_clamped_to_zero() -> None:
         patch.object(sut, "_dsp", mock_dsp),
         patch.object(sut, "_config", return_value=_make_usb_cfg()),
         patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
-        patch("calibrate.drivers.minidsp.MinidspSweepContext.from_config", return_value=None),
         patch("calibrate.config.update_config"),
         patch("asyncio.sleep"),
     ):
@@ -820,6 +774,7 @@ async def test_calibrate_level_usb_snr_fail_on_probe() -> None:
     from calibrate.measurement import MeasurementQualityError
 
     mock_dsp = AsyncMock()
+    mock_dsp.sweep_context = MagicMock(return_value=None)
     mock_engine = MagicMock()
     mock_engine.measure = AsyncMock(
         side_effect=MeasurementQualityError("snr", "SNR 8 dB < 20 dB", "increase level"),
@@ -829,7 +784,6 @@ async def test_calibrate_level_usb_snr_fail_on_probe() -> None:
         patch.object(sut, "_dsp", mock_dsp),
         patch.object(sut, "_config", return_value=_make_usb_cfg()),
         patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
-        patch("calibrate.drivers.minidsp.MinidspSweepContext.from_config", return_value=None),
         patch("calibrate.config.update_config"),
         patch("asyncio.sleep"),
     ):
@@ -856,6 +810,7 @@ async def test_calibrate_level_usb_no_dsp() -> None:
 async def test_calibrate_level_usb_solo_gain_hint() -> None:
     """USB mode with 2 subs: suggested_solo_gain_db is higher by ~6 dB."""
     mock_dsp = AsyncMock()
+    mock_dsp.sweep_context = MagicMock(return_value=None)
     mock_cfg = _make_usb_cfg()
     mock_cfg.minidsp.get.side_effect = lambda key, default=None: (
         [{"type": "sub"}, {"type": "sub"}, {"type": "shaker"}]
@@ -872,7 +827,6 @@ async def test_calibrate_level_usb_solo_gain_hint() -> None:
         patch.object(sut, "_dsp", mock_dsp),
         patch.object(sut, "_config", return_value=mock_cfg),
         patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
-        patch("calibrate.drivers.minidsp.MinidspSweepContext.from_config", return_value=None),
         patch("calibrate.config.update_config"),
         patch("asyncio.sleep"),
     ):
@@ -1115,14 +1069,6 @@ async def test_resource_measurements_latest_returns_first() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resource_eq_current(mock_dsp) -> None:
-    result = await _read_resource("eq://current")
-    data = json.loads(result)
-    assert "preset" in data
-    assert "filters" in data
-
-
-@pytest.mark.asyncio
 async def test_resource_unknown_uri() -> None:
     result = await _read_resource("unknown://foo")
     data = json.loads(result)
@@ -1163,31 +1109,12 @@ async def test_get_device_state_dsp_generic_exception(mock_avr, mock_dsp) -> Non
 
 
 @pytest.mark.asyncio
-async def test_read_eq_driver_error(mock_dsp) -> None:
-    """DriverError from dsp.current_preset → {ok: false}."""
-    mock_dsp.current_preset.side_effect = DriverError("dsp unreachable")
-    result = await _tool_read_eq()
-    assert not result["ok"]
-    assert "dsp unreachable" in result["error"]
-
-
-@pytest.mark.asyncio
 async def test_trigger_measurement_sounddevice_unavailable() -> None:
     """sounddevice not available → error."""
     with patch.dict(sys.modules, {"sounddevice": None}):
         result = await _tool_trigger_measurement()
     assert not result["ok"]
     assert "sounddevice" in result["error"] or "audio" in result["error"].lower()
-
-
-@pytest.mark.asyncio
-async def test_resource_eq_current_driver_error(mock_dsp) -> None:
-    """DriverError from dsp in eq://current resource → JSON error."""
-    mock_dsp.current_preset.side_effect = DriverError("preset unavailable")
-    result = await _read_resource("eq://current")
-    data = json.loads(result)
-    assert "error" in data
-    assert "preset unavailable" in data["error"]
 
 
 # ── MCP handler dispatch (call_tool for all branches) ─────────────────────────
@@ -1213,15 +1140,6 @@ async def test_call_tool_get_measurement_history() -> None:
     data = json.loads(texts[0].text)
     assert data["ok"]
     assert data["count"] == 0
-
-
-@pytest.mark.asyncio
-async def test_call_tool_read_eq(mock_dsp) -> None:
-    from calibrate.mcp_server import call_tool
-    texts = await call_tool("read_eq", {})
-    data = json.loads(texts[0].text)
-    assert data["ok"]
-    assert "filters" in data
 
 
 @pytest.mark.asyncio
@@ -1311,17 +1229,15 @@ async def test_list_resources_returns_known_resources() -> None:
     resources = await list_resources()
     uris = {str(r.uri) for r in resources}
     assert "measurements://latest" in uris
-    assert "eq://current" in uris
 
 
 @pytest.mark.asyncio
-async def test_read_resource_handler_delegates(mock_dsp) -> None:
-    """read_resource() MCP handler delegates to _read_resource()."""
+async def test_read_resource_handler_delegates() -> None:
+    """read_resource() MCP handler delegates to _read_resource() for unknown URIs."""
     from calibrate.mcp_server import read_resource
-    result = await read_resource("eq://current")
+    result = await read_resource("unknown://foo")
     data = json.loads(result)
-    assert "preset" in data
-    assert "filters" in data
+    assert "error" in data
 
 
 # ── create_app ────────────────────────────────────────────────────────────────
@@ -2161,7 +2077,7 @@ async def test_get_measurement_history_min_hz_filters_low_freqs() -> None:
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
-        result = await _tool_get_measurement_history(limit=1, min_hz=20.0)
+        result = await _tool_get_measurement_history(limit=1, min_hz=20.0, fmt="full")
     assert result["ok"]
     data = result["sessions"][0]
     assert data["freq_hz"] == [20.0, 50.0, 100.0, 200.0]
@@ -2175,7 +2091,7 @@ async def test_get_measurement_history_max_hz_filters_high_freqs() -> None:
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
-        result = await _tool_get_measurement_history(limit=1, max_hz=100.0)
+        result = await _tool_get_measurement_history(limit=1, max_hz=100.0, fmt="full")
     data = result["sessions"][0]
     assert data["freq_hz"] == [10.0, 20.0, 50.0, 100.0]
     assert data["spl_db"] == [1.0, 2.0, 3.0, 4.0]
@@ -2188,7 +2104,7 @@ async def test_get_measurement_history_min_max_hz_combined() -> None:
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
-        result = await _tool_get_measurement_history(limit=1, min_hz=20.0, max_hz=100.0)
+        result = await _tool_get_measurement_history(limit=1, min_hz=20.0, max_hz=100.0, fmt="full")
     data = result["sessions"][0]
     assert data["freq_hz"] == [20.0, 50.0, 100.0]
     assert data["spl_db"] == [2.0, 3.0, 4.0]
@@ -2201,7 +2117,7 @@ async def test_get_measurement_history_decimation() -> None:
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
-        result = await _tool_get_measurement_history(limit=1, decimation=2)
+        result = await _tool_get_measurement_history(limit=1, decimation=2, fmt="full")
     data = result["sessions"][0]
     assert data["freq_hz"] == [10.0, 30.0, 50.0]
     assert data["spl_db"] == [1.0, 3.0, 5.0]
@@ -2214,59 +2130,10 @@ async def test_get_measurement_history_rounds_floats() -> None:
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
-        result = await _tool_get_measurement_history(limit=1)
+        result = await _tool_get_measurement_history(limit=1, fmt="full")
     data = result["sessions"][0]
     assert data["freq_hz"] == [20.14, 40.28]
     assert data["spl_db"] == [-5.12, -3.99]
-
-
-# ── read_input_eq ────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_read_input_eq_starts_empty(mock_dsp) -> None:
-    """No input EQ applied yet → empty filter list."""
-    result = await _tool_read_input_eq()
-    assert result["ok"]
-    assert result["filters"] == []
-    assert result["target"] == "input"
-
-
-@pytest.mark.asyncio
-async def test_read_input_eq_reflects_applied_state(mock_dsp) -> None:
-    """After apply_input_eq, read_input_eq returns the applied filters."""
-    from calibrate.mcp_server import _tool_apply_input_eq
-    filters = [
-        {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
-        {"freq": 50.0, "gain_db": -2.0, "q": 1.0, "type": "peaking"},
-    ]
-    apply_result = await _tool_apply_input_eq(filters)
-    assert apply_result["ok"]
-
-    read_result = await _tool_read_input_eq()
-    assert read_result["ok"]
-    assert len(read_result["filters"]) == 2
-    assert read_result["preset"] == 0
-
-
-@pytest.mark.asyncio
-async def test_read_input_eq_driver_error(mock_dsp) -> None:
-    """DriverError from dsp.current_preset → {ok: false}."""
-    mock_dsp.current_preset.side_effect = DriverError("dsp unreachable")
-    result = await _tool_read_input_eq()
-    assert not result["ok"]
-    assert "read_input_eq error" in result["error"]
-
-
-@pytest.mark.asyncio
-async def test_call_tool_read_input_eq_dispatch(mock_dsp) -> None:
-    """call_tool('read_input_eq') dispatches correctly."""
-    from calibrate.mcp_server import call_tool
-    texts = await call_tool("read_input_eq", {})
-    data = json.loads(texts[0].text)
-    assert data["ok"]
-    assert "filters" in data
-    assert data["target"] == "input"
 
 
 # ── compute_deviation ────────────────────────────────────────────────────────
@@ -3385,16 +3252,56 @@ async def test_design_fir_with_target_curve() -> None:
 
 @pytest.mark.asyncio
 async def test_design_fir_invalid_tap_count() -> None:
-    """Tap count outside 64-2048 → error."""
+    """Tap count outside the driver's [min, max] range → error."""
     freqs = [20.0, 50.0, 100.0]
     spls = [75.0, 75.0, 75.0]
     session = _make_fr_session(freqs, spls)
 
+    # No _dsp attached → falls back to the built-in miniDSP defaults (64-2048).
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
         result = await _tool_design_fir(session_id=1, num_taps=32)
     assert not result["ok"]
-    assert "64-2048" in result["error"]
+    assert "64" in result["error"] and "2048" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_design_fir_uses_driver_capabilities() -> None:
+    """When a driver is attached, tap limits and sample rate come from it."""
+    import numpy as np
+    from calibrate.drivers.dsp_driver import DSPCapabilities
+    import calibrate.mcp_server as srv
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [75.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+
+    class _StubDSP:
+        capabilities = DSPCapabilities(
+            max_delay_ms=1000.0,
+            max_preset_index=-1,
+            valid_sources=frozenset(),
+            processing_rate=48_000,
+            max_peq_slots=32,
+            fir_capable=True,
+            fir_min_taps=64,
+            fir_max_taps_per_output=65536,
+            fir_shared_tap_pool=None,
+            fir_sample_rate_hz=48_000,
+        )
+
+    prev = srv._dsp
+    srv._dsp = _StubDSP()  # type: ignore[assignment]
+    try:
+        with patch("calibrate.storage.SessionStore") as MockStore:
+            MockStore.return_value.list_sessions.return_value = [session]
+            # 8192 taps would fail the old hardcoded 2048 limit — should pass now.
+            result = await _tool_design_fir(session_id=1, num_taps=8192)
+        assert result["ok"], result
+        # Frequency resolution reflects the driver's FIR sample rate (48 kHz), not 96 kHz.
+        assert result["freq_resolution_hz"] == round(48_000 / 8192, 1)
+    finally:
+        srv._dsp = prev
 
 
 @pytest.mark.asyncio

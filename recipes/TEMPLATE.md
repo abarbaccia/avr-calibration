@@ -32,8 +32,9 @@ version: {semantic version}
 
 ## Phase 0 — Setup
 {MUST reset ALL DSP state to known defaults before any measurement.
- `read_eq` / `get_output_state` only track in-memory changes since
- server start. Hardware flash retains prior settings. Always write explicitly.}
+ The miniDSP is write-only — there is no readback. `get_output_state`
+ only reflects what this MCP server has written since it started.
+ Hardware flash retains prior settings. Always write explicitly.}
 
 ## Phase N — {Recipe-specific phases}
 {The recipe's core logic.}
@@ -128,5 +129,7 @@ Only reference tools from this list.
 | `get_measurement_history` | FR data with coherence (use format="compact") |
 | `get_fr_summary` | 1/3-octave downsampled FR (coarse, quick checks only) |
 | `compare_sessions` | Per-band delta between two measurements |
-| `read_eq` / `read_input_eq` | Current PEQ state |
 | `fetch_recipe` | Load a recipe by name |
+
+> PEQ is write-only — track filters you applied in conversation context; pass the
+> full merged set to `apply_eq` each iteration (never just a delta).

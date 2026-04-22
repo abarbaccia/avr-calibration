@@ -26,6 +26,17 @@ DEFAULT_CONFIG: dict = {
             {"index": 3, "label": "", "type": "unused"},
         ],
     },
+    "camilladsp": {
+        "host": "127.0.0.1",
+        "port": 1234,
+        "samplerate": 48000,
+        "chunksize": 1024,
+        "input_channels": 2,
+        "output_channels": 10,
+        "capture": None,
+        "playback": None,
+        "max_peq_slots": 16,
+    },
     "mic": {
         "name": "UMIK",
     },
@@ -83,6 +94,8 @@ CONFIG_TEMPLATE = """\
 # AVR Calibration Configuration
 # Run 'calibrate check' after editing to verify everything is reachable.
 
+# dsp_driver: minidsp        # "minidsp" (default) or "camilladsp"
+
 denon:
   # host: "192.168.1.100"  # Optional: set a fixed IP to skip SSDP auto-discovery.
   #                         # Leave commented out — the equipment check will find
@@ -99,6 +112,28 @@ minidsp:
         outputs: [0, 1, 2, 3]   # output indices this input routes to (unmuted)
       - input: 1
         outputs: [0, 1, 2, 3]
+
+# CamillaDSP (used when dsp_driver: camilladsp). The driver owns the whole
+# pipeline — on every EQ/gain/delay change it regenerates the config and
+# reloads the daemon. Hand-authored CamillaDSP pipelines on this daemon will
+# be replaced the first time the MCP server connects.
+# camilladsp:
+#   host: "127.0.0.1"
+#   port: 1234
+#   samplerate: 48000
+#   chunksize: 1024
+#   input_channels: 2
+#   output_channels: 10
+#   capture:
+#     type: Alsa
+#     device: "hw:Loopback,1,0"
+#     channels: 2
+#     format: S32LE
+#   playback:
+#     type: Alsa
+#     device: "hw:USB,0,0"
+#     channels: 10
+#     format: S32LE
 
 sub:
   port_tune_hz: 22       # Hz — ported sub tuning frequency (shown on FR chart)
@@ -160,6 +195,10 @@ class Config:
     @property
     def minidsp(self) -> dict:
         return self._data.get("minidsp", {})
+
+    @property
+    def camilladsp(self) -> dict:
+        return self._data.get("camilladsp", {})
 
     @property
     def mic(self) -> dict:

@@ -34,7 +34,6 @@ protocol, ordering, and cleanup. Recipes stay hardware-agnostic.
 | `set_volume` | "set AVR volume" | Denon volume control | Done |
 | `get_device_state` | "what's the system state" | Queries all hardware, combines | Done |
 | `check_system` | "is everything working" | PreflightChecker.run_all() | Done |
-| `read_eq` | "current EQ state" | In-memory EQ tracking | Done |
 | `fetch_recipe` | "load a recipe" | Filesystem | Done |
 | `get_config` / `set_config` | "read/write config" | Filesystem | Done |
 | `get_measurement_history` | "past measurements" | SQLite | Done |
@@ -411,3 +410,44 @@ Claude-driven correction lets them specify exactly what they want.
 - [x] Add MCP tool reference
 - [x] Add safety rules (non-negotiable, code-enforced)
 - [x] Add skill routing for calibration skills
+
+---
+
+## Deferred: Collapse `active_dsp_state` into driver + snapshots
+
+The miniDSP is write-only — there is no readback. `read_eq` / `read_input_eq` (the
+MCP tools that pretended to read) have been removed. What remains is the
+`active_dsp_state` SQLite table, which is an overwrite-per-key write-log populated
+by `_persist_dsp_state()` on every `apply_eq` / `apply_input_eq` / `set_delay` /
+`set_polarity` / `set_output_gain` call.
+
+It's redundant in intent with the `full_state_snapshot` column now stored on every
+calibration run + iteration (commit bcb2c56), but it is load-bearing today:
+
+1. `SessionStore.snapshot_full_dsp_state()` (`storage.py:659`) builds the snapshot
+   JSON by reading `get_active_dsp()`. Drop the table → snapshots become empty.
+2. `web.py:/api/dsp-state` (line ~2100) and the activity feed (line ~1914) read
+   the same table to render the live dashboard. Drop the table → dashboard goes
+   blank.
+
+### Plan for the collapse
+- [ ] Add `MinidspDriver.snapshot_state()` returning the full in-memory state dict
+  (EQ per preset + output, gains, delays, polarities, FIR). Already tracked in
+  `_eq_state`, `_output_gain`, `_output_delay`, `_output_polarity`, `_fir_state`.
+- [ ] Decide where `target_curve` lives (it's optimization intent, not DSP state —
+  `calibration_runs.target_curve_data` already stores it per-run). Either stop
+  including it in the "DSP snapshot" or promote it to a first-class column.
+- [ ] Refactor `snapshot_full_dsp_state()` to call the driver's `snapshot_state()`
+  instead of reading SQLite.
+- [ ] Refactor `web.py:/api/dsp-state` to read from the driver (same process) or
+  from the most recent run's `full_state_snapshot`. Pick one — reading from the
+  driver is live; reading from snapshots is consistent with history view.
+- [ ] Refactor `web.py` activity feed to pull "EQ applied" events from
+  `calibration_iterations` instead of active_dsp_state timestamps.
+- [ ] Delete: `active_dsp_state` table + migration, `set_active_dsp` /
+  `get_active_dsp` / `clear_active_dsp` on SessionStore, `_persist_dsp_state`
+  and all its callers in `mcp_server.py`, associated tests in `test_storage.py`
+  and `test_web.py`.
+
+Not urgent — the duplication isn't hurting anything. Worth doing next time we
+touch web dashboard state, to collapse onto one source of truth.

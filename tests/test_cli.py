@@ -16,7 +16,24 @@ from click.testing import CliRunner
 
 from calibrate.cli import cli
 from calibrate.config import Config
+from calibrate.drivers.dsp_driver import DSPCapabilities
 from calibrate.preflight import CheckResult
+
+
+def _minidsp_like_caps() -> DSPCapabilities:
+    """Representative capabilities for a miniDSP-style DSP in tests."""
+    return DSPCapabilities(
+        max_delay_ms=30.0,
+        max_preset_index=3,
+        valid_sources=frozenset({"Analog", "Toslink", "Usb", "Spdif", "Aes"}),
+        processing_rate=96_000,
+        max_peq_slots=8,
+        fir_capable=True,
+        fir_min_taps=64,
+        fir_max_taps_per_output=2048,
+        fir_shared_tap_pool=4096,
+        fir_sample_rate_hz=96_000,
+    )
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -274,6 +291,7 @@ class TestSignalPathApply:
         """Valid --preset → set_preset called, 'Done.' printed."""
         cfg_path = _make_config_file(tmp_path)
         mock_driver = AsyncMock()
+        mock_driver.capabilities = _minidsp_like_caps()
         with (
             patch("calibrate.cli.CONFIG_PATH", cfg_path),
             patch("calibrate.cli.load_dsp_driver", return_value=mock_driver),
@@ -287,6 +305,7 @@ class TestSignalPathApply:
         """Valid --source → set_source called."""
         cfg_path = _make_config_file(tmp_path)
         mock_driver = AsyncMock()
+        mock_driver.capabilities = _minidsp_like_caps()
         with (
             patch("calibrate.cli.CONFIG_PATH", cfg_path),
             patch("calibrate.cli.load_dsp_driver", return_value=mock_driver),
@@ -311,6 +330,7 @@ class TestSignalPathApply:
             "mic": {"name": "UMIK"},
         })
         mock_driver = AsyncMock()
+        mock_driver.capabilities = _minidsp_like_caps()
         with (
             patch("calibrate.cli.CONFIG_PATH", cfg_path),
             patch("calibrate.cli.load_dsp_driver", return_value=mock_driver),
@@ -324,6 +344,7 @@ class TestSignalPathApply:
         from calibrate.drivers.base import DriverError
         cfg_path = _make_config_file(tmp_path)
         mock_driver = AsyncMock()
+        mock_driver.capabilities = _minidsp_like_caps()
         mock_driver.set_preset.side_effect = DriverError("write failed")
         with (
             patch("calibrate.cli.CONFIG_PATH", cfg_path),
@@ -337,6 +358,7 @@ class TestSignalPathApply:
         """Generic exception → red error message, exit 1."""
         cfg_path = _make_config_file(tmp_path)
         mock_driver = AsyncMock()
+        mock_driver.capabilities = _minidsp_like_caps()
         mock_driver.set_source.side_effect = OSError("network unreachable")
         with (
             patch("calibrate.cli.CONFIG_PATH", cfg_path),

@@ -488,3 +488,54 @@ measurement:
 **Deferred because:** Current PEQ workflow (analyze_decay → narrow-Q cuts) is the practical equivalent for amplitude reduction. FIR inverse pre-filtering is Dirac-level complexity and warrants its own tooling before a recipe can be written.
 **Effort:** L — requires IR inversion tooling (likely scipy), regularization logic, FIR coefficient pipeline, and latency compensation in config/MCP.
 **Priority:** P3 — nice-to-have; only meaningfully better than PEQ for T60 reduction, not amplitude reduction.
+
+### TODO-SAFETY-1: Promote speaker-protection limits to per-speaker configs
+**What:** Move the hard-coded SVS PB12-NSD limits in `calibrate/safety.py` (MIN_BOOST_FREQ_HZ, MAX_BOOST_PER_BAND_DB, MAX_BOOST_ABOVE_THRESHOLD_DB, MAX_CUMULATIVE_BOOST_DB, HPF_FREQ_HZ/ORDER) out of module-level constants and into per-speaker profile configs (e.g. `config/speakers/svs-pb12-nsd.yaml`, `config/speakers/<mains-model>.yaml`). `SafetyValidator` takes a speaker profile at construction and validates against those limits. Output channels map to speaker profiles in `config.yaml`.
+**Why:** Current limits are SVS-specific (ported sub, 22 Hz tuning). As soon as we calibrate mains or a second sub model through CamillaDSP + 18i20, the limits become wrong — a sealed sub or a tower main has completely different excursion/port/thermal profiles. Today's single-speaker assumption is baked into the module docstring; needs to be config-driven before multi-speaker calibration.
+**How:** Speaker profile schema (min_boost_freq, max_boost_per_band_db, max_boost_above_threshold_db, threshold_hz, max_cumulative_boost_db, hpf_freq, hpf_order). `SafetyValidator(profile: SpeakerProfile)`. Per-output-channel profile lookup in apply_eq path. Keep current SVS values as the default profile.
+**Effort:** M — schema + validator refactor + config plumbing + tests. Existing tests pin current values; will need per-profile fixtures.
+**Priority:** P2 — blocks full-system calibration (mains + subs) through CamillaDSP. Not a blocker for the bass-only driver swap.
+
+### TODO-CAMILLA-PREFLIGHT: Denon transparency preflight for CamillaDSP workflow
+**What:** Add a preflight check that verifies the Denon is in a "transparent" configuration before a CamillaDSP-target calibration runs. If the Denon isn't transparent, the DSP calibration is silently invalidated (user listens to a different response than was measured).
+
+Required Denon state (refuse or hard-warn if any fail):
+- Audyssey / MultEQ: **off** or bypass
+- Dynamic EQ: **off**
+- Dynamic Volume: **off**
+- Restorer: **off**
+- Tone Defeat: **on** (or bass/treble trims at 0)
+- Channel level trims: **0 dB** (or a single known LFE offset compensated once in CamillaDSP)
+- Source Direct / Pure Direct: **on** at listening input
+- Speaker distances: **0** (or fixed reference — delay lives in CamillaDSP, not the AVR)
+- Bass management: explicit, fixed — either Denon crosses over or CamillaDSP does, not both
+
+**Why:** When CamillaDSP is the calibration target, the Denon's only job is to pass signal unchanged plus a fixed gain. Any of the above drifting silently breaks the workflow — the user calibrates one transfer function and listens to another. This is the #1 way the "calibrate at DSP, AVR is transparent" pattern fails in the wild.
+
+**How:** Extend `preflight.check_denon()` (or add `check_denon_transparent()` gated on `dsp_driver: camilladsp`) to read each flag via `DenonDriver.get_state()`. Some flags may not be readable via denonavr and will require a user-confirmation prompt ("confirm Audyssey is bypassed on your receiver"). Persist the LFE trim offset to `config.yaml` so CamillaDSP can compensate once and the preflight can verify it hasn't drifted.
+
+**Effort:** M — per-flag denonavr API verification; some fall back to user confirmation.
+**Priority:** P1 — blocker for the CamillaDSP-target workflow. Land before first CamillaDSP calibration run.
+
+---
+
+### TODO-CAMILLA-CLEANUP: Close DSPDriver abstraction leaks before 18i20 swap
+**What:** Replace every direct import from `calibrate/adapters/minidsp.py` or `calibrate/drivers/minidsp.py` in code outside the driver/adapter layer with calls on the `DSPDriver` abstract interface. The `DSPDriver` ABC at `calibrate/drivers/dsp_driver.py` and the registry at `calibrate/drivers/registry.py` are already in place — these leaks are the only thing blocking a clean CamillaDspDriver drop-in. Specific leaks:
+
+| File:line | Leak | Target |
+|-----------|------|--------|
+| `calibrate/cli.py:325` | `from ..adapters.minidsp import VALID_SOURCES, MAX_PRESET_INDEX` | Hardware constants belong on the driver (e.g. `driver.valid_sources`, `driver.max_preset_index` or a `DSPCapabilities` dataclass returned from `driver.capabilities()`). |
+| `calibrate/alignment.py:274` | `from .adapters.minidsp import MAX_DELAY_MS` | `driver.capabilities().max_delay_ms`. miniDSP 2x4 HD caps at ~80 ms per output; CamillaDSP is limited only by chunk size. Different hardware = different ceiling. |
+| `calibrate/preflight.py:139,284` | `from .adapters.minidsp import _get_status_via_cli, MinidspApiError` | `driver.get_state()` already exists on the ABC — use it. The private `_get_*_via_cli` helpers are miniDSP-specific and must not leak. |
+| `calibrate/mcp_server.py:152` | `from .drivers.minidsp import MinidspSweepContext` | Promote the sweep-context concept to `DSPDriver.sweep_context()` (async context manager). Each driver handles its own pre-sweep setup (mute/route/input-select) and restores on exit. |
+| `calibrate/mcp_server.py:2155,2164` | `_get_source_via_cli, _get_status_via_cli` direct | `driver.get_state()` / new `driver.get_source()` method. |
+| `calibrate/dsp.py` (biquad math) | Comments hardcode "miniDSP 2x4 HD" and `sample_rate=96_000` default | Comments: rewrite as generic biquad math. `sample_rate` default: pass from driver (`driver.processing_rate`) at call sites; remove the 96 kHz default. 18i20 + CamillaDSP will likely run 48 kHz. |
+| `tests/test_alignment.py`, `tests/test_preflight.py` | Import from `adapters.minidsp` to exercise high-level logic | Swap to a fake `DSPDriver` fixture. These tests currently pin the miniDSP impl rather than testing against the contract. |
+
+**Why:** Today the DSPDriver abstraction exists but is bypassed in ~6 places. Every bypass will break (silently or loudly) the moment `dsp_driver: "camilladsp"` is set in config. Fixing them now, while miniDSP is still the reference impl, makes the CamillaDspDriver implementation a pure additive change — write the new driver, add one line to the registry, swap the config value.
+
+**How:** For each row above, (1) extend the `DSPDriver` ABC with the method/property needed, (2) implement it on `MinidspDriver` (trivial — delegate to existing private helpers), (3) replace the direct import at the call site. Run the full test suite after each row — each is independent and individually reversible. Keep commits small (one leak per commit) so the CamillaDSP driver PR later can show a clean, tiny diff.
+
+**Effort:** M — maybe half a day. Each leak is a 1-to-1 swap; the hard part is the sweep-context refactor (`MinidspSweepContext` is the most stateful piece). `DSPCapabilities` dataclass is a nice consolidation — `max_delay_ms`, `max_preset_index`, `valid_sources`, `processing_rate`, `max_peq_slots` all belong together.
+
+**Priority:** P1 — prerequisite for the CamillaDSP + 18i20 driver swap. Do before the 18i20 arrives; landing this before the hardware shows up means the new-hardware PR is purely additive.

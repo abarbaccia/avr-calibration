@@ -618,12 +618,13 @@ class TestSignalPathSyncEdgeCases:
         assert "skipped" in result.detail
 
     async def test_generic_exception_returns_failed_result(self, config):
-        """Generic exception during miniDSP status fetch → failed CheckResult."""
+        """DriverError during device state fetch → failed CheckResult."""
         from unittest.mock import AsyncMock, patch
+        from calibrate.drivers.base import DriverError
         config._data["minidsp"]["signal_path"] = {"source": "Analog"}
-        with patch("calibrate.adapters.minidsp._get_status_via_cli",
+        with patch("calibrate.drivers.minidsp.MinidspDriver.get_state",
                    new_callable=AsyncMock,
-                   side_effect=OSError("network unreachable")):
+                   side_effect=DriverError("network unreachable")):
             result = await PreflightChecker(config).check_signal_path_sync()
         assert not result.passed
-        assert "Cannot reach miniDSP daemon" in result.error
+        assert "Cannot read device state" in result.error
