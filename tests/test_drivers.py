@@ -1629,6 +1629,24 @@ async def test_camilladsp_set_routing_builds_mixer_mapping() -> None:
     assert by_dest[3] == []
 
 
+def test_camilladsp_default_routing_is_subs_only_not_broadcast() -> None:
+    """Default routing must send input 0 only to sub_outputs, not to every channel.
+
+    Regression guard: on a 10-output 18i20 where outputs 2-9 are wired to
+    mains/tweeters, a default of "input 0 → all outputs" would blast the LFE
+    sweep through every driver at full gain. The driver starts in the
+    minimum safe state; any broader routing has to come from set_routing().
+    """
+    driver = CamillaDSPDriver(input_channels=2, output_channels=10, sub_outputs=[0, 1])
+    # input 0 → subs only
+    for out in range(10):
+        expected = out in {0, 1}
+        assert driver._routing[0][out] is expected, f"output {out} default mismatch"
+    # input 1 → silent everywhere
+    for out in range(10):
+        assert driver._routing[1][out] is False
+
+
 @pytest.mark.asyncio
 async def test_camilladsp_set_master_gain_does_not_push_pipeline() -> None:
     """SetVolume bypasses the pipeline — no SetConfig call should be issued."""
