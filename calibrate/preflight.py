@@ -76,6 +76,7 @@ class PreflightChecker:
             (dsp_label, self.check_minidsp_combined()),
             ("Denon AVR", self.check_denon_and_playback()),
             ("Signal Path", self.check_signal_path_sync()),
+            ("Output routing", self.check_output_routing_safety()),
         ]
         names = [name for name, _ in checks]
         coros = [coro for _, coro in checks]
@@ -488,3 +489,76 @@ class PreflightChecker:
         host = self.config.denon.get("host")
         detail = "denon.host not set (will use SSDP auto-discovery)" if not host else "All fields present"
         return CheckResult(name="Config", passed=True, detail=detail)
+
+    async def check_output_routing_safety(self) -> CheckResult:
+        """Warn when transducers are cabled to Focusrite Monitor-bus outputs.
+
+        The Scarlett 18i20's back-panel Line Outs 01-04 are hardwired to its
+        Monitor 1/2 front-panel knobs — read-only in software, so writes via
+        `amixer`/CamillaDSP silently have no effect on level. Lines 05-10 are
+        direct PCM DACs (full software control). We hit this on run 14 where
+        the front-right sub was cabled to Line 02 (Monitor 1 R), silently
+        attenuated ~33 dB by a turned-down knob.
+
+        The heuristic:
+          - Only warns on CamillaDSP (miniDSP-native installs are unaffected).
+          - Only inspects transducers with role in {sub, shaker, main, surround,
+            atmos, tactile} — unused slots are skipped by design.
+          - Output indices 0-3 (0-indexed) == Lines 01-04 (1-indexed on the
+            back panel). If any active output lands there, warn with the list.
+
+        Non-fatal: calibration can still proceed, but the user is informed so
+        they can re-cable before running a long session that will silently
+        mis-correct the wrong channel.
+        """
+        if self.config.dsp_driver_name != "camilladsp":
+            return CheckResult(
+                name="Output routing",
+                passed=True,
+                detail="not applicable (non-CamillaDSP DSP)",
+            )
+
+        graph = self.config.signal_graph
+        transducers = getattr(graph, "transducers", ()) or ()
+        if not transducers:
+            return CheckResult(
+                name="Output routing",
+                passed=True,
+                detail="no signal_graph transducers to inspect",
+            )
+
+        monitor_bus_offenders: list[str] = []
+        for t in transducers:
+            role = (getattr(t, "role", "") or "").lower()
+            if role in {"", "unused"}:
+                continue
+            idx = getattr(t, "output_index", None)
+            if isinstance(idx, int) and 0 <= idx <= 3:
+                tname = getattr(t, "name", f"idx{idx}")
+                line_label = f"Line 0{idx + 1}"
+                monitor_bus_offenders.append(f"{tname}→{line_label}")
+
+        if not monitor_bus_offenders:
+            return CheckResult(
+                name="Output routing",
+                passed=True,
+                detail="all active outputs on direct-PCM lines (5-10)",
+            )
+
+        joined = ", ".join(monitor_bus_offenders)
+        return CheckResult(
+            name="Output routing",
+            passed=False,
+            detail=(
+                f"{len(monitor_bus_offenders)} transducer(s) on Focusrite Monitor-bus "
+                f"Lines 01-04: {joined}"
+            ),
+            error=(
+                "Lines 01-04 on the Scarlett 18i20 are slaved to the Monitor 1/2 "
+                "front-panel knobs and are READ-ONLY in software. A turned-down "
+                "knob will silently attenuate calibration signal without any "
+                "software indication. Move these cables to Lines 05-10 (direct "
+                "PCM, full software control) and update signal_graph.transducers "
+                "output_index values accordingly."
+            ),
+        )

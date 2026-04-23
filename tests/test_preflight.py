@@ -261,10 +261,11 @@ class TestRunAll:
             patch.object(checker, "check_minidsp_combined", return_value=CheckResult("miniDSP", True, "2x4HD; /dev/hidraw0 present")),
             patch.object(checker, "check_denon_and_playback", return_value=CheckResult("Denon AVR", True, "X3800H; USB: miniDSP")),
             patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
+            patch.object(checker, "check_output_routing_safety", return_value=CheckResult("Output routing", True, "not applicable")),
         ):
             results = await checker.run_all()
         assert all(r.passed for r in results)
-        assert len(results) == 5
+        assert len(results) == 6
 
     async def test_unhandled_exception_becomes_failed_result(self, config):
         checker = PreflightChecker(config)
@@ -274,6 +275,7 @@ class TestRunAll:
             patch.object(checker, "check_minidsp_combined", side_effect=RuntimeError("boom")),
             patch.object(checker, "check_denon_and_playback", return_value=CheckResult("Denon AVR", True, "X3800H")),
             patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
+            patch.object(checker, "check_output_routing_safety", return_value=CheckResult("Output routing", True, "not applicable")),
         ):
             results = await checker.run_all()
         minidsp = next(r for r in results if r.name == "miniDSP 2x4 HD")
@@ -288,12 +290,14 @@ class TestRunAll:
             patch.object(checker, "check_minidsp_combined", side_effect=RuntimeError("err")),
             patch.object(checker, "check_denon_and_playback", side_effect=RuntimeError("err")),
             patch.object(checker, "check_signal_path_sync", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_output_routing_safety", side_effect=RuntimeError("err")),
         ):
             results = await checker.run_all()
         # DSP label now comes from the configured driver — "miniDSP 2x4 HD" for
         # dsp_driver: minidsp (the test fixture default).
         assert [r.name for r in results] == [
             "Config", "Microphone", "miniDSP 2x4 HD", "Denon AVR", "Signal Path",
+            "Output routing",
         ]
 
     async def test_result_names_camilladsp_label(self, config):
@@ -646,3 +650,72 @@ class TestSignalPathSyncEdgeCases:
             result = await PreflightChecker(config).check_signal_path_sync()
         assert not result.passed
         assert "Cannot read device state" in result.error
+
+
+# ── Output routing safety (Focusrite Monitor-bus detection) ─────────────────
+
+@pytest.mark.asyncio
+class TestOutputRoutingSafety:
+    """Scarlett 18i20 Lines 01-04 are slaved to the Monitor 1/2 hardware knobs
+    (read-only in software). Warn when any active transducer lands on those
+    lines. Non-fatal, but catches the silent-attenuation footgun from run 14.
+    """
+
+    def _config_with_graph(self, dsp_driver: str, transducer_indices: list[tuple[str, str, int]]) -> "Config":
+        """transducer_indices: list of (name, role, output_index)."""
+        from calibrate.config import Config
+        return Config({
+            "dsp_driver": dsp_driver,
+            "denon": {"host": "192.168.1.100"},
+            "minidsp": {"host": "localhost", "port": 5380},
+            "mic": {"name": "UMIK"},
+            "signal_graph": {
+                "transducers": [
+                    {
+                        "name": n,
+                        "role": r,
+                        "processor_ref": "camilla" if dsp_driver == "camilladsp" else "minidsp",
+                        "output_index": idx,
+                        "safety_profile_ref": "svs_pb12_nsd",
+                    }
+                    for (n, r, idx) in transducer_indices
+                ],
+            },
+        })
+
+    async def test_non_camilladsp_driver_is_skipped(self):
+        config = self._config_with_graph("minidsp", [("sub_a", "sub", 1)])
+        result = await PreflightChecker(config).check_output_routing_safety()
+        assert result.passed
+        assert "non-CamillaDSP" in result.detail
+
+    async def test_all_outputs_on_direct_pcm_lines(self):
+        config = self._config_with_graph("camilladsp", [
+            ("sub_fr", "sub", 5),
+            ("sub_nf", "sub", 6),
+            ("shaker", "shaker", 7),
+        ])
+        result = await PreflightChecker(config).check_output_routing_safety()
+        assert result.passed
+        assert "direct-PCM" in result.detail
+
+    async def test_monitor_bus_offenders_are_flagged(self):
+        config = self._config_with_graph("camilladsp", [
+            ("sub_fr", "sub", 1),     # Line 02 — Monitor 1 R
+            ("sub_nf", "sub", 2),     # Line 03 — Monitor 2 L
+            ("shaker", "shaker", 7),  # safe
+        ])
+        result = await PreflightChecker(config).check_output_routing_safety()
+        assert not result.passed
+        assert "Line 02" in result.detail
+        assert "Line 03" in result.detail
+        assert "Line 08" not in result.detail  # shaker at 7 → safe, not listed
+        assert "Monitor" in result.error
+
+    async def test_unused_transducers_are_skipped(self):
+        config = self._config_with_graph("camilladsp", [
+            ("front_left_unused", "unused", 0),  # Line 01 BUT unused — ignore
+            ("sub_fr", "sub", 5),                # safe
+        ])
+        result = await PreflightChecker(config).check_output_routing_safety()
+        assert result.passed
