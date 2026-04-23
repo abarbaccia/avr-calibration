@@ -260,24 +260,37 @@ an already-aligned sub.
 For each sub:
 1. Mute all other subs
 2. `measure(label="sub_{N}-solo-align", position="MLP")` — note `session_id`
-3. `analyze_ir(session_id)` → `peak_time_s`, `peak_sign`, `spl_db`
+3. `analyze_ir(session_id)` → `peak_sign`, `spl_db` (see note about `peak_time_ms` below)
 4. Unmute
 
-### 1.2 Analyze phase relationship
+**Note on `peak_time_ms`:** since the cross-correlation alignment fix
+(PR #88), every measurement's IR peak is anchored to t=0 by design to
+eliminate stream-start jitter. This means `peak_time_ms` is essentially
+always 0 and cannot be used to compute inter-sub arrival times anymore.
+`peak_sign` and `spl_db` are still meaningful. Use Phase 1.2's
+`compare_sub_phase` as the PRIMARY delay-estimation tool (next step).
 
-`compare_sub_phase(session_a, session_b)` — per-band phase difference, predicted
-coherent sum. Know where subs reinforce vs cancel BEFORE applying delay or
-polarity.
+### 1.2 Analyze phase relationship (primary alignment tool)
+
+`compare_sub_phase(session_a, session_b)` — per-band phase difference,
+predicted coherent sum. This is THE tool for alignment, not `analyze_ir`
+(see note above). The per-band `phase_diff_deg` lets you compute the
+delay offset needed: at frequency f, a delay of Δt ms produces a phase
+shift of `360 × f × Δt / 1000` degrees. Pick a band in the upper
+focus range (e.g. 50–80 Hz — high enough to be modal-cancellation-free,
+low enough to still be sub territory), read off `phase_diff_deg`, and
+solve for Δt.
 
 ### 1.3 Apply delay correction
 
-Sub with latest `peak_time_s` = reference (delay = 0).
-Each earlier sub: `delay_ms = (reference_peak_time_s - its_peak_time_s) * 1000`.
-Apply via `set_delay`.
+Compute Δt from `compare_sub_phase` output (see Phase 1.2 for the
+formula). Delay the sub that leads. Apply via `set_delay`.
 
 **Describe every hardware action explicitly.** Example:
-"Sub 2 (Nearfield) arrives 3.2 ms earlier than Sub 1 (Front Right). Adding
-3.2 ms delay to output 2 so both subs arrive simultaneously at the mic."
+"compare_sub_phase shows sub_nearfield leading sub_front_right by 134°
+at 40 Hz, which at 40 Hz is 9.3 ms. Adding 7.5 ms delay to
+sub_nearfield (close to the 9.3 ms ideal, rounded for a clean value)
+so the two arrive together at the mic."
 
 ### 1.4 Polarity test (measurement-based)
 
