@@ -74,7 +74,7 @@ def _make_delayed_recording(
 def _make_engine_mock() -> MagicMock:
     """Stub MeasurementEngine that passes validate_recording without raising."""
     engine = MagicMock()
-    engine.validate_recording.return_value = []  # no warnings
+    engine.validate_recording.return_value = ([], 0)  # no warnings, no pre-delay
     return engine
 
 

@@ -112,7 +112,7 @@ class TestMeasureHeadless:
 
         # validate_recording is called inside measure(); mock it so random signals
         # don't fail the SNR quality gate in tests that aren't testing quality gates.
-        engine.validate_recording = MagicMock(return_value=[])
+        engine.validate_recording = MagicMock(return_value=([], 0))
 
         mock_sd = sys.modules["sounddevice"]
         mock_sd.reset_mock()
