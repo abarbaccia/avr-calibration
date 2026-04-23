@@ -2560,6 +2560,75 @@ async def test_compute_deviation_exclude_geometry_true_auto_excludes() -> None:
     assert result["rms_db"] < 0.5
 
 
+@pytest.mark.asyncio
+async def test_compute_deviation_excluded_band_diagnostics() -> None:
+    """T60 ringing in excluded bands (port rolloff / geometry / null zone) is
+    surfaced via `excluded_band_diagnostics`.
+
+    Decay modes in included bands, or with T60 <= 400 ms, must NOT appear.
+    """
+    freqs = [22.0, 25.0, 30.0, 40.0, 50.0, 63.0, 80.0]
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
+    # 50 Hz is a deep null; 22/25 Hz below port rolloff (default 28 Hz).
+    spls = [65.0, 70.0, 74.0, 75.0, 50.0, 76.0, 75.0]
+    session = _make_deviation_session(1, freqs, spls)
+
+    # Mock analyze_decay: 5 modes.
+    # - 24 Hz @ 600 ms → port_rolloff, included
+    # - 50 Hz @ 700 ms → null_zone, included
+    # - 63 Hz @ 800 ms → geometry, included
+    # - 40 Hz @ 900 ms → NOT excluded (normal band), filtered out
+    # - 25 Hz @ 200 ms → port_rolloff but T60 below threshold, filtered out
+    decay_payload = {
+        "ok": True,
+        "modes": [
+            {"freq_hz": 24.0, "t60_ms": 600.0, "peak_db": 6.0},
+            {"freq_hz": 50.0, "t60_ms": 700.0, "peak_db": 4.5},
+            {"freq_hz": 63.0, "t60_ms": 800.0, "peak_db": 3.2},
+            {"freq_hz": 40.0, "t60_ms": 900.0, "peak_db": 8.0},
+            {"freq_hz": 25.0, "t60_ms": 200.0, "peak_db": 5.0},
+        ],
+    }
+
+    with patch("calibrate.storage.SessionStore") as MockStore, \
+         patch("calibrate.mcp_server._get_geometry_band_ranges", return_value=[(60.0, 66.0)]), \
+         patch("calibrate.mcp_server._tool_analyze_decay", return_value=decay_payload):
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_compute_deviation(
+            session_id=1, target_curve=target,
+        )
+
+    assert result["ok"]
+    diags = result["excluded_band_diagnostics"]
+    reasons = {d["freq_hz"]: d["reason"] for d in diags}
+    assert reasons == {24.0: "port_rolloff", 50.0: "null_zone", 63.0: "geometry"}
+    # Ensure 40 Hz (included band) and 25 Hz (T60 below 400 ms) did not appear.
+    assert 40.0 not in reasons
+    assert 25.0 not in reasons
+    # Shape check on one entry.
+    port_entry = next(d for d in diags if d["freq_hz"] == 24.0)
+    assert port_entry["t60_ms"] == 600.0
+    assert port_entry["peak_db"] == 6.0
+
+
+@pytest.mark.asyncio
+async def test_compute_deviation_excluded_band_diagnostics_graceful_on_failure() -> None:
+    """If analyze_decay raises or returns not-ok, diagnostics is an empty list."""
+    freqs = [30.0, 40.0, 50.0, 63.0, 80.0]
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
+    spls = [75.0, 75.0, 75.0, 75.0, 75.0]
+    session = _make_deviation_session(1, freqs, spls)
+
+    with patch("calibrate.storage.SessionStore") as MockStore, \
+         patch("calibrate.mcp_server._tool_analyze_decay",
+               side_effect=RuntimeError("no impulse response")):
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_compute_deviation(session_id=1, target_curve=target)
+
+    assert result["ok"]
+    assert result["excluded_band_diagnostics"] == []
+
+
 # ── anchor_target ────────────────────────────────────────────────────────────
 
 
@@ -4501,6 +4570,103 @@ async def test_fit_correction_filter_requires_target_curve_or_offsets() -> None:
         )
     assert not result["ok"]
     assert "target_curve" in result["error"] or "target_offsets" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_fit_correction_filter_max_q_boost_raises_boost_q() -> None:
+    """max_q_boost should push boost filters to higher Q (narrower), preventing
+    the LM optimiser from parking a broad low-Q boost that bleeds broadband level."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 400).tolist()
+    # A broad shallow dip at 45 Hz that the optimiser would naturally fill with
+    # a wide (low-Q) boost if unconstrained.
+    spls = [80.0 - 4.0 * np.exp(-((f - 45.0) ** 2) / 200.0) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+    target = {
+        "points": [{"freq": 20, "spl": 80.0}, {"freq": 120, "spl": 80.0}],
+        "band": [20, 120],
+    }
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        unconstrained = await _tool_fit_correction_filter(
+            session_id=1, target_curve=target,
+            freq_range=[30.0, 90.0], num_filters=2,
+            constraints={"max_boost_db": 6.0},
+            exclude_geometry=False,
+        )
+        constrained = await _tool_fit_correction_filter(
+            session_id=1, target_curve=target,
+            freq_range=[30.0, 90.0], num_filters=2,
+            constraints={"max_boost_db": 6.0, "max_q_boost": 3.0, "boost_q_penalty": 10.0},
+            exclude_geometry=False,
+        )
+    assert unconstrained["ok"] and constrained["ok"]
+    # Mean Q of boost filters should be higher (narrower) when max_q_boost is applied.
+    def mean_boost_q(result: dict) -> float:
+        boosts = [f for f in result["filters"] if f["gain_db"] > 0.1]
+        return sum(f["q"] for f in boosts) / len(boosts) if boosts else 0.0
+
+    constrained_q = mean_boost_q(constrained)
+    unconstrained_q = mean_boost_q(unconstrained)
+    # If there are boost filters, the constrained run should have higher or equal Q.
+    boost_filters = [f for f in constrained["filters"] if f["gain_db"] > 0.1]
+    if boost_filters:
+        assert constrained_q >= unconstrained_q - 0.1, (
+            f"max_q_boost didn't raise boost Q: constrained={constrained_q:.2f} "
+            f"unconstrained={unconstrained_q:.2f}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_fit_correction_filter_baseline_filters_incremental() -> None:
+    """baseline_filters should pre-apply an existing correction so the
+    optimiser designs *additional* filters on top rather than redoing the
+    whole bank from scratch."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 400).tolist()
+    # Two peaks: 40 Hz and 70 Hz, both +6 dB above target.
+    spls = [
+        80.0
+        + 6.0 * np.exp(-((f - 40.0) ** 2) / 9.0)
+        + 6.0 * np.exp(-((f - 70.0) ** 2) / 9.0)
+        for f in freqs
+    ]
+    session = _make_fr_session(freqs, spls)
+    target = {
+        "points": [{"freq": 20, "spl": 80.0}, {"freq": 120, "spl": 80.0}],
+        "band": [20, 120],
+    }
+    # Suppose a -6 dB cut at 40 Hz is already applied in hardware.
+    existing_filter = {"type": "peaking", "freq": 40.0, "gain_db": -6.0, "q": 3.0}
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        # Without baseline — optimiser sees both peaks, assigns filters to both.
+        without_baseline = await _tool_fit_correction_filter(
+            session_id=1, target_curve=target,
+            freq_range=[30.0, 90.0], num_filters=2,
+            exclude_geometry=False,
+        )
+        # With baseline — 40 Hz peak already corrected; optimiser should focus on 70 Hz.
+        with_baseline = await _tool_fit_correction_filter(
+            session_id=1, target_curve=target,
+            freq_range=[30.0, 90.0], num_filters=2,
+            baseline_filters=[existing_filter],
+            exclude_geometry=False,
+        )
+    assert without_baseline["ok"] and with_baseline["ok"]
+    # The baseline run should place at least one filter near 70 Hz.
+    filters_near_70 = [
+        f for f in with_baseline["filters"] if 60.0 <= f["freq"] <= 80.0
+    ]
+    assert filters_near_70, (
+        f"baseline_filters: expected a cut near 70 Hz but got {with_baseline['filters']}"
+    )
+    # rms_before for the baseline run should be lower (40 Hz peak already corrected).
+    assert with_baseline["rms_before"] < without_baseline["rms_before"], (
+        "baseline_filters should reduce rms_before by pre-applying existing correction"
+    )
 
 
 @pytest.mark.asyncio

@@ -859,6 +859,48 @@ async def _tool_compute_deviation(
                     zone_start = zone_end = f
             null_zones.append({"lo_hz": zone_start, "hi_hz": zone_end})
 
+        # Surface T60 ringing in excluded bands. compute_deviation excludes
+        # port-rolloff, geometry, and null-zone bands from RMS (EQ can't fix
+        # them), but the LLM still needs to know if those bands have bad
+        # ringing (T60 > 400 ms) that calls for physical treatment.
+        excluded_band_diagnostics: list[dict] = []
+        try:
+            decay_result = await _tool_analyze_decay(session_id=session_id)
+            if decay_result.get("ok"):
+                for mode in decay_result.get("modes", []):
+                    freq_hz = float(mode.get("freq_hz", 0.0))
+                    t60_ms = float(mode.get("t60_ms", 0.0))
+                    if t60_ms <= 400.0:
+                        continue
+                    if freq_hz < port_rolloff_hz:
+                        reason = "port_rolloff"
+                    elif _in_geometry(freq_hz):
+                        reason = "geometry"
+                    elif any(
+                        zone["lo_hz"] <= freq_hz <= zone["hi_hz"]
+                        for zone in null_zones
+                    ):
+                        reason = "null_zone"
+                    else:
+                        continue
+                    excluded_band_diagnostics.append({
+                        "freq_hz": round(freq_hz, 1),
+                        "t60_ms": round(t60_ms, 1),
+                        "peak_db": round(float(mode.get("peak_db", 0.0)), 1),
+                        "reason": reason,
+                    })
+            else:
+                log.warning(
+                    "compute_deviation: analyze_decay failed (%s); "
+                    "excluded_band_diagnostics will be empty",
+                    decay_result.get("error"),
+                )
+        except Exception as exc:
+            log.warning(
+                "compute_deviation: analyze_decay raised (%s); "
+                "excluded_band_diagnostics will be empty", exc,
+            )
+
         return _ok(
             session_id=session_id,
             rms_db=round(rms, 2),
@@ -877,6 +919,7 @@ async def _tool_compute_deviation(
             ],
             null_zones=null_zones,
             summary=summary,
+            excluded_band_diagnostics=excluded_band_diagnostics,
         )
     except Exception as exc:
         return _err(f"compute_deviation failed: {exc}")
@@ -1594,6 +1637,7 @@ async def _tool_fit_correction_filter(
     constraints: dict | None = None,
     num_filters: int = 1,
     exclude_geometry: bool = True,
+    baseline_filters: list[dict] | None = None,
 ) -> dict:
     """Find the optimal PEQ filter(s) to minimize RMS in a frequency range.
 
@@ -1698,6 +1742,22 @@ async def _tool_fit_correction_filter(
         def _in_geometry(freq_hz: float) -> bool:
             return any(lo <= freq_hz <= hi for lo, hi in geometry_ranges)
 
+        # baseline_filters: when caller passes the currently-applied filter
+        # bank, apply it to the measured FR first so the optimiser sees the
+        # residual *after* the existing correction. Lets the fit add new
+        # filters on top instead of replacing the whole bank.
+        def _apply_baseline(freq_hz: float) -> float:
+            total = 0.0
+            for bf in baseline_filters or []:
+                total += _biquad_response(
+                    freq_hz,
+                    bf.get("type", "peaking"),
+                    float(bf["freq"]),
+                    float(bf["gain_db"]),
+                    float(bf.get("q", 0.707)),
+                )
+            return total
+
         # Build error pairs in the target range
         error_pairs = []
         excluded_geometry_points = 0
@@ -1710,7 +1770,8 @@ async def _tool_fit_correction_filter(
             if _in_geometry(f):
                 excluded_geometry_points += 1
                 continue
-            error_pairs.append((f, measured, target, measured - target))
+            corrected = measured + _apply_baseline(f)
+            error_pairs.append((f, corrected, target, corrected - target))
 
         if not error_pairs:
             return _err(f"no data in range {range_lo}-{range_hi} Hz")
@@ -1734,6 +1795,13 @@ async def _tool_fit_correction_filter(
         preserve_mean_strength = float(c.get("preserve_mean_strength", 1.0))
         doublet_penalty = float(c.get("doublet_penalty", 0.0))
         doublet_max_hz = float(c.get("doublet_max_hz", 5.0))
+        # Cap Q on positive-gain filters. LM otherwise parks a broad Q~0.5
+        # boost at the band edge that bleeds into adjacent bands and pushes
+        # mean level up. Cuts rarely have this pathology (narrow cuts are
+        # benign). None/0 disables the penalty.
+        max_q_boost = c.get("max_q_boost")
+        max_q_boost = float(max_q_boost) if max_q_boost is not None else None
+        boost_q_penalty = float(c.get("boost_q_penalty", 5.0))
 
         # ── Multi-filter joint optimization (N > 1) ─────────────────────────
         # For N > 1, treat the filter parameters as a continuous optimization
@@ -1815,6 +1883,23 @@ async def _tool_fit_correction_filter(
                 # or down across the whole band.
                 if mean_weight > 0:
                     extras.append(np.array([mean_weight * float(np.mean(correction))]))
+
+                # Boost-Q penalty: one slot per filter — non-zero only when
+                # the filter is a boost (positive gain) with Q below
+                # max_q_boost. Penalises low-Q positive-gain filters that
+                # otherwise bleed broadband level up.
+                if max_q_boost is not None:
+                    bq = np.zeros(num_filters)
+                    for i in range(num_filters):
+                        if gains[i] > 0:
+                            q_i = float(x[3 * i + 2])
+                            if q_i < max_q_boost:
+                                bq[i] = (
+                                    boost_q_penalty
+                                    * (max_q_boost - q_i)
+                                    * gains[i]
+                                )
+                    extras.append(bq)
 
                 # Doublet penalty: one slot per unordered filter pair so the
                 # residual vector is a fixed size (scipy requires it). Each
@@ -6097,22 +6182,26 @@ _TOOLS: list[Tool] = [
                 "constraints": {
                     "type": "object",
                     "description": (
-                        "Optional. {max_boost_db, min_q, max_q, filter_type, "
-                        "preserve_mean, preserve_mean_strength, "
-                        "doublet_penalty, doublet_max_hz}. filter_type "
-                        "honored only when num_filters=1 (joint mode is "
-                        "peaking-only). preserve_mean=True keeps "
-                        "mean(correction) ≈ 0 so broadband level stays put; "
-                        "preserve_mean_strength (default 1.0) multiplies "
-                        "the soft-constraint weight — raise above 1 to "
-                        "force mean preservation harder at some SSE cost. "
-                        "doublet_penalty > 0 discourages opposing-sign filter "
-                        "pairs within doublet_max_hz (default 5 Hz)."
+                        "Optional. {max_boost_db, min_q, max_q, max_q_boost, "
+                        "boost_q_penalty, filter_type, preserve_mean, "
+                        "preserve_mean_strength, doublet_penalty, "
+                        "doublet_max_hz}. filter_type honored only when "
+                        "num_filters=1 (joint mode is peaking-only). "
+                        "preserve_mean=True keeps mean(correction) ≈ 0 so "
+                        "broadband level stays put; preserve_mean_strength "
+                        "(default 1.0) multiplies the soft-constraint "
+                        "weight. doublet_penalty > 0 discourages opposing-"
+                        "sign filter pairs within doublet_max_hz. "
+                        "max_q_boost caps Q on positive-gain (boost) "
+                        "filters separately — prevents broad low-Q boosts "
+                        "from bleeding into adjacent bands."
                     ),
                     "properties": {
                         "max_boost_db": {"type": "number"},
                         "min_q": {"type": "number"},
                         "max_q": {"type": "number"},
+                        "max_q_boost": {"type": "number"},
+                        "boost_q_penalty": {"type": "number"},
                         "filter_type": {"type": "string"},
                         "preserve_mean": {"type": "boolean"},
                         "preserve_mean_strength": {"type": "number"},
@@ -6140,6 +6229,18 @@ _TOOLS: list[Tool] = [
                         "unfixable nulls."
                     ),
                     "default": True,
+                },
+                "baseline_filters": {
+                    "type": "array",
+                    "description": (
+                        "Optional currently-applied PEQ filter bank. When "
+                        "passed, the tool applies these filters to the "
+                        "measured FR before fitting so the returned filters "
+                        "refine the existing correction instead of replacing "
+                        "it. Use with num_filters=1 to add a single targeted "
+                        "tweak on top of the current bank."
+                    ),
+                    "items": {"type": "object"},
                 },
             },
             "required": ["session_id", "freq_range"],
@@ -6572,6 +6673,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             constraints=arguments.get("constraints"),
             num_filters=int(arguments.get("num_filters", 1)),
             exclude_geometry=bool(arguments.get("exclude_geometry", True)),
+            baseline_filters=arguments.get("baseline_filters"),
         )
     elif name == "predict_rms":
         result = await _tool_predict_rms(
