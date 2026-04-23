@@ -683,12 +683,18 @@ async def _tool_compute_deviation(
     port_rolloff_hz: float = 28.0,
     resolution: str = "sixth_octave",
     convergence_threshold: float = 1.5,
+    exclude_geometry: bool = True,
 ) -> dict:
     """Compute RMS deviation of a measurement against a target curve.
 
     Automatically detects and excludes:
     - Null zones: frequencies where measured SPL is > null_threshold_db below the band average
     - Below-port rolloff: frequencies below port_rolloff_hz where the sub physically can't produce output
+    - Geometry nulls (optional, on by default): 1/3-octave bands that analyze_phase
+      classifies as 'geometry' — near-π phase offset caused by cancellation at the
+      listener position. EQ cannot fix these; including them inflates RMS and
+      drives the driving agent to keep iterating past convergence. Run 14's RMS
+      was dominated by the 27 Hz and 69 Hz bands for exactly this reason.
 
     Resolution controls the summary band density:
     - "third_octave": ~6 bands in 25-80 Hz (original, coarse)
@@ -747,11 +753,30 @@ async def _tool_compute_deviation(
         measured_spls = [s for _, s in pairs]
         band_avg = sum(measured_spls) / len(measured_spls)
 
+        # Geometry bands (near-π cancellation) from analyze_phase. EQ can't fix
+        # them, so treat them like null zones for RMS purposes.
+        geometry_ranges: list[tuple[float, float]] = []
+        if exclude_geometry:
+            try:
+                geometry_ranges = await _get_geometry_band_ranges(
+                    session_id, min_hz=band_lo, max_hz=band_hi,
+                )
+            except Exception as exc:
+                log.warning(
+                    "compute_deviation: geometry exclusion unavailable (%s); "
+                    "falling back to SPL-based null detection only", exc,
+                )
+                geometry_ranges = []
+
+        def _in_geometry(freq_hz: float) -> bool:
+            return any(lo <= freq_hz < hi for lo, hi in geometry_ranges)
+
         # Classify each frequency point
         per_band_errors = []
         included_errors = []
         excluded_null = []
         excluded_rolloff = []
+        excluded_geometry = []
 
         for freq, measured in pairs:
             target = interpolate_target(freq)
@@ -763,16 +788,21 @@ async def _tool_compute_deviation(
             # Check exclusions
             is_null = measured < (band_avg - null_threshold_db)
             is_rolloff = freq < port_rolloff_hz
+            is_geometry = _in_geometry(freq)
 
             entry = {
                 "freq_hz": round(freq, 1),
                 "measured_db": round(measured, 1),
                 "target_db": round(target, 1),
                 "error_db": round(error, 1),
-                "excluded": is_null or is_rolloff,
+                "excluded": is_null or is_rolloff or is_geometry,
             }
 
-            if is_null:
+            # Priority: geometry first (most specific), then null, then rolloff.
+            if is_geometry:
+                excluded_geometry.append(round(freq, 1))
+                entry["exclude_reason"] = "geometry"
+            elif is_null:
                 excluded_null.append(round(freq, 1))
                 entry["exclude_reason"] = "null"
             elif is_rolloff:
@@ -840,6 +870,11 @@ async def _tool_compute_deviation(
             included_points=len(included_errors),
             excluded_null_points=len(excluded_null),
             excluded_rolloff_points=len(excluded_rolloff),
+            excluded_geometry_points=len(excluded_geometry),
+            geometry_bands=[
+                {"lo_hz": round(lo, 1), "hi_hz": round(hi, 1)}
+                for lo, hi in geometry_ranges
+            ],
             null_zones=null_zones,
             summary=summary,
         )
@@ -854,6 +889,7 @@ async def _tool_anchor_target(
     max_boost_db: float = 6.0,
     null_threshold_db: float = 15.0,
     port_rolloff_hz: float = 28.0,
+    exclude_geometry: bool = True,
 ) -> dict:
     """Compute the optimal reference SPL for a target curve against a baseline measurement.
 
@@ -925,12 +961,29 @@ async def _tool_anchor_target(
         measured_spls = [s for _, s in pairs]
         band_avg = sum(measured_spls) / len(measured_spls)
 
+        # Geometry bands (near-π cancellation) from analyze_phase — same
+        # treatment as compute_deviation: exclude so the anchor doesn't get
+        # dragged toward an unreachable limiting frequency.
+        geometry_ranges_at: list[tuple[float, float]] = []
+        if exclude_geometry:
+            try:
+                geometry_ranges_at = await _get_geometry_band_ranges(
+                    session_id, min_hz=band_lo, max_hz=band_hi,
+                )
+            except Exception as exc:
+                log.warning(
+                    "anchor_target: geometry exclusion unavailable (%s); "
+                    "falling back to SPL-based null detection only", exc,
+                )
+                geometry_ranges_at = []
+
         # Compute headroom at each valid frequency
         headroom_values: list[tuple[float, float, float, float]] = (
             []
         )  # (freq, measured, offset, headroom)
         excluded_null: list[float] = []
         excluded_rolloff: list[float] = []
+        excluded_geometry_at: list[float] = []
 
         for freq, measured in pairs:
             offset = interpolate_offset(freq)
@@ -939,8 +992,11 @@ async def _tool_anchor_target(
 
             is_null = measured < (band_avg - null_threshold_db)
             is_rolloff = freq < port_rolloff_hz
+            is_geometry = any(lo <= freq < hi for lo, hi in geometry_ranges_at)
 
-            if is_null:
+            if is_geometry:
+                excluded_geometry_at.append(round(freq, 1))
+            elif is_null:
                 excluded_null.append(round(freq, 1))
             elif is_rolloff:
                 excluded_rolloff.append(round(freq, 1))
@@ -960,15 +1016,19 @@ async def _tool_anchor_target(
         )
         reference_spl = min_headroom + max_boost_db
 
-        # Build anchored target curve (absolute SPL at each offset point)
+        # Build anchored target curve. Flag anchored points that are below
+        # port_rolloff_hz as unreachable — the sub physically can't produce
+        # those levels, so Phase 3 filter design should ignore them.
         anchored_points = []
         for p in offsets_sorted:
-            anchored_points.append(
-                {
-                    "freq": p["freq_hz"],
-                    "spl": round(reference_spl + p["offset_db"], 2),
-                }
-            )
+            point = {
+                "freq": p["freq_hz"],
+                "spl": round(reference_spl + p["offset_db"], 2),
+            }
+            if p["freq_hz"] < port_rolloff_hz:
+                point["reachable"] = False
+                point["reason"] = "below port-tune rolloff"
+            anchored_points.append(point)
 
         # Build error summary at each target offset frequency
         error_summary = []
@@ -1012,6 +1072,11 @@ async def _tool_anchor_target(
             error_summary=error_summary,
             excluded_null_points=len(excluded_null),
             excluded_rolloff_points=len(excluded_rolloff),
+            excluded_geometry_points=len(excluded_geometry_at),
+            geometry_bands=[
+                {"lo_hz": round(lo, 1), "hi_hz": round(hi, 1)}
+                for lo, hi in geometry_ranges_at
+            ],
             null_zones=null_zones,
             valid_points=len(headroom_values),
         )
@@ -1870,6 +1935,32 @@ async def _tool_optimize_q(
         )
     except Exception as exc:
         return _err(f"optimize_q failed: {exc}")
+
+
+async def _get_geometry_band_ranges(
+    session_id: int, min_hz: float, max_hz: float,
+) -> list[tuple[float, float]]:
+    """Return per-1/3-octave (lo_hz, hi_hz) ranges classified as 'geometry'.
+
+    Thin wrapper around _tool_analyze_phase used by compute_deviation and
+    anchor_target to auto-exclude near-π cancellation bands — EQ can't fix
+    them, and letting them dominate RMS drives the driving agent to chase
+    a convergence target that isn't physically reachable. Returns [] if
+    analyze_phase has no phase data or fails entirely.
+    """
+    result = await _tool_analyze_phase(
+        session_id=session_id, min_hz=min_hz, max_hz=max_hz,
+    )
+    if not result.get("ok") or not result.get("has_phase_data"):
+        return []
+    out: list[tuple[float, float]] = []
+    for band in result.get("bands", []):
+        if band.get("classification") != "geometry":
+            continue
+        centre = float(band["freq_hz"])
+        factor = 2 ** (1 / 6)
+        out.append((centre / factor, centre * factor))
+    return out
 
 
 def _classify_fixability(freq_hz: float, excess_gd_ms: float) -> tuple[str, bool]:
@@ -3955,6 +4046,139 @@ async def _tool_recommend_fir_phase(
         return _err(f"recommend_fir_phase failed: {exc}")
 
 
+async def _tool_verify_fir_effect(
+    pre_session_id: int,
+    post_session_id: int,
+    predicted_effect: list[dict],
+    tolerance_db: float = 2.0,
+    min_hz: float = 20.0,
+    max_hz: float = 120.0,
+) -> dict:
+    """Compare a designed FIR's predicted effect against the measured delta.
+
+    After applying a FIR, the predicted magnitude change (from design_fir's
+    ``predicted_effect`` field) and the measured delta (post - pre solo
+    measurement at 1/3-octave) should match within ~2 dB. Bigger divergences
+    usually mean one of:
+
+      - The FIR didn't land: pipeline rebuild wiped it, shadow state didn't
+        include it, or the apply call was silently rejected.
+      - Room interaction the design didn't model (room reflections hitting
+        the mic that weren't in the pre-FIR measurement).
+      - Measurement variance — one of the two measurements was noisy. Run
+        again if coherence was low.
+
+    Arguments:
+      pre_session_id, post_session_id — solo measurements taken before and
+        after apply_fir on the same sub.
+      predicted_effect — the list[{freq_hz, fir_effect_db}] returned by
+        design_fir. Forward it verbatim.
+      tolerance_db — max allowed |predicted - measured| in any band before
+        flagging. Default 2 dB.
+
+    Returns per-band comparison, a list of bands that exceed ``tolerance_db``
+    (``off_spec_bands``), and overall RMS discrepancy. ``within_tolerance``
+    is True only when every band in the focus range passes.
+    """
+    from .storage import SessionStore
+    import math
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        pre = next((s for s in sessions if s.id == pre_session_id), None)
+        post = next((s for s in sessions if s.id == post_session_id), None)
+        if pre is None:
+            return _err(f"pre_session_id {pre_session_id} not found")
+        if post is None:
+            return _err(f"post_session_id {post_session_id} not found")
+        if not pre.start_fr or not pre.start_fr.frequencies:
+            return _err(f"pre session {pre_session_id} has no FR data")
+        if not post.start_fr or not post.start_fr.frequencies:
+            return _err(f"post session {post_session_id} has no FR data")
+        if not predicted_effect:
+            return _err(
+                "predicted_effect is required — forward the value returned by "
+                "design_fir verbatim"
+            )
+
+        # Downsample both to 1/3-octave for robust per-band comparison.
+        pre_bands = _downsample_to_third_octave(pre.start_fr.frequencies, pre.start_fr.spl)
+        post_bands = _downsample_to_third_octave(post.start_fr.frequencies, post.start_fr.spl)
+        pre_by_freq = {b["freq_hz"]: b["spl_db"] for b in pre_bands}
+        post_by_freq = {b["freq_hz"]: b["spl_db"] for b in post_bands}
+
+        # Index predicted effect by freq so we can match to the band centres.
+        pred_by_freq = {
+            float(p["freq_hz"]): float(p["fir_effect_db"])
+            for p in predicted_effect
+        }
+
+        bands: list[dict] = []
+        off_spec: list[dict] = []
+        discrepancies: list[float] = []
+        for freq in sorted(pred_by_freq):
+            if freq < min_hz or freq > max_hz:
+                continue
+            if freq not in pre_by_freq or freq not in post_by_freq:
+                continue
+            measured_delta = post_by_freq[freq] - pre_by_freq[freq]
+            predicted_delta = pred_by_freq[freq]
+            discrepancy = measured_delta - predicted_delta
+            entry = {
+                "freq_hz": round(freq, 1),
+                "predicted_db": round(predicted_delta, 1),
+                "measured_db": round(measured_delta, 1),
+                "discrepancy_db": round(discrepancy, 1),
+                "within_tolerance": abs(discrepancy) <= tolerance_db,
+            }
+            bands.append(entry)
+            discrepancies.append(discrepancy)
+            if not entry["within_tolerance"]:
+                off_spec.append(entry)
+
+        if not bands:
+            return _err(
+                "no bands matched between predicted_effect, pre session, and "
+                "post session in the requested frequency range"
+            )
+
+        rms = math.sqrt(sum(d * d for d in discrepancies) / len(discrepancies))
+        within = len(off_spec) == 0
+
+        if within:
+            note = (
+                f"FIR landed as designed across {len(bands)} bands "
+                f"(RMS discrepancy {rms:.2f} dB, within ±{tolerance_db:.1f} dB "
+                f"tolerance)."
+            )
+        else:
+            worst = max(off_spec, key=lambda b: abs(b["discrepancy_db"]))
+            note = (
+                f"FIR effect diverges from prediction in {len(off_spec)} of "
+                f"{len(bands)} bands (RMS discrepancy {rms:.2f} dB). Worst: "
+                f"{worst['freq_hz']} Hz predicted {worst['predicted_db']:+.1f} dB, "
+                f"measured {worst['measured_db']:+.1f} dB "
+                f"(Δ {worst['discrepancy_db']:+.1f} dB). Check: did the FIR "
+                f"actually apply (get_output_state.fir_taps)? Was coherence "
+                f"high enough on both measurements? Did the room state change "
+                f"between measurements?"
+            )
+
+        return _ok(
+            pre_session_id=pre_session_id,
+            post_session_id=post_session_id,
+            bands=bands,
+            off_spec_bands=off_spec,
+            within_tolerance=within,
+            tolerance_db=tolerance_db,
+            rms_discrepancy_db=round(rms, 2),
+            note=note,
+        )
+    except Exception as exc:
+        return _err(f"verify_fir_effect failed: {exc}")
+
+
 async def _tool_check_system() -> dict:
     """Run all pre-flight hardware checks and return results."""
     from .preflight import PreflightChecker
@@ -4963,6 +5187,55 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="verify_fir_effect",
+        description=(
+            "Compare a designed FIR's predicted effect (from design_fir's "
+            "predicted_effect field) against the measured delta between pre-FIR "
+            "and post-FIR solo measurements. Flags bands where |predicted - "
+            "measured| exceeds tolerance_db (default 2.0). Use this after "
+            "apply_fir to catch: (1) FIR that didn't land (pipeline wipe, "
+            "silent rejection), (2) unexpected room interaction, (3) noisy "
+            "measurement. Returns per-band comparison, off-spec band list, "
+            "and overall RMS discrepancy."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pre_session_id": {
+                    "type": "integer",
+                    "description": "Solo measurement session_id from BEFORE apply_fir.",
+                },
+                "post_session_id": {
+                    "type": "integer",
+                    "description": "Solo measurement session_id from AFTER apply_fir on the same sub.",
+                },
+                "predicted_effect": {
+                    "type": "array",
+                    "description": (
+                        "The `predicted_effect` field from design_fir's response. "
+                        "List of {freq_hz, fir_effect_db}. Forward verbatim."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "freq_hz": {"type": "number"},
+                            "fir_effect_db": {"type": "number"},
+                        },
+                        "required": ["freq_hz", "fir_effect_db"],
+                    },
+                },
+                "tolerance_db": {
+                    "type": "number",
+                    "description": "Max |predicted - measured| per band before flagging. Default 2.0.",
+                    "default": 2.0,
+                },
+                "min_hz": {"type": "number", "default": 20.0},
+                "max_hz": {"type": "number", "default": 120.0},
+            },
+            "required": ["pre_session_id", "post_session_id", "predicted_effect"],
+        },
+    ),
+    Tool(
         name="check_system",
         description=(
             "Run pre-flight hardware checks: config, miniDSP (USB + daemon), "
@@ -5070,6 +5343,17 @@ _TOOLS: list[Tool] = [
                         "Default: 1.5. Adjust based on recipe's convergence goals."
                     ),
                 },
+                "exclude_geometry": {
+                    "type": "boolean",
+                    "description": (
+                        "Default true. When true, runs analyze_phase on the "
+                        "session and excludes 1/3-octave bands classified as "
+                        "'geometry' (near-π phase offset from cancellation at "
+                        "the listener position) from the RMS calculation. EQ "
+                        "cannot fix these; including them inflates RMS and "
+                        "drives the driving agent to iterate past convergence."
+                    ),
+                },
             },
             "required": ["session_id", "target_curve"],
         },
@@ -5130,6 +5414,16 @@ _TOOLS: list[Tool] = [
                     "description": (
                         "Frequencies below this are excluded as below-port rolloff. "
                         "Default: 28 Hz."
+                    ),
+                },
+                "exclude_geometry": {
+                    "type": "boolean",
+                    "description": (
+                        "Default true. When true, runs analyze_phase and excludes "
+                        "1/3-octave bands classified as 'geometry' (cancellation "
+                        "nulls) from the headroom calculation — prevents the "
+                        "anchor from being dragged toward a target the room can't "
+                        "physically reach."
                     ),
                 },
             },
@@ -5841,6 +6135,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             audio_delay_budget_ms=float(arguments.get("audio_delay_budget_ms", 200.0)),
             preringing_ms=float(arguments.get("preringing_ms", 25.0)),
         )
+    elif name == "verify_fir_effect":
+        result = await _tool_verify_fir_effect(
+            pre_session_id=int(arguments["pre_session_id"]),
+            post_session_id=int(arguments["post_session_id"]),
+            predicted_effect=arguments["predicted_effect"],
+            tolerance_db=float(arguments.get("tolerance_db", 2.0)),
+            min_hz=float(arguments.get("min_hz", 20.0)),
+            max_hz=float(arguments.get("max_hz", 120.0)),
+        )
     elif name == "check_system":
         result = await _tool_check_system()
     elif name == "get_fr_summary":
@@ -5859,6 +6162,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             port_rolloff_hz=float(arguments.get("port_rolloff_hz", 28.0)),
             resolution=arguments.get("resolution", "sixth_octave"),
             convergence_threshold=float(arguments.get("convergence_threshold", 1.5)),
+            exclude_geometry=bool(arguments.get("exclude_geometry", True)),
         )
     elif name == "anchor_target":
         result = await _tool_anchor_target(
@@ -5868,6 +6172,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             max_boost_db=float(arguments.get("max_boost_db", 6.0)),
             null_threshold_db=float(arguments.get("null_threshold_db", 15.0)),
             port_rolloff_hz=float(arguments.get("port_rolloff_hz", 28.0)),
+            exclude_geometry=bool(arguments.get("exclude_geometry", True)),
         )
     elif name == "compare_sessions":
         result = await _tool_compare_sessions(

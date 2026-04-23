@@ -2509,6 +2509,57 @@ async def test_call_tool_compute_deviation_dispatch() -> None:
     assert "converged" in data
 
 
+@pytest.mark.asyncio
+async def test_compute_deviation_exclude_geometry_false_keeps_geometry_bands() -> None:
+    """With exclude_geometry=False, geometry-classified bands count against RMS.
+
+    Safety net: confirms the new auto-exclusion is opt-out-able. Uses a
+    mock session with no phase data so analyze_phase returns nothing —
+    behavior should match pre-change.
+    """
+    freqs = [30.0, 40.0, 50.0, 63.0, 80.0]
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
+    spls = [75.5, 75.8, 74.5, 75.2, 74.9]
+    session = _make_deviation_session(1, freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_compute_deviation(
+            session_id=1, target_curve=target, exclude_geometry=False,
+        )
+    assert result["ok"]
+    # No phase data → no geometry bands exist either way.
+    assert result["excluded_geometry_points"] == 0
+    assert result["geometry_bands"] == []
+
+
+@pytest.mark.asyncio
+async def test_compute_deviation_exclude_geometry_true_auto_excludes() -> None:
+    """With exclude_geometry=True (default) and phase data classifying a
+    band as 'geometry', compute_deviation excludes it from RMS automatically.
+
+    Patches _get_geometry_band_ranges directly so we don't need to reproduce
+    the entire analyze_phase pipeline just to verify the wiring.
+    """
+    freqs = [30.0, 40.0, 50.0, 63.0, 80.0]
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
+    # 50 Hz is 10 dB below target — big error. Without geometry exclusion it
+    # would dominate RMS; with geometry exclusion (we'll classify 50 Hz as
+    # geometry) it drops out entirely.
+    spls = [75.0, 75.0, 65.0, 75.0, 75.0]
+    session = _make_deviation_session(1, freqs, spls)
+    with patch("calibrate.storage.SessionStore") as MockStore, \
+         patch("calibrate.mcp_server._get_geometry_band_ranges", return_value=[(47.0, 53.0)]):
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_compute_deviation(
+            session_id=1, target_curve=target, exclude_geometry=True,
+        )
+    assert result["ok"]
+    assert result["excluded_geometry_points"] >= 1
+    assert result["geometry_bands"] == [{"lo_hz": 47.0, "hi_hz": 53.0}]
+    # 50 Hz's -10 dB error is excluded — RMS should be ~0.
+    assert result["rms_db"] < 0.5
+
+
 # ── anchor_target ────────────────────────────────────────────────────────────
 
 
@@ -2663,6 +2714,161 @@ async def test_call_tool_anchor_target_dispatch() -> None:
     assert data["ok"]
     assert "reference_spl" in data
     assert "anchored_points" in data
+
+
+@pytest.mark.asyncio
+async def test_anchor_target_marks_below_port_rolloff_unreachable() -> None:
+    """Anchored points below port_rolloff_hz carry reachable=False so Phase 3
+    filter design can skip them."""
+    from calibrate.mcp_server import _tool_anchor_target
+
+    freqs = [25.0, 31.5, 40.0, 50.0, 63.0, 80.0]
+    spls = [-12.0, -14.0, -15.0, -18.0, -16.0, -20.0]
+    session = _make_deviation_session(1, freqs, spls)
+    offsets = [
+        {"freq_hz": 20, "offset_db": 6},   # below port_rolloff
+        {"freq_hz": 25, "offset_db": 5},
+        {"freq_hz": 40, "offset_db": 3},
+        {"freq_hz": 80, "offset_db": 0},
+    ]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.get_session.return_value = session
+        result = await _tool_anchor_target(
+            session_id=1, target_offsets=offsets, port_rolloff_hz=28.0,
+        )
+    assert result["ok"]
+    pts = {p["freq"]: p for p in result["anchored_points"]}
+    assert pts[20].get("reachable") is False
+    assert "port-tune rolloff" in pts[20].get("reason", "")
+    # In-band points should NOT be flagged.
+    assert pts[40].get("reachable", True) is True  # key absent or True
+    assert pts[80].get("reachable", True) is True
+
+
+@pytest.mark.asyncio
+async def test_anchor_target_exclude_geometry_wired() -> None:
+    """anchor_target forwards exclude_geometry to _get_geometry_band_ranges."""
+    from calibrate.mcp_server import _tool_anchor_target
+
+    freqs = [25.0, 31.5, 40.0, 50.0, 63.0, 80.0]
+    spls = [-12.0, -14.0, -15.0, -20.0, -16.0, -18.0]  # 50 Hz is a geometry null in our patch
+    session = _make_deviation_session(1, freqs, spls)
+    offsets = [
+        {"freq_hz": 25, "offset_db": 5},
+        {"freq_hz": 40, "offset_db": 3},
+        {"freq_hz": 50, "offset_db": 2},
+        {"freq_hz": 63, "offset_db": 1},
+        {"freq_hz": 80, "offset_db": 0},
+    ]
+    with patch("calibrate.storage.SessionStore") as MockStore, \
+         patch("calibrate.mcp_server._get_geometry_band_ranges", return_value=[(47.0, 53.0)]):
+        MockStore.return_value.get_session.return_value = session
+        result = await _tool_anchor_target(
+            session_id=1, target_offsets=offsets, exclude_geometry=True,
+        )
+    assert result["ok"]
+    assert result["excluded_geometry_points"] >= 1
+    assert result["geometry_bands"] == [{"lo_hz": 47.0, "hi_hz": 53.0}]
+
+
+# ── verify_fir_effect ────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_verify_fir_effect_within_tolerance() -> None:
+    """Measured delta matching predicted within tolerance → within_tolerance=True."""
+    from calibrate.mcp_server import _tool_verify_fir_effect
+
+    # 1/3-octave centres near our test band.
+    freqs = [25.0, 31.5, 40.0, 50.0, 63.0, 80.0]
+    pre_spls = [80.0, 82.0, 85.0, 80.0, 78.0, 76.0]
+    # FIR cut 3 dB everywhere in-band
+    post_spls = [80.0, 79.0, 82.0, 77.0, 75.0, 73.0]  # roughly -3 dB
+    pre_session = _make_deviation_session(1, freqs, pre_spls)
+    post_session = _make_deviation_session(2, freqs, post_spls)
+    predicted = [
+        {"freq_hz": 25.0, "fir_effect_db": 0.0},
+        {"freq_hz": 31.5, "fir_effect_db": -3.0},
+        {"freq_hz": 40.0, "fir_effect_db": -3.0},
+        {"freq_hz": 50.0, "fir_effect_db": -3.0},
+        {"freq_hz": 63.0, "fir_effect_db": -3.0},
+        {"freq_hz": 80.0, "fir_effect_db": -3.0},
+    ]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [pre_session, post_session]
+        result = await _tool_verify_fir_effect(
+            pre_session_id=1, post_session_id=2,
+            predicted_effect=predicted, tolerance_db=2.0,
+        )
+    assert result["ok"], result
+    assert result["within_tolerance"] is True
+    assert result["off_spec_bands"] == []
+    assert result["rms_discrepancy_db"] < 1.5
+
+
+@pytest.mark.asyncio
+async def test_verify_fir_effect_flags_off_spec_band() -> None:
+    """When measured delta diverges > tolerance, band is flagged."""
+    from calibrate.mcp_server import _tool_verify_fir_effect
+
+    freqs = [31.5, 40.0, 50.0, 63.0, 80.0]
+    pre_spls = [80.0, 82.0, 85.0, 80.0, 78.0]
+    # FIR was supposed to cut 3 dB at 50 Hz but actually didn't move (0 dB).
+    post_spls = [77.0, 79.0, 85.0, 77.0, 75.0]
+    pre_session = _make_deviation_session(1, freqs, pre_spls)
+    post_session = _make_deviation_session(2, freqs, post_spls)
+    predicted = [
+        {"freq_hz": 31.5, "fir_effect_db": -3.0},
+        {"freq_hz": 40.0, "fir_effect_db": -3.0},
+        {"freq_hz": 50.0, "fir_effect_db": -3.0},
+        {"freq_hz": 63.0, "fir_effect_db": -3.0},
+        {"freq_hz": 80.0, "fir_effect_db": -3.0},
+    ]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [pre_session, post_session]
+        result = await _tool_verify_fir_effect(
+            pre_session_id=1, post_session_id=2,
+            predicted_effect=predicted, tolerance_db=2.0,
+        )
+    assert result["ok"], result
+    assert result["within_tolerance"] is False
+    # 50 Hz should be in off_spec
+    off_spec_freqs = {b["freq_hz"] for b in result["off_spec_bands"]}
+    assert 50.0 in off_spec_freqs
+    assert "diverges" in result["note"] or "apply" in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_verify_fir_effect_requires_predicted() -> None:
+    from calibrate.mcp_server import _tool_verify_fir_effect
+
+    pre_session = _make_deviation_session(1, [50.0], [80.0])
+    post_session = _make_deviation_session(2, [50.0], [77.0])
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [pre_session, post_session]
+        result = await _tool_verify_fir_effect(
+            pre_session_id=1, post_session_id=2, predicted_effect=[],
+        )
+    assert not result["ok"]
+    assert "predicted_effect" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_verify_fir_effect_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+    freqs = [31.5, 40.0, 50.0, 63.0, 80.0]
+    pre_session = _make_deviation_session(1, freqs, [80.0, 82.0, 85.0, 80.0, 78.0])
+    post_session = _make_deviation_session(2, freqs, [77.0, 79.0, 82.0, 77.0, 75.0])
+    predicted = [{"freq_hz": f, "fir_effect_db": -3.0} for f in freqs]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [pre_session, post_session]
+        texts = await call_tool("verify_fir_effect", {
+            "pre_session_id": 1, "post_session_id": 2,
+            "predicted_effect": predicted, "tolerance_db": 2.0,
+        })
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "within_tolerance" in data
+    assert "rms_discrepancy_db" in data
 
 
 # ── compare_sessions ─────────────────────────────────────────────────────────
