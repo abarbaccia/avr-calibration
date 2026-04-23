@@ -145,7 +145,7 @@ def _instantiate_processor(config: Config, proc) -> AVRDriver | DSPDriver:
 
 def _make_minidsp(config: Config) -> MinidspDriver:
     host, port = config.minidsp_host_port
-    active_input = config.minidsp.get("active_input") or 0
+    active_input = config.active_input
     usb_input = config.measurement.get("output_channel", 1) - 1
     processing_rate = int(config.eq_capabilities.get("processing_rate", 96_000))
     return MinidspDriver(

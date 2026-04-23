@@ -204,3 +204,46 @@ class TestHdmiChannelMap:
         cfg = Config.load(p)
         assert cfg.hdmi_channel_for("lfe") == 4
         assert cfg.hdmi_channel_for("center") == 3
+
+
+class TestActiveInput:
+    """Config.active_input resolves a driver-neutral value with legacy fallback."""
+
+    def test_prefers_top_level_key(self):
+        cfg = Config({
+            "dsp_driver": "camilladsp",
+            "active_input": 7,
+            "minidsp": {"active_input": 1},
+        })
+        assert cfg.active_input == 7
+
+    def test_prefers_driver_block_over_minidsp_fallback(self):
+        cfg = Config({
+            "dsp_driver": "camilladsp",
+            "camilladsp": {"active_input": 3},
+            "minidsp": {"active_input": 1},
+        })
+        assert cfg.active_input == 3
+
+    def test_legacy_minidsp_block_on_minidsp_driver_no_warning(self, caplog):
+        import logging
+        cfg = Config({"dsp_driver": "minidsp", "minidsp": {"active_input": 2}})
+        with caplog.at_level(logging.WARNING, logger="calibrate.config"):
+            assert cfg.active_input == 2
+        assert not any("deprecated" in r.message.lower() for r in caplog.records)
+
+    def test_legacy_minidsp_block_on_camilladsp_driver_warns_once(self, caplog):
+        import logging
+        import calibrate.config as _cfg_mod
+        # Reset the warn cache so the test sees a fresh warning.
+        _cfg_mod._WARNED_KEYS.clear()
+        cfg = Config({"dsp_driver": "camilladsp", "minidsp": {"active_input": 0}})
+        with caplog.at_level(logging.WARNING, logger="calibrate.config"):
+            cfg.active_input
+            cfg.active_input  # second access — should not warn again
+        warnings = [r for r in caplog.records if "deprecated" in r.message.lower()]
+        assert len(warnings) == 1
+
+    def test_defaults_to_zero_when_nothing_configured(self):
+        cfg = Config({"dsp_driver": "camilladsp"})
+        assert cfg.active_input == 0

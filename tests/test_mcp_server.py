@@ -75,6 +75,7 @@ from calibrate.mcp_server import (
     _tool_sensitivity_analysis,
     _tool_fit_correction_filter,
     _tool_predict_rms,
+    _tool_recommend_fir_phase,
 )
 from calibrate.drivers.base import DriverError
 
@@ -1918,6 +1919,7 @@ async def test_call_tool_clear_fir_dispatch(mock_dsp) -> None:
 def mock_config_with_slots():
     """Mock _config() returning a config with two active output slots (indices 1, 2)."""
     cfg = MagicMock()
+    cfg.active_input = 0  # driver-neutral accessor; see Config.active_input
     cfg.minidsp.get.side_effect = lambda key, default=None: {
         "active_input": 0,
         "output_slots": [
@@ -2103,6 +2105,91 @@ async def test_call_tool_analyze_decay_dispatch() -> None:
     assert data["ok"]
     assert "mode_count" in data
     assert "modes" in data
+
+
+# ── recommend_fir_phase (Phase 2.5a decision) ───────────────────────────────
+
+@pytest.mark.asyncio
+async def test_recommend_fir_phase_recommends_mixed_for_long_t60() -> None:
+    """A 50 Hz mode with long T60 triggers a 'mixed' recommendation with taps
+    sized so the FIR impulse covers at least 2× the worst T60."""
+    session = _make_session_with_ringing_ir(session_id=1)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_recommend_fir_phase(session_id=1, t60_threshold_ms=300.0)
+    assert result["ok"], result
+    assert result["recommendation"] == "mixed"
+    assert len(result["offending_modes"]) >= 1
+    # suggested_num_taps should be a power of two, ≥ 8192, and give an impulse
+    # length at least equal to the worst T60 at fir_fs = 48 kHz (fallback).
+    taps = result["suggested_num_taps"]
+    assert taps & (taps - 1) == 0  # power of two
+    assert taps >= 8192
+    worst_t60 = max(m["t60_ms"] for m in result["offending_modes"])
+    impulse_ms = taps / 48_000 * 1000
+    assert impulse_ms >= worst_t60  # 2× was the target, ≥1× is the hard floor
+
+
+@pytest.mark.asyncio
+async def test_recommend_fir_phase_recommends_minimum_when_clean() -> None:
+    """A clean IR with no ringing modes → recommendation: minimum."""
+    session = _make_session_clean_ir(session_id=5)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_recommend_fir_phase(session_id=5)
+    assert result["ok"]
+    assert result["recommendation"] == "minimum"
+    assert result["offending_modes"] == []
+
+
+@pytest.mark.asyncio
+async def test_recommend_fir_phase_threshold_gate() -> None:
+    """Setting a very high t60 threshold rules out all modes → minimum."""
+    session = _make_session_with_ringing_ir(session_id=1)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_recommend_fir_phase(
+            session_id=1, t60_threshold_ms=10_000.0,
+        )
+    assert result["ok"]
+    assert result["recommendation"] == "minimum"
+
+
+@pytest.mark.asyncio
+async def test_recommend_fir_phase_session_not_found() -> None:
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = []
+        result = await _tool_recommend_fir_phase(session_id=9999)
+    assert not result["ok"]
+    assert "not found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_recommend_fir_phase_missing_ir() -> None:
+    session = MagicMock()
+    session.id = 1
+    session.impulse_response = None
+    session.start_fr = MagicMock()
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_recommend_fir_phase(session_id=1)
+    assert not result["ok"]
+    assert "no impulse response" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_recommend_fir_phase_dispatch() -> None:
+    from calibrate.mcp_server import call_tool
+    session = _make_session_with_ringing_ir(session_id=1)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        texts = await call_tool(
+            "recommend_fir_phase",
+            {"session_id": 1, "t60_threshold_ms": 300.0},
+        )
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert data["recommendation"] in {"minimum", "mixed"}
 
 
 # ── get_measurement_history — frequency filtering ─────────────────────────────
