@@ -56,6 +56,20 @@ than one DSP instance, transducers that aren't SVS PB12-NSDs (safety
 profiles matter), multiple named sources the LLM can reason about, or
 named groups for scoped calibration.
 
+## Transducer profiles — shipped library + local overrides
+
+Safety profiles live in two places:
+
+- **Shipped library**: `calibrate/profiles/transducers/*.yaml` — one YAML
+  file per transducer model, tracked in git. Every install loads the full
+  set at graph-construction time. Drop a file in, reference it by `name`,
+  no code change. Ships today with SVS PB12-NSD and Earthquake MQB-1.
+- **User inline**: `signal_graph.transducer_profiles` in the user's
+  `config.yaml`. Same schema. User declarations **override** shipped
+  profiles with the same name — so the library is a sensible default,
+  not a lock-in. Keep ad-hoc or site-specific overrides here and submit
+  repo PRs for profiles that should be shared.
+
 ## What the graph is loose about on purpose
 
 - **Role is an open string.** The LLM can reason about `"height"` or

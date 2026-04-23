@@ -173,6 +173,11 @@ class TransducerGroup:
 
 
 # Built-in default — matches current module-level constants in safety.py.
+# Kept as a module-level constant so ``SafetyValidator()`` (no args) and other
+# legacy call sites that reference ``SVS_PB12_NSD_PROFILE`` directly keep
+# working. The YAML copy in ``calibrate/profiles/transducers/svs_pb12_nsd.yaml``
+# is the authoritative version for the shared profile library; this constant
+# mirrors it verbatim.
 SVS_PB12_NSD_PROFILE = TransducerProfile(
     name="svs_pb12_nsd",
     min_boost_freq_hz=25.0,
@@ -186,6 +191,89 @@ SVS_PB12_NSD_PROFILE = TransducerProfile(
     hpf_order=4,
     notes="Default SVS PB12-NSD ported sub. Matches legacy safety.py constants.",
 )
+
+
+def _profile_from_dict(data: dict) -> TransducerProfile:
+    """Construct a TransducerProfile from the YAML dict shape.
+
+    Accepts the ``hpf: {freq, order}`` sub-block that both the user's
+    inline config and the shipped profile files use; flattens it onto
+    the dataclass fields ``hpf_freq_hz`` / ``hpf_order``. Missing fields
+    fall back to the dataclass defaults.
+    """
+    hpf = data.get("hpf")
+    hpf_freq: float | None
+    hpf_order: int
+    if hpf is None:
+        hpf_freq, hpf_order = None, 4
+    elif isinstance(hpf, dict):
+        raw_freq = hpf.get("freq")
+        hpf_freq = float(raw_freq) if raw_freq is not None else None
+        hpf_order = int(hpf.get("order", 4))
+    else:
+        hpf_freq, hpf_order = None, 4
+
+    return TransducerProfile(
+        name=data["name"],
+        min_boost_freq_hz=float(data.get("min_boost_freq_hz", 25.0)),
+        max_boost_per_band_db=float(data.get("max_boost_per_band_db", 6.0)),
+        max_boost_above_threshold_db=float(
+            data.get("max_boost_above_threshold_db", 8.0)
+        ),
+        freq_dependent_boost_threshold_hz=float(
+            data.get("freq_dependent_boost_threshold_hz", 30.0)
+        ),
+        max_cumulative_boost_db=float(data.get("max_cumulative_boost_db", 9.0)),
+        max_change_per_iter_db=float(data.get("max_change_per_iter_db", 3.0)),
+        max_change_simulated_db=float(data.get("max_change_simulated_db", 6.0)),
+        hpf_freq_hz=hpf_freq,
+        hpf_order=hpf_order,
+        notes=data.get("notes", ""),
+    )
+
+
+def load_builtin_profiles() -> tuple[TransducerProfile, ...]:
+    """Scan ``calibrate/profiles/transducers/*.yaml`` and return each as a profile.
+
+    Profiles ship with the package so new transducers can be added by dropping
+    a YAML file — no code change. The user's inline config.yaml declarations
+    override shipped profiles by ``name`` when the graph merges them.
+    """
+    import yaml
+    from pathlib import Path
+
+    profiles: list[TransducerProfile] = []
+    pkg_root = Path(__file__).resolve().parent
+    transducer_dir = pkg_root / "profiles" / "transducers"
+    if not transducer_dir.is_dir():
+        return ()
+    for yaml_path in sorted(transducer_dir.glob("*.yaml")):
+        try:
+            with open(yaml_path) as f:
+                data = yaml.safe_load(f)
+            if not isinstance(data, dict):
+                continue
+            profiles.append(_profile_from_dict(data))
+        except Exception:
+            # A malformed profile should never crash graph construction — the
+            # fallback is the built-in SVS default + whatever the user declares.
+            continue
+    return tuple(profiles)
+
+
+def _merge_profiles(
+    builtin: tuple[TransducerProfile, ...],
+    user: tuple[TransducerProfile, ...],
+) -> tuple[TransducerProfile, ...]:
+    """Return built-in profiles overlaid with user declarations.
+
+    Name collisions resolve to the user's version — the repo library is a
+    default / sensible fallback, not a lock-in.
+    """
+    by_name = {p.name: p for p in builtin}
+    for p in user:
+        by_name[p.name] = p
+    return tuple(by_name.values())
 
 
 @dataclass(frozen=True)
@@ -478,31 +566,9 @@ class SignalGraph:
                 )
                 for p in data.get("processors", [])
             ),
-            profiles=tuple(
-                TransducerProfile(
-                    name=p["name"],
-                    min_boost_freq_hz=float(p.get("min_boost_freq_hz", 25.0)),
-                    max_boost_per_band_db=float(p.get("max_boost_per_band_db", 6.0)),
-                    max_boost_above_threshold_db=float(
-                        p.get("max_boost_above_threshold_db", 8.0)
-                    ),
-                    freq_dependent_boost_threshold_hz=float(
-                        p.get("freq_dependent_boost_threshold_hz", 30.0)
-                    ),
-                    max_cumulative_boost_db=float(p.get("max_cumulative_boost_db", 9.0)),
-                    max_change_per_iter_db=float(p.get("max_change_per_iter_db", 3.0)),
-                    max_change_simulated_db=float(p.get("max_change_simulated_db", 6.0)),
-                    hpf_freq_hz=(
-                        float(p["hpf"]["freq"])
-                        if p.get("hpf") and p["hpf"].get("freq") is not None
-                        else None
-                    ),
-                    hpf_order=int(
-                        p["hpf"].get("order", 4) if p.get("hpf") else 4
-                    ),
-                    notes=p.get("notes", ""),
-                )
-                for p in data.get("transducer_profiles", [])
+            profiles=_merge_profiles(
+                load_builtin_profiles(),
+                tuple(_profile_from_dict(p) for p in data.get("transducer_profiles", [])),
             ),
             transducers=tuple(
                 Transducer(
@@ -533,7 +599,14 @@ class SignalGraph:
         """
         processors: list[Processor] = []
         transducers: list[Transducer] = []
-        profiles: list[TransducerProfile] = [SVS_PB12_NSD_PROFILE]
+        # Start from the shipped profile library so every legacy install sees
+        # the full set of known transducers (SVS, MQB-1, and anything else
+        # under calibrate/profiles/transducers/). Fall back to the in-memory
+        # SVS default only if the library fails to load for some reason.
+        builtin_profiles = load_builtin_profiles()
+        profiles: list[TransducerProfile] = (
+            list(builtin_profiles) if builtin_profiles else [SVS_PB12_NSD_PROFILE]
+        )
         groups: list[TransducerGroup] = []
 
         dsp_name = config.dsp_driver_name

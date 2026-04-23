@@ -1,0 +1,28 @@
+name: earthquake_mqb1
+min_boost_freq_hz: 12
+max_boost_per_band_db: 9
+max_boost_above_threshold_db: 12
+freq_dependent_boost_threshold_hz: 25
+max_cumulative_boost_db: 12
+max_change_per_iter_db: 3
+max_change_simulated_db: 6
+hpf:
+  freq: 8
+  order: 4
+notes: |
+  Earthquake Sound MQB-1 tactile transducer.
+
+  Specs: 15–50 Hz operating range, 300 W RMS / 500 W peak, 8 Ω, 1.5-inch stroke,
+  Neodymium motor with integrated thermal protection circuitry.
+
+  Looser boost limits than a ported sub — the MQB-1 is excursion-limited
+  mechanically, not acoustically, so there's no port-unloading concern and
+  sub-20 Hz content is the intended use case (it's how theater rumble translates
+  to tactile feedback). Profile lets EQ boost down to 12 Hz; HPF at 8 Hz / 4th
+  order catches DC drift and truly-subsonic garbage without cutting the tactile
+  range.
+
+  Tune these limits further per your amp + room. The profile assumes a
+  comfortably-powered amp (e.g. Behringer NX3000) running at partial gain;
+  a weaker amp may need tighter cumulative caps to keep the driver inside
+  its thermal envelope.
