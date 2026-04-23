@@ -1,11 +1,25 @@
 """Configuration loading for avr-calibration."""
 
+import logging
 import os
 from pathlib import Path
 
 import yaml
 
+log = logging.getLogger(__name__)
+
 CONFIG_PATH = Path.home() / ".avr-calibration" / "config.yaml"
+
+
+_WARNED_KEYS: set[str] = set()
+
+
+def _warn_once(message: str) -> None:
+    """Log a deprecation warning once per process, keyed by the message text."""
+    if message in _WARNED_KEYS:
+        return
+    _WARNED_KEYS.add(message)
+    log.warning("DEPRECATED: %s", message)
 
 DEFAULT_CONFIG: dict = {
     "avr_driver": "denon",
@@ -247,6 +261,43 @@ class Config:
             self.minidsp.get("host", "localhost"),
             int(self.minidsp.get("port", 5380)),
         )
+
+    @property
+    def active_input(self) -> int:
+        """Driver-neutral active-input index, with deprecation for legacy key.
+
+        Resolution order:
+          1. Top-level ``active_input:`` in config.yaml (new, driver-neutral).
+          2. ``<dsp_driver>.active_input`` inside the driver's own block.
+          3. ``minidsp.active_input`` (legacy — origin of this key).
+          4. Default: 0.
+
+        On CamillaDSP installs still using ``minidsp.active_input``, a
+        deprecation warning is logged once per process — the key is confusing
+        ("why am I configuring a miniDSP when my DSP is CamillaDSP?") and
+        should be moved either top-level or into the ``camilladsp:`` block.
+        """
+        top = self._data.get("active_input")
+        if top is not None:
+            return int(top)
+
+        dsp_block = self._data.get(self.dsp_driver_name)
+        if isinstance(dsp_block, dict):
+            scoped = dsp_block.get("active_input")
+            if scoped is not None:
+                return int(scoped)
+
+        legacy = self.minidsp.get("active_input")
+        if legacy is not None:
+            if self.dsp_driver_name != "minidsp":
+                _warn_once(
+                    f"minidsp.active_input is deprecated on {self.dsp_driver_name} "
+                    f"installs. Move it to a top-level 'active_input:' key (or "
+                    f"into the '{self.dsp_driver_name}:' block)."
+                )
+            return int(legacy)
+
+        return 0
 
     @property
     def sub_outputs(self) -> list[int]:

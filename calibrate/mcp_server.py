@@ -2996,7 +2996,7 @@ async def _tool_get_config() -> dict:
         data = dict(cfg._data)
 
         # EQ capabilities — tells Claude what PEQ resources are available
-        active_input = cfg.minidsp.get("active_input") or 0
+        active_input = cfg.active_input
         sub_outputs = cfg.sub_outputs
         slots = list(range(2, 10))  # slots 2-9
 
@@ -3531,7 +3531,7 @@ async def _tool_configure_matrix(active_input: int | None = None) -> dict:
     """Route the active DSP input to enabled outputs, skipping defective/unused ones."""
     try:
         cfg = _config()
-        input_idx = active_input if active_input is not None else cfg.minidsp.get("active_input", 0)
+        input_idx = active_input if active_input is not None else cfg.active_input
         # Only route to outputs that are not marked unused in config.
         slots = cfg.minidsp.get("output_slots", [])
         enabled_indices = {s["index"] for s in slots if s.get("type") != "unused"}
@@ -3640,6 +3640,131 @@ async def _tool_analyze_decay(
         return _err(f"decay analysis error: {exc}")
     except Exception as exc:
         return _err(f"analyze_decay failed: {exc}")
+
+
+async def _tool_recommend_fir_phase(
+    session_id: int,
+    t60_threshold_ms: float = 500.0,
+    peak_db_threshold: float = 0.0,
+    freq_min: float = 20.0,
+    freq_max: float = 200.0,
+) -> dict:
+    """Recommend FIR phase mode + tap count based on post-FIR decay.
+
+    Codifies the recipe's Phase 2.5a decision point so the LLM cannot skip it:
+    a min-phase FIR only flattens magnitude, it does not actively cancel
+    decay. If a solo post-FIR measurement still shows a prominent mode
+    (peak_db above target-band average AND T60 above threshold), a
+    mixed-phase FIR can cancel some of that decay — but only if the FIR
+    impulse is at least as long as the mode's T60.
+
+    Returns:
+      - recommendation: "minimum" (current FIR is fine) or "mixed"
+        (re-design with phase_mode="mixed").
+      - offending_modes: modes that triggered the "mixed" recommendation
+        (peak_db ≥ threshold AND T60 ≥ threshold).
+      - suggested_num_taps: when recommending mixed, the smallest tap count
+        whose impulse length covers the longest offending T60, clamped to
+        the driver's fir_max_taps_per_output and rounded up to a power of 2.
+
+    Call this AFTER applying the initial min-phase FIR and taking a
+    post-FIR solo measurement.
+    """
+    from .storage import SessionStore
+    from .decay import analyze_decay as _analyze_decay
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        session = next((s for s in sessions if s.id == session_id), None)
+        if session is None:
+            return _err(f"session {session_id} not found")
+
+        ir = session.impulse_response
+        if not ir:
+            return _err(
+                f"session {session_id} has no impulse response — re-run measure"
+            )
+        sample_rate = session.start_fr.sample_rate if session.start_fr else 48000
+
+        modes = _analyze_decay(
+            ir,
+            sample_rate=sample_rate,
+            t60_threshold_ms=min(t60_threshold_ms, 300.0),
+            freq_min=freq_min,
+            freq_max=freq_max,
+        )
+
+        offenders = [
+            {
+                "freq_hz": m.freq_hz,
+                "t60_ms": m.t60_ms,
+                "peak_db": m.peak_db,
+                "priority": m.priority,
+            }
+            for m in modes
+            if m.peak_db >= peak_db_threshold and m.t60_ms >= t60_threshold_ms
+        ]
+
+        if not offenders:
+            worst = modes[0] if modes else None
+            detail = (
+                f"worst mode: {worst.freq_hz:.1f} Hz T60={worst.t60_ms:.0f} ms "
+                f"peak={worst.peak_db:.1f} dB"
+                if worst else
+                "no ringing modes found"
+            )
+            return _ok(
+                session_id=session_id,
+                recommendation="minimum",
+                offending_modes=[],
+                t60_threshold_ms=t60_threshold_ms,
+                peak_db_threshold=peak_db_threshold,
+                note=(
+                    f"No modes exceed the {t60_threshold_ms:.0f} ms T60 + "
+                    f"{peak_db_threshold:.1f} dB peak threshold — min-phase "
+                    f"FIR is adequate. ({detail})"
+                ),
+            )
+
+        # Mixed-phase recommended. Size the FIR so its impulse duration
+        # covers the longest offending T60 with some headroom (2×).
+        worst_t60_ms = max(m["t60_ms"] for m in offenders)
+        fir_fs = 48_000
+        fir_max = 65_536
+        if _dsp is not None:
+            caps = _dsp.capabilities
+            if caps.fir_capable:
+                fir_fs = caps.fir_sample_rate_hz
+                fir_max = caps.fir_max_taps_per_output
+        min_taps = int((worst_t60_ms / 1000.0) * 2.0 * fir_fs)
+        # Round up to next power of two for FFT-friendly sizes.
+        suggested = 1
+        while suggested < max(8192, min_taps):
+            suggested <<= 1
+        suggested = min(suggested, fir_max)
+
+        offender_summary = ", ".join(
+            f"{m['freq_hz']:.1f} Hz T60={m['t60_ms']:.0f} ms" for m in offenders[:3]
+        )
+        return _ok(
+            session_id=session_id,
+            recommendation="mixed",
+            offending_modes=offenders,
+            suggested_num_taps=suggested,
+            t60_threshold_ms=t60_threshold_ms,
+            peak_db_threshold=peak_db_threshold,
+            note=(
+                f"Mixed-phase FIR recommended: {len(offenders)} mode(s) exceed "
+                f"the {t60_threshold_ms:.0f} ms T60 threshold ({offender_summary}). "
+                f"Re-run design_fir with phase_mode='mixed', "
+                f"num_taps={suggested} (impulse length "
+                f"{suggested / fir_fs * 1000:.0f} ms ≥ 2× worst T60 "
+                f"{worst_t60_ms:.0f} ms)."
+            ),
+        )
+    except Exception as exc:
+        return _err(f"recommend_fir_phase failed: {exc}")
 
 
 async def _tool_check_system() -> dict:
@@ -4579,6 +4704,55 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="recommend_fir_phase",
+        description=(
+            "Recommend FIR phase mode based on a post-FIR solo measurement. "
+            "Codifies the bass-calibration-fir recipe's Phase 2.5a decision "
+            "point so the LLM can't silently skip it: call this AFTER "
+            "applying the initial min-phase FIR and measuring that sub solo. "
+            "If any mode has peak_db >= peak_db_threshold (default 0, i.e. above "
+            "band average) AND T60 >= t60_threshold_ms (default 500), returns "
+            "recommendation='mixed' with a suggested tap count whose impulse "
+            "length covers 2× the worst T60 (clamped to the driver's "
+            "fir_max_taps_per_output). Otherwise recommendation='minimum' and "
+            "the current FIR is adequate."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "integer",
+                    "description": (
+                        "Solo post-FIR measurement session to analyse. "
+                        "This must be a measurement taken AFTER applying the "
+                        "initial min-phase FIR to the sub in question."
+                    ),
+                },
+                "t60_threshold_ms": {
+                    "type": "number",
+                    "description": (
+                        "T60 threshold for flagging a mode. Default 500 ms — "
+                        "matches the recipe's mixed-phase trigger. Lower values "
+                        "make the check more aggressive."
+                    ),
+                    "default": 500.0,
+                },
+                "peak_db_threshold": {
+                    "type": "number",
+                    "description": (
+                        "Only consider modes with peak_db >= this value. "
+                        "Default 0.0 (above band average). Set lower to include "
+                        "less prominent modes."
+                    ),
+                    "default": 0.0,
+                },
+                "freq_min": {"type": "number", "default": 20.0},
+                "freq_max": {"type": "number", "default": 200.0},
+            },
+            "required": ["session_id"],
+        },
+    ),
+    Tool(
         name="check_system",
         description=(
             "Run pre-flight hardware checks: config, miniDSP (USB + daemon), "
@@ -5435,6 +5609,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             freq_min=float(arguments.get("freq_min", 20.0)),
             freq_max=float(arguments.get("freq_max", 200.0)),
         )
+    elif name == "recommend_fir_phase":
+        result = await _tool_recommend_fir_phase(
+            session_id=int(arguments["session_id"]),
+            t60_threshold_ms=float(arguments.get("t60_threshold_ms", 500.0)),
+            peak_db_threshold=float(arguments.get("peak_db_threshold", 0.0)),
+            freq_min=float(arguments.get("freq_min", 20.0)),
+            freq_max=float(arguments.get("freq_max", 200.0)),
+        )
     elif name == "check_system":
         result = await _tool_check_system()
     elif name == "get_fr_summary":
@@ -5667,7 +5849,13 @@ def create_app() -> Starlette:
                 log.warning("DSP rehydrate failed (shadow stays empty): %s", exc)
 
         # Configure DSP input routing if active_input is set
-        active_input = cfg.minidsp.get("active_input")
+        has_active_input = (
+            "active_input" in cfg._data
+            or (isinstance(cfg._data.get(cfg.dsp_driver_name), dict)
+                and "active_input" in cfg._data[cfg.dsp_driver_name])
+            or cfg.minidsp.get("active_input") is not None
+        )
+        active_input = cfg.active_input if has_active_input else None
         if active_input is not None and _dsp is not None:
             try:
                 await _dsp.configure_active_input(int(active_input))

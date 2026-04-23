@@ -377,28 +377,33 @@ If a sub's post-FIR response has residual peaks > 2 dB:
 For **each sub**, after applying its min-phase FIR (Phase 2.3) and taking its
 post-FIR solo measurement (Phase 2.4):
 
-1. Call `analyze_decay(session_id=<sub_solo_postfir>, freq_min=20, freq_max=120)`
-   and log the returned `modes[]` list.
-2. For each mode in `modes[]` where `peak_db >= 0` (i.e. above band average)
-   AND `t60_ms > 500`:
-   - **DO NOT proceed to Phase 2.6 or Phase 3.** Re-run
-     `design_fir(session_id=<pre_FIR_solo>, phase_mode="mixed", num_taps=32768)`
-     for this sub. The impulse length (`num_taps / sample_rate`) must be
-     ≥ the worst offending mode's T60.
-   - Re-apply the new FIR via `apply_fir`. Re-measure solo. Re-run
-     `analyze_decay`. Verify the mode's T60 dropped.
-3. If no modes exceed the 500 ms threshold, log "Phase 2.5a: no mixed-phase
-   candidates (worst T60 = X ms on Y Hz)" and proceed.
-4. If mixed-phase still leaves T60 > 500 ms on a major mode after 2 attempts,
-   document the residual in the retrospective and recommend bass-trap
-   placement for that specific frequency.
+1. **MANDATORY tool call:** `recommend_fir_phase(session_id=<sub_solo_postfir>)`.
+   Evaluates T60 and peak prominence against the recipe's thresholds and
+   returns `recommendation: "minimum" | "mixed"`, `offending_modes`, and
+   `suggested_num_taps`. Do not eyeball `analyze_decay` and decide yourself;
+   call the tool. If the tool is unavailable (older container), abort and
+   surface the version mismatch to the user.
+2. **If `recommendation == "mixed"`:** DO NOT proceed to Phase 2.6 or Phase 3.
+   - Re-run `design_fir(session_id=<pre_FIR_solo>, phase_mode="mixed",
+     num_taps=<suggested_num_taps>, return_coefficients=false)` for this sub.
+   - Apply via `apply_fir(output_index=N, design_session_id=<pre_FIR_solo>)`.
+   - Re-measure that sub solo.
+   - Re-run `recommend_fir_phase` on the new post-mixed-FIR measurement. If
+     it still returns "mixed" on the second pass, document the residual,
+     recommend bass-trap placement for the offending frequency, and proceed.
+     Two mixed-phase attempts is the max per sub.
+3. **If `recommendation == "minimum"`:** log the tool's `note` field in your
+   iteration record and proceed to Phase 2.6.
+4. Every `save_calibration_iteration` call for Phase 2 MUST include the
+   tool's `recommendation` and `offending_modes` in the `filters_proposed`
+   payload, so post-hoc audits can verify the check was executed.
 
-**Why the rule exists:** min-phase FIR flattens magnitude but does **not**
-cancel decay. Mixed-phase FIR actively cancels decay in exchange for a small
-amount of pre-ringing, inaudible below ~100 Hz where the ear integrates over
-20–30 ms. Skipping this step leaves audible ringing that PEQ in Phase 3
-cannot fix. **This happened on run 14 — the 46.9 Hz mode on the front-right
-sub sat at 2037 ms T60 because Phase 2.5a was skipped.** Do not repeat.
+**Why this is a tool, not prose:** min-phase FIR flattens magnitude but does
+not cancel decay; mixed-phase FIR actively cancels decay in exchange for a
+small amount of pre-ringing, inaudible below ~100 Hz. In run 14 the driving
+LLM skipped this step, left a 46.9 Hz mode at 2037 ms T60, and moved to
+Phase 3. Turning the decision into a single structured tool result is
+harder to silently omit than a free-form paragraph.
 
 ### 2.6 Combined verification
 

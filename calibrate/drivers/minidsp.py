@@ -695,7 +695,7 @@ class MinidspSweepContext:
             return None
         # USB sweep: PyTTa output channel (1-indexed) → miniDSP matrix input (0-indexed)
         usb_input = config.measurement.get("output_channel", 1) - 1
-        normal_input = config.minidsp.get("active_input", 0)
+        normal_input = config.active_input
         # Determine which outputs are enabled (skip unused/defective)
         slots = config.minidsp.get("output_slots", [])
         enabled = {s["index"] for s in slots if s.get("type") != "unused"}
