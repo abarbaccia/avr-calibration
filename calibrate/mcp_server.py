@@ -141,6 +141,14 @@ _dsp: DSPDriver | None = None
 # pointing at the first entry of each kind, preserving every legacy call site.
 _drivers = None  # DriverRegistry | None
 
+# Server-side cache for FIR coefficients produced by design_fir. Lets callers
+# opt out of the coefficient round-trip (design_fir returns arrays up to
+# ~65 536 floats; ~140 KB JSON at 8 192 taps) by passing
+# return_coefficients=false and later referencing the cached design by its
+# source session_id in apply_fir(design_session_id=...). Cleared implicitly
+# on process restart — callers must re-design if the server has been bounced.
+_fir_design_cache: dict[int, list[float]] = {}
+
 
 def _default_dsp_name() -> str | None:
     """Return the processor name of the active default DSP, or None.
@@ -2180,6 +2188,7 @@ async def _tool_design_fir(
     num_taps: int = 1024,
     phase_mode: str = "minimum",
     freq_focus_hz: list[float] | None = None,
+    return_coefficients: bool = True,
 ) -> dict:
     """Design FIR correction coefficients from a measurement.
 
@@ -2191,6 +2200,11 @@ async def _tool_design_fir(
       - "minimum": no pre-ringing, phase not corrected (safest)
       - "linear": symmetric, corrects phase, adds pre-ringing (cleanest)
       - "mixed": minimum-phase below freq_focus, linear above (compromise)
+
+    return_coefficients: when False, the coefficient array is cached server-side
+    keyed by session_id and omitted from the response. Callers then apply the
+    FIR via apply_fir(output_index, design_session_id=session_id). Useful when
+    the full array (8k+ taps ≈ 140 KB JSON) would exceed client token budgets.
     """
     from .storage import SessionStore
 
@@ -2334,19 +2348,37 @@ async def _tool_design_fir(
 
         coefficients = [round(float(c), 8) for c in fir_td]
 
-        return _ok(
-            session_id=session_id,
-            num_taps=num_taps,
-            phase_mode=phase_mode,
-            pre_ringing_ms=pre_ringing_ms,
-            freq_resolution_hz=freq_resolution,
-            coefficients=coefficients,
-            predicted_effect=predicted_bands,
-            note=f"FIR at {fir_fs}Hz, {num_taps} taps, {phase_mode} phase. "
-                 f"Freq resolution: {freq_resolution}Hz. "
-                 f"Pre-ringing: {pre_ringing_ms}ms. "
-                 f"Pass coefficients to apply_fir(output_index, coefficients).",
-        )
+        # Cache even when returning the full array — callers may still prefer
+        # the by-reference apply path to avoid re-uploading ~140 KB of floats.
+        _fir_design_cache[int(session_id)] = coefficients
+        peak_abs = float(np.max(np.abs(fir_td))) if num_taps else 0.0
+
+        result = {
+            "session_id": session_id,
+            "num_taps": num_taps,
+            "phase_mode": phase_mode,
+            "pre_ringing_ms": pre_ringing_ms,
+            "freq_resolution_hz": freq_resolution,
+            "peak_abs": round(peak_abs, 6),
+            "predicted_effect": predicted_bands,
+            "design_cached": True,
+        }
+        if return_coefficients:
+            result["coefficients"] = coefficients
+            result["note"] = (
+                f"FIR at {fir_fs}Hz, {num_taps} taps, {phase_mode} phase. "
+                f"Freq resolution: {freq_resolution}Hz. Pre-ringing: {pre_ringing_ms}ms. "
+                f"Pass coefficients to apply_fir(output_index, coefficients) or "
+                f"apply_fir(output_index, design_session_id={session_id})."
+            )
+        else:
+            result["note"] = (
+                f"FIR at {fir_fs}Hz, {num_taps} taps, {phase_mode} phase. "
+                f"Freq resolution: {freq_resolution}Hz. Pre-ringing: {pre_ringing_ms}ms. "
+                f"Coefficients cached server-side; apply via "
+                f"apply_fir(output_index, design_session_id={session_id})."
+            )
+        return _ok(**result)
     except Exception as exc:
         return _err(f"design_fir failed: {exc}")
 
@@ -3369,26 +3401,73 @@ async def _tool_analyze_ir(
         return _err(f"analyze_ir failed: {exc}")
 
 
-async def _tool_apply_fir(output_index: int, coefficients: list[float]) -> dict:
-    """Write FIR coefficients to a single DSP output."""
+async def _tool_apply_fir(
+    output_index: int,
+    coefficients: list[float] | None = None,
+    design_session_id: int | None = None,
+) -> dict:
+    """Write FIR coefficients to a single DSP output.
+
+    Source (exactly one required):
+      - ``coefficients``: inline float array (legacy path)
+      - ``design_session_id``: the session_id passed to a prior ``design_fir``
+        call. Coefficients are retrieved from the server-side cache; avoids
+        shipping large arrays through the tool call.
+    """
+    if coefficients is not None and design_session_id is not None:
+        return _err("apply_fir: pass either coefficients or design_session_id, not both")
+    if coefficients is None and design_session_id is None:
+        return _err("apply_fir: provide either coefficients or design_session_id")
+
+    source: str
+    if design_session_id is not None:
+        cached = _fir_design_cache.get(int(design_session_id))
+        if not cached:
+            return _err(
+                f"apply_fir: no cached design for session_id={design_session_id}. "
+                f"Run design_fir first; cache is cleared on server restart."
+            )
+        coefficients = cached
+        source = f"design_session_id={design_session_id}"
+    else:
+        source = "inline"
+
     try:
         await _dsp.apply_fir(output_index, coefficients)  # type: ignore[union-attr]
-        return _ok(output_index=output_index, taps=len(coefficients))
     except DriverError as exc:
         return _err(str(exc))
     except Exception as exc:
         return _err(f"apply_fir error: {exc}")
+
+    # Persist so a CamillaDSP rebuild (triggered by any later apply_*/set_* call)
+    # or MCP-server restart rehydrates the FIR back into the shadow state.
+    from .storage import dsp_output_key
+    processor = _default_dsp_name() or "dsp"
+    _persist_dsp_state(
+        dsp_output_key(processor, int(output_index), "fir"),
+        {"coefficients": list(coefficients), "num_taps": len(coefficients)},
+    )
+    return _ok(output_index=output_index, taps=len(coefficients), source=source)
 
 
 async def _tool_clear_fir(output_index: int) -> dict:
     """Clear FIR coefficients and reset output to passthrough."""
     try:
         await _dsp.clear_fir(output_index)  # type: ignore[union-attr]
-        return _ok(output_index=output_index, message="FIR cleared")
     except DriverError as exc:
         return _err(str(exc))
     except Exception as exc:
         return _err(f"clear_fir error: {exc}")
+
+    # Mirror the clear to persisted state so a rehydrate after restart doesn't
+    # resurrect a stale FIR that was just cleared.
+    from .storage import dsp_output_key
+    processor = _default_dsp_name() or "dsp"
+    _persist_dsp_state(
+        dsp_output_key(processor, int(output_index), "fir"),
+        {"coefficients": [], "num_taps": 0},
+    )
+    return _ok(output_index=output_index, message="FIR cleared")
 
 
 async def _tool_set_output_gain(
@@ -4308,12 +4387,15 @@ _TOOLS: list[Tool] = [
         name="apply_fir",
         description=(
             "Write FIR filter coefficients to a single DSP output. "
-            "Coefficients are floats normalized so the peak is <= 1.0. "
             "Tap-count ceiling and FIR sample rate come from eq_capabilities "
             "(fir_max_taps_per_output and fir_sample_rate_hz). "
             "Use after analyze_decay to shorten room-mode ringing that PEQ cannot fix — "
             "FIR corrects the time-domain decay; PEQ only reduces the peak magnitude. "
-            "After writing, get_output_state will show fir_taps = len(coefficients)."
+            "After writing, get_output_state will show fir_taps = len(coefficients). "
+            "Source is one of `coefficients` (inline float array; must be peak-normalized "
+            "≤ 1.0) or `design_session_id` (pulls coefficients from the last design_fir "
+            "call on that session, skipping the large-payload round-trip). "
+            "Coefficients persist across CamillaDSP config rebuilds and MCP restarts."
         ),
         inputSchema={
             "type": "object",
@@ -4329,11 +4411,21 @@ _TOOLS: list[Tool] = [
                         "FIR filter coefficients as floats. "
                         "Length must be <= fir_max_taps_per_output from eq_capabilities. "
                         "Sample rate must match fir_sample_rate_hz. "
-                        "Normalize so peak abs value <= 1.0."
+                        "Normalize so peak abs value <= 1.0. "
+                        "Mutually exclusive with design_session_id."
+                    ),
+                },
+                "design_session_id": {
+                    "type": "integer",
+                    "description": (
+                        "session_id from a prior design_fir call. Uses the server-side "
+                        "cached coefficients. Mutually exclusive with coefficients. "
+                        "Cache is cleared on MCP restart — re-run design_fir if the "
+                        "server was bounced since the design."
                     ),
                 },
             },
-            "required": ["output_index", "coefficients"],
+            "required": ["output_index"],
         },
     ),
     Tool(
@@ -4852,6 +4944,16 @@ _TOOLS: list[Tool] = [
                     "items": {"type": "number"},
                     "description": "[lo_hz, hi_hz] — only correct within this range, taper to zero outside. Omit to correct full range.",
                 },
+                "return_coefficients": {
+                    "type": "boolean",
+                    "description": (
+                        "Default true. Set false to skip the coefficient array in the "
+                        "response — coefficients are cached server-side keyed by "
+                        "session_id; apply via apply_fir(design_session_id=<session_id>). "
+                        "Use false when the array (e.g. 8k+ taps ≈ 140 KB JSON) would "
+                        "exceed the client's token budget."
+                    ),
+                },
             },
             "required": ["session_id"],
         },
@@ -5302,9 +5404,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             search_window_ms=float(arguments.get("search_window_ms", 50.0)),
         )
     elif name == "apply_fir":
+        coeffs_arg = arguments.get("coefficients")
         result = await _tool_apply_fir(
             output_index=int(arguments["output_index"]),
-            coefficients=[float(c) for c in arguments["coefficients"]],
+            coefficients=([float(c) for c in coeffs_arg] if coeffs_arg is not None else None),
+            design_session_id=(
+                int(arguments["design_session_id"]) if "design_session_id" in arguments else None
+            ),
         )
     elif name == "clear_fir":
         result = await _tool_clear_fir(output_index=int(arguments["output_index"]))
