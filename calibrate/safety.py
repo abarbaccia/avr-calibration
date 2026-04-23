@@ -92,6 +92,17 @@ class FilterSpec:
     type: FilterType
 
 
+class SafetyValidationError(Exception):
+    """Raised by ``SafetyValidator.validate_fir`` on safety violations.
+
+    Carries a human-readable message that names the offending frequency
+    band and dB magnitude so callers can surface it to the LLM / user.
+    Matches the style of ``ValidationResult.failed``'s error string but
+    is raised rather than returned — FIR validation has no "simulation
+    verified" relaxation path that needs a soft return.
+    """
+
+
 @dataclass
 class ValidationResult:
     """Result of a SafetyValidator check.
@@ -319,6 +330,109 @@ class SafetyValidator:
                     f"{' [simulation-verified]' if simulation_verified else ''})"
                 )
         return ValidationResult.passed()
+
+    # ── FIR magnitude validation ───────────────────────────────────────────────
+
+    def validate_fir(
+        self,
+        coefficients: list[float],
+        sample_rate: int,
+        profile: "TransducerProfile | None" = None,
+    ) -> None:
+        """Validate a FIR filter's magnitude response against the profile's limits.
+
+        Mirrors the PEQ safety rules, applied in the frequency domain via FFT:
+
+        1. **Below ``profile.min_boost_freq_hz``** — any boost must be
+           ≤ ``profile.max_boost_per_band_db`` (port-unloading protection;
+           matches the PEQ boost-frequency-floor check).
+        2. **From ``min_boost_freq_hz`` up through 200 Hz** — any boost must
+           be ≤ ``profile.max_boost_above_threshold_db`` (thermal ceiling,
+           matches the recipe's Phase 2.2 manual-check and PEQ
+           ``_check_per_band_boost_ceiling`` for the above-threshold band).
+        3. **Cuts are always safe** — attenuation is not constrained.
+
+        Magnitude is computed via ``numpy.fft.rfft`` and binned to the same
+        1/3-octave centres used by the PEQ validator, so an FIR that
+        aggregates +4 dB across two adjacent bins still reads as "+4 dB at
+        this band", not as an invisible piecewise-legal stack.
+
+        Args:
+            coefficients: FIR taps (float array).
+            sample_rate: rate the FIR will run at, in Hz — sets the FFT's
+                frequency axis. Required because the same tap sequence has
+                a different magnitude response at 48 kHz vs 96 kHz.
+            profile: transducer profile to validate against. Defaults to
+                the validator's own profile (``SafetyValidator(profile)``),
+                so the driver-level call can stay zero-arg.
+
+        Raises:
+            SafetyValidationError: if any 1/3-octave band's peak magnitude
+                exceeds the applicable limit. Message names the offending
+                frequency band and the observed dB level.
+        """
+        import numpy as np
+
+        prof = profile if profile is not None else self._profile
+
+        if not coefficients:
+            # Empty FIR is a no-op; driver layer will reject before us but
+            # guard anyway so validate_fir is independently safe to call.
+            return
+
+        taps = np.asarray(coefficients, dtype=np.float64)
+        # Zero-pad to fine frequency resolution. At 96 kHz we need ~2 Hz bin
+        # width to reliably cover the 20 Hz 1/3-octave band (17.8–22.4 Hz),
+        # so demand sample_rate/n_fft ≤ 2 Hz → n_fft ≥ sample_rate/2. The
+        # power-of-two rounding above that keeps the FFT path fast.
+        min_n_fft = max(4096, int(2 ** np.ceil(np.log2(max(int(sample_rate) // 2, 4096)))))
+        n_fft = max(min_n_fft, int(2 ** np.ceil(np.log2(max(len(taps), 2)))))
+        spectrum = np.fft.rfft(taps, n=n_fft)
+        freqs = np.fft.rfftfreq(n_fft, d=1.0 / float(sample_rate))
+        # 20·log10(|H|). Guard against log(0) at notches; cuts aren't a safety
+        # concern so we can clip the floor without affecting any check.
+        mag = np.abs(spectrum)
+        mag_db = 20.0 * np.log10(np.maximum(mag, 1e-9))
+
+        # Bin peak magnitude per 1/3-octave band (20 Hz … 200 Hz).
+        # Bin edges: ±1/6-octave around each centre (log-spaced).
+        half_step = 2.0 ** (1.0 / 6.0)
+        per_band: dict[float, float] = {}
+        for centre in THIRD_OCTAVE_CENTRES_HZ:
+            lo = centre / half_step
+            hi = centre * half_step
+            mask = (freqs >= lo) & (freqs < hi)
+            if not np.any(mask):
+                continue
+            per_band[centre] = float(np.max(mag_db[mask]))
+
+        floor = prof.min_boost_freq_hz
+        below_floor_limit = prof.max_boost_per_band_db
+        thermal_limit = prof.max_boost_above_threshold_db
+
+        for centre, peak_db in per_band.items():
+            if peak_db <= 0.0:
+                # Cut — always safe.
+                continue
+            if centre < floor:
+                if peak_db > below_floor_limit:
+                    raise SafetyValidationError(
+                        f"SafetyValidator: FIR boost of +{peak_db:.1f} dB "
+                        f"in {centre:.0f} Hz 1/3-octave band exceeds "
+                        f"below-port-tune limit of +{below_floor_limit:.0f} dB "
+                        f"(profile {prof.name!r}, floor {floor:.0f} Hz). "
+                        f"Boost below the port-tuning frequency risks "
+                        f"port unloading and driver damage."
+                    )
+            else:
+                if peak_db > thermal_limit:
+                    raise SafetyValidationError(
+                        f"SafetyValidator: FIR boost of +{peak_db:.1f} dB "
+                        f"at {centre:.0f} Hz 1/3-octave band exceeds thermal "
+                        f"ceiling of +{thermal_limit:.0f} dB "
+                        f"(profile {prof.name!r}). Reduce the FIR's boost "
+                        f"or target a different frequency."
+                    )
 
     def _check_hpf_present(self, filters: list[FilterSpec]) -> ValidationResult:
         """Verify a HPF at or below the profile's HPF frequency is present.

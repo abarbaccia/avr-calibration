@@ -1687,7 +1687,9 @@ async def test_camilladsp_set_master_gain_does_not_push_pipeline() -> None:
 async def test_camilladsp_apply_fir_writes_conv_filter_with_inline_values() -> None:
     driver = CamillaDSPDriver(output_channels=4)
     call = _stub_client(driver)
-    coeffs = [0.0, 0.5, 1.0, 0.5, 0.0]
+    # Normalized tent so DC gain = 1.0 (0 dB) — avoids the SafetyValidator
+    # tripping on the unnormalized +6 dB DC boost.
+    coeffs = [0.0, 0.25, 0.5, 0.25, 0.0]
     await driver.apply_fir(0, coeffs)
     assert driver._fir_state[0] == coeffs
 
