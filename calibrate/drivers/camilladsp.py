@@ -373,6 +373,10 @@ class CamillaDSPDriver(DSPDriver):
                         self._output_delay[idx] = float(data["delay_ms"])
                     elif field == "polarity":
                         self._output_polarity[idx] = bool(data["inverted"])
+                    elif field == "fir":
+                        coeffs = data.get("coefficients", [])
+                        if coeffs:
+                            self._fir_state[idx] = [float(c) for c in coeffs]
                 elif parsed["kind"] == "input" and parsed["field"] == "eq":
                     filters = data.get("filters", [])
                     if filters:

@@ -1864,6 +1864,47 @@ async def test_call_tool_apply_fir_dispatch(mock_dsp) -> None:
 
 
 @pytest.mark.asyncio
+async def test_apply_fir_via_design_session_id(mock_dsp) -> None:
+    """apply_fir accepts a design_session_id that maps to a cached design."""
+    from calibrate import mcp_server as _mod
+    coeffs = [0.1, 0.2, 0.3, 0.4, 0.5]
+    _mod._fir_design_cache[42] = coeffs
+    try:
+        result = await _tool_apply_fir(output_index=1, design_session_id=42)
+    finally:
+        _mod._fir_design_cache.pop(42, None)
+    assert result["ok"]
+    assert result["taps"] == 5
+    assert result["source"] == "design_session_id=42"
+    mock_dsp.apply_fir.assert_awaited_once_with(1, coeffs)
+
+
+@pytest.mark.asyncio
+async def test_apply_fir_rejects_both_sources(mock_dsp) -> None:
+    result = await _tool_apply_fir(
+        output_index=0, coefficients=[1.0], design_session_id=1,
+    )
+    assert not result["ok"]
+    assert "not both" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_apply_fir_rejects_missing_source(mock_dsp) -> None:
+    result = await _tool_apply_fir(output_index=0)
+    assert not result["ok"]
+    assert "provide either" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_apply_fir_missing_design_in_cache(mock_dsp) -> None:
+    from calibrate import mcp_server as _mod
+    _mod._fir_design_cache.pop(9999, None)
+    result = await _tool_apply_fir(output_index=0, design_session_id=9999)
+    assert not result["ok"]
+    assert "no cached design" in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_call_tool_clear_fir_dispatch(mock_dsp) -> None:
     from calibrate.mcp_server import call_tool
     texts = await call_tool("clear_fir", {"output_index": 0})
@@ -3359,6 +3400,58 @@ async def test_call_tool_design_fir_dispatch() -> None:
     data = json.loads(texts[0].text)
     assert data["ok"]
     assert "coefficients" in data
+
+
+@pytest.mark.asyncio
+async def test_design_fir_return_coefficients_false_caches_only() -> None:
+    """design_fir with return_coefficients=False omits the array and caches it."""
+    import numpy as np
+    from calibrate import mcp_server as _mod
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls = [75.0 + 3.0 * np.sin(2 * np.pi * f / 40) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+
+    _mod._fir_design_cache.pop(1, None)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        design = await _tool_design_fir(
+            session_id=1, num_taps=128, return_coefficients=False,
+        )
+    try:
+        assert design["ok"], design
+        assert design["design_cached"] is True
+        assert "coefficients" not in design
+        assert design["peak_abs"] <= 1.0 + 1e-8
+        cached = _mod._fir_design_cache.get(1)
+        assert cached is not None and len(cached) == 128
+    finally:
+        _mod._fir_design_cache.pop(1, None)
+
+
+def test_camilladsp_rehydrate_restores_fir_from_active_state() -> None:
+    """rehydrate_from_active_state restores _fir_state for the 'fir' field."""
+    import asyncio
+    from calibrate.drivers.camilladsp import CamillaDSPDriver
+    from calibrate.storage import dsp_output_key
+
+    driver = CamillaDSPDriver(
+        host="127.0.0.1", port=1234, processing_rate=48_000,
+        input_channels=2, output_channels=4,
+        capture_device={"type": "Alsa", "device": "hw:Loopback,1,0", "channels": 2, "format": "S32_LE"},
+        playback_device={"type": "Alsa", "device": "hw:USB,0,0", "channels": 4, "format": "S32_LE"},
+    )
+    coeffs = [0.1, -0.2, 0.3, -0.4]
+    active_state = {
+        dsp_output_key("camilla", 1, "fir"): {"coefficients": coeffs, "num_taps": 4},
+    }
+    # Rehydrate without pushing to a live daemon — patch the push call to a no-op.
+    async def _no_push():
+        pass
+    driver._push_config_locked = _no_push  # type: ignore[assignment]
+
+    asyncio.run(driver.rehydrate_from_active_state(active_state))
+    assert driver._fir_state.get(1) == [float(c) for c in coeffs]
 
 
 # ── LLM filter-design math tools ─────────────────────────────────────────────
