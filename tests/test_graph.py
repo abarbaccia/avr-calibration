@@ -107,6 +107,84 @@ def test_from_legacy_attaches_svs_profile_to_subs() -> None:
     assert profile.name == SVS_PB12_NSD_PROFILE.name
 
 
+# ── Shared transducer profile library ────────────────────────────────────────
+
+
+def test_load_builtin_profiles_finds_shipped_yaml_files() -> None:
+    """The repo's profiles/transducers/*.yaml files load into TransducerProfile dataclasses."""
+    from calibrate.graph import load_builtin_profiles
+
+    profiles = load_builtin_profiles()
+    names = {p.name for p in profiles}
+    # SVS default is shipped.
+    assert "svs_pb12_nsd" in names
+    # Earthquake MQB-1 was added alongside the library.
+    assert "earthquake_mqb1" in names
+
+
+def test_builtin_svs_profile_matches_in_memory_constant() -> None:
+    """The YAML copy of svs_pb12_nsd must agree with the SVS_PB12_NSD_PROFILE constant.
+
+    Both exist because the constant is the back-compat default for bare
+    ``SafetyValidator()`` callers; the YAML is the authoritative library
+    entry. They must not drift.
+    """
+    from calibrate.graph import load_builtin_profiles
+
+    shipped = next(
+        p for p in load_builtin_profiles() if p.name == SVS_PB12_NSD_PROFILE.name
+    )
+    assert shipped.min_boost_freq_hz == SVS_PB12_NSD_PROFILE.min_boost_freq_hz
+    assert shipped.max_boost_per_band_db == SVS_PB12_NSD_PROFILE.max_boost_per_band_db
+    assert shipped.max_cumulative_boost_db == SVS_PB12_NSD_PROFILE.max_cumulative_boost_db
+    assert shipped.hpf_freq_hz == SVS_PB12_NSD_PROFILE.hpf_freq_hz
+    assert shipped.hpf_order == SVS_PB12_NSD_PROFILE.hpf_order
+
+
+def test_mqb1_profile_allows_sub_20hz_content() -> None:
+    """Earthquake MQB-1 profile permits boost down to 12 Hz — tactile sub-20 Hz is the point."""
+    from calibrate.graph import load_builtin_profiles
+
+    mqb1 = next(p for p in load_builtin_profiles() if p.name == "earthquake_mqb1")
+    # Boost floor well below 20 Hz — tactile transducers live in 15-50 Hz.
+    assert mqb1.min_boost_freq_hz <= 15.0
+    # HPF is protective but doesn't cut into the tactile range.
+    assert mqb1.hpf_freq_hz is not None and mqb1.hpf_freq_hz < 15.0
+
+
+def test_from_dict_merges_user_profiles_over_builtins() -> None:
+    """User-declared profile with the same name as a built-in overrides it."""
+    data = {
+        "transducer_profiles": [
+            # Override the shipped SVS profile with a quirkier version.
+            {"name": "svs_pb12_nsd", "max_boost_per_band_db": 2.0,
+             "hpf": {"freq": 25, "order": 4}},
+        ],
+    }
+    g = SignalGraph.from_dict(data)
+    svs = next(p for p in g.profiles if p.name == "svs_pb12_nsd")
+    assert svs.max_boost_per_band_db == 2.0, "user override didn't win"
+    assert svs.hpf_freq_hz == 25.0
+    # MQB-1 is still present from the library (user didn't override it).
+    assert any(p.name == "earthquake_mqb1" for p in g.profiles)
+
+
+def test_from_dict_without_user_profiles_still_has_library() -> None:
+    """A graph with no ``transducer_profiles`` block inherits the full library."""
+    g = SignalGraph.from_dict({})
+    names = {p.name for p in g.profiles}
+    assert "svs_pb12_nsd" in names
+    assert "earthquake_mqb1" in names
+
+
+def test_from_legacy_includes_full_library_not_just_svs() -> None:
+    """Legacy shim synthesises a graph that sees every shipped profile, not only SVS."""
+    cfg = Config(DEFAULT_CONFIG.copy())
+    g = SignalGraph.from_legacy(cfg)
+    names = {p.name for p in g.profiles}
+    assert {"svs_pb12_nsd", "earthquake_mqb1"} <= names
+
+
 def test_from_legacy_honours_shaker_slot_type() -> None:
     data = DEFAULT_CONFIG.copy()
     data["minidsp"] = {**DEFAULT_CONFIG["minidsp"]}
