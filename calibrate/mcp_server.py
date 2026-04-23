@@ -3400,6 +3400,7 @@ async def _tool_mute_output(
     """
     if target is not None and output_indices:
         return _err("mute_output: pass either target or output_indices, not both")
+    from .storage import dsp_output_key
     try:
         if target is not None:
             records = _resolve_for_dispatch(target)
@@ -3412,11 +3413,21 @@ async def _tool_mute_output(
                 if dkey in by_driver:
                     idxs = by_driver.pop(dkey)
                     await rec["driver"].mute_outputs(idxs)
+                    for idx in idxs:
+                        _persist_dsp_state(
+                            dsp_output_key(rec["processor"], int(idx), "mute"),
+                            {"muted": True},
+                        )
                     touched.append({"processor": rec["processor"], "outputs": idxs})
             return _ok(target=target, muted=touched)
         if not output_indices:
             return _err("mute_output: target or output_indices required")
         await _dsp.mute_outputs(output_indices)  # type: ignore[union-attr]
+        processor = _default_dsp_name() or "dsp"
+        for idx in output_indices:
+            _persist_dsp_state(
+                dsp_output_key(processor, int(idx), "mute"), {"muted": True},
+            )
         return _ok(muted=output_indices)
     except _DispatchError as exc:
         return exc.err
@@ -3431,6 +3442,7 @@ async def _tool_unmute_output(
     """Unmute DSP outputs. See ``mute_output`` for ``target`` semantics."""
     if target is not None and output_indices:
         return _err("unmute_output: pass either target or output_indices, not both")
+    from .storage import dsp_output_key
     try:
         if target is not None:
             records = _resolve_for_dispatch(target)
@@ -3443,11 +3455,21 @@ async def _tool_unmute_output(
                 if dkey in by_driver:
                     idxs = by_driver.pop(dkey)
                     await rec["driver"].unmute_outputs(idxs)
+                    for idx in idxs:
+                        _persist_dsp_state(
+                            dsp_output_key(rec["processor"], int(idx), "mute"),
+                            {"muted": False},
+                        )
                     touched.append({"processor": rec["processor"], "outputs": idxs})
             return _ok(target=target, unmuted=touched)
         if not output_indices:
             return _err("unmute_output: target or output_indices required")
         await _dsp.unmute_outputs(output_indices)  # type: ignore[union-attr]
+        processor = _default_dsp_name() or "dsp"
+        for idx in output_indices:
+            _persist_dsp_state(
+                dsp_output_key(processor, int(idx), "mute"), {"muted": False},
+            )
         return _ok(unmuted=output_indices)
     except _DispatchError as exc:
         return exc.err

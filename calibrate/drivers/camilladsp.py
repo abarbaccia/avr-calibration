@@ -377,6 +377,8 @@ class CamillaDSPDriver(DSPDriver):
                         coeffs = data.get("coefficients", [])
                         if coeffs:
                             self._fir_state[idx] = [float(c) for c in coeffs]
+                    elif field == "mute":
+                        self._output_muted[idx] = bool(data["muted"])
                 elif parsed["kind"] == "input" and parsed["field"] == "eq":
                     filters = data.get("filters", [])
                     if filters:
@@ -528,19 +530,28 @@ class CamillaDSPDriver(DSPDriver):
 
         Each output channel lists exactly those inputs routed to it (enabled).
         Outputs with no routed input get no sources (silence).
+
+        Muted outputs get no sources regardless of routing state — CamillaDSP
+        does NOT reliably honor the Gain filter's ``mute: true`` flag when a
+        Conv (FIR) or Delay filter sits earlier in the per-output pipeline.
+        Observed in run 15: muting sub_nearfield via Gain mute left the
+        delayed FIR output still reaching the Focusrite, contaminating every
+        solo measurement. Removing the mixer source is the only reliable
+        way to silence an output on this CamillaDSP configuration.
         """
         mapping: list[dict] = []
         for out_idx in range(self._output_channels):
             sources = []
-            for inp_idx in range(self._input_channels):
-                enabled = self._routing.get(inp_idx, {}).get(out_idx, False)
-                if enabled:
-                    sources.append({
-                        "channel": inp_idx,
-                        "gain": 0.0,
-                        "inverted": False,
-                        "mute": False,
-                    })
+            if not self._output_muted.get(out_idx, False):
+                for inp_idx in range(self._input_channels):
+                    enabled = self._routing.get(inp_idx, {}).get(out_idx, False)
+                    if enabled:
+                        sources.append({
+                            "channel": inp_idx,
+                            "gain": 0.0,
+                            "inverted": False,
+                            "mute": False,
+                        })
             mapping.append({"dest": out_idx, "sources": sources})
         return {
             "cal_matrix": {

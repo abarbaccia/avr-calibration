@@ -1905,3 +1905,67 @@ async def test_camilladsp_rehydrate_tolerates_legacy_flat_keys() -> None:
     await driver.rehydrate_from_active_state(active_state)
     assert len(driver._output_eq[0]) == 1
     assert driver._output_gain[1] == -1.5
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_mute_removes_mixer_sources() -> None:
+    """Muting drops the output's mixer sources entirely.
+
+    Discovered in run 15: CamillaDSP's Gain-filter ``mute: true`` does not
+    reliably silence an output when the per-output pipeline has a Conv (FIR)
+    or Delay filter earlier. The only dependable way to silence is to remove
+    the mixer source so no signal reaches the output at all. This test pins
+    the driver to that behavior — if someone refactors the mixer build to
+    "restore" the source for a muted channel, the test fails.
+    """
+    driver = CamillaDSPDriver(output_channels=4, input_channels=2, sub_outputs=[0, 1])
+    _stub_client(driver)
+
+    # Route input 0 to outputs 0 and 1, then mute output 1.
+    await driver.set_routing({0: {0: True, 1: True}, 1: {}})
+    await driver.mute_outputs([1])
+
+    mixer = driver._build_mixer()["cal_matrix"]
+    mapping = {entry["dest"]: entry["sources"] for entry in mixer["mapping"]}
+    # Output 0 keeps its source.
+    assert len(mapping[0]) == 1
+    assert mapping[0][0]["channel"] == 0
+    # Output 1 is muted — mixer sources are empty regardless of routing.
+    assert mapping[1] == []
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_unmute_restores_mixer_sources() -> None:
+    """Unmute puts the sources back according to the current routing."""
+    driver = CamillaDSPDriver(output_channels=4, input_channels=2, sub_outputs=[0, 1])
+    _stub_client(driver)
+
+    await driver.set_routing({0: {0: True, 1: True}, 1: {}})
+    await driver.mute_outputs([1])
+    assert driver._build_mixer()["cal_matrix"]["mapping"][1]["sources"] == []
+
+    await driver.unmute_outputs([1])
+    mapping = driver._build_mixer()["cal_matrix"]["mapping"]
+    assert len(mapping[1]["sources"]) == 1
+    assert mapping[1]["sources"][0]["channel"] == 0
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_rehydrate_restores_mute_state() -> None:
+    """active_dsp_state carries a 'mute' field now; rehydrate picks it up.
+
+    Matches the eq/gain/delay/polarity/fir pattern; before this change mute
+    was the only state field that evaporated on MCP restart.
+    """
+    driver = CamillaDSPDriver(output_channels=4, input_channels=2, sub_outputs=[0, 1])
+    _stub_client(driver)
+    await driver.set_routing({0: {0: True, 1: True}, 1: {}})
+
+    active_state = {
+        "processor:camilla:output:1:mute": {"muted": True},
+    }
+    await driver.rehydrate_from_active_state(active_state)
+    assert driver._output_muted.get(1) is True
+    # And the rebuilt mixer has no source for output 1.
+    mapping = driver._build_mixer()["cal_matrix"]["mapping"]
+    assert mapping[1]["sources"] == []
