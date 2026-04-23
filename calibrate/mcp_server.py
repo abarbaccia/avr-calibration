@@ -1588,28 +1588,38 @@ async def _tool_sensitivity_analysis(
 
 async def _tool_fit_correction_filter(
     session_id: int,
-    target_curve: dict,
     freq_range: list[float],
+    target_curve: dict | None = None,
+    target_offsets: list[dict] | None = None,
     constraints: dict | None = None,
     num_filters: int = 1,
+    exclude_geometry: bool = True,
 ) -> dict:
     """Find the optimal PEQ filter(s) to minimize RMS in a frequency range.
 
     When ``num_filters == 1`` (default), runs grid-search-plus-refinement for
     one peaking filter — the LLM picks the region, the tool finds the best
-    (freq, gain, Q). Same behavior as before.
+    (freq, gain, Q).
 
     When ``num_filters > 1``, uses scipy's Levenberg-Marquardt
     (``least_squares`` with trust-region bounds) to **jointly** optimize all
-    filter parameters at once. 3N free variables per call. Replaces the
-    manual iterative filter-design loop — a 5-filter fit that would take 4
-    measure/tweak iterations by hand converges in one tool call.
+    filter parameters at once. 3N free variables per call.
 
-    Safety: the filter set is peaking-only (use apply_eq's HPF for the
-    mandatory infrasonic protection). Bounds keep per-filter gain within the
-    SafetyValidator budget so the returned set applies cleanly.
+    Target anchoring: pass ``target_offsets`` (relative dB, e.g. Harman offsets)
+    and the tool calls anchor_target internally to compute the correct reference
+    SPL for the baseline — avoids the common mistake of reusing a stale
+    reference_spl. Or pass ``target_curve`` directly with absolute SPL points.
 
-    constraints: {max_boost_db, min_q, max_q, filter_type (single-filter mode only)}
+    Geometry exclusion: when ``exclude_geometry=True`` (default), near-π
+    cancellation bands (from analyze_phase) are dropped from the residuals
+    before fitting so the LM doesn't waste filter slots trying to fill
+    unfixable nulls.
+
+    constraints: {max_boost_db, min_q, max_q, filter_type, preserve_mean,
+    doublet_penalty, doublet_max_hz}. ``preserve_mean=True`` adds a penalty
+    that keeps mean(correction) ≈ 0 so broadband level stays balanced.
+    ``doublet_penalty`` > 0 penalises opposing-sign filter pairs closer than
+    ``doublet_max_hz`` (default 5 Hz) to discourage ugly +N/-N doublets.
     """
     from .storage import SessionStore
     import math
@@ -1630,11 +1640,34 @@ async def _tool_fit_correction_filter(
         if num_filters > 8:
             return _err("num_filters > 8 not supported (SafetyValidator slot budget)")
 
+        range_lo, range_hi = float(freq_range[0]), float(freq_range[1])
+
+        # Auto-anchor: if caller passed target_offsets, compute ref_spl from
+        # the current baseline so the fit doesn't inherit a stale anchor.
+        anchored_reference_spl: float | None = None
+        if target_offsets and not target_curve:
+            anchor = await _tool_anchor_target(
+                session_id=session_id,
+                target_offsets=target_offsets,
+                band=[range_lo, range_hi],
+                exclude_geometry=exclude_geometry,
+            )
+            if not anchor.get("ok"):
+                return _err(
+                    f"auto-anchor failed: {anchor.get('error', 'unknown')}"
+                )
+            anchored_reference_spl = float(anchor["reference_spl"])
+            target_curve = {
+                "points": anchor["anchored_points"],
+                "band": [range_lo, range_hi],
+            }
+
+        if not target_curve:
+            return _err("must pass target_curve or target_offsets")
         points = target_curve.get("points", [])
         if not points:
             return _err("target_curve must include 'points'")
 
-        range_lo, range_hi = float(freq_range[0]), float(freq_range[1])
         target_sorted = sorted(points, key=lambda p: p["freq"])
 
         def interp_target(freq_hz):
@@ -1650,13 +1683,32 @@ async def _tool_fit_correction_filter(
                     return s0 + t * (s1 - s0)
             return target_sorted[-1]["spl"]
 
+        # Geometry-band exclusion: pull 1/3-octave ranges classified as
+        # near-π cancellation by analyze_phase so the optimizer doesn't
+        # waste slots trying to fill unfixable nulls.
+        geometry_ranges: list[tuple[float, float]] = []
+        if exclude_geometry:
+            try:
+                geometry_ranges = await _get_geometry_band_ranges(
+                    session_id, min_hz=range_lo, max_hz=range_hi,
+                )
+            except Exception as exc:
+                log.warning("fit_correction_filter: geometry exclusion failed: %s", exc)
+
+        def _in_geometry(freq_hz: float) -> bool:
+            return any(lo <= freq_hz <= hi for lo, hi in geometry_ranges)
+
         # Build error pairs in the target range
         error_pairs = []
+        excluded_geometry_points = 0
         for f, measured in zip(fr.frequencies, fr.spl):
             if f < range_lo or f > range_hi:
                 continue
             target = interp_target(f)
             if target is None:
+                continue
+            if _in_geometry(f):
+                excluded_geometry_points += 1
                 continue
             error_pairs.append((f, measured, target, measured - target))
 
@@ -1672,6 +1724,16 @@ async def _tool_fit_correction_filter(
         min_q = float(c.get("min_q", 0.5))
         max_q = float(c.get("max_q", 10.0))
         ftype = c.get("filter_type", "peaking")
+        preserve_mean = bool(c.get("preserve_mean", False))
+        # Soft-constraint weight for the mean(correction)≈0 penalty. Default
+        # sqrt(N) puts the penalty on comparable footing with per-point SSE
+        # so the optimiser trades mean drift roughly 1:1 against fit quality.
+        # Raise this above 1.0 (multiplier) to force the optimiser harder
+        # toward exact mean preservation at some cost to SSE — useful when
+        # the caller cares more about broadband level than L2 fit.
+        preserve_mean_strength = float(c.get("preserve_mean_strength", 1.0))
+        doublet_penalty = float(c.get("doublet_penalty", 0.0))
+        doublet_max_hz = float(c.get("doublet_max_hz", 5.0))
 
         # ── Multi-filter joint optimization (N > 1) ─────────────────────────
         # For N > 1, treat the filter parameters as a continuous optimization
@@ -1724,15 +1786,57 @@ async def _tool_fit_correction_filter(
                 lb.extend([range_lo, -15.0, min_q])
                 ub.extend([range_hi, max_boost, max_q])
 
+            # Penalty weights scaled to RMS magnitude. sqrt(N) so the
+            # single scalar penalty term matches the N per-point residuals
+            # when summed in quadrature.
+            n_points = len(freqs_arr)
+            mean_weight = (
+                preserve_mean_strength * float(np.sqrt(n_points))
+                if preserve_mean else 0.0
+            )
+
             def residuals(x: np.ndarray) -> np.ndarray:
                 """Per-frequency residual: target - (measured + sum of filter responses)."""
                 correction = np.zeros_like(freqs_arr)
+                gains = np.empty(num_filters)
+                centres = np.empty(num_filters)
                 for i in range(num_filters):
                     fc, g, q = float(x[3 * i]), float(x[3 * i + 1]), float(x[3 * i + 2])
-                    # _biquad_response takes a single frequency; vectorize
+                    centres[i] = fc
+                    gains[i] = g
                     for j, fj in enumerate(freqs_arr):
                         correction[j] += _biquad_response(fj, "peaking", fc, g, q)
-                return measured_arr + correction - target_arr
+
+                base = measured_arr + correction - target_arr
+                extras: list[np.ndarray] = [base]
+
+                # preserve_mean: penalise net DC shift of the correction so
+                # the LM optimiser can't satisfy L2 by riding the level up
+                # or down across the whole band.
+                if mean_weight > 0:
+                    extras.append(np.array([mean_weight * float(np.mean(correction))]))
+
+                # Doublet penalty: one slot per unordered filter pair so the
+                # residual vector is a fixed size (scipy requires it). Each
+                # slot is non-zero only when the pair is both close (within
+                # doublet_max_hz) and opposing-sign; magnitude scales with
+                # the geometric mean of the gains and falls off linearly
+                # with spacing.
+                if doublet_penalty > 0 and num_filters > 1:
+                    n_pairs = num_filters * (num_filters - 1) // 2
+                    penalties = np.zeros(n_pairs)
+                    k = 0
+                    for i in range(num_filters):
+                        for j in range(i + 1, num_filters):
+                            spacing = abs(centres[i] - centres[j])
+                            if spacing < doublet_max_hz and gains[i] * gains[j] < 0:
+                                strength = float(np.sqrt(abs(gains[i] * gains[j])))
+                                proximity = 1.0 - spacing / doublet_max_hz
+                                penalties[k] = doublet_penalty * strength * proximity
+                            k += 1
+                    extras.append(penalties)
+
+                return np.concatenate(extras) if len(extras) > 1 else base
 
             try:
                 result = least_squares(
@@ -1759,11 +1863,21 @@ async def _tool_fit_correction_filter(
                 })
             fit_filters.sort(key=lambda f: f["freq"])
 
-            # Compute final RMS using the optimizer's residual.
-            final_residuals = residuals(result.x)
-            rms_after = float(np.sqrt(np.mean(final_residuals ** 2)))
+            # Final RMS is computed from the base residuals only — we don't
+            # want the penalty terms inflating the reported number. Rebuild
+            # the correction from the optimiser's solution.
+            final_correction = np.zeros_like(freqs_arr)
+            for i in range(num_filters):
+                fc = float(result.x[3 * i])
+                g = float(result.x[3 * i + 1])
+                q = float(result.x[3 * i + 2])
+                for j, fj in enumerate(freqs_arr):
+                    final_correction[j] += _biquad_response(fj, "peaking", fc, g, q)
+            base_resid = measured_arr + final_correction - target_arr
+            rms_after = float(np.sqrt(np.mean(base_resid ** 2)))
+            mean_correction = float(np.mean(final_correction))
 
-            return _ok(
+            result_payload: dict = dict(
                 session_id=session_id,
                 freq_range=[range_lo, range_hi],
                 num_filters_requested=num_filters,
@@ -1771,10 +1885,19 @@ async def _tool_fit_correction_filter(
                 rms_before=round(rms_before, 3),
                 rms_after=round(rms_after, 3),
                 rms_improvement=round(rms_before - rms_after, 3),
+                mean_correction_db=round(mean_correction, 3),
                 filters=fit_filters,
                 optimizer_status=int(result.status),
                 optimizer_message=str(result.message),
+                excluded_geometry_points=excluded_geometry_points,
+                geometry_bands=[
+                    {"lo_hz": round(lo, 1), "hi_hz": round(hi, 1)}
+                    for lo, hi in geometry_ranges
+                ],
             )
+            if anchored_reference_spl is not None:
+                result_payload["anchored_reference_spl"] = round(anchored_reference_spl, 2)
+            return _ok(**result_payload)
 
         # ── Single-filter grid search (N == 1) ──────────────────────────────
         best_rms = rms_before
@@ -5949,11 +6072,22 @@ _TOOLS: list[Tool] = [
                 },
                 "target_curve": {
                     "type": "object",
-                    "description": "Target curve with points",
+                    "description": "Target curve with absolute-SPL points. Pass this OR target_offsets.",
                     "properties": {
                         "points": {"type": "array", "items": {"type": "object"}},
                         "band": {"type": "array", "items": {"type": "number"}},
                     },
+                },
+                "target_offsets": {
+                    "type": "array",
+                    "description": (
+                        "Target offsets as [{freq_hz, offset_db}] relative to a "
+                        "reference frequency (e.g. Harman: 80 Hz = 0 dB). "
+                        "When provided, the tool calls anchor_target internally "
+                        "to pick the correct reference_spl for this baseline — "
+                        "avoids stale-anchor bugs. Pass this OR target_curve."
+                    ),
+                    "items": {"type": "object"},
                 },
                 "freq_range": {
                     "type": "array",
@@ -5962,12 +6096,28 @@ _TOOLS: list[Tool] = [
                 },
                 "constraints": {
                     "type": "object",
-                    "description": "Optional: {max_boost_db, min_q, max_q, filter_type}. filter_type only honored when num_filters=1 (joint mode is peaking-only).",
+                    "description": (
+                        "Optional. {max_boost_db, min_q, max_q, filter_type, "
+                        "preserve_mean, preserve_mean_strength, "
+                        "doublet_penalty, doublet_max_hz}. filter_type "
+                        "honored only when num_filters=1 (joint mode is "
+                        "peaking-only). preserve_mean=True keeps "
+                        "mean(correction) ≈ 0 so broadband level stays put; "
+                        "preserve_mean_strength (default 1.0) multiplies "
+                        "the soft-constraint weight — raise above 1 to "
+                        "force mean preservation harder at some SSE cost. "
+                        "doublet_penalty > 0 discourages opposing-sign filter "
+                        "pairs within doublet_max_hz (default 5 Hz)."
+                    ),
                     "properties": {
                         "max_boost_db": {"type": "number"},
                         "min_q": {"type": "number"},
                         "max_q": {"type": "number"},
                         "filter_type": {"type": "string"},
+                        "preserve_mean": {"type": "boolean"},
+                        "preserve_mean_strength": {"type": "number"},
+                        "doublet_penalty": {"type": "number"},
+                        "doublet_max_hz": {"type": "number"},
                     },
                 },
                 "num_filters": {
@@ -5980,8 +6130,19 @@ _TOOLS: list[Tool] = [
                     ),
                     "default": 1,
                 },
+                "exclude_geometry": {
+                    "type": "boolean",
+                    "description": (
+                        "Default true. When true, drops 1/3-octave bands "
+                        "classified as near-π geometry cancellation by "
+                        "analyze_phase from the residuals before fitting, so "
+                        "the optimizer doesn't waste filter slots on "
+                        "unfixable nulls."
+                    ),
+                    "default": True,
+                },
             },
-            "required": ["session_id", "target_curve", "freq_range"],
+            "required": ["session_id", "freq_range"],
         },
     ),
     Tool(
@@ -6405,10 +6566,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     elif name == "fit_correction_filter":
         result = await _tool_fit_correction_filter(
             session_id=int(arguments["session_id"]),
-            target_curve=arguments["target_curve"],
+            target_curve=arguments.get("target_curve"),
+            target_offsets=arguments.get("target_offsets"),
             freq_range=arguments["freq_range"],
             constraints=arguments.get("constraints"),
             num_filters=int(arguments.get("num_filters", 1)),
+            exclude_geometry=bool(arguments.get("exclude_geometry", True)),
         )
     elif name == "predict_rms":
         result = await _tool_predict_rms(

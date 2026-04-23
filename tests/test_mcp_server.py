@@ -4335,6 +4335,175 @@ async def test_call_tool_fit_correction_filter_joint_dispatch() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fit_correction_filter_preserve_mean_balances_level() -> None:
+    """preserve_mean=True should keep mean(correction) near zero, preventing
+    the broadband level swings seen in the 2026-04-23 auto-PEQ session
+    (v1 mean -1.45 dB, v3 mean -2.06 dB when preserve_mean is off)."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    # Measurement sits uniformly 3 dB above a flat 75 dB target — the
+    # L2-optimal answer without mean-preservation is "cut everything",
+    # which drives mean(correction) strongly negative. preserve_mean
+    # should rein that in.
+    spls = [78.0 for _ in freqs]
+    session = _make_fr_session(freqs, spls)
+    target = {
+        "points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}],
+        "band": [20, 120],
+    }
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        off = await _tool_fit_correction_filter(
+            session_id=1, target_curve=target,
+            freq_range=[25.0, 100.0], num_filters=3,
+            exclude_geometry=False,
+        )
+        on = await _tool_fit_correction_filter(
+            session_id=1, target_curve=target,
+            freq_range=[25.0, 100.0], num_filters=3,
+            constraints={"preserve_mean": True},
+            exclude_geometry=False,
+        )
+    assert off["ok"] and on["ok"], (off, on)
+    assert "mean_correction_db" in on
+    assert abs(on["mean_correction_db"]) <= abs(off["mean_correction_db"]) + 1e-6
+
+
+@pytest.mark.asyncio
+async def test_fit_correction_filter_doublet_penalty_discourages_opposing_pairs() -> None:
+    """doublet_penalty > 0 should push the optimiser away from stacking
+    a +N/-N pair of filters at nearby centre frequencies (the tonight
+    LM +6/-7 doublet at 46.9/49.7 Hz pattern)."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 400).tolist()
+    # A tight peak centred at 50 Hz — LM with no penalty often fits this
+    # with a broader boost + tight cut doublet.
+    spls = [75.0 + 6.0 * np.exp(-((f - 50.0) ** 2) / 4.0) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+    target = {
+        "points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}],
+        "band": [20, 120],
+    }
+
+    def doublet_score(filters: list[dict], max_spacing_hz: float) -> float:
+        """Sum sqrt(|g_i * g_j|) across opposing-sign pairs within spacing.
+        Bigger = more doublet-y. Zero when no nearby opposing pairs."""
+        total = 0.0
+        for i, a in enumerate(filters):
+            for b in filters[i + 1:]:
+                if abs(a["freq"] - b["freq"]) >= max_spacing_hz:
+                    continue
+                if a["gain_db"] * b["gain_db"] < 0:
+                    total += (abs(a["gain_db"] * b["gain_db"])) ** 0.5
+        return total
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        unpenalised = await _tool_fit_correction_filter(
+            session_id=1, target_curve=target,
+            freq_range=[30.0, 90.0], num_filters=3,
+            constraints={"doublet_penalty": 0.0},
+            exclude_geometry=False,
+        )
+        penalised = await _tool_fit_correction_filter(
+            session_id=1, target_curve=target,
+            freq_range=[30.0, 90.0], num_filters=3,
+            constraints={"doublet_penalty": 20.0, "doublet_max_hz": 10.0},
+            exclude_geometry=False,
+        )
+    assert unpenalised["ok"] and penalised["ok"]
+    # Penalty should reduce the doublet magnitude (or leave it at 0).
+    unpenalised_score = doublet_score(unpenalised["filters"], 10.0)
+    penalised_score = doublet_score(penalised["filters"], 10.0)
+    assert penalised_score <= unpenalised_score
+
+
+@pytest.mark.asyncio
+async def test_fit_correction_filter_exclude_geometry_drops_null_band() -> None:
+    """exclude_geometry=True should drop frequencies inside geometry bands
+    returned by _get_geometry_band_ranges from the residuals — the
+    optimiser shouldn't waste a slot fighting an unfixable null."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 400).tolist()
+    # Plant a deep cancellation null at 70 Hz that would tempt a +6 dB
+    # boost filter if the optimiser didn't know it was geometry.
+    spls = [75.0 - 20.0 * np.exp(-((f - 70.0) ** 2) / 4.0) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+    target = {
+        "points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}],
+        "band": [20, 120],
+    }
+
+    with patch("calibrate.storage.SessionStore") as MockStore, \
+         patch("calibrate.mcp_server._get_geometry_band_ranges",
+               return_value=[(62.5, 78.7)]):
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_fit_correction_filter(
+            session_id=1, target_curve=target,
+            freq_range=[40.0, 100.0], num_filters=2,
+            exclude_geometry=True,
+        )
+    assert result["ok"]
+    assert result["excluded_geometry_points"] > 0
+    assert result["geometry_bands"] == [{"lo_hz": 62.5, "hi_hz": 78.7}]
+    # No returned filter should sit inside the excluded geometry band.
+    for f in result["filters"]:
+        assert not (62.5 <= f["freq"] <= 78.7), \
+            f"filter at {f['freq']} lies inside excluded geometry band"
+
+
+@pytest.mark.asyncio
+async def test_fit_correction_filter_auto_anchor_from_target_offsets() -> None:
+    """target_offsets (relative Harman-style) should trigger anchor_target
+    and use the returned anchored_points as the absolute target."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls = [75.0 for _ in freqs]
+    session = _make_fr_session(freqs, spls)
+
+    anchored_points = [
+        {"freq": 25, "spl": 80.0}, {"freq": 80, "spl": 75.0},
+    ]
+
+    async def fake_anchor(**kwargs):
+        assert kwargs["target_offsets"][0]["freq_hz"] == 25
+        return {
+            "ok": True,
+            "reference_spl": -21.33,
+            "anchored_points": anchored_points,
+        }
+
+    with patch("calibrate.storage.SessionStore") as MockStore, \
+         patch("calibrate.mcp_server._tool_anchor_target", side_effect=fake_anchor), \
+         patch("calibrate.mcp_server._get_geometry_band_ranges", return_value=[]):
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_fit_correction_filter(
+            session_id=1,
+            target_offsets=[
+                {"freq_hz": 25, "offset_db": 5},
+                {"freq_hz": 80, "offset_db": 0},
+            ],
+            freq_range=[25.0, 80.0], num_filters=2,
+        )
+    assert result["ok"]
+    assert result["anchored_reference_spl"] == -21.33
+
+
+@pytest.mark.asyncio
+async def test_fit_correction_filter_requires_target_curve_or_offsets() -> None:
+    """Must pass either target_curve or target_offsets."""
+    session = _make_fr_session([20.0, 120.0], [75.0, 75.0])
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_fit_correction_filter(
+            session_id=1, freq_range=[25.0, 100.0], num_filters=2,
+        )
+    assert not result["ok"]
+    assert "target_curve" in result["error"] or "target_offsets" in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_predict_rms_basic() -> None:
     """predict_rms returns predicted deviation for proposed filters."""
     import numpy as np
