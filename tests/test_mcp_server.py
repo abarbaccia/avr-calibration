@@ -3490,6 +3490,39 @@ async def test_call_tool_design_fir_dispatch() -> None:
 
 
 @pytest.mark.asyncio
+async def test_call_tool_design_fir_dispatch_return_coefficients_false() -> None:
+    """The dispatcher must forward return_coefficients=False — otherwise the
+    caller's opt-out is silently ignored and the large array comes back anyway.
+    Regression test for the Apr-23 verification fix.
+    """
+    from calibrate.mcp_server import call_tool
+    from calibrate import mcp_server as _mod
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls = [75.0 + 3.0 * np.sin(2 * np.pi * f / 40) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+    _mod._fir_design_cache.pop(1, None)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        texts = await call_tool("design_fir", {
+            "session_id": 1,
+            "num_taps": 128,
+            "return_coefficients": False,
+        })
+    try:
+        data = json.loads(texts[0].text)
+        assert data["ok"], data
+        assert data["design_cached"] is True
+        assert "coefficients" not in data, (
+            "dispatcher dropped return_coefficients=False — "
+            "array would blow the token budget on 8k+ taps"
+        )
+    finally:
+        _mod._fir_design_cache.pop(1, None)
+
+
+@pytest.mark.asyncio
 async def test_design_fir_return_coefficients_false_caches_only() -> None:
     """design_fir with return_coefficients=False omits the array and caches it."""
     import numpy as np
