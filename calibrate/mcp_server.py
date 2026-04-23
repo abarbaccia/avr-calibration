@@ -1591,13 +1591,25 @@ async def _tool_fit_correction_filter(
     target_curve: dict,
     freq_range: list[float],
     constraints: dict | None = None,
+    num_filters: int = 1,
 ) -> dict:
-    """Find the optimal single PEQ filter to minimize RMS in a frequency range.
+    """Find the optimal PEQ filter(s) to minimize RMS in a frequency range.
 
-    The LLM decides WHICH region to correct and any constraints. This tool
-    does the numerical optimization to find the best (freq, gain, Q).
+    When ``num_filters == 1`` (default), runs grid-search-plus-refinement for
+    one peaking filter — the LLM picks the region, the tool finds the best
+    (freq, gain, Q). Same behavior as before.
 
-    constraints: {max_boost_db, min_q, max_q, filter_type}
+    When ``num_filters > 1``, uses scipy's Levenberg-Marquardt
+    (``least_squares`` with trust-region bounds) to **jointly** optimize all
+    filter parameters at once. 3N free variables per call. Replaces the
+    manual iterative filter-design loop — a 5-filter fit that would take 4
+    measure/tweak iterations by hand converges in one tool call.
+
+    Safety: the filter set is peaking-only (use apply_eq's HPF for the
+    mandatory infrasonic protection). Bounds keep per-filter gain within the
+    SafetyValidator budget so the returned set applies cleanly.
+
+    constraints: {max_boost_db, min_q, max_q, filter_type (single-filter mode only)}
     """
     from .storage import SessionStore
     import math
@@ -1612,6 +1624,11 @@ async def _tool_fit_correction_filter(
         fr = session.start_fr
         if not fr or not fr.frequencies:
             return _err(f"session {session_id} has no FR data")
+
+        if num_filters < 1:
+            return _err("num_filters must be >= 1")
+        if num_filters > 8:
+            return _err("num_filters > 8 not supported (SafetyValidator slot budget)")
 
         points = target_curve.get("points", [])
         if not points:
@@ -1656,7 +1673,110 @@ async def _tool_fit_correction_filter(
         max_q = float(c.get("max_q", 10.0))
         ftype = c.get("filter_type", "peaking")
 
-        # Grid search + refinement (scipy optional, grid is robust)
+        # ── Multi-filter joint optimization (N > 1) ─────────────────────────
+        # For N > 1, treat the filter parameters as a continuous optimization
+        # problem and solve with scipy.optimize.least_squares (trust-region
+        # Levenberg-Marquardt). One tool call produces a full converged PEQ
+        # set that would otherwise require N measure-and-tweak iterations
+        # by hand.
+        if num_filters > 1:
+            try:
+                import numpy as np
+                from scipy.optimize import least_squares
+            except Exception as exc:
+                return _err(f"num_filters>1 requires scipy+numpy ({exc})")
+
+            freqs_arr = np.array([e[0] for e in error_pairs])
+            measured_arr = np.array([e[1] for e in error_pairs])
+            target_arr = np.array([e[2] for e in error_pairs])
+
+            # Log-uniform initial filter centres across the band so the
+            # starting point isn't pathologically bad. Gains start at
+            # `-sign(error)` small; Q starts at 2 (mid-broad).
+            init_freqs = [
+                range_lo * (range_hi / range_lo) ** (i / (num_filters - 1))
+                for i in range(num_filters)
+            ]
+            # Each filter's starting gain tries to reduce the local error
+            # at that centre frequency — keeps LM from wandering.
+            init_gains = []
+            for fc in init_freqs:
+                # Linear-interpolate local error at fc
+                if fc <= freqs_arr[0]:
+                    local_err = measured_arr[0] - target_arr[0]
+                elif fc >= freqs_arr[-1]:
+                    local_err = measured_arr[-1] - target_arr[-1]
+                else:
+                    idx = int(np.searchsorted(freqs_arr, fc))
+                    local_err = measured_arr[idx] - target_arr[idx]
+                # Want a filter gain of -local_err, clamped to safe range
+                init_gains.append(float(np.clip(-local_err, -10.0, max_boost * 0.8)))
+
+            # Pack initial params: [f_0, g_0, q_0, f_1, g_1, q_1, ...]
+            x0 = []
+            for fc, g in zip(init_freqs, init_gains):
+                x0.extend([float(fc), g, 2.0])
+            x0 = np.array(x0)
+
+            # Bounds: per-filter (freq in [lo, hi], gain in [-15, max_boost], Q in [min_q, max_q]).
+            lb, ub = [], []
+            for _ in range(num_filters):
+                lb.extend([range_lo, -15.0, min_q])
+                ub.extend([range_hi, max_boost, max_q])
+
+            def residuals(x: np.ndarray) -> np.ndarray:
+                """Per-frequency residual: target - (measured + sum of filter responses)."""
+                correction = np.zeros_like(freqs_arr)
+                for i in range(num_filters):
+                    fc, g, q = float(x[3 * i]), float(x[3 * i + 1]), float(x[3 * i + 2])
+                    # _biquad_response takes a single frequency; vectorize
+                    for j, fj in enumerate(freqs_arr):
+                        correction[j] += _biquad_response(fj, "peaking", fc, g, q)
+                return measured_arr + correction - target_arr
+
+            try:
+                result = least_squares(
+                    residuals, x0, bounds=(lb, ub),
+                    method="trf", max_nfev=400,
+                )
+            except Exception as exc:
+                return _err(f"least_squares failed: {exc}")
+
+            fit_filters: list[dict] = []
+            for i in range(num_filters):
+                fc = float(result.x[3 * i])
+                g = float(result.x[3 * i + 1])
+                q = float(result.x[3 * i + 2])
+                # Drop filters whose gain is effectively zero — LM may park a
+                # redundant slot at 0 dB, and that just wastes a PEQ slot.
+                if abs(g) < 0.15:
+                    continue
+                fit_filters.append({
+                    "type": "peaking",
+                    "freq": round(fc, 1),
+                    "gain_db": round(g, 2),
+                    "q": round(q, 2),
+                })
+            fit_filters.sort(key=lambda f: f["freq"])
+
+            # Compute final RMS using the optimizer's residual.
+            final_residuals = residuals(result.x)
+            rms_after = float(np.sqrt(np.mean(final_residuals ** 2)))
+
+            return _ok(
+                session_id=session_id,
+                freq_range=[range_lo, range_hi],
+                num_filters_requested=num_filters,
+                num_filters_returned=len(fit_filters),
+                rms_before=round(rms_before, 3),
+                rms_after=round(rms_after, 3),
+                rms_improvement=round(rms_before - rms_after, 3),
+                filters=fit_filters,
+                optimizer_status=int(result.status),
+                optimizer_message=str(result.message),
+            )
+
+        # ── Single-filter grid search (N == 1) ──────────────────────────────
         best_rms = rms_before
         best_params = None
 
@@ -5809,10 +5929,16 @@ _TOOLS: list[Tool] = [
     Tool(
         name="fit_correction_filter",
         description=(
-            "Find the optimal single PEQ filter to minimize RMS error in a frequency "
-            "range. You decide WHICH region and constraints; this tool does the "
-            "numerical optimization to find the best (freq, gain, Q). Returns the "
-            "filter parameters and predicted RMS improvement."
+            "Fit PEQ filter(s) to minimize RMS error in a frequency range. "
+            "With ``num_filters=1`` (default), grid-search + refine one peaking "
+            "filter — the LLM picks the region, the tool finds the best "
+            "(freq, gain, Q). With ``num_filters > 1``, jointly optimize N "
+            "peaking filters via scipy's Levenberg-Marquardt (trust-region "
+            "least squares with bounds). One call produces a converged PEQ "
+            "set that would otherwise take N manual measure-and-tweak "
+            "iterations. Up to 8 filters (SafetyValidator slot budget). "
+            "Returns the filter list, RMS before/after, and optimizer status. "
+            "Peaking-only — pair with a mandatory HPF from apply_eq."
         ),
         inputSchema={
             "type": "object",
@@ -5836,13 +5962,23 @@ _TOOLS: list[Tool] = [
                 },
                 "constraints": {
                     "type": "object",
-                    "description": "Optional: {max_boost_db, min_q, max_q, filter_type}",
+                    "description": "Optional: {max_boost_db, min_q, max_q, filter_type}. filter_type only honored when num_filters=1 (joint mode is peaking-only).",
                     "properties": {
                         "max_boost_db": {"type": "number"},
                         "min_q": {"type": "number"},
                         "max_q": {"type": "number"},
                         "filter_type": {"type": "string"},
                     },
+                },
+                "num_filters": {
+                    "type": "integer",
+                    "description": (
+                        "Number of peaking filters to fit. Default 1 (grid "
+                        "search one filter). 2-8 triggers joint Levenberg-"
+                        "Marquardt optimization over 3N parameters. Use when "
+                        "you want the tool to design a complete PEQ set."
+                    ),
+                    "default": 1,
                 },
             },
             "required": ["session_id", "target_curve", "freq_range"],
@@ -6272,6 +6408,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             target_curve=arguments["target_curve"],
             freq_range=arguments["freq_range"],
             constraints=arguments.get("constraints"),
+            num_filters=int(arguments.get("num_filters", 1)),
         )
     elif name == "predict_rms":
         result = await _tool_predict_rms(
