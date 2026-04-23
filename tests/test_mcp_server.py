@@ -4227,6 +4227,113 @@ async def test_fit_correction_filter_respects_constraints() -> None:
         assert result["best_filter"]["gain_db"] <= 3.0
 
 
+# ── multi-filter joint optimization (num_filters > 1) ──────────────────────
+
+@pytest.mark.asyncio
+async def test_fit_correction_filter_joint_beats_single_on_3_peaks() -> None:
+    """A response with 3 distinct peaks at 35 / 55 / 80 Hz should be better
+    corrected by a 3-filter joint fit than by a single filter.
+
+    Regression test for the manual iteration loop that burned 4 iterations
+    in run 16 hand-tuning filter freq/gain/Q one at a time.
+    """
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 400).tolist()
+    # Three peaks: +4 dB at 35, +5 dB at 55, +4 dB at 80
+    def peak(fc, height, width):
+        return lambda f: height * np.exp(-((f - fc) ** 2) / (2 * width ** 2))
+    bumps = [peak(35, 4.0, 3.0), peak(55, 5.0, 4.0), peak(80, 4.0, 4.0)]
+    spls = [75.0 + sum(b(f) for b in bumps) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+
+    target = {
+        "points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}],
+        "band": [20, 120],
+    }
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        single = await _tool_fit_correction_filter(
+            session_id=1, target_curve=target,
+            freq_range=[25.0, 100.0], num_filters=1,
+        )
+        joint = await _tool_fit_correction_filter(
+            session_id=1, target_curve=target,
+            freq_range=[25.0, 100.0], num_filters=3,
+        )
+    assert single["ok"] and joint["ok"], (single, joint)
+    # Joint fit's RMS should be at least modestly better than single.
+    assert joint["rms_after"] < single["rms_after"]
+    # Three filters requested, three (or fewer after zero-gain pruning) returned.
+    assert len(joint["filters"]) <= 3
+    assert joint["num_filters_requested"] == 3
+    # Each returned filter should be inside the freq_range we asked for.
+    for f in joint["filters"]:
+        assert 25.0 <= f["freq"] <= 100.0
+        assert f["type"] == "peaking"
+
+
+@pytest.mark.asyncio
+async def test_fit_correction_filter_joint_respects_bounds() -> None:
+    """Multi-filter mode respects max_boost_db, min_q, max_q bounds."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls = [75.0 + 8.0 * np.exp(-((f - 50) ** 2) / 20) for f in freqs]  # 8 dB peak
+    session = _make_fr_session(freqs, spls)
+
+    target = {
+        "points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}],
+        "band": [20, 120],
+    }
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_fit_correction_filter(
+            session_id=1, target_curve=target,
+            freq_range=[25.0, 100.0], num_filters=2,
+            constraints={"max_boost_db": 3.0, "min_q": 1.0, "max_q": 5.0},
+        )
+    assert result["ok"]
+    for f in result["filters"]:
+        assert f["gain_db"] <= 3.0, "exceeds max_boost_db"
+        assert 1.0 <= f["q"] <= 5.0, f"Q {f['q']} out of [1,5] bounds"
+
+
+@pytest.mark.asyncio
+async def test_fit_correction_filter_joint_rejects_too_many_filters() -> None:
+    """num_filters > 8 is rejected (SafetyValidator slot budget)."""
+    target = {"points": [{"freq": 20, "spl": 75}, {"freq": 120, "spl": 75}], "band": [20, 120]}
+    session = _make_fr_session([20.0, 120.0], [75.0, 75.0])
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_fit_correction_filter(
+            session_id=1, target_curve=target,
+            freq_range=[25.0, 100.0], num_filters=9,
+        )
+    assert not result["ok"]
+    assert "slot budget" in result["error"].lower() or "8" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_fit_correction_filter_joint_dispatch() -> None:
+    """The dispatcher forwards num_filters to the multi-filter path."""
+    from calibrate.mcp_server import call_tool
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls = [75.0 + 4.0 * np.exp(-((f - 50) ** 2) / 20) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+
+    target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}], "band": [20, 120]}
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        texts = await call_tool("fit_correction_filter", {
+            "session_id": 1, "target_curve": target,
+            "freq_range": [25.0, 100.0], "num_filters": 2,
+        })
+    data = json.loads(texts[0].text)
+    assert data["ok"]
+    assert "filters" in data
+    assert data["num_filters_requested"] == 2
+
+
 @pytest.mark.asyncio
 async def test_predict_rms_basic() -> None:
     """predict_rms returns predicted deviation for proposed filters."""
