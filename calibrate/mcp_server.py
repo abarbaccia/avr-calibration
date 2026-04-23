@@ -5686,6 +5686,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             num_taps=int(arguments.get("num_taps", 1024)),
             phase_mode=arguments.get("phase_mode", "minimum"),
             freq_focus_hz=arguments.get("freq_focus_hz"),
+            return_coefficients=bool(arguments.get("return_coefficients", True)),
         )
     # ── LLM filter-design math tools ────────────────────────────────────────
     elif name == "evaluate_transfer_function":
