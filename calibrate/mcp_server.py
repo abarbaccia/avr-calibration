@@ -2189,22 +2189,38 @@ async def _tool_design_fir(
     phase_mode: str = "minimum",
     freq_focus_hz: list[float] | None = None,
     return_coefficients: bool = True,
+    preringing_ms: float = 25.0,
 ) -> dict:
     """Design FIR correction coefficients from a measurement.
 
     The LLM decides the strategy (phase mode, tap count, frequency focus).
     This tool computes the coefficients and returns them with a predicted
-    response and pre-ringing estimate.
+    response, pre-ringing estimate, and the latency the FIR will add.
 
     phase_mode:
-      - "minimum": no pre-ringing, phase not corrected (safest)
-      - "linear": symmetric, corrects phase, adds pre-ringing (cleanest)
-      - "mixed": minimum-phase below freq_focus, linear above (compromise)
+      - "minimum": no pre-ringing, magnitude-only correction. Latency ≈ 0.
+        Leaves modal ringing intact — the filter shortens the peak, not the
+        decay. Safe default.
+      - "linear": symmetric impulse, full magnitude + phase correction.
+        Latency = num_taps / 2 / sample_rate. At 65 536 taps / 48 kHz this
+        is 683 ms, well beyond most AVR lip-sync budgets.
+      - "mixed": homomorphic decomposition into a min-phase magnitude part
+        and a bounded excess-phase all-pass part. The excess-phase component
+        is windowed so pre-ringing stays within ``preringing_ms`` (default
+        25 ms). This actively cancels modal decay while keeping latency
+        within typical AVR Audio-Delay/lip-sync budgets. Below ~100 Hz the
+        ear integrates over 20-30 ms so the pre-ringing is inaudible.
+        Latency ≈ ``preringing_ms`` + a few ms for the min-phase core.
+        Set ``preringing_ms=0`` to degenerate to minimum-phase.
 
     return_coefficients: when False, the coefficient array is cached server-side
     keyed by session_id and omitted from the response. Callers then apply the
     FIR via apply_fir(output_index, design_session_id=session_id). Useful when
     the full array (8k+ taps ≈ 140 KB JSON) would exceed client token budgets.
+
+    preringing_ms: (mixed-phase only) maximum pre-ringing window in ms.
+    Bounds the audio latency of the filter and the inaudible-smear window
+    below 100 Hz. Default 25 ms matches bass psychoacoustic thresholds.
     """
     from .storage import SessionStore
 
@@ -2307,22 +2323,130 @@ async def _tool_design_fir(
                 log.warning("minimum_phase() failed, falling back to windowed truncation")
                 fir_td = fir_td[:num_taps] * np.hanning(num_taps)
             pre_ringing_ms = 0.0
-        else:  # mixed
-            # Mixed: minimum phase below focus, linear above
+        else:  # mixed — proper homomorphic decomposition with bounded pre-ringing
+            # Mixed-phase via the Kirkeby-style construction:
+            #   1. Start from the linear-phase target impulse (real spectrum)
+            #   2. Split it into min-phase magnitude × excess-phase all-pass
+            #   3. Window the excess-phase impulse to cap pre-ringing
+            #   4. Convolve the windowed excess with the min-phase core
+            #
+            # Result: magnitude ≈ linear-phase version (full correction), phase
+            # advances the early portion of the modal decay so convolving with
+            # source audio partially cancels the room's post-ringing tail.
+            # Latency is bounded by the windowed excess-phase extent.
             H = fir_correction
-            fir_td = np.fft.irfft(H, n=n_fft)
+            fir_td_full = np.fft.irfft(H, n=n_fft)
+
+            # Min-phase core — same path as phase_mode="minimum"
             try:
-                fir_td_mp = minimum_phase(fir_td[:num_taps * 2], method="homomorphic", n_fft=n_fft)
-                fir_td = fir_td_mp[:num_taps]
+                fir_min = minimum_phase(
+                    fir_td_full[:num_taps * 2], method="homomorphic", n_fft=n_fft,
+                )
+                fir_min = fir_min[:num_taps]
             except Exception:
-                log.warning("minimum_phase() failed, falling back to windowed truncation")
-                fir_td = fir_td[:num_taps] * np.hanning(num_taps)
-            pre_ringing_ms = 0.0
+                log.warning("minimum_phase() failed in mixed-phase; falling back to min-phase only")
+                fir_td = fir_td_full[:num_taps] * np.hanning(num_taps)
+                pre_ringing_ms = 0.0
+                # jump to post-mixed normalise/output path
+                fir_min = fir_td
+            else:
+                # Excess-phase all-pass = FFT(linear) / FFT(min-phase). Magnitude
+                # ≈ 1 by construction (same magnitude response); the phase of
+                # H_excess encodes the group-delay difference. Guard against
+                # near-zero H_min at frequencies outside the focus band where
+                # both impulses have ~0 energy — division blows up otherwise.
+                n_fft_ap = max(n_fft, 4 * num_taps)
+                H_lin = np.fft.rfft(fir_td_full, n=n_fft_ap)
+                # Centre the linear impulse so H_lin has symmetric phase; this
+                # keeps the all-pass's mass near the centre of the buffer,
+                # which makes windowing well-defined.
+                H_min_fft = np.fft.rfft(
+                    np.concatenate([fir_min, np.zeros(n_fft_ap - num_taps)]),
+                    n=n_fft_ap,
+                )
+                eps = 1e-10 * float(np.max(np.abs(H_min_fft)) or 1.0)
+                denom = H_min_fft.copy()
+                denom_mag = np.abs(denom)
+                small = denom_mag < eps
+                if np.any(small):
+                    denom[small] = eps
+                H_excess = H_lin / denom
+                # Normalise to strictly unit-magnitude (numerical cleanup so
+                # windowing doesn't accidentally amplify magnitude).
+                mag = np.abs(H_excess)
+                mag[mag < 1e-12] = 1.0
+                H_excess = H_excess / mag
+
+                # Band-limit the all-pass to the correction band. Outside the
+                # focus range we WANT pass-through (no phase correction, no
+                # magnitude change). Letting the raw all-pass extend to full
+                # bandwidth forces its time-domain impulse to be long, which
+                # then loses magnitude when we window it — hurting correction
+                # in the very band we're trying to fix.
+                ap_freqs = np.fft.rfftfreq(n_fft_ap, d=1.0 / fir_fs)
+                if freq_focus_hz:
+                    focus_lo_ap, focus_hi_ap = float(freq_focus_hz[0]), float(freq_focus_hz[1])
+                else:
+                    focus_lo_ap, focus_hi_ap = 20.0, 200.0
+                # Smooth ramp to pass-through above 1.5× focus_hi — keeps
+                # magnitude smooth at the cutoff rather than a hard step.
+                upper_edge = focus_hi_ap * 1.5
+                ramp_width = max(1.0, focus_hi_ap * 0.25)
+                ramp = np.clip((ap_freqs - upper_edge) / ramp_width, 0.0, 1.0)
+                # Where ramp == 1, replace H_excess with 1.0 (pass-through).
+                H_excess = H_excess * (1.0 - ramp) + 1.0 * ramp
+
+                # Back to time domain. fftshift brings the zero-delay sample
+                # to the centre of the buffer — the all-pass impulse is
+                # typically symmetric-ish around there, so windowing around
+                # the centre is natural.
+                h_excess = np.fft.fftshift(np.fft.irfft(H_excess, n=n_fft_ap))
+
+                # Cap pre-ringing. `preringing_ms` sets the symmetric Hann
+                # half-width around the centre peak. Setting it to 0 makes
+                # the window a single sample, which degenerates to min-phase.
+                pre_samples = max(1, int(round(preringing_ms / 1000.0 * fir_fs)))
+                total_win = 2 * pre_samples
+                # Centre of the fftshifted buffer
+                centre = n_fft_ap // 2
+                win = np.zeros_like(h_excess)
+                hann_w = np.hanning(total_win) if total_win > 1 else np.array([1.0])
+                lo = max(0, centre - pre_samples)
+                hi = min(n_fft_ap, lo + total_win)
+                hann_w = hann_w[: hi - lo]
+                win[lo:hi] = hann_w
+                h_excess_windowed = h_excess * win
+
+                # Undo the fftshift so the windowed excess is causal-ish
+                # relative to a buffer of num_taps. We keep only the
+                # non-zero span around the centre for the convolution.
+                excess_lo = max(0, centre - pre_samples)
+                excess_hi = min(n_fft_ap, centre + pre_samples)
+                h_excess_short = h_excess_windowed[excess_lo:excess_hi]
+
+                # Convolve min-phase core with the windowed excess-phase
+                # all-pass. Result length is num_taps + len(excess) - 1;
+                # trim back to num_taps from the front (preserving the main
+                # energy peak position within the buffer).
+                fir_td = np.convolve(fir_min, h_excess_short, mode="full")
+                fir_td = fir_td[:num_taps]
+
+                # Pre-ringing time is the window half-width. The peak of the
+                # final impulse lands at ≈ pre_samples samples in, which is
+                # also the effective latency.
+                pre_ringing_ms = round(pre_samples / fir_fs * 1000, 2)
 
         # Normalize so peak <= 1.0
         peak = float(np.max(np.abs(fir_td)))
         if peak > 0:
             fir_td = fir_td / peak
+
+        # Effective audio latency: position of the impulse's energy peak.
+        # For min-phase this lands at sample 0 (~0 ms). For linear-phase it
+        # lands at N/2. For mixed-phase it lands at the pre-ringing window
+        # half-width. AVR Audio-Delay settings need to compensate for this.
+        peak_idx = int(np.argmax(np.abs(fir_td)))
+        latency_ms = round(peak_idx / fir_fs * 1000, 2)
 
         # Compute predicted frequency response of the FIR
         fir_H = np.fft.rfft(fir_td, n=n_fft)
@@ -2358,6 +2482,7 @@ async def _tool_design_fir(
             "num_taps": num_taps,
             "phase_mode": phase_mode,
             "pre_ringing_ms": pre_ringing_ms,
+            "latency_ms": latency_ms,
             "freq_resolution_hz": freq_resolution,
             "peak_abs": round(peak_abs, 6),
             "predicted_effect": predicted_bands,
@@ -2368,15 +2493,17 @@ async def _tool_design_fir(
             result["note"] = (
                 f"FIR at {fir_fs}Hz, {num_taps} taps, {phase_mode} phase. "
                 f"Freq resolution: {freq_resolution}Hz. Pre-ringing: {pre_ringing_ms}ms. "
-                f"Pass coefficients to apply_fir(output_index, coefficients) or "
+                f"Latency: {latency_ms}ms (compensate via AVR Audio Delay or "
+                f"speaker-distance settings). Pass coefficients to "
+                f"apply_fir(output_index, coefficients) or "
                 f"apply_fir(output_index, design_session_id={session_id})."
             )
         else:
             result["note"] = (
                 f"FIR at {fir_fs}Hz, {num_taps} taps, {phase_mode} phase. "
                 f"Freq resolution: {freq_resolution}Hz. Pre-ringing: {pre_ringing_ms}ms. "
-                f"Coefficients cached server-side; apply via "
-                f"apply_fir(output_index, design_session_id={session_id})."
+                f"Latency: {latency_ms}ms. Coefficients cached server-side; "
+                f"apply via apply_fir(output_index, design_session_id={session_id})."
             )
         return _ok(**result)
     except Exception as exc:
@@ -3677,6 +3804,8 @@ async def _tool_recommend_fir_phase(
     peak_db_threshold: float = 0.0,
     freq_min: float = 20.0,
     freq_max: float = 200.0,
+    audio_delay_budget_ms: float = 200.0,
+    preringing_ms: float = 25.0,
 ) -> dict:
     """Recommend FIR phase mode + tap count based on post-FIR decay.
 
@@ -3773,14 +3902,42 @@ async def _tool_recommend_fir_phase(
             suggested <<= 1
         suggested = min(suggested, fir_max)
 
+        # Latency budgeting. With proper mixed-phase, the FIR's added audio
+        # latency is ≈ preringing_ms (the windowed excess-phase extent) — NOT
+        # the tap count. The AVR's Audio Delay / lip-sync control must cover
+        # this. Typical home AVRs (Denon X-series) budget 200 ms; if the
+        # requested pre-ringing exceeds that, we cap the pre-ringing window
+        # and advise the user.
+        suggested_preringing_ms = preringing_ms
+        fits_in_budget = suggested_preringing_ms <= audio_delay_budget_ms
+        if not fits_in_budget:
+            suggested_preringing_ms = audio_delay_budget_ms
+        # Estimated latency = preringing window half-width (peak of mixed
+        # impulse lands at that offset) + a sample or two for the min-phase
+        # core's tiny group delay.
+        estimated_latency_ms = round(suggested_preringing_ms, 2)
+
         offender_summary = ", ".join(
             f"{m['freq_hz']:.1f} Hz T60={m['t60_ms']:.0f} ms" for m in offenders[:3]
+        )
+        budget_note = (
+            f"Latency fits the {audio_delay_budget_ms:.0f} ms AVR Audio-Delay "
+            f"budget — no lip-sync concern."
+        ) if fits_in_budget else (
+            f"WARNING: requested pre-ringing {preringing_ms:.0f} ms exceeds "
+            f"the {audio_delay_budget_ms:.0f} ms AVR Audio-Delay budget; "
+            f"clamped to {suggested_preringing_ms:.0f} ms. Some modal decay "
+            f"cancellation will be sacrificed."
         )
         return _ok(
             session_id=session_id,
             recommendation="mixed",
             offending_modes=offenders,
             suggested_num_taps=suggested,
+            suggested_preringing_ms=suggested_preringing_ms,
+            estimated_latency_ms=estimated_latency_ms,
+            audio_delay_budget_ms=audio_delay_budget_ms,
+            fits_in_budget=fits_in_budget,
             t60_threshold_ms=t60_threshold_ms,
             peak_db_threshold=peak_db_threshold,
             note=(
@@ -3789,7 +3946,9 @@ async def _tool_recommend_fir_phase(
                 f"Re-run design_fir with phase_mode='mixed', "
                 f"num_taps={suggested} (impulse length "
                 f"{suggested / fir_fs * 1000:.0f} ms ≥ 2× worst T60 "
-                f"{worst_t60_ms:.0f} ms)."
+                f"{worst_t60_ms:.0f} ms), preringing_ms={suggested_preringing_ms:.0f}. "
+                f"Filter will add ~{estimated_latency_ms:.0f} ms of audio latency. "
+                f"{budget_note}"
             ),
         )
     except Exception as exc:
@@ -4777,6 +4936,28 @@ _TOOLS: list[Tool] = [
                 },
                 "freq_min": {"type": "number", "default": 20.0},
                 "freq_max": {"type": "number", "default": 200.0},
+                "audio_delay_budget_ms": {
+                    "type": "number",
+                    "description": (
+                        "Maximum audio latency the downstream AVR can compensate "
+                        "via its Audio-Delay/lip-sync control. Default 200 ms "
+                        "(Denon X-series). If the recommended pre-ringing "
+                        "window exceeds this, it's clamped and the response "
+                        "flags fits_in_budget=false."
+                    ),
+                    "default": 200.0,
+                },
+                "preringing_ms": {
+                    "type": "number",
+                    "description": (
+                        "Preferred pre-ringing window for mixed-phase. Default "
+                        "25 ms (inaudible for bass below ~100 Hz). This is "
+                        "both the filter latency AND the psychoacoustic smear "
+                        "budget — larger values cancel more modal decay but "
+                        "consume more AVR Audio-Delay headroom."
+                    ),
+                    "default": 25.0,
+                },
             },
             "required": ["session_id"],
         },
@@ -5156,6 +5337,18 @@ _TOOLS: list[Tool] = [
                         "Use false when the array (e.g. 8k+ taps ≈ 140 KB JSON) would "
                         "exceed the client's token budget."
                     ),
+                },
+                "preringing_ms": {
+                    "type": "number",
+                    "description": (
+                        "Mixed-phase only: maximum pre-ringing window in ms. "
+                        "Bounds how far the excess-phase impulse extends before "
+                        "the main energy peak — this is both the filter's added "
+                        "audio latency AND the psychoacoustic smear window. "
+                        "Default 25 ms (inaudible below ~100 Hz). Set to 0 to "
+                        "degenerate to minimum-phase. Ignored by minimum/linear modes."
+                    ),
+                    "default": 25.0,
                 },
             },
             "required": ["session_id"],
@@ -5645,6 +5838,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             peak_db_threshold=float(arguments.get("peak_db_threshold", 0.0)),
             freq_min=float(arguments.get("freq_min", 20.0)),
             freq_max=float(arguments.get("freq_max", 200.0)),
+            audio_delay_budget_ms=float(arguments.get("audio_delay_budget_ms", 200.0)),
+            preringing_ms=float(arguments.get("preringing_ms", 25.0)),
         )
     elif name == "check_system":
         result = await _tool_check_system()
@@ -5716,6 +5911,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             phase_mode=arguments.get("phase_mode", "minimum"),
             freq_focus_hz=arguments.get("freq_focus_hz"),
             return_coefficients=bool(arguments.get("return_coefficients", True)),
+            preringing_ms=float(arguments.get("preringing_ms", 25.0)),
         )
     # ── LLM filter-design math tools ────────────────────────────────────────
     elif name == "evaluate_transfer_function":

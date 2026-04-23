@@ -385,8 +385,18 @@ post-FIR solo measurement (Phase 2.4):
    surface the version mismatch to the user.
 2. **If `recommendation == "mixed"`:** DO NOT proceed to Phase 2.6 or Phase 3.
    - Re-run `design_fir(session_id=<pre_FIR_solo>, phase_mode="mixed",
-     num_taps=<suggested_num_taps>, return_coefficients=false)` for this sub.
+     num_taps=<suggested_num_taps>,
+     preringing_ms=<suggested_preringing_ms>,
+     return_coefficients=false)` for this sub. The tool's
+     `suggested_preringing_ms` (default 25 ms) bounds the filter's added
+     audio latency AND the psychoacoustic pre-ringing window — below
+     ~100 Hz the ear integrates over 20–30 ms so the pre-ringing is
+     inaudible. The `fits_in_budget` flag tells you whether the pre-ringing
+     stays within the AVR's Audio-Delay compensation range.
    - Apply via `apply_fir(output_index=N, design_session_id=<pre_FIR_solo>)`.
+   - **Set the AVR's Audio-Delay / lip-sync** to match the design's reported
+     `latency_ms` so video stays in sync with the bass. On Denon X-series
+     this is under Menu → Audio → Audio Delay.
    - Re-measure that sub solo.
    - Re-run `recommend_fir_phase` on the new post-mixed-FIR measurement. If
      it still returns "mixed" on the second pass, document the residual,
