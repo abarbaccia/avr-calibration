@@ -2192,6 +2192,46 @@ async def test_call_tool_recommend_fir_phase_dispatch() -> None:
     assert data["recommendation"] in {"minimum", "mixed"}
 
 
+@pytest.mark.asyncio
+async def test_recommend_fir_phase_suggests_preringing_and_latency() -> None:
+    """When recommending mixed, the response includes suggested_preringing_ms,
+    estimated_latency_ms, and whether it fits in the AVR audio-delay budget."""
+    session = _make_session_with_ringing_ir(session_id=1)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_recommend_fir_phase(
+            session_id=1,
+            t60_threshold_ms=300.0,
+            preringing_ms=25.0,
+            audio_delay_budget_ms=200.0,
+        )
+    assert result["ok"]
+    assert result["recommendation"] == "mixed"
+    assert result["suggested_preringing_ms"] == 25.0
+    assert result["estimated_latency_ms"] == pytest.approx(25.0, abs=1.0)
+    assert result["fits_in_budget"] is True
+    assert result["audio_delay_budget_ms"] == 200.0
+
+
+@pytest.mark.asyncio
+async def test_recommend_fir_phase_clamps_preringing_to_budget() -> None:
+    """If preringing_ms exceeds audio_delay_budget_ms, clamp and flag."""
+    session = _make_session_with_ringing_ir(session_id=1)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_recommend_fir_phase(
+            session_id=1,
+            t60_threshold_ms=300.0,
+            preringing_ms=500.0,
+            audio_delay_budget_ms=200.0,
+        )
+    assert result["ok"]
+    assert result["recommendation"] == "mixed"
+    assert result["suggested_preringing_ms"] == 200.0  # clamped
+    assert result["fits_in_budget"] is False
+    assert "exceeds" in result["note"].lower() or "warning" in result["note"].lower()
+
+
 # ── get_measurement_history — frequency filtering ─────────────────────────────
 
 def _make_fr_session(freqs: list[float], spls: list[float], session_id: int = 1) -> MagicMock:
@@ -3362,6 +3402,110 @@ async def test_design_fir_linear_phase() -> None:
     assert result["ok"]
     assert result["phase_mode"] == "linear"
     assert result["pre_ringing_ms"] > 0  # Linear phase has pre-ringing
+
+
+# ── mixed-phase: proper homomorphic decomposition ──────────────────────────
+
+@pytest.mark.asyncio
+async def test_design_fir_mixed_phase_reports_bounded_latency() -> None:
+    """Mixed-phase FIR's latency is bounded above by the preringing window.
+
+    The impulse peak lands at most `preringing_ms` samples into the buffer —
+    it can land earlier due to windowing edge effects and truncation, but
+    must NEVER exceed the user's pre-ringing budget (that would defeat the
+    whole point of the bound).
+    """
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [75.0 + 5.0 * np.sin(2 * np.pi * f / 40) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+
+    # Use a small preringing window so the test is rate-agnostic: at the
+    # fallback fir_fs=96 kHz, 2 ms = 192 samples (well within num_taps=1024).
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_fir(
+            session_id=1, num_taps=1024, phase_mode="mixed", preringing_ms=2.0,
+        )
+    assert result["ok"], result
+    assert result["phase_mode"] == "mixed"
+    # pre_ringing_ms matches the requested bound (reported value).
+    assert result["pre_ringing_ms"] == pytest.approx(2.0, abs=0.5)
+    # latency_ms is bounded above by the pre-ringing window (plus small jitter
+    # from min-phase core + windowing edge effects).
+    assert result["latency_ms"] <= 4.0, result
+    # And it's non-negative (peak doesn't land before sample 0).
+    assert result["latency_ms"] >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_design_fir_mixed_phase_with_zero_preringing_matches_minimum() -> None:
+    """mixed-phase with preringing_ms=0 should degenerate to minimum-phase.
+
+    This is the no-latency escape hatch — choosing mixed but asking for zero
+    pre-ringing should produce an impulse whose peak is at sample 0, same as
+    phase_mode='minimum'. Critical for the recipe's 'recommend_fir_phase → min'
+    branch where we want mixed-phase code path but no pre-ringing.
+    """
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [75.0 + 3.0 * np.sin(2 * np.pi * f / 40) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_fir(
+            session_id=1, num_taps=256, phase_mode="mixed", preringing_ms=0.0,
+        )
+    assert result["ok"], result
+    # Latency should be near-zero.
+    assert result["latency_ms"] <= 1.0, result
+
+
+@pytest.mark.asyncio
+async def test_design_fir_mixed_phase_magnitude_tracks_min_phase_in_focus_band() -> None:
+    """Within the focus band, mixed-phase magnitude should track min-phase.
+
+    Outside the focus band the all-pass is ramped to pass-through, so
+    magnitude matches min-phase's natural roll-off there too. The only
+    frequencies allowed to drift are near the pass-through transition (ramp
+    region). A proper homomorphic mixed-phase shouldn't diverge wildly from
+    min-phase anywhere it matters.
+    """
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [75.0 + 5.0 * np.sin(2 * np.pi * f / 40) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        min_result = await _tool_design_fir(
+            session_id=1, num_taps=2048, phase_mode="minimum",
+            freq_focus_hz=[25, 90],
+        )
+        mix_result = await _tool_design_fir(
+            session_id=1, num_taps=2048, phase_mode="mixed", preringing_ms=20.0,
+            freq_focus_hz=[25, 90],
+        )
+    assert min_result["ok"] and mix_result["ok"]
+    min_effect = {b["freq_hz"]: b["fir_effect_db"] for b in min_result["predicted_effect"]}
+    mix_effect = {b["freq_hz"]: b["fir_effect_db"] for b in mix_result["predicted_effect"]}
+    # Compare inside the correction band (25 <= f <= 90).
+    common = sorted(set(min_effect) & set(mix_effect))
+    in_band = [f for f in common if 25 <= f <= 90]
+    assert in_band, "no common bands to compare in 25-90 Hz"
+    deltas = [mix_effect[f] - min_effect[f] for f in in_band]
+    rms = (sum(d * d for d in deltas) / len(deltas)) ** 0.5
+    # 6 dB RMS is a loose but fair bound: short pre-ringing windows trade
+    # some magnitude accuracy for phase correction. The all-pass band-limit
+    # keeps this modest.
+    assert rms < 6.0, (
+        f"mixed-phase magnitude diverges by {rms:.2f} dB RMS in-band — "
+        f"deltas: {list(zip(in_band, deltas))}"
+    )
 
 
 @pytest.mark.asyncio
