@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.7.0] - 2026-04-23
+
+### Fixed
+- **IR peak jitter on ALSA/CamillaDSP pipelines:** `measure()` now strips the pre-sweep portion of the recording using the cross-correlation-derived sweep-start sample rather than a wall-clock `PRE_DELAY_S × sample_rate` offset. ALSA/PortAudio stream startup is non-deterministic (20–50 ms of variable latency on Loopback + CamillaDSP), so wall-clock stripping removed a variable amount of real sweep and produced matching IR-peak-time jitter. Cross-correlation locates the sweep itself and is immune to the stream-startup race. Diagnostic log line reports expected-vs-actual offset so you can see stream-start drift per run.
+
+### Changed
+- **`validate_recording` return signature:** now returns `tuple[list[dict], int]` — the second element is the sweep-start sample index derived from the existing FFT cross-correlation pass (no extra work). Callers must unpack; previously returned just the warnings list.
+
 ## [0.6.6.0] - 2026-04-12
 
 ### Changed
