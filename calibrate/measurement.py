@@ -253,9 +253,17 @@ class MeasurementEngine:
         noise_floor_window_ms: int = 500,
         correlation_threshold: float = 0.05,
         min_snr_db: float = 20.0,
-    ) -> list[dict]:
+    ) -> tuple[list[dict], int]:
         """
-        Three-check quality gate. Returns a list of warning dicts (may be empty).
+        Three-check quality gate. Returns ``(warnings, sweep_start_sample)``.
+
+        The second element is the cross-correlation-derived sample index where
+        the sweep actually begins in the recording. Callers must use this
+        (not ``PRE_DELAY_S * sample_rate``) to align the recording before
+        deconvolution — wall-clock alignment drifts with ALSA/PortAudio stream
+        startup latency and introduces 20–50 ms of IR peak jitter on variable
+        pipelines (ALSA Loopback + CamillaDSP being the worst offender).
+
         Raises MeasurementQualityError on a hard failure.
 
         Check 1 — Floor noise gate:
@@ -290,6 +298,8 @@ class MeasurementEngine:
         # ── Check 2: Sweep capture (FFT-based cross-correlation) ───────────
         # O(N log N) — np.correlate(..., mode='full') would be O(N²):
         # at 144k samples (3s @ 48kHz) that's ~100s on Pi Zero W.
+        # The cross-correlation also pins down *where* the sweep starts in
+        # the recording (lag_idx), which we return for alignment.
         n = len(sweep_array)
         rec_t = rec_array[:n]
         fft_len = n * 2  # zero-pad to avoid circular wrap
@@ -327,7 +337,7 @@ class MeasurementEngine:
                 suggestion="Increase amplifier volume or check miniDSP signal routing",
             )
 
-        return warnings_out
+        return warnings_out, lag_idx
 
     async def measure(
         self,
@@ -497,19 +507,36 @@ class MeasurementEngine:
 
         min_snr = float(cfg.get("min_snr_db", 20.0))
         # validate_recording uses the FULL recording (including pre-delay silence) for
-        # its noise-floor check — the first 500ms must be silence.
-        self.validate_recording(np, sweep_1d, rec_1d, sample_rate, min_snr_db=min_snr)
+        # its noise-floor check — the first 500ms must be silence. It also returns
+        # the sample index where the sweep actually begins in the recording, derived
+        # from an FFT cross-correlation against the reference sweep.
+        _warnings, sweep_start_sample = self.validate_recording(
+            np, sweep_1d, rec_1d, sample_rate, min_snr_db=min_snr,
+        )
 
-        # USBPlayback records PRE_DELAY_S (1s) of room noise BEFORE playing the sweep so
-        # validate_recording has silence for its noise-floor window.  But passing this
-        # pre-delayed recording directly to _compute_fr_arrays shifts the apparent IR
-        # peak by pre_delay_samples in the circular FFT — moving it outside the stored
-        # 24000-sample window and causing the peak-finder to return noise artifacts
-        # (e.g. 0.25ms instead of the true ~40ms arrival time).
-        # Strip the pre-delay so rec starts exactly when the sweep started playing.
-        # HDMIPlayback has no PRE_DELAY_S, so this is a no-op for HDMI.
-        pre_delay_samples = int(getattr(strategy, "PRE_DELAY_S", 0.0) * sample_rate)
-        rec_for_deconv = rec_1d[pre_delay_samples:] if pre_delay_samples > 0 else rec_1d
+        # Strip the pre-sweep portion so the recording passed to the deconvolver
+        # starts exactly at the first sample of the played sweep. We use the
+        # cross-correlation-derived ``sweep_start_sample`` rather than wall-clock
+        # ``PRE_DELAY_S × sample_rate`` because ALSA/PortAudio stream start is NOT
+        # instantaneous: on CamillaDSP + Loopback pipelines, the recording stream
+        # begins populating the buffer 20–50 ms after ``in_stream.start()`` is
+        # called, and the gap is non-deterministic (chunk-boundary dependent).
+        # Wall-clock stripping therefore removes a variable amount of sweep from
+        # the recording, which appears as IR-peak-time jitter of a similar scale.
+        # Cross-correlation locates the sweep itself and is immune to the stream-
+        # startup race. HDMIPlayback has no PRE_DELAY_S but still benefits because
+        # its stream-start latency is typically > 0.
+        rec_for_deconv = rec_1d[sweep_start_sample:] if sweep_start_sample > 0 else rec_1d
+        # For diagnostic use: the expected offset vs the actual offset tells us
+        # how much stream-startup latency we absorbed on this run.
+        expected_offset = int(getattr(strategy, "PRE_DELAY_S", 0.0) * sample_rate)
+        if expected_offset > 0:
+            drift_ms = 1000.0 * (sweep_start_sample - expected_offset) / sample_rate
+            log.info(
+                "measurement alignment: sweep_start=%d samples (expected %d); "
+                "drift=%.1f ms (negative = ALSA start was late)",
+                sweep_start_sample, expected_offset, drift_ms,
+            )
 
         # Raw recording peak in dBFS (before deconvolution) — used by
         # calibrate_level to compute actual SPL via mic sensitivity.

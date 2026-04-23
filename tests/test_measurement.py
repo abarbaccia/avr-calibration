@@ -145,8 +145,10 @@ class TestMeasure:
         mock_pytta.PlayRecMeasure.return_value.run.side_effect = None
 
         # validate_recording is now called inside measure(); mock it so random
-        # test signals don't trigger quality-gate errors.
-        engine.validate_recording = MagicMock(return_value=[])
+        # test signals don't trigger quality-gate errors. Returns (warnings,
+        # sweep_start_sample) — use 0 for the sample offset so the test
+        # recording is used verbatim without extra stripping.
+        engine.validate_recording = MagicMock(return_value=([], 0))
 
         return engine, mock_pytta, mock_sweep, mock_recording
 
@@ -366,8 +368,8 @@ class TestMeasurementQuality:
         rec = np.zeros(9600 + 200)
         rec[200:] += sweep * 0.5
         rec = rec[:9600]
-        warnings = engine.validate_recording(np, sweep, rec, 48000,
-                                              noise_floor_window_ms=3)
+        warnings, _ = engine.validate_recording(np, sweep, rec, 48000,
+                                                 noise_floor_window_ms=3)
         assert warnings == []
 
     def test_noisy_floor_produces_warning_not_error(self):
@@ -378,8 +380,8 @@ class TestMeasurementQuality:
         rec = rng.standard_normal(9600) * 0.02  # ~-34 dBFS
         # Add delayed sweep after the noise-floor window to pass correlation check
         rec[5000:] += sweep[:4600] * 0.5
-        warnings = engine.validate_recording(np, sweep, rec, 48000,
-                                              noise_floor_window_ms=100)
+        warnings, _ = engine.validate_recording(np, sweep, rec, 48000,
+                                                 noise_floor_window_ms=100)
         assert any(w["check"] == "floor_noise" for w in warnings)
 
     def test_sweep_not_captured_raises_quality_error(self):
@@ -429,7 +431,7 @@ class TestMeasurementQuality:
         sweep = self._make_sweep(9600)
         rec = np.zeros(9600)
         rec[:] = sweep * 0.001
-        warnings = engine.validate_recording(np, sweep, rec, 48000,
+        warnings, _ = engine.validate_recording(np, sweep, rec, 48000,
                                               noise_floor_window_ms=3,
                                               correlation_threshold=0.0,
                                               min_snr_db=-100.0)
@@ -452,10 +454,10 @@ class TestMeasurementQuality:
         pre = rng.standard_normal(200)
         pre = pre / np.sqrt(np.mean(pre ** 2)) * floor_rms * 0.99
         rec = np.concatenate([pre, sweep * 0.5])[:9600]
-        result = engine.validate_recording(np, sweep, rec, 48000,
+        warnings, _ = engine.validate_recording(np, sweep, rec, 48000,
                                             noise_floor_window_ms=3,
                                             min_snr_db=0.0)
-        assert isinstance(result, list)
+        assert isinstance(warnings, list)
 
 
 # ── compute_session_metadata ────────────────────────────────────────────────
