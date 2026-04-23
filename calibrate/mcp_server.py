@@ -3432,6 +3432,35 @@ async def _tool_apply_fir(
     else:
         source = "inline"
 
+    # Safety: validate FIR magnitude against the per-output transducer's
+    # profile before calling the driver. Driver also re-validates against
+    # the default profile — this layer provides the transducer-specific
+    # check (e.g. tighter limits for a shaker vs. a sub).
+    try:
+        from .safety import SafetyValidationError, SafetyValidator
+        cfg = _config()
+        graph = cfg.signal_graph
+        profile = None
+        fir_rate: int | None = None
+        for t in graph.transducers:
+            if t.output_index == int(output_index):
+                profile = graph.profile_for(t)
+                break
+        try:
+            caps = _dsp.capabilities  # type: ignore[union-attr]
+            fir_rate = int(caps.fir_sample_rate_hz)
+        except Exception:
+            fir_rate = 96_000
+        SafetyValidator(profile).validate_fir(
+            list(coefficients), sample_rate=fir_rate,
+        )
+    except SafetyValidationError as exc:
+        return _err(str(exc))
+    except Exception:
+        # Graph/profile lookup failure shouldn't prevent the driver's own
+        # default-profile safety check from running — fall through.
+        pass
+
     try:
         await _dsp.apply_fir(output_index, coefficients)  # type: ignore[union-attr]
     except DriverError as exc:

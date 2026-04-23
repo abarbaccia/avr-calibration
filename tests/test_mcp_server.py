@@ -1906,6 +1906,49 @@ async def test_apply_fir_missing_design_in_cache(mock_dsp) -> None:
 
 
 @pytest.mark.asyncio
+async def test_apply_fir_unsafe_boost_rejected(mock_dsp) -> None:
+    """apply_fir with a FIR that boosts +10 dB at 60 Hz must return ok=false.
+
+    The driver path raises DriverError when its SafetyValidator.validate_fir
+    rejects the coefficients; the tool surfaces that as a structured error.
+    """
+    import numpy as np
+    from calibrate.drivers.base import DriverError
+
+    # Build a FIR that boosts +10 dB in the 63 Hz 1/3-octave band (exceeds
+    # the +8 dB thermal ceiling).
+    n_taps = 32_768
+    rate = 48_000
+    freqs = np.fft.rfftfreq(n_taps, d=1.0 / rate)
+    mag = np.ones_like(freqs)
+    half_step = 2.0 ** (1.0 / 6.0)
+    mask = (freqs >= 63.0 / half_step) & (freqs <= 63.0 * half_step)
+    mag[mask] = 10.0 ** (10.0 / 20.0)
+    taps = np.fft.fftshift(np.fft.irfft(mag, n=n_taps)).tolist()
+
+    # Make the underlying driver raise DriverError when validate_fir rejects
+    # — this mirrors what camilladsp/minidsp apply_fir does in production.
+    mock_dsp.apply_fir.side_effect = DriverError(
+        "SafetyValidator: FIR boost of +10.0 dB at 63 Hz 1/3-octave band "
+        "exceeds thermal ceiling of +8 dB (profile 'svs_pb12_nsd')"
+    )
+
+    result = await _tool_apply_fir(output_index=1, coefficients=taps)
+    assert not result["ok"]
+    assert "SafetyValidator" in result["error"]
+    assert "dB" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_apply_fir_safe_coefficients_proceed(mock_dsp) -> None:
+    """apply_fir with a flat-magnitude FIR must proceed to the driver cleanly."""
+    coeffs = [1.0] + [0.0] * 127  # impulse → flat 0 dB
+    result = await _tool_apply_fir(output_index=1, coefficients=coeffs)
+    assert result["ok"]
+    mock_dsp.apply_fir.assert_awaited_once_with(1, coeffs)
+
+
+@pytest.mark.asyncio
 async def test_call_tool_clear_fir_dispatch(mock_dsp) -> None:
     from calibrate.mcp_server import call_tool
     texts = await call_tool("clear_fir", {"output_index": 0})

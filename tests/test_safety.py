@@ -10,8 +10,16 @@ Covers:
   - Multiple filters in one call
 """
 
+import math
+
+import numpy as np
 import pytest
-from calibrate.safety import FilterSpec, SafetyValidator, ValidationResult
+from calibrate.safety import (
+    FilterSpec,
+    SafetyValidationError,
+    SafetyValidator,
+    ValidationResult,
+)
 
 
 @pytest.fixture
@@ -261,3 +269,104 @@ def test_hpf_not_subject_to_gain_checks(validator: SafetyValidator) -> None:
     # This should fail only on HPF frequency check (18 Hz HPF satisfies the requirement)
     result = validator.validate(filters)
     assert result.ok
+
+
+# ── FIR magnitude validation ──────────────────────────────────────────────────
+
+_FIR_RATE = 48_000
+
+
+def _fir_boost_at(freq_hz: float, gain_db: float, n_taps: int = 32768) -> list[float]:
+    """Construct a FIR whose magnitude at *freq_hz* equals *gain_db*.
+
+    Uses frequency-sampling design with no windowing: the full-length IR's
+    FFT exactly reproduces the target magnitude spectrum we asked for, so
+    the validator's FFT check sees the gain we intended.
+    """
+    freqs = np.fft.rfftfreq(n_taps, d=1.0 / _FIR_RATE)
+    mag = np.ones_like(freqs)
+    half_step = 2.0 ** (1.0 / 6.0)
+    mask = (freqs >= freq_hz / half_step) & (freqs <= freq_hz * half_step)
+    mag[mask] = 10.0 ** (gain_db / 20.0)
+    # Zero-phase IR: real, symmetric.
+    ir = np.fft.irfft(mag, n=n_taps)
+    ir = np.fft.fftshift(ir)
+    return ir.tolist()
+
+
+def test_validate_fir_flat_passes(validator: SafetyValidator) -> None:
+    """A pure impulse (flat magnitude = 0 dB) must not raise."""
+    taps = [1.0] + [0.0] * 255
+    validator.validate_fir(taps, sample_rate=_FIR_RATE)
+
+
+def test_validate_fir_boost_below_port_tune_fails(validator: SafetyValidator) -> None:
+    """SVS PB12-NSD profile: +10 dB at 20 Hz (below 25 Hz floor) must raise."""
+    taps = _fir_boost_at(freq_hz=20.0, gain_db=10.0)
+    with pytest.raises(SafetyValidationError) as excinfo:
+        validator.validate_fir(taps, sample_rate=_FIR_RATE)
+    msg = str(excinfo.value)
+    # Error must name a frequency and dB value so operators know what failed.
+    assert "Hz" in msg
+    assert "dB" in msg
+    # Either "port" (below-tune check) or "20" / "25" (offending band / limit).
+    assert "port" in msg.lower() or "below" in msg.lower()
+
+
+def test_validate_fir_boost_thermal_ceiling_fails(validator: SafetyValidator) -> None:
+    """+10 dB at 60 Hz exceeds the +8 dB thermal ceiling (SVS profile)."""
+    taps = _fir_boost_at(freq_hz=63.0, gain_db=10.0)
+    with pytest.raises(SafetyValidationError) as excinfo:
+        validator.validate_fir(taps, sample_rate=_FIR_RATE)
+    msg = str(excinfo.value)
+    assert "Hz" in msg
+    assert "dB" in msg
+    assert "thermal" in msg.lower() or "ceiling" in msg.lower()
+
+
+def test_validate_fir_deep_cut_passes(validator: SafetyValidator) -> None:
+    """-15 dB cut at 60 Hz must pass — cuts are always safe."""
+    taps = _fir_boost_at(freq_hz=63.0, gain_db=-15.0)
+    validator.validate_fir(taps, sample_rate=_FIR_RATE)
+
+
+def test_validate_fir_error_names_frequency_and_db(
+    validator: SafetyValidator,
+) -> None:
+    """The error message must surface both the offending band (Hz) and dB level.
+
+    Used so the LLM / operator sees *what* was unsafe, not just that it was.
+    """
+    taps = _fir_boost_at(freq_hz=63.0, gain_db=12.0)
+    with pytest.raises(SafetyValidationError) as excinfo:
+        validator.validate_fir(taps, sample_rate=_FIR_RATE)
+    msg = str(excinfo.value)
+    # Must contain a digit-Hz token and a +dB number.
+    import re
+    assert re.search(r"\d+\s*Hz", msg)
+    assert re.search(r"\+\d+(?:\.\d+)?\s*dB", msg)
+
+
+def test_validate_fir_empty_is_noop(validator: SafetyValidator) -> None:
+    """Empty coefficients list must not raise (driver layer handles the error)."""
+    validator.validate_fir([], sample_rate=_FIR_RATE)
+
+
+def test_validate_fir_uses_passed_profile_over_validator_default() -> None:
+    """Explicit profile argument overrides the validator's bound profile."""
+    from calibrate.graph import TransducerProfile
+
+    loose = TransducerProfile(
+        name="loose_test",
+        min_boost_freq_hz=10.0,
+        max_boost_per_band_db=20.0,
+        max_boost_above_threshold_db=20.0,
+        freq_dependent_boost_threshold_hz=10.0,
+        max_cumulative_boost_db=30.0,
+        hpf_freq_hz=None,
+    )
+    taps = _fir_boost_at(freq_hz=63.0, gain_db=10.0)
+    # Default (strict) validator would reject; passing the loose profile accepts.
+    SafetyValidator().validate_fir(
+        taps, sample_rate=_FIR_RATE, profile=loose,
+    )

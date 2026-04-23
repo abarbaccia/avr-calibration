@@ -379,6 +379,18 @@ class MinidspDriver(DSPDriver):
         if len(coefficients) == 0:
             raise DriverError("coefficients list is empty; use clear_fir() to reset")
 
+        # Safety: validate FIR magnitude response against the default
+        # (SVS PB12-NSD) profile before we commit taps to the device.
+        # The miniDSP shares a single FIR tap pool across outputs, but
+        # the magnitude check is per-output and still applies.
+        from ..safety import SafetyValidationError, SafetyValidator
+        try:
+            SafetyValidator().validate_fir(
+                list(coefficients), sample_rate=int(sample_rate)
+            )
+        except SafetyValidationError as exc:
+            raise DriverError(str(exc))
+
         arr = np.array(coefficients, dtype=np.float32)
 
         async with self._lock:

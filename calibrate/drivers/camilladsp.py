@@ -869,6 +869,19 @@ class CamillaDSPDriver(DSPDriver):
                 f"FIR sample rate {sample_rate} != processing rate {caps.fir_sample_rate_hz}"
             )
 
+        # Safety: validate the FIR's magnitude response against the default
+        # profile (SVS PB12-NSD) before any pipeline write, matching the
+        # existing apply_eq behaviour. MCP server may re-validate against a
+        # transducer-specific profile — that's belt-and-braces, not duplicate.
+        from ..safety import SafetyValidationError, SafetyValidator
+        try:
+            SafetyValidator().validate_fir(
+                list(coefficients),
+                sample_rate=int(sample_rate or caps.fir_sample_rate_hz),
+            )
+        except SafetyValidationError as exc:
+            raise DriverError(str(exc))
+
         async with self._lock:
             prev = list(self._fir_state.get(output_index, []))
             self._fir_state[int(output_index)] = [float(c) for c in coefficients]

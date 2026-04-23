@@ -616,8 +616,18 @@ own workflow for convenience.
 
 ## Safety notes
 
-**FIR magnitude is NOT currently checked by `SafetyValidator`.** The recipe
-must verify design-time at Phase 2.2:
+**FIR magnitude IS now code-enforced by `SafetyValidator.validate_fir`.**
+Every `apply_fir` call runs the FIR's magnitude response through the FFT
+and rejects coefficients that exceed:
+- +`max_boost_per_band_db` below `min_boost_freq_hz` (port protection;
+  +6 dB below 25 Hz for the SVS PB12-NSD profile)
+- +`max_boost_above_threshold_db` above the port-tune floor up through
+  200 Hz (+8 dB thermal ceiling for the SVS profile)
+
+The recipe's Phase 2.2 design-time inspection is therefore belt-and-braces:
+the validator is the sole non-bypassable guardrail, but checking the
+designed FIR's magnitude before `apply_fir` still helps the LLM iterate
+without bouncing off the driver-level rejection. Keep checking:
 - No boost > +6 dB below 25 Hz (port protection)
 - No boost > +8 dB above 25 Hz (thermal)
 - Minimum-phase default (no pre-ring)
@@ -667,20 +677,13 @@ accept a less perfect flattening rather than pushing boost close to limits.
 
 These would improve the recipe's effectiveness. Not required to run.
 
-### SafetyValidator for FIR
+### SafetyValidator for FIR — **DONE**
 
-Currently, `apply_fir` writes coefficients without checking the resulting
-magnitude response. A badly-designed FIR (or one handed in directly) could
-ship +9 dB of boost at 20 Hz.
-
-Proposed: `SafetyValidator.validate_fir(coefficients, sample_rate, profile)`:
-- Compute the FIR's magnitude response via FFT
-- Check max boost below `profile.min_boost_freq_hz` ≤ `profile.max_boost_per_band_db`
-- Check max boost 25–120 Hz ≤ 8 dB (thermal)
-- Raise `SafetyValidationError` on violation
-
-Would make the recipe's Phase 2.2 inspection step belt-and-braces rather
-than sole guardrail.
+`SafetyValidator.validate_fir(coefficients, sample_rate, profile)` now runs
+before every `apply_fir` (both CamillaDSP and miniDSP drivers). Unsafe FIRs
+raise `SafetyValidationError` → surfaced as `DriverError` → returned as
+`{ok: false, error: "SafetyValidator: ..."}` by the MCP tool. The Phase 2.2
+magnitude check in this recipe is now belt-and-braces, not the sole guardrail.
 
 ### FIR composition tool
 
