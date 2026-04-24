@@ -190,20 +190,32 @@ The recipe must check the predicted FIR magnitude before calling `apply_fir`:
 
 ### 0.0 Reset ALL DSP state
 
-The DSP is write-only; prior sessions leave state. Start from zero.
+**⚠️ NEVER SKIP THIS PHASE — IT DIRECTLY AFFECTS FIR DESIGN ACCURACY**
+
+The MCP driver carries in-memory DSP state across calibration runs and pushes the
+full config to CamillaDSP on every write. This means stale FIR coefficients, PEQ
+filters, gain trims, and delays from a prior run are silently active when the new
+run starts. Any baseline measurement taken without resetting first is contaminated —
+the FIR design will target a pre-shaped response, and the final calibration will be
+wrong. This has caused real regressions (e.g., run 17 FIRs designed against run 16's
+input PEQ, producing a mismatched FIR-PEQ combination).
 
 For **every output** (including unused/shaker):
 1. `set_delay(output_index, 0)` — clear alignment delays
 2. `set_polarity(output_index, inverted=false)` — clear polarity flips
 3. `set_output_gain(output_index, 0)` — clear level trims
-4. `clear_fir(output_index)` — **critical** — reset to passthrough before designing new FIRs
+4. `clear_fir(output_index)` — reset to passthrough before designing new FIRs
 
 For **each sub output**:
 5. `apply_eq(output_index, [HPF only])` — HPF-only baseline, clears all PEQ slots
 
 For **inputs**:
-6. `apply_input_eq([HPF only])` — clears target curve
+6. `apply_input_eq([HPF only])` — **clears any target curve from prior runs**
 7. `set_master_gain(0)` — reset master gain
+
+**Verification (mandatory):** After completing the above, call `get_output_state` for
+each sub output and confirm: `fir_taps == 0`, `gain_db == 0`, `delay_ms == 0`.
+If any value is non-zero, the reset did not complete — do NOT proceed to measurements.
 
 ### 0.1 Configure input routing
 
