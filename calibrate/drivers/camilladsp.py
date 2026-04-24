@@ -176,8 +176,9 @@ class _BridgeSweepContext:
         self._driver = driver
         self._bridge_service = bridge_service
         self._playback_device = playback_device
+        self.active = False
 
-    async def __aenter__(self) -> "_BridgeSweepContext":
+    async def enter(self) -> "_BridgeSweepContext":
         if self._bridge_service:
             log.info("sweep_context: stopping bridge service %s", self._bridge_service)
             await asyncio.get_running_loop().run_in_executor(
@@ -189,9 +190,10 @@ class _BridgeSweepContext:
             )
 
         await self._prime_loopback()
+        self.active = True
         return self
 
-    async def __aexit__(self, *_) -> None:
+    async def exit(self) -> None:
         if self._bridge_service:
             log.info("sweep_context: starting bridge service %s", self._bridge_service)
             await asyncio.get_running_loop().run_in_executor(
@@ -201,6 +203,13 @@ class _BridgeSweepContext:
                     check=False, capture_output=True,
                 ),
             )
+        self.active = False
+
+    async def __aenter__(self) -> "_BridgeSweepContext":
+        return await self.enter()
+
+    async def __aexit__(self, *_) -> None:
+        await self.exit()
 
     async def _prime_loopback(self) -> None:
         """Open the loopback write side briefly so CamillaDSP can open the read side.

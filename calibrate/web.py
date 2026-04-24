@@ -23,7 +23,8 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from .config import Config, CONFIG_PATH
-from .drivers.denon import DenonDriver
+from .drivers.registry import load_drivers_from_graph
+from .graph import default_display_name
 from .measurement import FrequencyResponse, _find_umik_device
 from .storage import SessionStore
 
@@ -1982,46 +1983,76 @@ async def get_feedback(session_id: int) -> list[dict]:
     return store.get_feedback(session_id)
 
 
+def _format_processor_detail(kind: str, state: dict) -> str:
+    """Render a processor's ``get_state()`` dict into a one-line status string.
+
+    Kept kind-aware (not driver-aware) because the useful fields differ by
+    role: AVRs surface input/volume, DSPs surface preset/source or volume.
+    Any field the driver omits is silently skipped.
+    """
+    if kind == "avr":
+        parts = []
+        if (inp := state.get("input")) is not None:
+            parts.append(f"Input: {inp}")
+        if (vol := state.get("volume")) is not None:
+            parts.append(f"Volume: {vol} dB")
+        return ", ".join(parts) or str(state.get("host", ""))
+
+    # DSP — preset/source only meaningful on miniDSP; CamillaDSP reports volume.
+    parts = []
+    preset = state.get("preset")
+    source = state.get("source")
+    if preset is not None or source is not None:
+        parts.append(f"Preset: {preset if preset is not None else '?'}")
+        if source is not None:
+            parts.append(f"Source: {source}")
+    if (vol := state.get("volume")) is not None:
+        parts.append(f"Volume: {vol} dB")
+    if (cpu := state.get("cpu_load")) is not None:
+        parts.append(f"CPU: {cpu}")
+    return ", ".join(parts) or str(state.get("host", ""))
+
+
 @app.get("/api/status")
 async def system_status() -> dict:
     """Return system device status and last calibration run."""
     devices = []
     cfg = _load_config()
 
-    # Denon (via DenonDriver abstraction)
-    denon_host = cfg.denon.get("host")
-    if denon_host:
-        try:
-            driver = DenonDriver(denon_host)
-            state = await driver.get_state()
-            if state.get("connected"):
-                devices.append({
-                    "name": "Denon AVR",
-                    "connected": True,
-                    "detail": f"Input: {state.get('input')}, Volume: {state.get('volume')} dB",
-                })
-            else:
-                devices.append({"name": "Denon AVR", "connected": False, "detail": denon_host})
-        except Exception:
-            devices.append({"name": "Denon AVR", "connected": False, "detail": denon_host})
-
-    # miniDSP
-    minidsp_host, minidsp_port = cfg.minidsp_host_port
+    # Walk the signal graph and ask each processor driver to report itself.
+    # Display name comes from the graph (``display_name`` on each Processor,
+    # with a driver_ref→label fallback), so adding a new DSP backend — or
+    # renaming an install's existing one — needs no changes here.
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            r = await client.get(f"http://{minidsp_host}:{minidsp_port}/devices/0")
-            if r.status_code == 200:
-                data = r.json()
-                master = data.get("master", {})
+        registry = load_drivers_from_graph(cfg)
+    except Exception as e:
+        registry = None
+        devices.append({"name": "Signal graph", "connected": False, "detail": str(e)})
+
+    if registry is not None:
+        for proc in cfg.signal_graph.processors:
+            label = default_display_name(proc)
+            driver = registry.get(proc.name)
+            if driver is None:
+                devices.append({"name": label, "connected": False, "detail": "not loaded"})
+                continue
+            try:
+                state = await driver.get_state()
+            except Exception as e:
+                devices.append({"name": label, "connected": False, "detail": str(e)})
+                continue
+            if not state.get("connected"):
                 devices.append({
-                    "name": "miniDSP 2x4 HD",
-                    "connected": True,
-                    "detail": f"Preset: {master.get('preset', '?')}, Source: {master.get('source', '?')}",
+                    "name": label,
+                    "connected": False,
+                    "detail": str(state.get("host", "")),
                 })
-            else:
-                devices.append({"name": "miniDSP 2x4 HD", "connected": False, "detail": "HTTP error"})
-    except Exception:
-        devices.append({"name": "miniDSP 2x4 HD", "connected": False, "detail": f"{minidsp_host}:{minidsp_port}"})
+                continue
+            devices.append({
+                "name": label,
+                "connected": True,
+                "detail": _format_processor_detail(proc.kind, state),
+            })
 
     # UMIK
     try:
