@@ -300,6 +300,13 @@ class MeasurementEngine:
         # at 144k samples (3s @ 48kHz) that's ~100s on Pi Zero W.
         # The cross-correlation also pins down *where* the sweep starts in
         # the recording (lag_idx), which we return for alignment.
+        #
+        # A raw log-sweep×recording correlation is dominated by a broad
+        # low-frequency hump that biases argmax toward lag=0 — that bias
+        # varies per measurement (ALSA stream-start jitter + clipping
+        # interacting differently on each run) and silently contaminates
+        # the absolute IR peak time. We peak-detect on the envelope of a
+        # bandpassed correlation so the start-of-sweep lag is repeatable.
         n = len(sweep_array)
         rec_t = rec_array[:n]
         fft_len = n * 2  # zero-pad to avoid circular wrap
@@ -323,7 +330,19 @@ class MeasurementEngine:
         # clips (multiple samples hit 1.0) or when there are room transients:
         # the first clipping sample may be in the floor window, collapsing
         # signal_rms ≈ floor_rms and giving SNR ≈ 0 dB despite a valid sweep.
-        lag_idx = int(np.argmax(np.abs(corr[:n])))  # circular lag in [0, n)
+        corr_search = corr[:n]
+        try:
+            from scipy.signal import butter, sosfiltfilt, hilbert
+            sos = butter(4, [30.0, 150.0], btype="band", fs=sample_rate, output="sos")
+            corr_bp = sosfiltfilt(sos, corr_search)
+            corr_envelope = np.abs(hilbert(corr_bp))
+        except Exception as _bxexc:
+            corr_envelope = np.abs(corr_search)
+            log.warning(
+                "sweep-start bandpass/hilbert unavailable (%s); falling back to |corr|",
+                _bxexc,
+            )
+        lag_idx = int(np.argmax(corr_envelope))  # circular lag in [0, n)
         sig_start = max(0, lag_idx)
         sig_end = min(len(rec_array), lag_idx + n)
         peak_window = rec_array[sig_start:sig_end]
