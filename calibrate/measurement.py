@@ -630,17 +630,33 @@ class MeasurementEngine:
         Y = np.fft.rfft(rec_array[:n], n=n)
 
         # ── Cross-correlation for timing ─────────────────────────────
-        # C = IFFT(conj(X)·Y) — no division, no DC artifact.
-        # Peak of C = propagation delay (sub → mic travel time).
-        # Used by detect_ir_onset instead of deconvolved IR peak.
-        C = np.fft.irfft(np.conj(X) * Y, n=n)
-        search_n = min(int(0.050 * sample_rate), n)  # 50ms search window
-        xcorr_peak_idx = int(np.argmax(np.abs(C[:search_n])))
+        # Plain C = IFFT(conj(X)·Y) is useless: a log sweep has most of its
+        # energy at low frequencies, so the cross-correlation is dominated
+        # by a broad low-frequency hump that peaks at lag 0 regardless of
+        # actual travel time. We bandlimit to the sub's operating range
+        # (30–150 Hz) and peak on the Hilbert envelope within a physical
+        # travel-time window (≥1 ms, ≤20 ms → 0.3–6.9 m path).
+        C_full = np.fft.irfft(np.conj(X) * Y, n=n)
+        try:
+            from scipy.signal import butter, sosfiltfilt, hilbert
+            sos = butter(4, [30.0, 150.0], btype="band", fs=sample_rate, output="sos")
+            C_bp = sosfiltfilt(sos, C_full)
+            envelope = np.abs(hilbert(C_bp))
+        except Exception as _xexc:  # scipy missing or filter edge case
+            envelope = np.abs(C_full)
+            log.warning("xcorr bandpass/hilbert unavailable (%s); using raw |C|", _xexc)
+        # Physical travel-time window: 1 ms (avoid DC hump) to 20 ms (6.9 m path)
+        lo_idx = max(1, int(0.001 * sample_rate))
+        hi_idx = min(n, int(0.020 * sample_rate))
+        if hi_idx <= lo_idx:
+            hi_idx = min(n, lo_idx + 1)
+        rel_idx = int(np.argmax(envelope[lo_idx:hi_idx]))
+        xcorr_peak_idx = lo_idx + rel_idx
         xcorr_peak_ms = round(xcorr_peak_idx / sample_rate * 1000.0, 3)
-        xcorr_peak_sign = 1 if C[xcorr_peak_idx] >= 0.0 else -1
+        xcorr_peak_sign = 1 if C_full[xcorr_peak_idx] >= 0.0 else -1
         log.info(
-            "xcorr peak: %.3f ms (sample %d), sign=%+d",
-            xcorr_peak_ms, xcorr_peak_idx, xcorr_peak_sign,
+            "xcorr peak: %.3f ms (sample %d of window [%d,%d)), sign=%+d",
+            xcorr_peak_ms, xcorr_peak_idx, lo_idx, hi_idx, xcorr_peak_sign,
         )
 
         # Regularised deconvolution (Wiener-style).

@@ -272,31 +272,38 @@ an already-aligned sub.
 For each sub:
 1. Mute all other subs
 2. `measure(label="sub_{N}-solo-align", position="MLP")` — note `session_id`
-3. `analyze_ir(session_id)` → `peak_sign`, `spl_db` (see note about `peak_time_ms` below)
+3. `analyze_ir(session_id)` → `peak_time_s`, `peak_sign`, `spl_db`
 4. Unmute
 
-**Note on `peak_time_ms`:** since the cross-correlation alignment fix
-(PR #88), every measurement's IR peak is anchored to t=0 by design to
-eliminate stream-start jitter. This means `peak_time_ms` is essentially
-always 0 and cannot be used to compute inter-sub arrival times anymore.
-`peak_sign` and `spl_db` are still meaningful. Use Phase 1.2's
-`compare_sub_phase` as the PRIMARY delay-estimation tool (next step).
+`peak_time_s` is the sub→mic travel time recovered from a bandlimited
+(30–150 Hz) Hilbert-envelope cross-correlation peak. Differential
+`peak_time_s` between subs is a valid first-pass delay estimate but
+carries ~0.5–1 ms residual bias from the bandpass group delay. Use
+`compare_sub_phase.delay_estimate` (Phase 1.2) as the primary source —
+its phase-slope fit is unbiased.
 
 ### 1.2 Analyze phase relationship (primary alignment tool)
 
 `compare_sub_phase(session_a, session_b)` — per-band phase difference,
-predicted coherent sum. This is THE tool for alignment, not `analyze_ir`
-(see note above). The per-band `phase_diff_deg` lets you compute the
-delay offset needed: at frequency f, a delay of Δt ms produces a phase
-shift of `360 × f × Δt / 1000` degrees. Pick a band in the upper
-focus range (e.g. 50–80 Hz — high enough to be modal-cancellation-free,
-low enough to still be sub territory), read off `phase_diff_deg`, and
-solve for Δt.
+predicted coherent sum, AND a phase-slope delay estimate. Use
+`delay_estimate.delay_ms` as the primary alignment target:
+
+- Positive `delay_ms` → sub_b trails sub_a → delay sub_a.
+- Negative `delay_ms` → sub_a trails sub_b → delay sub_b.
+
+Trust the estimate when `fit_r2 ≥ 0.8` and `mean_concentration ≥ 0.7`.
+If either is low, per-bin phase is scattered (likely modal cancellation
+dominates the chosen band); narrow `min_hz`/`max_hz` to a cleaner
+range and re-run, or fall back to measurement-based polarity/position
+iteration rather than guessing a delay.
+
+Per-band `phase_diff_deg` is informational — do NOT solve for Δt from a
+single band; wrapping makes that ambiguous.
 
 ### 1.3 Apply delay correction
 
-Compute Δt from `compare_sub_phase` output (see Phase 1.2 for the
-formula). Delay the sub that leads. Apply via `set_delay`.
+Take `delay_estimate.delay_ms` from Phase 1.2 and apply to the leading
+sub via `set_delay`. Round to the DSP's delay resolution.
 
 **Describe every hardware action explicitly.** Example:
 "compare_sub_phase shows sub_nearfield leading sub_front_right by 134°

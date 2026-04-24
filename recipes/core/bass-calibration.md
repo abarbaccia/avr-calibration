@@ -246,10 +246,17 @@ reinforce or cancel. Understand the interaction before correcting.
 
 ### 1.3 Apply delay correction
 
-The sub with the latest `peak_time_s` is the reference (delay = 0).
-Each earlier-arriving sub gets:
-  delay_ms = (reference_peak_time_s - its_peak_time_s) * 1000
-Apply via `set_delay`.
+Prefer `compare_sub_phase.delay_estimate.delay_ms` (phase-slope fit —
+unbiased). Trust it when `fit_r2 ≥ 0.8` and `mean_concentration ≥ 0.7`;
+otherwise fall back to the `analyze_ir` peak-time difference:
+
+- Fallback: sub with latest `peak_time_s` is reference (delay = 0);
+  each earlier-arriving sub gets
+  `delay_ms = (reference_peak_time_s - its_peak_time_s) * 1000`.
+  Note: bandpass-filter group delay gives this ~0.5–1 ms bias, so it
+  is a coarse estimate only.
+
+Apply the chosen delay via `set_delay` to the leading sub.
 
 ### 1.4 Polarity test (measurement-based)
 
