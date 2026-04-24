@@ -52,6 +52,7 @@ from calibrate.mcp_server import (
     _tool_clear_fir,
     _tool_compare_sessions,
     _tool_compare_sub_phase,
+    _tool_optimize_sub_alignment,
     _tool_compute_deviation,
     _tool_configure_matrix,
     _tool_design_fir,
@@ -5518,3 +5519,144 @@ def test_parse_dsp_key_handles_both_shapes() -> None:
     # Non-DSP keys yield None
     assert parse_dsp_key("target_curve") is None
     assert parse_dsp_key("random_garbage") is None
+
+
+# ── optimize_sub_alignment ───────────────────────────────────────────────────
+
+def _make_session_with_synth_ir(session_id: int, ir, sample_rate: int = 48000) -> MagicMock:
+    """Build a mock Session whose impulse_response is the given ndarray."""
+    mock_fr = MagicMock()
+    mock_fr.sample_rate = sample_rate
+    s = MagicMock()
+    s.id = session_id
+    s.label = f"sub_{session_id} @ MLP"
+    s.start_fr = mock_fr
+    s.impulse_response = list(ir)
+    return s
+
+
+def _synthetic_sub_ir(sample_rate: int, n: int, arrival_s: float,
+                       amplitude: float = 1.0, invert: bool = False):
+    """A band-limited impulse representing one sub's solo response at the mic.
+
+    Direct arrival is a Kronecker impulse at `arrival_s`, lowpass-filtered to
+    ~150 Hz so the resulting IR has sub-like bandwidth. Room tail is ignored
+    — good enough to test that the optimizer recovers alignment from direct
+    arrivals alone, which is the diagnostic we care about.
+    """
+    import numpy as np
+    from scipy.signal import butter, sosfiltfilt
+    ir = np.zeros(n)
+    idx = int(arrival_s * sample_rate)
+    if idx < n:
+        ir[idx] = amplitude * (-1.0 if invert else 1.0)
+    sos = butter(4, 150.0, btype="low", fs=sample_rate, output="sos")
+    return sosfiltfilt(sos, ir)
+
+
+@pytest.mark.asyncio
+async def test_optimize_sub_alignment_two_subs_recovers_delay() -> None:
+    """Two synthetic subs 10 ms apart → optimizer should delay the leader ~10 ms."""
+    import numpy as np
+    sr = 48000
+    n = int(0.5 * sr)
+    # Sub A arrives at 3 ms (closer/leading), Sub B arrives at 13 ms (trailing).
+    ir_a = _synthetic_sub_ir(sr, n, arrival_s=0.003)
+    ir_b = _synthetic_sub_ir(sr, n, arrival_s=0.013)
+    sess_a = _make_session_with_synth_ir(1, ir_a, sr)
+    sess_b = _make_session_with_synth_ir(2, ir_b, sr)
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [sess_a, sess_b]
+        result = await _tool_optimize_sub_alignment(
+            session_ids=[1, 2], min_hz=30.0, max_hz=150.0, max_delay_ms=20.0,
+        )
+
+    assert result["ok"], result
+    assert len(result["per_sub"]) == 2
+    # Relative delay between leading (A) and trailing (B) sub should match the
+    # true 10 ms differential within bandpass-filter-group-delay tolerance.
+    # Absolute offsets can drift because only the differential affects
+    # alignment, and the optimizer bottoms out anywhere on the "aligned plateau".
+    rec_a = result["per_sub"][0]
+    rec_b = result["per_sub"][1]
+    assert (rec_a["delay_ms"] - rec_b["delay_ms"]) == pytest.approx(10.0, abs=2.0)
+    # And it should claim an improvement over the 0/0 baseline.
+    assert result["improvement_db"] > 0.5
+
+
+@pytest.mark.asyncio
+async def test_optimize_sub_alignment_detects_polarity_flip() -> None:
+    """One sub wired inverted at same arrival → optimizer produces a clear win
+    over the 0/0 baseline (polarity flip OR delay escape — either is fine,
+    what matters is the cancellation goes away)."""
+    import numpy as np
+    sr = 48000
+    n = int(0.5 * sr)
+    ir_a = _synthetic_sub_ir(sr, n, arrival_s=0.005, invert=False)
+    ir_b = _synthetic_sub_ir(sr, n, arrival_s=0.005, invert=True)  # polarity flipped
+    sess_a = _make_session_with_synth_ir(1, ir_a, sr)
+    sess_b = _make_session_with_synth_ir(2, ir_b, sr)
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [sess_a, sess_b]
+        result = await _tool_optimize_sub_alignment(
+            session_ids=[1, 2], min_hz=30.0, max_hz=150.0, max_delay_ms=10.0,
+        )
+
+    assert result["ok"], result
+    # Baseline (both 0 ms, no flip) is the deeply-cancelling case. Any valid
+    # recommendation should substantially improve it.
+    assert result["improvement_db"] > 3.0
+    rec_a, rec_b = result["per_sub"]
+    resolved_by_polarity = rec_a["polarity_inverted"] != rec_b["polarity_inverted"]
+    resolved_by_delay = abs(rec_a["delay_ms"] - rec_b["delay_ms"]) > 1.0
+    assert resolved_by_polarity or resolved_by_delay
+
+
+@pytest.mark.asyncio
+async def test_optimize_sub_alignment_three_subs() -> None:
+    """Three subs at 2/7/13 ms → leading sub should get ~11 ms more delay than
+    the trailing one. Tolerance is generous because the objective is flatness
+    of the SUMMED response, not exact travel-time recovery (the three subs'
+    bandpassed impulses overlap at useful bass frequencies)."""
+    import numpy as np
+    sr = 48000
+    n = int(0.5 * sr)
+    ir_a = _synthetic_sub_ir(sr, n, arrival_s=0.002)
+    ir_b = _synthetic_sub_ir(sr, n, arrival_s=0.007)
+    ir_c = _synthetic_sub_ir(sr, n, arrival_s=0.013)
+    sessions = [_make_session_with_synth_ir(i + 1, ir, sr) for i, ir in enumerate([ir_a, ir_b, ir_c])]
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = sessions
+        result = await _tool_optimize_sub_alignment(
+            session_ids=[1, 2, 3], min_hz=30.0, max_hz=150.0, max_delay_ms=20.0,
+        )
+
+    assert result["ok"]
+    assert len(result["per_sub"]) == 3
+    delays = [r["delay_ms"] for r in result["per_sub"]]
+    # Delays should spread the subs in the right ORDER: most-delay on leader (A),
+    # least on trailer (C). And at least ~half the true differential should show.
+    assert delays[0] > delays[2]
+    assert delays[0] - delays[2] >= 5.0
+    assert result["improvement_db"] > 1.0
+
+
+@pytest.mark.asyncio
+async def test_optimize_sub_alignment_missing_session() -> None:
+    """Unknown session_id → error."""
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = []
+        result = await _tool_optimize_sub_alignment(session_ids=[99, 100])
+    assert not result["ok"]
+    assert "not found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_optimize_sub_alignment_requires_two_subs() -> None:
+    """Single session_id is not enough to align."""
+    result = await _tool_optimize_sub_alignment(session_ids=[1])
+    assert not result["ok"]
+    assert "at least 2" in result["error"]

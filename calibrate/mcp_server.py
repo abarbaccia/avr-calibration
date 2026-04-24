@@ -2723,6 +2723,203 @@ async def _tool_compare_sub_phase(
         return _err(f"compare_sub_phase failed: {exc}")
 
 
+async def _tool_optimize_sub_alignment(
+    session_ids: list[int],
+    target_curve: dict | None = None,
+    min_hz: float = 20.0,
+    max_hz: float = 120.0,
+    max_delay_ms: float = 30.0,
+    search_polarity: bool = True,
+    gain_search_db: float = 3.0,
+    seed: int = 42,
+) -> dict:
+    """MSO-style numerical sub alignment.
+
+    Given N solo-sub session IDs (one measurement per sub, all others muted),
+    search per-sub (delay_ms, gain_db, polarity_inverted) that minimizes the
+    RMS deviation of the PREDICTED combined FR vs target in [min_hz, max_hz].
+
+    When target_curve is None we minimize the std-dev of the combined FR in
+    band (flatness objective). Pass a target_curve = {"points":[{"freq","spl"},…]}
+    to optimize against e.g. Harman or cinema-bass.
+
+    Bounds:
+      delay_ms  ∈ [0, max_delay_ms]  (lower-bound 0: optimizer delays leading
+                                       subs rather than negatively delaying
+                                       trailing subs)
+      gain_db   ∈ [-gain_search_db, +gain_search_db]  (level match)
+      polarity  ∈ {0, 1}             (continuous in DE, snapped on return)
+
+    Returns per-sub recommendations + predicted combined FR + improvement_db.
+    """
+    try:
+        from .storage import SessionStore
+        import numpy as np
+
+        if not session_ids or len(session_ids) < 2:
+            return _err("optimize_sub_alignment: need at least 2 session_ids")
+
+        store = SessionStore()
+        sessions = store.list_sessions()
+        by_id = {s.id: s for s in sessions}
+        subs = []
+        for sid in session_ids:
+            s = by_id.get(sid)
+            if s is None:
+                return _err(f"session {sid} not found")
+            if not s.impulse_response:
+                return _err(f"session {sid} has no impulse_response")
+            if not s.start_fr or not s.start_fr.sample_rate:
+                return _err(f"session {sid} has no sample_rate")
+            subs.append(s)
+
+        sr = int(subs[0].start_fr.sample_rate)
+        for s in subs:
+            if int(s.start_fr.sample_rate) != sr:
+                return _err(f"session {s.id}: sample_rate mismatch ({s.start_fr.sample_rate} vs {sr})")
+
+        # Pad all IRs to the max length so shift+sum aligns sample-for-sample.
+        irs = [np.asarray(s.impulse_response, dtype=np.float64) for s in subs]
+        n = max(len(ir) for ir in irs)
+        irs_padded = np.stack([np.pad(ir, (0, n - len(ir))) for ir in irs])
+
+        # Frequency grid for the combined FR.
+        freqs = np.fft.rfftfreq(n, d=1.0 / sr)
+        in_band = (freqs >= min_hz) & (freqs <= max_hz)
+        if not np.any(in_band):
+            return _err(f"no frequency bins in [{min_hz}, {max_hz}] Hz")
+
+        # Target vector over the full rfft grid (only evaluated in-band).
+        target_db: "np.ndarray | None" = None
+        if target_curve is not None:
+            points = target_curve.get("points") if isinstance(target_curve, dict) else None
+            if not points:
+                return _err("target_curve must be {'points':[{freq,spl},…]}")
+            tgt_f = np.array([float(p["freq"]) for p in points], dtype=np.float64)
+            tgt_spl = np.array([float(p["spl"]) for p in points], dtype=np.float64)
+            order = np.argsort(tgt_f)
+            tgt_f = tgt_f[order]
+            tgt_spl = tgt_spl[order]
+            # log-freq interpolation, dB is linear
+            target_db = np.interp(np.log(np.maximum(freqs, 1e-6)), np.log(tgt_f), tgt_spl)
+        else:
+            # Default objective uses a single-target vector = per-frequency
+            # "achievable ceiling" (max solo-FR across subs). Reaching it means
+            # subs sum constructively; falling below means cancellation.
+            per_sub_db = np.stack([
+                20.0 * np.log10(np.abs(np.fft.rfft(ir)) + 1e-12) for ir in irs_padded
+            ])
+            target_db = np.max(per_sub_db, axis=0)
+
+        N_subs = len(subs)
+        max_delay_samples = int(max_delay_ms * sr / 1000.0)
+
+        def combined_fr_db(params: "np.ndarray") -> "np.ndarray":
+            combined = np.zeros(n, dtype=np.float64)
+            for i in range(N_subs):
+                delay_ms = float(params[3 * i])
+                gain_db = float(params[3 * i + 1])
+                pol = float(params[3 * i + 2])
+                d_samples = int(round(delay_ms * sr / 1000.0))
+                if d_samples >= n:
+                    d_samples = n - 1
+                shifted = np.zeros(n, dtype=np.float64)
+                if d_samples == 0:
+                    shifted = irs_padded[i].copy()
+                else:
+                    shifted[d_samples:] = irs_padded[i][:n - d_samples]
+                sign = -1.0 if pol > 0.5 else 1.0
+                g_lin = 10.0 ** (gain_db / 20.0)
+                combined += sign * g_lin * shifted
+            H = np.fft.rfft(combined)
+            return 20.0 * np.log10(np.abs(H) + 1e-12)
+
+        def objective(params: "np.ndarray") -> float:
+            fr = combined_fr_db(params)
+            in_fr = fr[in_band]
+            in_t = target_db[in_band]
+            # Asymmetric penalty: one-sided RMS below the target ceiling. Being
+            # ABOVE the per-freq ceiling (rare — requires N subs summing
+            # coherently at a freq where one sub alone was already near max) is
+            # fine; being below means cancellation, which is what we're trying
+            # to fix. One-sided avoids the "trivially flat at -inf is good"
+            # failure mode of a symmetric-RMS objective on a flatness target.
+            below = np.maximum(0.0, in_t - in_fr)
+            return float(np.sqrt(np.mean(below ** 2)))
+
+        # Bounds: delay ∈ [0, max_delay_ms], gain ∈ [±gain], polarity ∈ [0, 1]
+        pol_hi = 1.0 if search_polarity else 0.0
+        bounds = []
+        for _ in range(N_subs):
+            bounds.append((0.0, float(max_delay_ms)))
+            bounds.append((-float(gain_search_db), float(gain_search_db)))
+            bounds.append((0.0, pol_hi))
+
+        # Baseline: everyone aligned at 0 / 0 / 0 — current pre-optimization state.
+        baseline_params = np.zeros(3 * N_subs)
+        baseline_err = objective(baseline_params)
+
+        from scipy.optimize import differential_evolution
+        result = differential_evolution(
+            objective,
+            bounds=bounds,
+            maxiter=200,
+            popsize=15,
+            tol=1e-4,
+            seed=seed,
+            polish=True,
+        )
+
+        # Build per-sub recommendations.
+        per_sub = []
+        best = result.x
+        for i, s in enumerate(subs):
+            delay_ms = round(float(best[3 * i]), 3)
+            gain_db = round(float(best[3 * i + 1]), 2)
+            polarity_inverted = bool(best[3 * i + 2] > 0.5)
+            per_sub.append({
+                "session_id": s.id,
+                "label": s.label,
+                "delay_ms": delay_ms,
+                "gain_db": gain_db,
+                "polarity_inverted": polarity_inverted,
+            })
+
+        optimized_err = float(result.fun)
+        improvement_db = round(baseline_err - optimized_err, 2)
+
+        # Return the predicted combined FR on the native grid for downstream sim/plot.
+        predicted_combined_db = combined_fr_db(best).tolist()
+
+        # Convenience: band-limited predicted FR summary.
+        in_band_freqs = freqs[in_band].tolist()
+        in_band_pred = [float(x) for x in combined_fr_db(best)[in_band]]
+
+        return _ok(
+            per_sub=per_sub,
+            band_hz=[min_hz, max_hz],
+            baseline_error_db=round(baseline_err, 3),
+            optimized_error_db=round(optimized_err, 3),
+            improvement_db=improvement_db,
+            objective="rms_vs_target" if target_curve is not None else "rms_vs_per_freq_max",
+            predicted_combined={
+                "frequencies": in_band_freqs,
+                "spl_db": in_band_pred,
+            },
+            converged=bool(result.success),
+            n_evaluations=int(result.nfev),
+            note=(
+                "Per-sub recommendations minimize predicted combined-FR error in-band. "
+                "Apply delay via set_delay, gain via set_output_gain, polarity via "
+                "set_polarity per session_id. Then measure combined to verify "
+                "improvement_db shows up. Delay floor is 0 — trailing subs stay put, "
+                "leading subs get delayed to align."
+            ),
+        )
+    except Exception as exc:
+        return _err(f"optimize_sub_alignment failed: {exc}")
+
+
 async def _tool_design_fir(
     session_id: int,
     target_curve: dict | None = None,
@@ -6051,6 +6248,55 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="optimize_sub_alignment",
+        description=(
+            "MSO-style multi-sub alignment. Given one solo-sub session per sub "
+            "(mute others, measure, repeat), searches per-sub (delay_ms, gain_db, "
+            "polarity_inverted) that minimize predicted combined-FR error in-band. "
+            "Default objective is flatness of the combined response; pass a target_curve "
+            "(e.g. Harman, cinema-bass) to optimize against a specific target instead. "
+            "Replaces the compare_sub_phase delay_estimate for alignment — this directly "
+            "optimizes the thing you care about (combined SPL) rather than inferring it "
+            "from a phase-slope fit that can fail in strongly modal rooms. "
+            "Scales to N subs. Apply per-sub recommendations via set_delay / "
+            "set_output_gain / set_polarity, then measure combined to verify."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": (
+                        "Solo measurement session IDs, one per sub (2+ required). Order "
+                        "determines how recommendations are labeled in the response."
+                    ),
+                },
+                "target_curve": {
+                    "type": "object",
+                    "description": (
+                        "Optional {points:[{freq,spl},…]}. Omit for flatness objective."
+                    ),
+                },
+                "min_hz": {"type": "number", "description": "Lower band edge (default: 20)"},
+                "max_hz": {"type": "number", "description": "Upper band edge (default: 120)"},
+                "max_delay_ms": {
+                    "type": "number",
+                    "description": "Max per-sub delay the optimizer will assign (default: 30)",
+                },
+                "search_polarity": {
+                    "type": "boolean",
+                    "description": "Include polarity flip in search (default: true)",
+                },
+                "gain_search_db": {
+                    "type": "number",
+                    "description": "±range for per-sub gain trim search (default: 3 dB)",
+                },
+            },
+            "required": ["session_ids"],
+        },
+    ),
+    Tool(
         name="design_fir",
         description=(
             "Design FIR correction filter coefficients. You decide the strategy: phase mode "
@@ -6749,6 +6995,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             session_b=int(arguments["session_b"]),
             min_hz=float(arguments.get("min_hz", 20.0)),
             max_hz=float(arguments.get("max_hz", 120.0)),
+        )
+    elif name == "optimize_sub_alignment":
+        result = await _tool_optimize_sub_alignment(
+            session_ids=[int(x) for x in arguments["session_ids"]],
+            target_curve=arguments.get("target_curve"),
+            min_hz=float(arguments.get("min_hz", 20.0)),
+            max_hz=float(arguments.get("max_hz", 120.0)),
+            max_delay_ms=float(arguments.get("max_delay_ms", 30.0)),
+            search_polarity=bool(arguments.get("search_polarity", True)),
+            gain_search_db=float(arguments.get("gain_search_db", 3.0)),
         )
     elif name == "design_fir":
         result = await _tool_design_fir(
