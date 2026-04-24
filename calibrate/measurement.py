@@ -790,18 +790,27 @@ def detect_ir_onset(
 
     Fallback (legacy sessions without xcorr_peak_ms): bandpass filters the
     deconvolved IR to the sub's operating range to suppress the DC artifact.
+    Searches the **full** IR rather than the first ``search_window_ms`` ms so
+    that legacy sessions whose IR was recorded before the alignment fix (and
+    therefore contains leading pre-sweep silence) return a non-zero peak time
+    reflecting the actual travel time from the sub to the mic. Sessions
+    recorded after the alignment fix have their pre-sweep silence stripped
+    before the IR is computed, so their peak is within the first 50 ms.
 
     Returns:
         {peak_time_ms, peak_sign, spl_db, sample_rate}
+
+    ``peak_time_ms`` is the absolute travel time from the sub to the mic in ms
+    (measured from the start of the stored IR). Two calls on different solo-sub
+    sessions produce values whose difference is the delay offset to apply via
+    ``set_delay``.
     """
     import numpy as np
 
-    search_samples = max(1, int(search_window_ms / 1000.0 * sample_rate))
-    search_samples = min(search_samples, len(ir))
-
     if xcorr_peak_ms is not None:
         # Primary path: cross-correlation timing (no DC artifact).
-        peak_idx = min(int(xcorr_peak_ms / 1000.0 * sample_rate), search_samples - 1)
+        # Clamp to the stored IR length to avoid out-of-bounds indexing.
+        peak_idx = min(int(xcorr_peak_ms / 1000.0 * sample_rate), len(ir) - 1)
         peak_sign = 1 if ir[peak_idx] >= 0.0 else -1
         spl_db = float(20.0 * np.log10(np.abs(ir[peak_idx]) + 1e-12))
         return {
@@ -812,24 +821,25 @@ def detect_ir_onset(
         }
 
     # Fallback: bandpass the deconvolved IR to suppress DC artifact.
+    # Search the full IR (not just search_window_ms) so legacy sessions whose
+    # IR contains leading pre-sweep silence produce a non-zero peak_time_ms.
     from scipy.signal import butter, sosfiltfilt
 
-    window = ir[:search_samples].copy()
     lo, hi = IR_ONSET_BAND_HZ
     sos = butter(2, [lo, hi], btype="band", fs=sample_rate, output="sos")
-    window = sosfiltfilt(sos, window)
+    filtered = sosfiltfilt(sos, ir)
 
-    abs_window = np.abs(window)
-    max_idx = int(np.argmax(abs_window))
+    abs_filtered = np.abs(filtered)
+    max_idx = int(np.argmax(abs_filtered))
 
     onset_ratio = 10.0 ** (IR_ONSET_THRESHOLD_DB / 20.0)  # 0.1 for -20 dB
-    onset_threshold = abs_window[max_idx] * onset_ratio
-    onset_candidates = np.where(abs_window >= onset_threshold)[0]
+    onset_threshold = abs_filtered[max_idx] * onset_ratio
+    onset_candidates = np.where(abs_filtered >= onset_threshold)[0]
     peak_idx = int(onset_candidates[0]) if len(onset_candidates) > 0 else max_idx
 
     peak_sign = 1 if ir[peak_idx] >= 0.0 else -1
     peak_time_s = peak_idx / sample_rate
-    spl_db = float(20.0 * np.log10(abs_window[max_idx] + 1e-12))
+    spl_db = float(20.0 * np.log10(abs_filtered[max_idx] + 1e-12))
 
     return {
         "peak_time_ms": round(peak_time_s * 1000.0, 3),

@@ -191,10 +191,33 @@ class PreflightChecker:
 
         try:
             await driver.get_state()
+
+            # CamillaDSP-specific: check that the audio pipeline is Running, not
+            # just that the websocket is up. An Inactive pipeline means no audio
+            # is flowing (e.g. the loopback write side was never opened). This is
+            # a warning — not a hard failure — because the sweep context primes
+            # the loopback before each measurement.
+            pipeline_state_str = ""
+            if dsp_name == "camilladsp" and hasattr(driver, "pipeline_state"):
+                state = await driver.pipeline_state()
+                pipeline_state_str = state
+                if state not in ("Running", "Unknown"):
+                    return CheckResult(
+                        name=display,
+                        passed=True,  # warning, not hard failure
+                        detail=(
+                            f"{display} at {host}:{port} — pipeline state: {state} "
+                            "(not Running; will be primed before measurement)"
+                        ),
+                    )
+
+            detail = f"{display} at {host}:{port}"
+            if pipeline_state_str and pipeline_state_str != "Unknown":
+                detail += f" — pipeline: {pipeline_state_str}"
             return CheckResult(
                 name=display,
                 passed=True,
-                detail=f"{display} at {host}:{port}",
+                detail=detail,
             )
 
         except DriverError as exc:

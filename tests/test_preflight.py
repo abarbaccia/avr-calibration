@@ -719,3 +719,91 @@ class TestOutputRoutingSafety:
         ])
         result = await PreflightChecker(config).check_output_routing_safety()
         assert result.passed
+
+
+# ── Bug 4: pipeline_state — warn when CamillaDSP pipeline is Inactive ─────────
+
+@pytest.mark.asyncio
+class TestCamillaDSPPipelineStateInPreflight:
+    """check_minidsp warns (but passes) when CamillaDSP pipeline is Inactive.
+
+    The priming step in _BridgeSweepContext.__enter__ (Bug 2 fix) will restart
+    the pipeline before measurement, so an Inactive state at preflight time is
+    non-fatal — just informational.
+    """
+
+    def _camilladsp_config(self) -> "Config":
+        from calibrate.config import Config, DEFAULT_CONFIG
+        data = {
+            **DEFAULT_CONFIG,
+            "dsp_driver": "camilladsp",
+            "camilladsp": {
+                **DEFAULT_CONFIG["camilladsp"],
+                "host": "127.0.0.1",
+                "port": 1234,
+            },
+        }
+        return Config(data)
+
+    async def test_running_pipeline_passes_cleanly(self) -> None:
+        """check_minidsp passes with clean detail when pipeline is Running."""
+        from calibrate.drivers.camilladsp import CamillaDSPDriver
+        cfg = self._camilladsp_config()
+        driver = CamillaDSPDriver()
+        responses = {"GetState": "Running", "GetVolume": 0.0, "GetMute": False, "GetProcessingLoad": 0.0}
+        driver._client._ws = object()
+        driver._client.call = AsyncMock(side_effect=lambda cmd, *a, **kw: responses[cmd])
+
+        import calibrate.drivers.registry as _reg
+        with patch.object(_reg, "load_dsp_driver", return_value=driver):
+            result = await PreflightChecker(cfg).check_minidsp()
+
+        assert result.passed
+        assert "Inactive" not in result.detail
+
+    async def test_inactive_pipeline_warns_but_passes(self) -> None:
+        """check_minidsp passes (warning) when pipeline is Inactive."""
+        from calibrate.drivers.camilladsp import CamillaDSPDriver
+        cfg = self._camilladsp_config()
+        driver = CamillaDSPDriver()
+
+        responses = {"GetState": "Inactive", "GetVolume": 0.0, "GetMute": False}
+        driver._client._ws = object()
+        driver._client.call = AsyncMock(side_effect=lambda cmd, *a, **kw: responses.get(cmd, "Inactive"))
+
+        import calibrate.drivers.registry as _reg
+        with patch.object(_reg, "load_dsp_driver", return_value=driver):
+            result = await PreflightChecker(cfg).check_minidsp()
+
+        assert result.passed  # warning, not hard failure
+        assert "Inactive" in result.detail
+        assert "not Running" in result.detail
+
+    async def test_unknown_pipeline_state_does_not_warn(self) -> None:
+        """check_minidsp does not add a warning when state is Unknown (websocket error).
+
+        pipeline_state() returns "Unknown" on DriverError; check_minidsp should
+        still pass and not include an Inactive warning.
+        """
+        from calibrate.drivers.camilladsp import CamillaDSPDriver
+        from calibrate.drivers.base import DriverError
+        cfg = self._camilladsp_config()
+        driver = CamillaDSPDriver()
+
+        # get_state succeeds for all commands; pipeline_state is separately mocked
+        # to return "Unknown" so we don't fight with the get_state call ordering.
+        responses = {"GetState": "Running", "GetVolume": 0.0, "GetMute": False, "GetProcessingLoad": 0.0}
+        driver._client._ws = object()
+        driver._client.call = AsyncMock(side_effect=lambda cmd, *a, **kw: responses[cmd])
+
+        # Override pipeline_state directly to return Unknown without a DriverError.
+        driver.pipeline_state = AsyncMock(return_value="Unknown")
+
+        import calibrate.drivers.registry as _reg
+        with patch.object(_reg, "load_dsp_driver", return_value=driver):
+            result = await PreflightChecker(cfg).check_minidsp()
+
+        assert result.passed
+        # Unknown state should not trigger the Inactive warning
+        assert "Inactive" not in result.detail
+        assert "not Running" not in result.detail
