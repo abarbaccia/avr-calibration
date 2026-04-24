@@ -533,28 +533,34 @@ class MeasurementEngine:
             np, sweep_1d, rec_1d, sample_rate, min_snr_db=min_snr,
         )
 
-        # Strip the pre-sweep portion so the recording passed to the deconvolver
-        # starts exactly at the first sample of the played sweep. We use the
-        # cross-correlation-derived ``sweep_start_sample`` rather than wall-clock
-        # ``PRE_DELAY_S × sample_rate`` because ALSA/PortAudio stream start is NOT
-        # instantaneous: on CamillaDSP + Loopback pipelines, the recording stream
-        # begins populating the buffer 20–50 ms after ``in_stream.start()`` is
-        # called, and the gap is non-deterministic (chunk-boundary dependent).
-        # Wall-clock stripping therefore removes a variable amount of sweep from
-        # the recording, which appears as IR-peak-time jitter of a similar scale.
-        # Cross-correlation locates the sweep itself and is immune to the stream-
-        # startup race. HDMIPlayback has no PRE_DELAY_S but still benefits because
-        # its stream-start latency is typically > 0.
-        rec_for_deconv = rec_1d[sweep_start_sample:] if sweep_start_sample > 0 else rec_1d
-        # For diagnostic use: the expected offset vs the actual offset tells us
-        # how much stream-startup latency we absorbed on this run.
+        # Strip a FIXED amount of pre-silence (shared across all measurements)
+        # rather than the per-measurement ``sweep_start_sample`` — the xcorr
+        # anchor drifts with each sub's direct-arrival amplitude (a loud
+        # nearfield sub biases the envelope peak later than a quiet far sub),
+        # which silently destroys the inter-sub differential delay we need for
+        # alignment. With a common fixed anchor, the IR peak times share one
+        # reference across sub-solo runs, so their differential = pure
+        # geometric delay + ALSA-start jitter (which is small and roughly
+        # constant for back-to-back runs).
+        #
+        # We strip ``PRE_DELAY_S - SWEEP_SAFETY_S`` so that even with worst-case
+        # ALSA stream-start jitter (20–50 ms late on CamillaDSP + Loopback) we
+        # never strip into the actual sweep. The residual silence before the
+        # sweep shows up as a constant positive offset in the IR — harmless for
+        # differential alignment, and the deconvolution tolerates it.
         expected_offset = int(getattr(strategy, "PRE_DELAY_S", 0.0) * sample_rate)
+        SWEEP_SAFETY_S = 0.1  # leave 100 ms of pre-sweep silence in rec_for_deconv
+        fixed_strip = max(0, expected_offset - int(SWEEP_SAFETY_S * sample_rate))
+        rec_for_deconv = rec_1d[fixed_strip:] if fixed_strip > 0 else rec_1d
+        # Diagnostic: xcorr anchor vs the fixed-strip anchor. Negative drift
+        # means ALSA started late; large |drift| across measurements is what
+        # we used to over-correct for (and is why we no longer strip by it).
         if expected_offset > 0:
             drift_ms = 1000.0 * (sweep_start_sample - expected_offset) / sample_rate
             log.info(
-                "measurement alignment: sweep_start=%d samples (expected %d); "
-                "drift=%.1f ms (negative = ALSA start was late)",
-                sweep_start_sample, expected_offset, drift_ms,
+                "measurement alignment: xcorr sweep_start=%d samples (expected %d, "
+                "drift=%.1f ms); fixed_strip=%d samples (shared anchor)",
+                sweep_start_sample, expected_offset, drift_ms, fixed_strip,
             )
 
         # Raw recording peak in dBFS (before deconvolution) — used by
@@ -664,9 +670,12 @@ class MeasurementEngine:
         except Exception as _xexc:  # scipy missing or filter edge case
             envelope = np.abs(C_full)
             log.warning("xcorr bandpass/hilbert unavailable (%s); using raw |C|", _xexc)
-        # Physical travel-time window: 1 ms (avoid DC hump) to 20 ms (6.9 m path)
+        # After fixed-strip in measure(), the IR is anchored at (PRE_DELAY_S −
+        # SWEEP_SAFETY_S) relative to play start, so the direct arrival sits at
+        # (~100 ms pre-sweep silence residue) + ALSA-start-jitter + sub→mic
+        # travel. Search the whole first 200 ms to catch it even with jitter.
         lo_idx = max(1, int(0.001 * sample_rate))
-        hi_idx = min(n, int(0.020 * sample_rate))
+        hi_idx = min(n, int(0.200 * sample_rate))
         if hi_idx <= lo_idx:
             hi_idx = min(n, lo_idx + 1)
         rel_idx = int(np.argmax(envelope[lo_idx:hi_idx]))
