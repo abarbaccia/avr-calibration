@@ -533,34 +533,35 @@ class MeasurementEngine:
             np, sweep_1d, rec_1d, sample_rate, min_snr_db=min_snr,
         )
 
-        # Strip a FIXED amount of pre-silence (shared across all measurements)
-        # rather than the per-measurement ``sweep_start_sample`` — the xcorr
-        # anchor drifts with each sub's direct-arrival amplitude (a loud
-        # nearfield sub biases the envelope peak later than a quiet far sub),
-        # which silently destroys the inter-sub differential delay we need for
-        # alignment. With a common fixed anchor, the IR peak times share one
-        # reference across sub-solo runs, so their differential = pure
-        # geometric delay + ALSA-start jitter (which is small and roughly
-        # constant for back-to-back runs).
+        # Align the reference sweep to the recording's layout by PADDING the
+        # sweep with leading silence (not stripping the recording). Stripping
+        # would truncate the sweep tail after min(len(sweep),len(rec)) capped
+        # the usable window, killing low-freq accuracy and SPL. Padding keeps
+        # the full sweep analyzable and gives every measurement a shared
+        # time anchor so inter-sub differentials reflect pure geometric delay
+        # (+ small back-to-back ALSA jitter).
         #
-        # We strip ``PRE_DELAY_S - SWEEP_SAFETY_S`` so that even with worst-case
-        # ALSA stream-start jitter (20–50 ms late on CamillaDSP + Loopback) we
-        # never strip into the actual sweep. The residual silence before the
-        # sweep shows up as a constant positive offset in the IR — harmless for
-        # differential alignment, and the deconvolution tolerates it.
+        # Amount padded: PRE_DELAY_S − SWEEP_SAFETY_S, so even if ALSA stream
+        # start is ~50 ms late we still have some pre-sweep silence in the
+        # deconvolver's view. IR peak lands at (SWEEP_SAFETY_S − jitter) +
+        # travel_time; differential between subs cancels the offset.
         expected_offset = int(getattr(strategy, "PRE_DELAY_S", 0.0) * sample_rate)
-        SWEEP_SAFETY_S = 0.1  # leave 100 ms of pre-sweep silence in rec_for_deconv
-        fixed_strip = max(0, expected_offset - int(SWEEP_SAFETY_S * sample_rate))
-        rec_for_deconv = rec_1d[fixed_strip:] if fixed_strip > 0 else rec_1d
-        # Diagnostic: xcorr anchor vs the fixed-strip anchor. Negative drift
-        # means ALSA started late; large |drift| across measurements is what
-        # we used to over-correct for (and is why we no longer strip by it).
+        SWEEP_SAFETY_S = 0.1
+        pre_pad_samples = max(0, expected_offset - int(SWEEP_SAFETY_S * sample_rate))
+        if pre_pad_samples > 0:
+            sweep_for_deconv = np.concatenate([
+                np.zeros(pre_pad_samples, dtype=sweep_1d.dtype),
+                sweep_1d,
+            ])
+        else:
+            sweep_for_deconv = sweep_1d
+        rec_for_deconv = rec_1d
         if expected_offset > 0:
             drift_ms = 1000.0 * (sweep_start_sample - expected_offset) / sample_rate
             log.info(
                 "measurement alignment: xcorr sweep_start=%d samples (expected %d, "
-                "drift=%.1f ms); fixed_strip=%d samples (shared anchor)",
-                sweep_start_sample, expected_offset, drift_ms, fixed_strip,
+                "drift=%.1f ms); pre_pad=%d samples (shared anchor via sweep pad)",
+                sweep_start_sample, expected_offset, drift_ms, pre_pad_samples,
             )
 
         # Raw recording peak in dBFS (before deconvolution) — used by
@@ -583,7 +584,7 @@ class MeasurementEngine:
                 log.warning("Failed to load mic cal file %s: %s", cal_path, exc)
 
         frequencies, spl, ir_samples, phase, coherence, xcorr_peak_ms = self._compute_fr_arrays(
-            np, sweep_1d, rec_for_deconv, freq_min, freq_max, sample_rate,
+            np, sweep_for_deconv, rec_for_deconv, freq_min, freq_max, sample_rate,
             cal_curve=cal_curve,
         )
 
