@@ -854,6 +854,49 @@ class TestDetectIrOnset:
         # Fallback should find onset before the room mode, even if not exact
         assert result["peak_time_ms"] < 20.0
 
+    def test_fallback_finds_peak_beyond_search_window_ms(self):
+        """Bug 3 regression: legacy sessions whose IR contains pre-sweep silence
+        have their IR peak at e.g. 1000ms (after 1s of silence + ~10ms travel).
+        The old code searched only ir[:search_window_ms] (50ms) and returned 0.0.
+        The fix searches the full IR so these sessions return a non-zero peak_time_ms.
+        """
+        sr = 48000
+        # Simulate a legacy session: 1s of pre-sweep silence + 10ms travel time.
+        # Old code with 50ms window would miss this peak entirely.
+        legacy_ir = np.zeros(int(sr * 1.5))  # 1.5s IR
+        peak_sample = int(sr * 1.0) + int(0.010 * sr)  # 1010ms into the IR
+        legacy_ir[peak_sample] = 1.0
+        result = detect_ir_onset(legacy_ir, sr, search_window_ms=50.0)
+        # Must not return 0.0 — the peak is at ~1010ms
+        assert result["peak_time_ms"] > 50.0, (
+            f"Legacy IR peak at {peak_sample/sr*1000:.1f}ms should not be missed; "
+            f"got peak_time_ms={result['peak_time_ms']:.1f}ms"
+        )
+
+    def test_two_legacy_sessions_produce_different_peak_times(self):
+        """Bug 3: analyze_ir on two different sessions must return distinct peak_time_ms
+        so delay offsets can be computed for sub alignment.
+        """
+        sr = 48000
+        # Sub 1: peak at 1005ms (1s silence + 5ms travel)
+        ir1 = np.zeros(int(sr * 1.5))
+        ir1[int(sr * 1.0) + int(0.005 * sr)] = 1.0
+
+        # Sub 2: peak at 1012ms (1s silence + 12ms travel)
+        ir2 = np.zeros(int(sr * 1.5))
+        ir2[int(sr * 1.0) + int(0.012 * sr)] = 1.0
+
+        r1 = detect_ir_onset(ir1, sr, search_window_ms=50.0)
+        r2 = detect_ir_onset(ir2, sr, search_window_ms=50.0)
+
+        delay_offset_ms = r2["peak_time_ms"] - r1["peak_time_ms"]
+        assert abs(delay_offset_ms - 7.0) < 6.0, (
+            f"Expected ~7ms delay offset, got {delay_offset_ms:.2f}ms"
+        )
+        assert r1["peak_time_ms"] != r2["peak_time_ms"], (
+            "Two sessions with different travel times must return different peak_time_ms"
+        )
+
 
 # ── parse_umik_sensitivity ────────────────────────────────────────────────────
 

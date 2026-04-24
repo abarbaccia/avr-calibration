@@ -1969,3 +1969,219 @@ async def test_camilladsp_rehydrate_restores_mute_state() -> None:
     # And the rebuilt mixer has no source for output 1.
     mapping = driver._build_mixer()["cal_matrix"]["mapping"]
     assert mapping[1]["sources"] == []
+
+
+# ── Bug 1: _BridgeSweepContext — stop/start bridge around sweep ───────────────
+
+from calibrate.drivers.camilladsp import _BridgeSweepContext
+
+
+class TestBridgeSweepContext:
+    """Unit tests for _BridgeSweepContext (Bug 1 + Bug 2 fixes)."""
+
+    def _make_driver(self) -> "CamillaDSPDriver":
+        driver = CamillaDSPDriver(output_channels=4, input_channels=2, sub_outputs=[0, 1])
+        _stub_client(driver)
+        return driver
+
+    @pytest.mark.asyncio
+    async def test_enter_stops_bridge_when_configured(self) -> None:
+        """When bridge_service is set, __enter__ calls systemctl stop."""
+        driver = self._make_driver()
+        ctx = _BridgeSweepContext(driver, "denon-sub-bridge.service", "hw:2,0")
+
+        calls: list[list[str]] = []
+
+        def _fake_run(cmd, **_):
+            calls.append(cmd)
+
+        mock_sd = MagicMock()
+        mock_sd.query_devices.return_value = []  # device not found → skip primer
+        with (
+            patch("calibrate.drivers.camilladsp.subprocess.run", side_effect=_fake_run),
+            patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        ):
+            await ctx.__aenter__()
+
+        assert ["systemctl", "stop", "denon-sub-bridge.service"] in calls
+
+    @pytest.mark.asyncio
+    async def test_exit_starts_bridge_when_configured(self) -> None:
+        """When bridge_service is set, __exit__ calls systemctl start."""
+        driver = self._make_driver()
+        ctx = _BridgeSweepContext(driver, "denon-sub-bridge.service", "hw:2,0")
+
+        calls: list[list[str]] = []
+
+        def _fake_run(cmd, **_):
+            calls.append(cmd)
+
+        mock_sd = MagicMock()
+        mock_sd.query_devices.return_value = []
+        with (
+            patch("calibrate.drivers.camilladsp.subprocess.run", side_effect=_fake_run),
+            patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        ):
+            await ctx.__aexit__(None, None, None)
+
+        assert ["systemctl", "start", "denon-sub-bridge.service"] in calls
+
+    @pytest.mark.asyncio
+    async def test_no_systemctl_when_bridge_service_is_none(self) -> None:
+        """When bridge_service is None, systemctl is never called."""
+        driver = self._make_driver()
+        ctx = _BridgeSweepContext(driver, None, "hw:2,0")
+
+        run_called = []
+
+        def _fake_run(cmd, **_):
+            run_called.append(cmd)
+
+        mock_sd = MagicMock()
+        mock_sd.query_devices.return_value = []
+        with (
+            patch("calibrate.drivers.camilladsp.subprocess.run", side_effect=_fake_run),
+            patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        ):
+            await ctx.__aenter__()
+            await ctx.__aexit__(None, None, None)
+
+        assert run_called == [], "systemctl must not be called when bridge_service is None"
+
+    @pytest.mark.asyncio
+    async def test_primer_writes_silence_to_loopback_device(self) -> None:
+        """Bug 2: __enter__ opens the loopback device and writes silence."""
+        driver = self._make_driver()
+        ctx = _BridgeSweepContext(driver, None, "Loopback: PCM (hw:2,0)")
+
+        import numpy as np
+
+        stream = MagicMock()
+        stream.start = MagicMock()
+        stream.write = MagicMock()
+        stream.stop = MagicMock()
+        stream.close = MagicMock()
+
+        mock_sd = MagicMock()
+        mock_sd.query_devices.return_value = [
+            {"name": "Loopback: PCM (hw:2,0)", "max_output_channels": 2},
+        ]
+        mock_sd.OutputStream.return_value = stream
+
+        with (
+            patch("calibrate.drivers.camilladsp.subprocess.run", return_value=None),
+            patch.dict(sys.modules, {"sounddevice": mock_sd, "numpy": np}),
+        ):
+            await ctx.__aenter__()
+
+        mock_sd.OutputStream.assert_called_once()
+        call_kwargs = mock_sd.OutputStream.call_args
+        assert call_kwargs.kwargs.get("samplerate") == 48000
+        assert call_kwargs.kwargs.get("channels") == 2
+        assert call_kwargs.kwargs.get("dtype") == "int32"
+        stream.start.assert_called_once()
+        stream.write.assert_called_once()
+        stream.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_primer_skips_gracefully_when_device_not_found(self) -> None:
+        """Bug 2: missing loopback device logs a warning but does not raise."""
+        driver = self._make_driver()
+        ctx = _BridgeSweepContext(driver, None, "hw:2,0")
+
+        mock_sd = MagicMock()
+        mock_sd.query_devices.return_value = [
+            {"name": "Some Other Device", "max_output_channels": 2},
+        ]
+
+        with (
+            patch("calibrate.drivers.camilladsp.subprocess.run", return_value=None),
+            patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        ):
+            # Must not raise even if the device is not found.
+            await ctx.__aenter__()
+
+        mock_sd.OutputStream.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sweep_context_usb_returns_bridge_context(self) -> None:
+        """CamillaDSPDriver.sweep_context returns _BridgeSweepContext for USB route."""
+        from calibrate.config import Config, DEFAULT_CONFIG
+
+        driver = self._make_driver()
+        cfg_data = {
+            **DEFAULT_CONFIG,
+            "measurement": {**DEFAULT_CONFIG["measurement"], "playback_route": "usb"},
+            "camilladsp": {**DEFAULT_CONFIG["camilladsp"], "bridge_service": "denon-sub-bridge.service"},
+        }
+        cfg = Config(cfg_data)
+        ctx = driver.sweep_context(cfg)
+        assert isinstance(ctx, _BridgeSweepContext)
+
+    def test_sweep_context_hdmi_returns_hdmi_context(self) -> None:
+        """CamillaDSPDriver.sweep_context returns DSPHDMISweepContext for HDMI route."""
+        from calibrate.config import Config, DEFAULT_CONFIG
+        from calibrate.drivers.dsp_driver import DSPHDMISweepContext
+
+        driver = self._make_driver()
+        cfg_data = {
+            **DEFAULT_CONFIG,
+            "measurement": {**DEFAULT_CONFIG["measurement"], "playback_route": "hdmi"},
+        }
+        cfg = Config(cfg_data)
+        ctx = driver.sweep_context(cfg)
+        assert isinstance(ctx, DSPHDMISweepContext)
+
+    def test_sweep_context_usb_no_bridge_returns_bridge_context(self) -> None:
+        """USB route without bridge_service still returns _BridgeSweepContext (primer runs)."""
+        from calibrate.config import Config, DEFAULT_CONFIG
+
+        driver = self._make_driver()
+        cfg_data = {
+            **DEFAULT_CONFIG,
+            "measurement": {**DEFAULT_CONFIG["measurement"], "playback_route": "usb"},
+        }
+        cfg = Config(cfg_data)
+        ctx = driver.sweep_context(cfg)
+        assert isinstance(ctx, _BridgeSweepContext)
+        assert ctx._bridge_service is None
+
+
+# ── Bug 4: pipeline_state — detect Inactive CamillaDSP pipeline ───────────────
+
+
+class TestCamillaDSPPipelineState:
+    """Unit tests for CamillaDSPDriver.pipeline_state (Bug 4)."""
+
+    @pytest.mark.asyncio
+    async def test_pipeline_state_returns_running_when_active(self) -> None:
+        driver = CamillaDSPDriver()
+        driver._client._ws = object()
+        driver._client.call = AsyncMock(return_value="Running")
+        state = await driver.pipeline_state()
+        assert state == "Running"
+        driver._client.call.assert_awaited_once_with("GetState")
+
+    @pytest.mark.asyncio
+    async def test_pipeline_state_returns_inactive_when_pipeline_down(self) -> None:
+        driver = CamillaDSPDriver()
+        driver._client._ws = object()
+        driver._client.call = AsyncMock(return_value="Inactive")
+        state = await driver.pipeline_state()
+        assert state == "Inactive"
+
+    @pytest.mark.asyncio
+    async def test_pipeline_state_returns_unknown_when_not_connected(self) -> None:
+        driver = CamillaDSPDriver()
+        # _client._ws is None → not connected
+        state = await driver.pipeline_state()
+        assert state == "Unknown"
+
+    @pytest.mark.asyncio
+    async def test_pipeline_state_returns_unknown_on_driver_error(self) -> None:
+        from calibrate.drivers.base import DriverError
+        driver = CamillaDSPDriver()
+        driver._client._ws = object()
+        driver._client.call = AsyncMock(side_effect=DriverError("timeout"))
+        state = await driver.pipeline_state()
+        assert state == "Unknown"

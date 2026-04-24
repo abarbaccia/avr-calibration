@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import subprocess
 from typing import Any
 
 import yaml
@@ -146,6 +147,120 @@ class _CamillaWSClient:
             raise DriverError(f"CamillaDSP {command} failed: {msg}")
 
         return inner.get("value")
+
+
+class _BridgeSweepContext:
+    """Async context manager that stops the Denon-sub bridge around a sweep.
+
+    On ``__enter__``:
+      1. Stops ``bridge_service`` via ``systemctl stop`` (if configured), so
+         the loopback write side (``hw:Loopback,0,0``) is free.
+      2. Primes the loopback by opening ``hw:Loopback,0,0`` via sounddevice,
+         writing ~0.5 s of silence, triggering a CamillaDSP config push so
+         the daemon opens its capture device, sleeping 300 ms, then closing
+         the stream. The upcoming sweep then takes over the device cleanly.
+
+    On ``__exit__``: starts the bridge service again (if configured).
+
+    If ``bridge_service`` is ``None``, the stop/start calls are skipped but
+    the loopback primer still runs (CamillaDSP may still need it when started
+    cold without a bridge holding the device open).
+    """
+
+    def __init__(
+        self,
+        driver: "CamillaDSPDriver",
+        bridge_service: str | None,
+        playback_device: str,
+    ) -> None:
+        self._driver = driver
+        self._bridge_service = bridge_service
+        self._playback_device = playback_device
+
+    async def __aenter__(self) -> "_BridgeSweepContext":
+        if self._bridge_service:
+            log.info("sweep_context: stopping bridge service %s", self._bridge_service)
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    ["systemctl", "stop", self._bridge_service],
+                    check=False, capture_output=True,
+                ),
+            )
+
+        await self._prime_loopback()
+        return self
+
+    async def __aexit__(self, *_) -> None:
+        if self._bridge_service:
+            log.info("sweep_context: starting bridge service %s", self._bridge_service)
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    ["systemctl", "start", self._bridge_service],
+                    check=False, capture_output=True,
+                ),
+            )
+
+    async def _prime_loopback(self) -> None:
+        """Open the loopback write side briefly so CamillaDSP can open the read side.
+
+        CamillaDSP gets EINVAL on ``snd_pcm_hw_params_set_format`` when it tries
+        to open ``hw:Loopback,1,0`` (the capture/read side) if nothing has yet
+        opened the write side (``hw:Loopback,0,0``). Writing a short burst of
+        silence establishes the format negotiation; CamillaDSP can then open its
+        capture device successfully when we push a config reload.
+        """
+        try:
+            import sounddevice as sd
+            import numpy as np
+
+            devices = sd.query_devices()
+            dev_idx: int | None = None
+            for i, d in enumerate(devices):
+                if (
+                    self._playback_device
+                    and self._playback_device.lower() in str(d.get("name", "")).lower()
+                    and d.get("max_output_channels", 0) > 0
+                ):
+                    dev_idx = i
+                    break
+
+            if dev_idx is None:
+                log.warning(
+                    "sweep_context: loopback device %r not found — skipping primer; "
+                    "CamillaDSP may fail to start",
+                    self._playback_device,
+                )
+                return
+
+            log.info("sweep_context: priming loopback via device index %d", dev_idx)
+            silence = np.zeros((int(48000 * 0.5), 2), dtype="int32")
+            stream = sd.OutputStream(
+                device=dev_idx,
+                samplerate=48000,
+                channels=2,
+                dtype="int32",
+            )
+            stream.start()
+            stream.write(silence)
+
+            # Trigger a CamillaDSP config push so the daemon opens its capture
+            # device while the loopback write side is held open.
+            try:
+                async with self._driver._lock:
+                    await self._driver._push_config_locked()
+            except Exception as exc:
+                log.warning("sweep_context: config push during primer failed: %s", exc)
+
+            await asyncio.sleep(0.3)
+            stream.stop()
+            stream.close()
+            log.info("sweep_context: loopback primer complete")
+        except ImportError:
+            log.warning("sweep_context: sounddevice not available — skipping loopback primer")
+        except Exception as exc:
+            log.warning("sweep_context: loopback primer failed: %s", exc)
 
 
 class CamillaDSPDriver(DSPDriver):
@@ -841,18 +956,42 @@ class CamillaDSPDriver(DSPDriver):
             await self._client.call("SetVolume", float(gain_db))
 
     def sweep_context(self, config):
-        """HDMI sweep neutralisation; no-op for USB direct (pipeline is always live).
+        """Return an async context manager that prepares CamillaDSP for a sweep.
 
-        CamillaDSP has no source switching (``valid_sources`` is empty), so the
-        HDMI context reduces to ``master_gain_hdmi_db`` management. Returns
-        ``None`` for the USB route — the pipeline already has the sweep signal
-        on its inputs; nothing to neutralise.
+        USB route: returns a ``_BridgeSweepContext`` that stops the
+        ``bridge_service`` (if configured) so the loopback write side is free,
+        primes the ALSA loopback so CamillaDSP can open its capture device, and
+        restores the bridge on exit.
+
+        HDMI route: returns a ``DSPHDMISweepContext`` for master-gain management.
         """
         from .dsp_driver import DSPHDMISweepContext
         route = config.measurement.get("playback_route", "usb")
         if route == "hdmi":
             return DSPHDMISweepContext(self, config)
-        return None
+        # USB route: wrap bridge stop/start + loopback primer.
+        bridge_service = config.camilladsp.get("bridge_service")
+        playback_device = config.measurement.get("playback_device", "")
+        return _BridgeSweepContext(self, bridge_service, playback_device)
+
+    async def pipeline_state(self) -> str:
+        """Return the CamillaDSP pipeline state string.
+
+        Calls ``GetState`` over the websocket and returns the state value
+        (e.g. ``"Running"``, ``"Inactive"``, ``"Error"``). Returns
+        ``"Unknown"`` on any error (not connected, timeout, etc.) so
+        callers can treat an unknown state as a warning without raising.
+        """
+        try:
+            async with self._lock:
+                if not self._client.connected:
+                    return "Unknown"
+                state = await self._client.call("GetState")
+                if isinstance(state, str):
+                    return state
+                return str(state) if state is not None else "Unknown"
+        except Exception:
+            return "Unknown"
 
     # ── FIR ───────────────────────────────────────────────────────────────────
 
