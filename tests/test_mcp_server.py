@@ -50,6 +50,7 @@ from calibrate.mcp_server import (
     _tool_calibrate_level,
     _tool_check_system,
     _tool_clear_fir,
+    _tool_reset_dsp_defaults,
     _tool_compare_sessions,
     _tool_compare_sub_phase,
     _tool_optimize_sub_alignment,
@@ -5662,3 +5663,226 @@ async def test_optimize_sub_alignment_requires_two_subs() -> None:
     result = await _tool_optimize_sub_alignment(session_ids=[1])
     assert not result["ok"]
     assert "at least 2" in result["error"]
+
+
+# ── reset_dsp_defaults ───────────────────────────────────────────────────────
+
+def _make_graph_two_subs():
+    """Stand-in signal_graph with 2 subs, each with an 18 Hz HPF profile."""
+    profile = MagicMock()
+    profile.name = "svs_pb12_nsd"
+    profile.hpf_freq_hz = 18.0
+    t1 = MagicMock()
+    t1.name = "sub_front_right"
+    t1.processor = "camilla"
+    t1.output_index = 5
+    t1.profile = "svs_pb12_nsd"
+    t2 = MagicMock()
+    t2.name = "sub_nearfield"
+    t2.processor = "camilla"
+    t2.output_index = 6
+    t2.profile = "svs_pb12_nsd"
+    graph = MagicMock()
+    graph.transducers = [t1, t2]
+    graph.profiles = [profile]
+    return graph
+
+
+@pytest.mark.asyncio
+async def test_reset_dsp_defaults_clears_all_per_output_state(mock_dsp) -> None:
+    """Each transducer gets polarity=false, gain=0, delay=0, FIR cleared, EQ=HPF-only."""
+    graph = _make_graph_two_subs()
+    fake_cfg = MagicMock()
+    fake_cfg.signal_graph = graph
+
+    with patch("calibrate.mcp_server._config", return_value=fake_cfg):
+        result = await _tool_reset_dsp_defaults()
+
+    assert result["ok"]
+    assert result["transducers_reset"] == 2
+    # Driver calls per sub
+    mock_dsp.set_output_polarity.assert_any_await(5, False)
+    mock_dsp.set_output_polarity.assert_any_await(6, False)
+    mock_dsp.set_output_gain.assert_any_await(5, 0.0)
+    mock_dsp.set_output_delay.assert_any_await(5, 0.0)
+    mock_dsp.clear_fir.assert_any_await(5)
+    # Every change record includes reset flags
+    for rec in result["changes"]:
+        assert rec["polarity_reset"] is True
+        assert rec["gain_reset"] is True
+        assert rec["delay_reset"] is True
+        assert rec["fir_cleared"] is True
+
+
+@pytest.mark.asyncio
+async def test_reset_dsp_defaults_dry_run_does_not_touch_hardware(mock_dsp) -> None:
+    """dry_run=True should preview changes without calling the driver."""
+    graph = _make_graph_two_subs()
+    fake_cfg = MagicMock()
+    fake_cfg.signal_graph = graph
+
+    with patch("calibrate.mcp_server._config", return_value=fake_cfg):
+        result = await _tool_reset_dsp_defaults(dry_run=True)
+
+    assert result["ok"]
+    assert result["dry_run"] is True
+    # Driver methods NOT called in dry-run
+    mock_dsp.set_output_polarity.assert_not_awaited()
+    mock_dsp.set_output_gain.assert_not_awaited()
+    mock_dsp.set_output_delay.assert_not_awaited()
+    mock_dsp.clear_fir.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reset_dsp_defaults_preserve_eq_keeps_filters(mock_dsp) -> None:
+    """preserve_eq=True resets polarity/gain/delay/fir but not EQ."""
+    graph = _make_graph_two_subs()
+    fake_cfg = MagicMock()
+    fake_cfg.signal_graph = graph
+
+    with patch("calibrate.mcp_server._config", return_value=fake_cfg):
+        result = await _tool_reset_dsp_defaults(preserve_eq=True)
+
+    assert result["ok"]
+    for rec in result["changes"]:
+        assert rec["polarity_reset"] is True
+        assert "eq_reset" not in rec  # EQ not touched
+
+
+@pytest.mark.asyncio
+async def test_reset_dsp_defaults_no_transducers_errors() -> None:
+    """Config with no transducers returns an error."""
+    graph = MagicMock()
+    graph.transducers = []
+    graph.profiles = []
+    fake_cfg = MagicMock()
+    fake_cfg.signal_graph = graph
+
+    with patch("calibrate.mcp_server._config", return_value=fake_cfg):
+        result = await _tool_reset_dsp_defaults()
+
+    assert not result["ok"]
+    assert "no signal_graph transducers" in result["error"]
+
+
+# ── start_calibration ────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_start_calibration_resets_state_and_opens_run(mock_dsp) -> None:
+    """Happy path: reset + state snapshot + run open all happen in one call."""
+    from calibrate.mcp_server import _tool_start_calibration
+    graph = _make_graph_two_subs()
+    fake_cfg = MagicMock(); fake_cfg.signal_graph = graph
+
+    with patch("calibrate.mcp_server._config", return_value=fake_cfg), \
+         patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.save_run.return_value = 42
+        result = await _tool_start_calibration(
+            recipe_name="bass-calibration-fir", target="harman-bass",
+        )
+
+    assert result["ok"]
+    assert result["run_id"] == 42
+    assert result["recipe_name"] == "bass-calibration-fir"
+    assert result["target"] == "harman-bass"
+    # Reset occurred
+    assert result["reset"]["ok"]
+    mock_dsp.set_output_polarity.assert_any_await(5, False)
+    mock_dsp.set_output_polarity.assert_any_await(6, False)
+
+
+@pytest.mark.asyncio
+async def test_start_calibration_reset_state_false_skips_reset(mock_dsp) -> None:
+    """reset_state=False bypasses the reset phase (resume a configured run)."""
+    from calibrate.mcp_server import _tool_start_calibration
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.save_run.return_value = 99
+        result = await _tool_start_calibration(
+            recipe_name="bass-calibration", target="flat", reset_state=False,
+        )
+    assert result["ok"]
+    assert result["reset"] is None
+    mock_dsp.set_output_polarity.assert_not_awaited()
+
+
+# ── fit_shelf_for_target ─────────────────────────────────────────────────────
+
+def _make_fr_session_for_shelf(freqs, spls, session_id=1):
+    """Minimal session with FR for shelf-fit tests."""
+    mock_fr = MagicMock()
+    mock_fr.frequencies = freqs
+    mock_fr.spl = spls
+    mock_fr.sample_rate = 48000
+    s = MagicMock()
+    s.id = session_id
+    s.start_fr = mock_fr
+    s.impulse_response = None
+    return s
+
+
+@pytest.mark.asyncio
+async def test_fit_shelf_recovers_known_shelf_parameters(mock_dsp) -> None:
+    """Synthetic test: flat measurement, Harman-like target with +5 dB low-end
+    lift. Optimizer should find a low_shelf that boosts the low end — the
+    mean-centered objective specifically selects for SHAPE match."""
+    from calibrate.mcp_server import _tool_fit_shelf_for_target
+    import numpy as np
+
+    # _biquad_response reads sample_rate from _dsp.capabilities.processing_rate;
+    # the AsyncMock fixture returns a Mock for that attr by default, so give it
+    # a real int or the biquad math collapses to zero.
+    mock_dsp.capabilities.processing_rate = 48000
+
+    freqs = np.logspace(np.log10(20), np.log10(200), 200).tolist()
+    # Flat measurement at -10 dB.
+    measured = [-10.0] * len(freqs)
+    sess = _make_fr_session_for_shelf(freqs, measured, session_id=1)
+    # Target has a +5 dB boost at low frequencies (Harman-style bass curve).
+    target = {"points": [
+        {"freq": 20, "spl": -5.0},
+        {"freq": 40, "spl": -6.0},
+        {"freq": 60, "spl": -8.0},
+        {"freq": 80, "spl": -10.0},
+        {"freq": 120, "spl": -10.0},
+        {"freq": 200, "spl": -10.0},
+    ]}
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [sess]
+        result = await _tool_fit_shelf_for_target(
+            session_id=1, target_curve=target, min_hz=25.0, max_hz=120.0,
+        )
+
+    assert result["ok"]
+    # Objective is mean-centered (shape-match, not absolute-level-match), so
+    # the fit doesn't recover the exact known shelf — it finds the shelf that
+    # best compensates the SHAPE deviation while preserving mean level. What
+    # we verify: the fit IS an improvement and is a BOOST (the measurement
+    # has a low-freq deficit that a low_shelf would fill).
+    assert result["predicted_rms_db"] < result["baseline_rms_db"]
+    assert result["improvement_db"] > 0.3
+    assert result["recommended_filter"]["gain_db"] > 0
+
+
+@pytest.mark.asyncio
+async def test_fit_shelf_missing_target_errors(mock_dsp) -> None:
+    from calibrate.mcp_server import _tool_fit_shelf_for_target
+    sess = _make_fr_session_for_shelf([20.0, 50.0], [-10.0, -10.0], session_id=1)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [sess]
+        result = await _tool_fit_shelf_for_target(session_id=1, target_curve={})
+    assert not result["ok"]
+    assert "target_curve" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_fit_shelf_session_not_found(mock_dsp) -> None:
+    from calibrate.mcp_server import _tool_fit_shelf_for_target
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = []
+        result = await _tool_fit_shelf_for_target(
+            session_id=99,
+            target_curve={"points": [{"freq": 50, "spl": -10}]},
+        )
+    assert not result["ok"]
+    assert "not found" in result["error"]

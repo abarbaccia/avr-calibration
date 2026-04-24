@@ -1,5 +1,14 @@
 # TODOS
 
+## Calibration quality improvements (2026-04-24)
+
+### TODO-CAL-1: Multi-position mic averaging (Fix #6)
+**What:** New `measure_multi_position(labels=[...], positions=[...])` tool that captures N sweeps across the listening area, averages the FRs (and coherence, IR envelope), stores both the averaged FR and the individual measurements. `design_fir` accepts averaged session. Recipe updated to optionally take multi-position measurements.
+**Why:** All current calibration is optimized for a single knife-edge mic position at MLP. Someone sitting 1 ft over hears a completely different response. Commercial tools (Dirac, Audyssey, MSO) all measure 6–10 positions and average. This is the biggest quality improvement available from software alone. The `optimize_sub_alignment` tool also needs to accept averaged sessions.
+**How:** (1) new MCP tool that loops `measure` at different `position=` labels and keeps a set of session_ids; (2) storage-level "measurement_batch" table linking sessions to a group; (3) aggregator function that computes position-averaged FR (coherent sum or magnitude average depending on use), averaged IR, minimum coherence per bin; (4) `design_fir` / `optimize_sub_alignment` updated to accept a batch_id and use the aggregate; (5) recipe Phase 0 offered multi-position measurement as optional path.
+**Effort:** L — ~300 LOC + schema change + recipe rewrite + real-room testing with mic on a stand.
+**Priority:** P1 — biggest audible improvement available from software changes.
+
 ## Backlog — Deep Research (not scheduled)
 
 ### TODO-FLASH-1: Atomic preset persist via native-app protocol
