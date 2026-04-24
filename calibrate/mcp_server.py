@@ -684,6 +684,7 @@ async def _tool_compute_deviation(
     resolution: str = "sixth_octave",
     convergence_threshold: float = 1.5,
     exclude_geometry: bool = True,
+    weight_by_coherence: bool = False,
 ) -> dict:
     """Compute RMS deviation of a measurement against a target curve.
 
@@ -771,9 +772,20 @@ async def _tool_compute_deviation(
         def _in_geometry(freq_hz: float) -> bool:
             return any(lo <= freq_hz < hi for lo, hi in geometry_ranges)
 
+        # Build a coherence lookup for the session so we can weight errors by
+        # measurement reliability. Low-coherence bands (<0.7) carry large
+        # measurement noise and shouldn't drive the optimizer into chasing
+        # artifacts. When weight_by_coherence is false this just populates
+        # per-band entries for inspection.
+        coh_by_freq: dict[float, float] = {}
+        if fr.coherence:
+            for f, c in zip(fr.frequencies, fr.coherence):
+                coh_by_freq[float(f)] = float(c)
+
         # Classify each frequency point
         per_band_errors = []
-        included_errors = []
+        included_errors: list[float] = []
+        included_coherence: list[float] = []
         excluded_null = []
         excluded_rolloff = []
         excluded_geometry = []
@@ -784,6 +796,7 @@ async def _tool_compute_deviation(
                 continue
 
             error = measured - target  # positive = above target, negative = below
+            coh = coh_by_freq.get(float(freq), 1.0)  # fall back to full weight if unknown
 
             # Check exclusions
             is_null = measured < (band_avg - null_threshold_db)
@@ -795,6 +808,7 @@ async def _tool_compute_deviation(
                 "measured_db": round(measured, 1),
                 "target_db": round(target, 1),
                 "error_db": round(error, 1),
+                "coherence": round(coh, 3),
                 "excluded": is_null or is_rolloff or is_geometry,
             }
 
@@ -810,14 +824,45 @@ async def _tool_compute_deviation(
                 entry["exclude_reason"] = "rolloff"
             else:
                 included_errors.append(error)
+                included_coherence.append(coh)
 
             per_band_errors.append(entry)
 
         if not included_errors:
             return _err("no usable frequency points after excluding nulls and rolloff")
 
-        # Compute RMS deviation
-        rms = math.sqrt(sum(e ** 2 for e in included_errors) / len(included_errors))
+        # Compute unweighted RMS first (backward-compatible, always reported).
+        rms_unweighted = math.sqrt(
+            sum(e ** 2 for e in included_errors) / len(included_errors)
+        )
+
+        # Coherence-weighted RMS: reliable bands (high coherence) dominate;
+        # noisy bands contribute proportionally less. A band with coherence
+        # 0.3 contributes less than half what a band with 0.7 contributes.
+        if weight_by_coherence and any(c > 0 for c in included_coherence):
+            weight_sum = sum(included_coherence) or 1e-9
+            rms_weighted = math.sqrt(
+                sum(c * e ** 2 for c, e in zip(included_coherence, included_errors))
+                / weight_sum
+            )
+            rms = rms_weighted
+        else:
+            rms = rms_unweighted
+
+        # Noise-floor estimate: what RMS would look like if everything WERE
+        # noise. Each bin's noise variance scales as (1 - coherence²) — bins
+        # with coh=0.5 contribute ~0.75 weight, coh=0.9 contributes ~0.19.
+        # Comparing RMS to this noise estimate tells the caller how much of
+        # their remaining error is signal vs measurement noise. If
+        # RMS ≈ noise_floor, further iteration is chasing noise.
+        if included_coherence:
+            noise_variance = sum((1.0 - c * c) for c in included_coherence) / len(included_coherence)
+            # Calibrate to dB-level noise; this heuristic targets a typical
+            # ±1 dB-per-bin range at coherence 0.7.
+            noise_floor_db = math.sqrt(noise_variance) * 2.0
+        else:
+            noise_floor_db = 0.0
+
         mean_error = sum(included_errors) / len(included_errors)
         max_error = max(included_errors, key=abs)
         converged = rms < convergence_threshold
@@ -904,12 +949,20 @@ async def _tool_compute_deviation(
         return _ok(
             session_id=session_id,
             rms_db=round(rms, 2),
+            rms_unweighted_db=round(rms_unweighted, 2),
+            noise_floor_estimate_db=round(noise_floor_db, 2),
+            weight_by_coherence=weight_by_coherence,
             converged=converged,
             convergence_threshold=convergence_threshold,
             resolution=resolution,
             mean_error_db=round(mean_error, 2),
             max_error_db=round(max_error, 1),
             included_points=len(included_errors),
+            mean_included_coherence=round(
+                sum(included_coherence) / len(included_coherence)
+                if included_coherence else 0.0,
+                3,
+            ),
             excluded_null_points=len(excluded_null),
             excluded_rolloff_points=len(excluded_rolloff),
             excluded_geometry_points=len(excluded_geometry),
@@ -2846,6 +2899,32 @@ async def _tool_optimize_sub_alignment(
             0.1, 1.0,
         )
 
+        # Coherence weights: bins with low coherence (<0.7) carry substantial
+        # measurement noise and should influence the optimizer proportionally
+        # less. Use the minimum coherence across all supplied solo sessions —
+        # if ANY sub is unreliable at a frequency, the combined-response
+        # prediction at that frequency is unreliable too. Missing coherence
+        # (legacy sessions) falls back to weight=1.0.
+        coh_arr: "np.ndarray | None" = None
+        try:
+            per_sub_coh = []
+            for s in subs:
+                if s.start_fr and s.start_fr.coherence:
+                    c_vals = np.array(s.start_fr.coherence, dtype=np.float64)
+                    c_f = np.array(s.start_fr.frequencies, dtype=np.float64)
+                    # Interp coherence onto the full freq grid then mask in-band
+                    c_interp = np.interp(freqs, c_f, c_vals)
+                    per_sub_coh.append(c_interp)
+            if per_sub_coh:
+                coh_arr = np.minimum.reduce(per_sub_coh)[in_band]
+                coh_arr = np.clip(coh_arr, 0.1, 1.0)
+        except Exception:
+            coh_arr = None
+
+        combined_weights = (
+            freq_weights * coh_arr if coh_arr is not None else freq_weights
+        )
+
         def objective(params: "np.ndarray") -> float:
             fr = combined_fr_db(params)
             in_fr = fr[in_band]
@@ -2857,7 +2936,7 @@ async def _tool_optimize_sub_alignment(
             # to fix. One-sided avoids the "trivially flat at -inf is good"
             # failure mode of a symmetric-RMS objective on a flatness target.
             below = np.maximum(0.0, in_t - in_fr)
-            weighted = freq_weights * below
+            weighted = combined_weights * below
             return float(np.sqrt(np.mean(weighted ** 2)))
 
         # Bounds: delay ∈ [0, max_delay_ms], gain ∈ [±gain], polarity ∈ [0, 1]
@@ -3782,6 +3861,206 @@ async def _tool_get_calibration_runs(limit: int = 10, run_id: int | None = None)
     return _ok(runs=runs)
 
 
+async def _tool_fit_shelf_for_target(
+    session_id: int,
+    target_curve: dict,
+    min_hz: float = 20.0,
+    max_hz: float = 120.0,
+    shelf_type: str = "low_shelf",
+    freq_bounds: list[float] | None = None,
+    gain_bounds: list[float] | None = None,
+    q_bounds: list[float] | None = None,
+) -> dict:
+    """Fit a shelf filter (freq, gain_db, Q) to minimize RMS deviation of
+    the predicted post-filter FR from a target curve in [min_hz, max_hz].
+
+    Replaces the manual shelf-tuning iteration (applying +5, +6, +7 dB
+    shelves by eye until Harman looks right): this runs scipy's
+    differential-evolution search over the 3-param filter and returns the
+    optimal parameters. Apply via ``apply_input_eq`` with the mandatory
+    HPF prepended.
+
+    **Default ranges** (sane for bass shelf shaping on a subwoofer):
+      freq ∈ [25, 80] Hz
+      gain_db ∈ [-6, +10]
+      Q ∈ [0.3, 1.5]
+
+    **Predicted RMS** is the objective value at the optimum — same
+    definition the recipe uses to judge convergence.
+
+    Overrides: pass ``freq_bounds`` / ``gain_bounds`` / ``q_bounds`` as
+    [lo, hi] lists to narrow or widen the search.
+    """
+    try:
+        import numpy as np
+        from scipy.optimize import differential_evolution
+
+        from .storage import SessionStore
+
+        if shelf_type not in ("low_shelf", "high_shelf"):
+            return _err(f"shelf_type must be low_shelf or high_shelf, got {shelf_type!r}")
+
+        tgt_points = target_curve.get("points") if isinstance(target_curve, dict) else None
+        if not tgt_points:
+            return _err("target_curve must be {'points': [{freq, spl}, ...]}")
+
+        store = SessionStore()
+        sessions = store.list_sessions()
+        sess = next((s for s in sessions if s.id == session_id), None)
+        if sess is None:
+            return _err(f"session {session_id} not found")
+        if not sess.start_fr or not sess.start_fr.frequencies:
+            return _err(f"session {session_id} has no FR data")
+
+        freqs = np.array(sess.start_fr.frequencies)
+        spls = np.array(sess.start_fr.spl)
+        in_band = (freqs >= min_hz) & (freqs <= max_hz)
+        band_freqs = freqs[in_band]
+        band_spls = spls[in_band]
+
+        # Target interp to our frequency grid (log-frequency, linear dB).
+        tgt_f = np.array([float(p["freq"]) for p in tgt_points], dtype=np.float64)
+        tgt_spl = np.array([float(p["spl"]) for p in tgt_points], dtype=np.float64)
+        order = np.argsort(tgt_f)
+        tgt_f = tgt_f[order]
+        tgt_spl = tgt_spl[order]
+        target_interp = np.interp(
+            np.log(np.maximum(band_freqs, 1e-6)),
+            np.log(tgt_f),
+            tgt_spl,
+        )
+
+        # Default bounds
+        fb = list(freq_bounds) if freq_bounds else [25.0, 80.0]
+        gb = list(gain_bounds) if gain_bounds else [-6.0, 10.0]
+        qb = list(q_bounds) if q_bounds else [0.3, 1.5]
+
+        def shelf_response_db(params: "np.ndarray") -> "np.ndarray":
+            fc, g, q = float(params[0]), float(params[1]), float(params[2])
+            # Apply the shelf to each in-band frequency by ADDING its
+            # predicted effect to the measured SPL (simulate_eq does the
+            # same — linear time-invariant: filter effect adds in dB).
+            effect = np.array(
+                [_biquad_response(float(f), shelf_type, fc, g, q) for f in band_freqs]
+            )
+            return band_spls + effect
+
+        # Level-shift the target to match the measurement's mean before
+        # evaluating the shelf. Real-world target curves are specified by
+        # SHAPE, not by absolute dBFS — the target's own anchor can be at
+        # any level, and we want to find the shelf that best matches the
+        # target shape regardless of where it sits on the SPL axis. The
+        # level shift is applied per-iteration using the post-filter
+        # measurement, not once against the raw baseline; that way a shelf
+        # that boosts low-end (which lifts the measured mean) gets properly
+        # credited for following an up-tilted target shape.
+        target_mean = float(np.mean(target_interp))
+
+        def objective(params: "np.ndarray") -> float:
+            predicted = shelf_response_db(params)
+            predicted_mean = float(np.mean(predicted))
+            target_shifted = target_interp + (predicted_mean - target_mean)
+            return float(np.sqrt(np.mean((predicted - target_shifted) ** 2)))
+
+        # Baseline uses the same level-shift rule applied to the raw
+        # (unfiltered) measurement, so baseline_rms and predicted_rms are
+        # directly comparable.
+        _raw_mean = float(np.mean(band_spls))
+        _target_baseline = target_interp + (_raw_mean - target_mean)
+        baseline_rms = float(np.sqrt(np.mean((band_spls - _target_baseline) ** 2)))
+
+        result = differential_evolution(
+            objective,
+            bounds=[tuple(fb), tuple(gb), tuple(qb)],
+            maxiter=200,
+            popsize=20,
+            tol=1e-4,
+            seed=42,
+            polish=True,
+        )
+
+        best_fc, best_g, best_q = float(result.x[0]), float(result.x[1]), float(result.x[2])
+        best_rms = float(result.fun)
+
+        return _ok(
+            recommended_filter={
+                "type": shelf_type,
+                "freq": round(best_fc, 2),
+                "gain_db": round(best_g, 2),
+                "q": round(best_q, 3),
+            },
+            baseline_rms_db=round(baseline_rms, 3),
+            predicted_rms_db=round(best_rms, 3),
+            improvement_db=round(baseline_rms - best_rms, 3),
+            band_hz=[min_hz, max_hz],
+            converged=bool(result.success),
+            n_evaluations=int(result.nfev),
+            note=(
+                "Apply via apply_input_eq with 18 Hz HPF prepended. The predicted_rms_db "
+                "is what the RMS-vs-target metric should read after a post-apply "
+                "measurement (± measurement noise)."
+            ),
+        )
+    except Exception as exc:
+        return _err(f"fit_shelf_for_target failed: {exc}")
+
+
+async def _tool_start_calibration(
+    recipe_name: str,
+    target: str,
+    reset_state: bool = True,
+    preserve_eq: bool = False,
+) -> dict:
+    """One-call Phase 0: reset stale DSP state, snapshot hardware state, open
+    a calibration run record. Returns the run_id to thread through subsequent
+    save_calibration_iteration / update_calibration_run calls.
+
+    **Why this exists:** every prior calibration run forgot one of three
+    setup steps: (a) clear stale persisted state, (b) record baseline
+    hardware state, (c) open a run record so measurements are linkable
+    post-hoc. Today's session on 2026-04-24 had 30+ loose sessions with
+    no run_id → they're invisible in get_calibration_runs. Today's
+    session also ran with a stale polarity flip for hours.
+
+    Skip reset_state only if you're resuming a run in progress.
+    """
+    try:
+        from .storage import SessionStore
+        # (1) Clean state — the #1 cause of wasted calibration time.
+        reset_summary: dict | None = None
+        if reset_state:
+            reset_summary = await _tool_reset_dsp_defaults(preserve_eq=preserve_eq)
+            if not reset_summary.get("ok"):
+                return _err(
+                    f"start_calibration: reset_dsp_defaults failed: "
+                    f"{reset_summary.get('error')}"
+                )
+        # (2) Snapshot current hardware state for later review.
+        device_state = await _tool_get_device_state()
+        # (3) Open a run record.
+        store = SessionStore()
+        run_id = store.save_run(
+            recipe_name,
+            target,
+            device_state=device_state if device_state.get("ok") else None,
+            run_type="calibration",
+        )
+        return _ok(
+            run_id=run_id,
+            recipe_name=recipe_name,
+            target=target,
+            reset=reset_summary,
+            device_state=device_state,
+            note=(
+                "Calibration run opened. Pass run_id to save_calibration_iteration "
+                "after each measurement pass, and to update_calibration_run at "
+                "the end with final_rms / converged / target_curve_data."
+            ),
+        )
+    except Exception as exc:
+        return _err(f"start_calibration failed: {exc}")
+
+
 async def _tool_save_calibration_run(
     recipe_name: str,
     target: str,
@@ -4399,6 +4678,157 @@ async def _tool_clear_fir(output_index: int) -> dict:
     return _ok(output_index=output_index, message="FIR cleared")
 
 
+async def _tool_reset_dsp_defaults(
+    dry_run: bool = False,
+    preserve_eq: bool = False,
+) -> dict:
+    """Clear ALL persisted per-output DSP state to defaults.
+
+    Resets every configured transducer to: polarity=normal, gain=0 dB,
+    delay=0 ms, FIR cleared, per-output EQ cleared (or HPF-only if the
+    transducer profile requires an infrasonic HPF). Input EQ goes to
+    HPF-only.
+
+    Returns a record of every value that was cleared, so the caller sees
+    exactly what stale state was overridden.
+
+    **Why this exists:** `active_dsp_state` persists across container
+    restarts. A polarity flip or gain trim from a prior calibration
+    silently re-applies on every boot. That corrupted multiple hours of
+    calibration work on 2026-04-24. `check_system` now WARNS; this tool
+    ACTS. Call this as Phase 0 of every calibration run unless you
+    explicitly want to preserve prior state.
+
+    `dry_run=True`: return the list of changes that WOULD be made
+    without touching hardware.
+    `preserve_eq=True`: keep EQ filters, only reset polarity/gain/delay/FIR.
+    """
+    from .storage import SessionStore, dsp_output_key
+    try:
+        cfg = _config()
+        graph = cfg.signal_graph
+        transducers = getattr(graph, "transducers", ()) or ()
+        if not transducers:
+            return _err("no signal_graph transducers to reset")
+
+        # What each transducer's safety profile requires post-reset.
+        # Profiles with hpf_freq_hz > 0 must retain that HPF after EQ reset.
+        profiles_by_name: dict[str, Any] = {
+            p.name: p for p in (getattr(graph, "profiles", ()) or ())
+        }
+
+        changes: list[dict] = []
+
+        for t in transducers:
+            proc = getattr(t, "processor", None) or _default_dsp_name() or "dsp"
+            out_idx = int(getattr(t, "output_index"))
+            tname = getattr(t, "name", f"output_{out_idx}")
+
+            # Determine required HPF for this transducer's profile.
+            profile_name = getattr(t, "profile", None)
+            profile = profiles_by_name.get(profile_name) if profile_name else None
+            hpf_freq = float(getattr(profile, "hpf_freq_hz", 0.0) or 0.0) if profile else 0.0
+            default_eq = (
+                [{"type": "hpf", "freq": hpf_freq, "gain_db": 0, "q": 0.707}]
+                if hpf_freq > 0 else []
+            )
+
+            t_changes: dict = {"transducer": tname, "output_index": out_idx, "processor": proc}
+
+            # polarity → false
+            if not dry_run:
+                try:
+                    await _dsp.set_output_polarity(out_idx, False)  # type: ignore[union-attr]
+                    _persist_dsp_state(
+                        dsp_output_key(proc, out_idx, "polarity"),
+                        {"inverted": False},
+                    )
+                except Exception as exc:
+                    log.warning("reset_dsp_defaults polarity %s: %s", tname, exc)
+            t_changes["polarity_reset"] = True
+
+            # gain → 0 dB
+            if not dry_run:
+                try:
+                    await _dsp.set_output_gain(out_idx, 0.0)  # type: ignore[union-attr]
+                    _persist_dsp_state(
+                        dsp_output_key(proc, out_idx, "gain"),
+                        {"gain_db": 0.0},
+                    )
+                except Exception as exc:
+                    log.warning("reset_dsp_defaults gain %s: %s", tname, exc)
+            t_changes["gain_reset"] = True
+
+            # delay → 0 ms
+            if not dry_run:
+                try:
+                    await _dsp.set_output_delay(out_idx, 0.0)  # type: ignore[union-attr]
+                    _persist_dsp_state(
+                        dsp_output_key(proc, out_idx, "delay"),
+                        {"delay_ms": 0.0},
+                    )
+                except Exception as exc:
+                    log.warning("reset_dsp_defaults delay %s: %s", tname, exc)
+            t_changes["delay_reset"] = True
+
+            # FIR → cleared
+            if not dry_run:
+                try:
+                    await _dsp.clear_fir(out_idx)  # type: ignore[union-attr]
+                    _persist_dsp_state(
+                        dsp_output_key(proc, out_idx, "fir"),
+                        {"coefficients": [], "num_taps": 0},
+                    )
+                except Exception as exc:
+                    log.warning("reset_dsp_defaults fir %s: %s", tname, exc)
+            t_changes["fir_cleared"] = True
+
+            # Per-output EQ → HPF-only (or empty if no HPF required)
+            if not preserve_eq:
+                if not dry_run:
+                    try:
+                        await _dsp.apply_eq(out_idx, default_eq)  # type: ignore[union-attr]
+                        _persist_dsp_state(
+                            dsp_output_key(proc, out_idx, "eq"),
+                            {"filters": default_eq, "preset": 0, "transducer": tname},
+                        )
+                    except Exception as exc:
+                        log.warning("reset_dsp_defaults eq %s: %s", tname, exc)
+                t_changes["eq_reset"] = True
+                t_changes["eq_default"] = default_eq
+
+            changes.append(t_changes)
+
+        # Input EQ → HPF-only (preserves the mandatory infrasonic filter,
+        # clears any target-curve shaping).
+        input_changes: dict = {"input_eq_reset": False}
+        if not preserve_eq:
+            try:
+                input_hpf = [{"type": "hpf", "freq": 18.0, "gain_db": 0, "q": 0.707}]
+                if not dry_run:
+                    await _dsp.apply_input_eq(input_hpf)  # type: ignore[union-attr]
+                    _persist_dsp_state("processor:" + (_default_dsp_name() or "dsp") + ":input:eq",
+                                       {"filters": input_hpf, "preset": 0})
+                input_changes["input_eq_reset"] = True
+                input_changes["input_eq_default"] = input_hpf
+            except Exception as exc:
+                log.warning("reset_dsp_defaults input_eq: %s", exc)
+
+        return _ok(
+            dry_run=dry_run,
+            transducers_reset=len(changes),
+            changes=changes,
+            input=input_changes,
+            note=(
+                "Per-output polarity/gain/delay/fir set to defaults; per-output EQ set to "
+                "profile-mandated HPF; input EQ set to infrasonic HPF only. All persisted "
+                "state in active_dsp_state mirrored. Run check_system to verify clean state."
+            ),
+        )
+    except Exception as exc:
+        return _err(f"reset_dsp_defaults error: {exc}")
+
+
 async def _tool_set_output_gain(
     gain_db: float,
     output_index: int | None = None,
@@ -4978,7 +5408,12 @@ _TOOLS: list[Tool] = [
             "behaviour. Filters are validated by SafetyValidator with the target's "
             "per-transducer profile; unsafe filters return {ok: false, "
             "error: 'SafetyValidator: ...'}. Each filter: {freq, gain_db, q, type}. "
-            "A mandatory HPF (default 18 Hz) must be included when the profile requires one."
+            "A mandatory HPF (default 18 Hz) must be included when the profile requires one.\n\n"
+            "**For per-sub modal correction, prefer design_fir on FIR-capable hardware.** "
+            "PEQ reduces modal peak amplitude but leaves the ringing time unchanged; FIR "
+            "both flattens magnitude AND shortens T60 decay. Check `eq_capabilities.fir_capable` "
+            "in get_config. Use apply_eq for: (a) the mandatory infrasonic HPF, (b) per-sub "
+            "safety limiting, (c) fallback when the hardware is FIR-incapable (miniDSP 2x4 HD)."
         ),
         inputSchema={
             "type": "object",
@@ -5032,8 +5467,12 @@ _TOOLS: list[Tool] = [
         name="apply_input_eq",
         description=(
             "Apply EQ filters to the DSP input channel (shared across all outputs). "
-            "Use this for the Harman target curve or any EQ that should affect all subs equally. "
-            "Filters are validated by SafetyValidator. "
+            "Use this for the TARGET CURVE — the shared shape every output receives "
+            "(Harman, cinema-bass, flat). Designed to be applied AFTER per-sub correction "
+            "(design_fir / apply_eq per sub) has flattened each sub's individual response. "
+            "Do NOT use input EQ to notch individual modes — modal cuts belong on the "
+            "specific sub that excites them. Pair with fit_shelf_for_target to auto-derive "
+            "the shelf parameters for a given target curve. "
             "Each filter: {freq: Hz, gain_db: dB, q: float, type: 'peaking'|"
             "'low_shelf'|'high_shelf'|'hpf'}. A mandatory 18Hz HPF must always be included."
         ),
@@ -5230,12 +5669,90 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="fit_shelf_for_target",
+        description=(
+            "Fit a shelf filter (freq, gain_db, Q) that minimizes RMS deviation of the "
+            "predicted post-filter FR from a target curve in-band. Replaces manual "
+            "shelf-iteration against a Harman or cinema-bass target. Returns the "
+            "recommended filter parameters and predicted RMS at the optimum. Apply via "
+            "apply_input_eq with 18 Hz HPF prepended."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "integer",
+                    "description": "Measurement session to fit against",
+                },
+                "target_curve": {
+                    "type": "object",
+                    "description": "{'points': [{'freq': Hz, 'spl': dB}, ...]}",
+                },
+                "min_hz": {"type": "number", "description": "Lower band edge (default: 20)"},
+                "max_hz": {"type": "number", "description": "Upper band edge (default: 120)"},
+                "shelf_type": {
+                    "type": "string",
+                    "enum": ["low_shelf", "high_shelf"],
+                    "description": "Shelf kind (default: low_shelf — the usual bass-curve shaper)",
+                },
+                "freq_bounds": {
+                    "type": "array", "items": {"type": "number"},
+                    "description": "[lo, hi] Hz (default: [25, 80])",
+                },
+                "gain_bounds": {
+                    "type": "array", "items": {"type": "number"},
+                    "description": "[lo, hi] dB (default: [-6, +10])",
+                },
+                "q_bounds": {
+                    "type": "array", "items": {"type": "number"},
+                    "description": "[lo, hi] Q (default: [0.3, 1.5])",
+                },
+            },
+            "required": ["session_id", "target_curve"],
+        },
+    ),
+    Tool(
+        name="start_calibration",
+        description=(
+            "One-call Phase 0 of a calibration run. Resets persisted per-output DSP state "
+            "to defaults (polarity/gain/delay/FIR/EQ), snapshots current hardware state, and "
+            "opens a calibration run record. Returns run_id for use with save_calibration_iteration "
+            "/ update_calibration_run. Prevents the 'stale state from prior run silently corrupts "
+            "new measurements' failure mode that ate 4 hours on 2026-04-24. "
+            "Pass reset_state=false only if resuming a run that's already configured. "
+            "Pass preserve_eq=true to keep existing EQ filters (rare — usually you want fresh)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "recipe_name": {
+                    "type": "string",
+                    "description": "Recipe being followed, e.g. 'bass-calibration-fir'",
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Target curve, e.g. 'harman-bass', 'cinema-bass', 'flat'",
+                },
+                "reset_state": {
+                    "type": "boolean",
+                    "description": "Reset persisted DSP state to defaults (default: true)",
+                },
+                "preserve_eq": {
+                    "type": "boolean",
+                    "description": "If resetting, keep EQ filters (default: false)",
+                },
+            },
+            "required": ["recipe_name", "target"],
+        },
+    ),
+    Tool(
         name="save_calibration_run",
         description=(
             "Create a new calibration run record. Returns the run_id for use with "
             "save_calibration_iteration and update_calibration_run. Call this at the "
             "start of a calibration session. Optionally captures equipment state "
-            "(get_device_state output) for later review."
+            "(get_device_state output) for later review. "
+            "Prefer start_calibration — it combines this with dsp_reset_defaults in one call."
         ),
         inputSchema={
             "type": "object",
@@ -5665,6 +6182,31 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="reset_dsp_defaults",
+        description=(
+            "Reset ALL persisted per-output DSP state (polarity, gain, delay, FIR, per-output EQ) "
+            "to defaults, plus input EQ to infrasonic HPF only. Use as Phase 0 of every calibration "
+            "run — active_dsp_state persists across container restarts, so a polarity flip or gain "
+            "trim from a prior run silently corrupts subsequent measurements until explicitly cleared. "
+            "Returns a detailed record of every value that was reset. Pass dry_run=true to preview "
+            "without touching hardware. Pass preserve_eq=true to reset only polarity/gain/delay/FIR "
+            "(useful for re-alignment without losing EQ work)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Preview changes without applying (default: false)",
+                },
+                "preserve_eq": {
+                    "type": "boolean",
+                    "description": "Keep EQ filters, only reset polarity/gain/delay/FIR (default: false)",
+                },
+            },
+        },
+    ),
+    Tool(
         name="set_master_gain",
         description=(
             "Set the miniDSP master output gain in dB. Range: -127 to 0 dB. "
@@ -6036,6 +6578,17 @@ _TOOLS: list[Tool] = [
                         "drives the driving agent to iterate past convergence."
                     ),
                 },
+                "weight_by_coherence": {
+                    "type": "boolean",
+                    "description": (
+                        "Default false. When true, weights each frequency's "
+                        "contribution to RMS by its measured coherence — "
+                        "low-coherence bands (noisy measurement) contribute "
+                        "proportionally less. Also returns noise_floor_estimate_db; "
+                        "if rms_db ≈ noise_floor_estimate_db, further iteration is "
+                        "chasing measurement noise. Use this to know when to stop."
+                    ),
+                },
             },
             "required": ["session_id", "target_curve"],
         },
@@ -6312,7 +6865,13 @@ _TOOLS: list[Tool] = [
     Tool(
         name="design_fir",
         description=(
-            "Design FIR correction filter coefficients. You decide the strategy: phase mode "
+            "**Preferred tool for per-sub modal correction on FIR-capable hardware.** "
+            "FIR simultaneously flattens magnitude AND shortens T60 decay (which PEQ cannot do — "
+            "PEQ only reduces the peak, the mode still rings). Designed against a solo-sub "
+            "measurement, applied per-output via apply_fir. Follow with recommend_fir_phase "
+            "to decide if a mixed-phase redesign would better attack long modes. "
+            "Compose this pattern across all subs independently before any input EQ work. "
+            "You decide the strategy: phase mode "
             "(minimum/linear/mixed), tap count, and frequency focus. The tool computes "
             "coefficients and returns them with a predicted effect and pre-ringing estimate. "
             "Pass coefficients to apply_fir(output_index, coefficients) to write to hardware. "
@@ -6824,6 +7383,24 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             limit=int(arguments.get("limit", 10)),
             run_id=arguments.get("run_id"),
         )
+    elif name == "fit_shelf_for_target":
+        result = await _tool_fit_shelf_for_target(
+            session_id=int(arguments["session_id"]),
+            target_curve=arguments["target_curve"],
+            min_hz=float(arguments.get("min_hz", 20.0)),
+            max_hz=float(arguments.get("max_hz", 120.0)),
+            shelf_type=str(arguments.get("shelf_type", "low_shelf")),
+            freq_bounds=arguments.get("freq_bounds"),
+            gain_bounds=arguments.get("gain_bounds"),
+            q_bounds=arguments.get("q_bounds"),
+        )
+    elif name == "start_calibration":
+        result = await _tool_start_calibration(
+            recipe_name=str(arguments["recipe_name"]),
+            target=str(arguments["target"]),
+            reset_state=bool(arguments.get("reset_state", True)),
+            preserve_eq=bool(arguments.get("preserve_eq", False)),
+        )
     elif name == "save_calibration_run":
         result = await _tool_save_calibration_run(
             recipe_name=arguments["recipe_name"],
@@ -6905,6 +7482,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         )
     elif name == "clear_fir":
         result = await _tool_clear_fir(output_index=int(arguments["output_index"]))
+    elif name == "reset_dsp_defaults":
+        result = await _tool_reset_dsp_defaults(
+            dry_run=bool(arguments.get("dry_run", False)),
+            preserve_eq=bool(arguments.get("preserve_eq", False)),
+        )
     elif name == "set_master_gain":
         result = await _tool_set_master_gain(gain_db=float(arguments["gain_db"]))
     elif name == "set_output_gain":
@@ -6964,6 +7546,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             resolution=arguments.get("resolution", "sixth_octave"),
             convergence_threshold=float(arguments.get("convergence_threshold", 1.5)),
             exclude_geometry=bool(arguments.get("exclude_geometry", True)),
+            weight_by_coherence=bool(arguments.get("weight_by_coherence", False)),
         )
     elif name == "anchor_target":
         result = await _tool_anchor_target(
