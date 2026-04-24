@@ -1689,6 +1689,7 @@ async def _tool_fit_correction_filter(
         # Auto-anchor: if caller passed target_offsets, compute ref_spl from
         # the current baseline so the fit doesn't inherit a stale anchor.
         anchored_reference_spl: float | None = None
+        anchor_warning: str | None = None
         if target_offsets and not target_curve:
             anchor = await _tool_anchor_target(
                 session_id=session_id,
@@ -1701,10 +1702,46 @@ async def _tool_fit_correction_filter(
                     f"auto-anchor failed: {anchor.get('error', 'unknown')}"
                 )
             anchored_reference_spl = float(anchor["reference_spl"])
+
+            # Bug 2 fix: detect when the anchor diverges above the measured
+            # SPL at the reference frequency — this forces the optimizer to
+            # place boost filters just to reach the target level, producing
+            # doublets. Clamp when max_boost_db==0; warn when >3 dB divergence.
+            _c_early = constraints or {}
+            _max_boost_early = float(_c_early.get("max_boost_db", 6.0))
+            _ref_freq = anchor.get("limiting_freq_hz")
+            if _ref_freq is not None:
+                # Find measured SPL at the reference frequency
+                _meas_at_ref = min(
+                    zip(fr.frequencies, fr.spl),
+                    key=lambda pair: abs(pair[0] - _ref_freq),
+                )[1]
+                _anchor_excess = anchored_reference_spl - _meas_at_ref
+                if _max_boost_early == 0 and _anchor_excess > 0:
+                    # Clamp: anchor cannot exceed measured SPL when no boosts
+                    # are allowed, or every correction becomes a required boost.
+                    anchored_reference_spl = _meas_at_ref
+                elif _anchor_excess > 3.0:
+                    anchor_warning = (
+                        f"anchor is {_anchor_excess:.1f}dB above measured at "
+                        f"{_ref_freq:.1f} Hz; consider using target_curve with "
+                        f"absolute SPL to prevent forced boosts"
+                    )
+
             target_curve = {
                 "points": anchor["anchored_points"],
                 "band": [range_lo, range_hi],
             }
+            # If anchor was clamped, rebuild anchored_points with updated reference
+            if _ref_freq is not None and _max_boost_early == 0:
+                _c_early_anchor_orig = float(anchor["reference_spl"])
+                _anchor_shift = anchored_reference_spl - _c_early_anchor_orig
+                if _anchor_shift != 0.0:
+                    target_curve["points"] = [
+                        {"freq": p["freq"], "spl": round(p["spl"] + _anchor_shift, 2),
+                         **{k: v for k, v in p.items() if k not in ("freq", "spl")}}
+                        for p in anchor["anchored_points"]
+                    ]
 
         if not target_curve:
             return _err("must pass target_curve or target_offsets")
@@ -1786,6 +1823,16 @@ async def _tool_fit_correction_filter(
         max_q = float(c.get("max_q", 10.0))
         ftype = c.get("filter_type", "peaking")
         preserve_mean = bool(c.get("preserve_mean", False))
+        # Bug 1 fix: when max_boost_db==0 and preserve_mean=True, the
+        # optimizer is in a degenerate state — preserve_mean penalises net
+        # downward mean corrections, but max_boost_db=0 prevents any
+        # compensating boosts. Auto-suppress preserve_mean in this case and
+        # report it in the response so the caller is aware.
+        if max_boost == 0 and preserve_mean:
+            preserve_mean = False
+            preserve_mean_suppressed = True
+        else:
+            preserve_mean_suppressed = False
         # Soft-constraint weight for the mean(correction)≈0 penalty. Default
         # sqrt(N) puts the penalty on comparable footing with per-point SSE
         # so the optimiser trades mean drift roughly 1:1 against fit quality.
@@ -1982,6 +2029,10 @@ async def _tool_fit_correction_filter(
             )
             if anchored_reference_spl is not None:
                 result_payload["anchored_reference_spl"] = round(anchored_reference_spl, 2)
+            if preserve_mean_suppressed:
+                result_payload["preserve_mean_suppressed"] = True
+            if anchor_warning:
+                result_payload["anchor_warning"] = anchor_warning
             return _ok(**result_payload)
 
         # ── Single-filter grid search (N == 1) ──────────────────────────────
@@ -2012,11 +2063,16 @@ async def _tool_fit_correction_filter(
                         best_params = {"freq": round(fc, 1), "gain_db": round(gain, 1), "q": round(q, 1)}
 
         if best_params is None:
-            return _ok(
+            _no_improve: dict = dict(
                 session_id=session_id,
                 message="no filter improves the response in this range",
                 rms_before=round(rms_before, 3),
             )
+            if preserve_mean_suppressed:
+                _no_improve["preserve_mean_suppressed"] = True
+            if anchor_warning:
+                _no_improve["anchor_warning"] = anchor_warning
+            return _ok(**_no_improve)
 
         # Refine with finer grid around best params
         fc0, g0, q0 = best_params["freq"], best_params["gain_db"], best_params["q"]
@@ -2045,7 +2101,7 @@ async def _tool_fit_correction_filter(
                         best_rms = rms
                         best_params = {"freq": round(fc, 1), "gain_db": round(gain, 1), "q": round(q, 1)}
 
-        return _ok(
+        _single_payload: dict = dict(
             session_id=session_id,
             freq_range=[range_lo, range_hi],
             rms_before=round(rms_before, 3),
@@ -2056,6 +2112,11 @@ async def _tool_fit_correction_filter(
                 **best_params,
             },
         )
+        if preserve_mean_suppressed:
+            _single_payload["preserve_mean_suppressed"] = True
+        if anchor_warning:
+            _single_payload["anchor_warning"] = anchor_warning
+        return _ok(**_single_payload)
     except Exception as exc:
         return _err(f"fit_correction_filter failed: {exc}")
 

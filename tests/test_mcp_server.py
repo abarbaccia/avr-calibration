@@ -4670,6 +4670,147 @@ async def test_fit_correction_filter_baseline_filters_incremental() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fit_correction_filter_preserve_mean_suppressed_when_max_boost_zero() -> None:
+    """Bug regression: preserve_mean=True + max_boost_db=0 creates a degenerate
+    optimizer state — preserve_mean penalises net-downward corrections while
+    max_boost_db=0 prevents compensating boosts. The tool must auto-suppress
+    preserve_mean and report preserve_mean_suppressed=True in the response."""
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    # Response sitting uniformly 4 dB above a flat 75 dB target.
+    # With preserve_mean=True + max_boost_db=0 the optimizer previously produced
+    # only 3 filters and poor improvement; suppression unlocks full cut-only fit.
+    spls = [79.0 for _ in freqs]
+    session = _make_fr_session(freqs, spls)
+    target = {
+        "points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}],
+        "band": [20, 120],
+    }
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_fit_correction_filter(
+            session_id=1, target_curve=target,
+            freq_range=[25.0, 100.0], num_filters=4,
+            constraints={"max_boost_db": 0, "preserve_mean": True},
+            exclude_geometry=False,
+        )
+
+    assert result["ok"], result
+    # The flag must be present and True
+    assert result.get("preserve_mean_suppressed") is True, (
+        "preserve_mean_suppressed should be True when max_boost_db=0 and "
+        f"preserve_mean=True, got: {result}"
+    )
+    # With suppress, the optimizer can make cuts freely → must improve RMS
+    assert result["rms_after"] < result["rms_before"], (
+        "optimizer should improve RMS when preserve_mean_suppressed frees cut-only path"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fit_correction_filter_anchor_warning_when_anchor_diverges() -> None:
+    """Bug regression: auto-anchor with target_offsets can set reference_spl
+    well above the measured value at the reference frequency, forcing boost
+    filters that produce doublets. When anchor diverges >3 dB above measured
+    at the limiting frequency the tool must emit anchor_warning."""
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    # Measured response: flat at 72 dB
+    spls = [72.0 for _ in freqs]
+    session = _make_fr_session(freqs, spls)
+
+    # Fake anchor: reference_spl=78 at limiting_freq_hz=50 Hz.
+    # Measured at 50 Hz is ~72 dB → anchor is 6 dB above measured → should warn.
+    anchored_points = [
+        {"freq": 25, "spl": 83.0},  # reference(78) + offset(+5)
+        {"freq": 80, "spl": 78.0},  # reference(78) + offset(0)
+    ]
+
+    async def fake_anchor_high(**kwargs):
+        return {
+            "ok": True,
+            "reference_spl": 78.0,
+            "limiting_freq_hz": 50.0,
+            "anchored_points": anchored_points,
+        }
+
+    with patch("calibrate.storage.SessionStore") as MockStore, \
+         patch("calibrate.mcp_server._tool_anchor_target",
+               side_effect=fake_anchor_high), \
+         patch("calibrate.mcp_server._get_geometry_band_ranges", return_value=[]):
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_fit_correction_filter(
+            session_id=1,
+            target_offsets=[
+                {"freq_hz": 25, "offset_db": 5},
+                {"freq_hz": 80, "offset_db": 0},
+            ],
+            freq_range=[25.0, 80.0], num_filters=2,
+            constraints={"max_boost_db": 6.0},
+            exclude_geometry=False,
+        )
+
+    assert result["ok"], result
+    assert "anchor_warning" in result, (
+        f"expected anchor_warning when anchor is 6 dB above measured, got: {result}"
+    )
+    assert "6.0" in result["anchor_warning"] or "6" in result["anchor_warning"], (
+        f"anchor_warning should mention the dB divergence: {result['anchor_warning']}"
+    )
+    assert "50.0" in result["anchor_warning"] or "50" in result["anchor_warning"], (
+        f"anchor_warning should mention the reference frequency: {result['anchor_warning']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fit_correction_filter_no_anchor_warning_when_anchor_close() -> None:
+    """Complement: no anchor_warning when anchor is within 3 dB of measured."""
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls = [75.0 for _ in freqs]
+    session = _make_fr_session(freqs, spls)
+
+    # Anchor only 2 dB above measured at 50 Hz → no warning
+    anchored_points = [
+        {"freq": 25, "spl": 80.0},
+        {"freq": 80, "spl": 77.0},
+    ]
+
+    async def fake_anchor_close(**kwargs):
+        return {
+            "ok": True,
+            "reference_spl": 77.0,
+            "limiting_freq_hz": 50.0,
+            "anchored_points": anchored_points,
+        }
+
+    with patch("calibrate.storage.SessionStore") as MockStore, \
+         patch("calibrate.mcp_server._tool_anchor_target",
+               side_effect=fake_anchor_close), \
+         patch("calibrate.mcp_server._get_geometry_band_ranges", return_value=[]):
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_fit_correction_filter(
+            session_id=1,
+            target_offsets=[
+                {"freq_hz": 25, "offset_db": 3},
+                {"freq_hz": 80, "offset_db": 0},
+            ],
+            freq_range=[25.0, 80.0], num_filters=2,
+            exclude_geometry=False,
+        )
+
+    assert result["ok"], result
+    assert "anchor_warning" not in result or result["anchor_warning"] is None, (
+        f"no anchor_warning expected when anchor is only 2 dB above measured, "
+        f"got: {result.get('anchor_warning')}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_predict_rms_basic() -> None:
     """predict_rms returns predicted deviation for proposed filters."""
     import numpy as np

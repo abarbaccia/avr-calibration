@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.8.0] - 2026-04-24
+
+### Fixed
+- **`fit_correction_filter` preserve_mean + max_boost_db=0 conflict:** When both constraints are active, the optimizer was degenerate — `preserve_mean` penalises net-downward corrections while `max_boost_db=0` prevents compensating boosts, producing poor filter selection (only 3 filters, minimal improvement). The tool now auto-suppresses `preserve_mean` in this case and reports `preserve_mean_suppressed: true` in the response so the caller is aware.
+- **`fit_correction_filter` auto-anchor divergence causing forced boosts:** When `target_offsets` is used, `anchor_target` can set `reference_spl` well above the measured SPL at the reference frequency, forcing the optimizer to place boost filters just to reach the anchor, producing doublets. The tool now clamps the anchor to measured SPL when `max_boost_db=0`, and emits `anchor_warning` with the divergence amount whenever the anchor is more than 3 dB above measured at the reference frequency.
+
 ## [0.6.7.0] - 2026-04-23
 
 ### Fixed
