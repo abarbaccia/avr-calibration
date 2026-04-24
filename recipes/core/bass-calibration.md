@@ -238,25 +238,24 @@ For each subwoofer:
 3. Call `analyze_ir(session_id)` — get `peak_time_s`, `peak_sign`, `spl_db`
 4. Unmute
 
-### 1.2 Analyze phase relationship
+### 1.2 Optimize alignment (primary tool)
 
-Call `compare_sub_phase(session_a, session_b)` using the solo session IDs.
-This shows per-band phase difference, predicted coherent sum, and whether subs
-reinforce or cancel. Understand the interaction before correcting.
+Call `optimize_sub_alignment(session_ids=[all solo session_ids])`. The
+tool numerically searches per-sub `{delay_ms, gain_db, polarity_inverted}`
+that minimize predicted combined-FR error against the per-frequency
+ceiling (= best possible if the subs summed coherently). Scales to N
+subs, optimizes directly what matters (combined response), and doesn't
+depend on fragile phase-slope/arrival-time recovery.
 
-### 1.3 Apply delay correction
+Use `compare_sub_phase` as a diagnostic only — to see WHERE subs fight
+(cancelling vs reinforcing bands) — not as the alignment primary.
 
-Prefer `compare_sub_phase.delay_estimate.delay_ms` (phase-slope fit —
-unbiased). Trust it when `fit_r2 ≥ 0.8` and `mean_concentration ≥ 0.7`;
-otherwise fall back to the `analyze_ir` peak-time difference:
+### 1.3 Apply the recommendations
 
-- Fallback: sub with latest `peak_time_s` is reference (delay = 0);
-  each earlier-arriving sub gets
-  `delay_ms = (reference_peak_time_s - its_peak_time_s) * 1000`.
-  Note: bandpass-filter group delay gives this ~0.5–1 ms bias, so it
-  is a coarse estimate only.
-
-Apply the chosen delay via `set_delay` to the leading sub.
+For each per-sub record from Phase 1.2, apply via:
+- `set_delay(target=<transducer>, delay_ms=<rec.delay_ms>)`
+- `set_output_gain(target=<transducer>, gain_db=<rec.gain_db>)` if nonzero
+- `set_polarity(target=<transducer>, inverted=<rec.polarity_inverted>)` if changed
 
 ### 1.4 Polarity test (measurement-based)
 

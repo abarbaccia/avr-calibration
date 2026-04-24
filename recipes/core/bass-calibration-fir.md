@@ -282,34 +282,41 @@ carries ~0.5–1 ms residual bias from the bandpass group delay. Use
 `compare_sub_phase.delay_estimate` (Phase 1.2) as the primary source —
 its phase-slope fit is unbiased.
 
-### 1.2 Analyze phase relationship (primary alignment tool)
+### 1.2 Optimize alignment (primary tool)
 
-`compare_sub_phase(session_a, session_b)` — per-band phase difference,
-predicted coherent sum, AND a phase-slope delay estimate. Use
-`delay_estimate.delay_ms` as the primary alignment target:
+`optimize_sub_alignment(session_ids=[solo_session_ids], min_hz, max_hz)` —
+MSO-style numerical search. Pass every solo-sub session ID; the tool
+returns per-sub recommended `{delay_ms, gain_db, polarity_inverted}`
+minimizing predicted combined-FR error against the per-frequency
+ceiling (= what the subs would produce if they summed perfectly).
 
-- Positive `delay_ms` → sub_b trails sub_a → delay sub_a.
-- Negative `delay_ms` → sub_a trails sub_b → delay sub_b.
+Trust when `improvement_db > 1` AND `converged: true`. If `improvement_db`
+is small, the subs are already aligned — accept the recommendation
+anyway (it's the best achievable at this geometry) or move on.
 
-Trust the estimate when `fit_r2 ≥ 0.8` and `mean_concentration ≥ 0.7`.
-If either is low, per-bin phase is scattered (likely modal cancellation
-dominates the chosen band); narrow `min_hz`/`max_hz` to a cleaner
-range and re-run, or fall back to measurement-based polarity/position
-iteration rather than guessing a delay.
+Pass a `target_curve` to optimize against e.g. a cinema-bass curve
+instead of the flatness-ceiling default. Scales to N subs.
 
-Per-band `phase_diff_deg` is informational — do NOT solve for Δt from a
-single band; wrapping makes that ambiguous.
+`compare_sub_phase` is still useful as a DIAGNOSTIC to understand
+*where* subs fight (the per-band `classification`: reinforcing /
+cancelling), but it is NOT the alignment primary — the phase-slope fit
+embedded there fails in strongly modal rooms where the room's modal
+structure dominates phase at low frequencies.
 
-### 1.3 Apply delay correction
+### 1.3 Apply the recommendations
 
-Take `delay_estimate.delay_ms` from Phase 1.2 and apply to the leading
-sub via `set_delay`. Round to the DSP's delay resolution.
+For each per-sub record from Phase 1.2:
+
+```
+set_delay(target=<transducer-name>, delay_ms=<rec.delay_ms>)
+set_output_gain(target=<transducer-name>, gain_db=<rec.gain_db>)  # if nonzero
+set_polarity(target=<transducer-name>, inverted=<rec.polarity_inverted>)  # if changed
+```
 
 **Describe every hardware action explicitly.** Example:
-"compare_sub_phase shows sub_nearfield leading sub_front_right by 134°
-at 40 Hz, which at 40 Hz is 9.3 ms. Adding 7.5 ms delay to
-sub_nearfield (close to the 9.3 ms ideal, rounded for a clean value)
-so the two arrive together at the mic."
+"optimize_sub_alignment recommends sub_nearfield delay=9.3 ms,
+gain=+0.5 dB, polarity=normal; sub_front_right delay=0 ms, gain=0 dB,
+polarity=normal. Applying these to align the two subs at MLP."
 
 ### 1.4 Polarity test (measurement-based)
 
