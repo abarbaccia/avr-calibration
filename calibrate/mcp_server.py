@@ -2590,7 +2590,18 @@ async def _tool_compare_sub_phase(
         spl_b = np.array(sb.start_fr.spl)
         phase_b = np.array(sb.start_fr.phase)
 
+        # Per-bin phase difference on a common frequency grid.
+        # Resample B onto A's grid so we can subtract phases bin-for-bin
+        # before averaging (critical: averaging wrapped radians is wrong;
+        # we take the complex-vector mean of exp(j·Δφ) per band instead).
+        phase_b_on_a = np.interp(freqs_a, freqs_b, phase_b)
+        spl_b_on_a = np.interp(freqs_a, freqs_b, spl_b)
+        delta_phase = phase_b_on_a - phase_a  # per-bin phase difference (rad)
+
         bands = []
+        band_centres_used: list[float] = []
+        band_delta_phase_rad: list[float] = []  # unwrapped-representative Δφ per band
+        band_weights: list[float] = []
         for centre in _THIRD_OCTAVE_CENTRES:
             if centre < min_hz or centre > max_hz:
                 continue
@@ -2606,13 +2617,19 @@ async def _tool_compare_sub_phase(
 
             avg_spl_a = float(np.mean(spl_a[mask_a]))
             avg_spl_b = float(np.mean(spl_b[mask_b]))
-            avg_phase_a = float(np.mean(phase_a[mask_a]))
-            avg_phase_b = float(np.mean(phase_b[mask_b]))
 
-            phase_diff = avg_phase_b - avg_phase_a
-            # Wrap to [-pi, pi]
-            phase_diff_wrapped = math.atan2(math.sin(phase_diff), math.cos(phase_diff))
+            # Complex unit-vector mean of Δφ across the band (wrap-safe).
+            delta_band = delta_phase[mask_a]
+            mean_vec = np.mean(np.exp(1j * delta_band))
+            phase_diff_wrapped = float(np.angle(mean_vec))
+            # |mean_vec| ∈ [0,1] — high when per-bin Δφ is consistent,
+            # low when phase scatters (unreliable band, low weight).
+            concentration = float(np.abs(mean_vec))
             phase_diff_deg = round(math.degrees(phase_diff_wrapped), 1)
+
+            # Per-bin average absolute phase (for predicted-sum vector math).
+            avg_phase_a = float(np.angle(np.mean(np.exp(1j * phase_a[mask_a]))))
+            avg_phase_b = float(np.angle(np.mean(np.exp(1j * phase_b_on_a[mask_a]))))
 
             # Predict coherent sum: vector addition of the two sub signals
             # Convert SPL to linear amplitude, add as complex vectors, convert back
@@ -2640,14 +2657,54 @@ async def _tool_compare_sub_phase(
                 "sub_a_spl_db": round(avg_spl_a, 1),
                 "sub_b_spl_db": round(avg_spl_b, 1),
                 "phase_diff_deg": phase_diff_deg,
+                "phase_concentration": round(concentration, 3),
                 "predicted_sum_db": round(sum_spl, 1),
                 "reinforcement_db": reinforcement_db,
                 "classification": classification,
             })
+            band_centres_used.append(centre)
+            band_delta_phase_rad.append(phase_diff_wrapped)
+            band_weights.append(concentration)
 
         # Summary statistics
         cancelling = [b for b in bands if b["classification"] == "cancelling"]
         reinforcing = [b for b in bands if b["classification"] == "reinforcing"]
+
+        # ── Delay estimate from phase-slope fit ──────────────────────
+        # Δφ(f) ≈ −2π·Δt·f  (sub B trailing sub A by Δt seconds).
+        # Weighted least-squares fit of UNWRAPPED Δφ vs f over the band
+        # centres gives an unambiguous delay recommendation.
+        delay_estimate = None
+        if len(band_centres_used) >= 3:
+            f_arr = np.array(band_centres_used, dtype=float)
+            p_arr = np.unwrap(np.array(band_delta_phase_rad, dtype=float))
+            w_arr = np.array(band_weights, dtype=float)
+            # Fit p = m*f + b (weighted). delay = -m / (2π).
+            W = np.diag(w_arr)
+            A = np.vstack([f_arr, np.ones_like(f_arr)]).T
+            try:
+                lhs = A.T @ W @ A
+                rhs = A.T @ W @ p_arr
+                slope, intercept = np.linalg.solve(lhs, rhs)
+                delay_ms = -float(slope) / (2.0 * math.pi) * 1000.0
+                # R² as a confidence signal
+                pred = A @ np.array([slope, intercept])
+                ss_res = float(np.sum(w_arr * (p_arr - pred) ** 2))
+                ss_tot = float(np.sum(w_arr * (p_arr - np.average(p_arr, weights=w_arr)) ** 2))
+                r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+                delay_estimate = {
+                    "delay_ms": round(delay_ms, 3),
+                    "interpretation": (
+                        f"sub_b trails sub_a by {delay_ms:+.2f} ms "
+                        "(positive → apply delay_ms to sub_a; negative → apply |delay_ms| to sub_b)"
+                    ),
+                    "fit_r2": round(r2, 3),
+                    "fit_intercept_deg": round(math.degrees(float(intercept)), 1),
+                    "n_bands": len(band_centres_used),
+                    "mean_concentration": round(float(np.mean(w_arr)), 3),
+                }
+            except np.linalg.LinAlgError:
+                delay_estimate = None
 
         return _ok(
             session_a=session_a,
@@ -2655,8 +2712,12 @@ async def _tool_compare_sub_phase(
             bands=bands,
             reinforcing_bands=len(reinforcing),
             cancelling_bands=len(cancelling),
+            delay_estimate=delay_estimate,
             note="Phase diff near 0°=reinforcing (+6dB ideal), near 180°=cancelling (deep null). "
-                 "Cancelling bands cannot be fixed with EQ — consider delay/polarity adjustment or repositioning.",
+                 "Use delay_estimate.delay_ms for alignment — it's a phase-slope fit across bands "
+                 "(unambiguous, unlike single-band Δφ). High fit_r2 and mean_concentration → trust it; "
+                 "low values → phase is scattered, rely on polarity/positioning instead. "
+                 "Cancelling bands after alignment cannot be fixed with EQ — consider repositioning.",
         )
     except Exception as exc:
         return _err(f"compare_sub_phase failed: {exc}")
