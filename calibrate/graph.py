@@ -113,6 +113,12 @@ class Processor:
     processor's driver — on a DSP these are output channel names
     (``"0".."9"``), on an AVR they're preout labels (``"preout_sub_1"``) or
     input keys (``"GAME2"``).
+
+    ``display_name`` (optional) is the human-readable label shown in the web
+    UI and other user-facing surfaces (e.g. ``"Living Room miniDSP"``,
+    ``"CamillaDSP"``). When unset, callers should fall back to
+    :func:`default_display_name` which derives a sensible label from
+    ``driver_ref``.
     """
 
     name: str
@@ -121,6 +127,26 @@ class Processor:
     inputs: tuple[str, ...] = ()
     outputs: tuple[str, ...] = ()
     config_key: str | None = None
+    display_name: str | None = None
+
+
+_DEFAULT_DISPLAY_NAMES: dict[str, str] = {
+    "denon": "Denon AVR",
+    "minidsp": "miniDSP 2x4 HD",
+    "camilladsp": "CamillaDSP",
+}
+
+
+def default_display_name(proc: Processor) -> str:
+    """Fallback human-readable label for a processor without ``display_name``.
+
+    Looks up the driver_ref in a small table of well-known drivers; unknown
+    drivers fall back to a title-cased version of the ref itself so third-party
+    drivers still render reasonably.
+    """
+    if proc.display_name:
+        return proc.display_name
+    return _DEFAULT_DISPLAY_NAMES.get(proc.driver_ref, proc.driver_ref.title())
 
 
 @dataclass(frozen=True)
@@ -510,6 +536,7 @@ class SignalGraph:
                     "driver_ref": p.driver_ref,
                     "kind": p.kind,
                     "outputs": list(p.outputs),
+                    "display_name": p.display_name or default_display_name(p),
                 }
                 for p in self.processors
             ],
@@ -563,6 +590,7 @@ class SignalGraph:
                     inputs=tuple(p.get("inputs", [])),
                     outputs=tuple(str(o) for o in p.get("outputs", [])),
                     config_key=p.get("config_key"),
+                    display_name=p.get("display_name"),
                 )
                 for p in data.get("processors", [])
             ),
