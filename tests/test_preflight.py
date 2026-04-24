@@ -262,10 +262,11 @@ class TestRunAll:
             patch.object(checker, "check_denon_and_playback", return_value=CheckResult("Denon AVR", True, "X3800H; USB: miniDSP")),
             patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
             patch.object(checker, "check_output_routing_safety", return_value=CheckResult("Output routing", True, "not applicable")),
+            patch.object(checker, "check_dsp_persisted_state", return_value=CheckResult("DSP persisted state", True, "all defaults")),
         ):
             results = await checker.run_all()
         assert all(r.passed for r in results)
-        assert len(results) == 6
+        assert len(results) == 7
 
     async def test_unhandled_exception_becomes_failed_result(self, config):
         checker = PreflightChecker(config)
@@ -291,13 +292,14 @@ class TestRunAll:
             patch.object(checker, "check_denon_and_playback", side_effect=RuntimeError("err")),
             patch.object(checker, "check_signal_path_sync", side_effect=RuntimeError("err")),
             patch.object(checker, "check_output_routing_safety", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_dsp_persisted_state", side_effect=RuntimeError("err")),
         ):
             results = await checker.run_all()
         # DSP label now comes from the configured driver — "miniDSP 2x4 HD" for
         # dsp_driver: minidsp (the test fixture default).
         assert [r.name for r in results] == [
             "Config", "Microphone", "miniDSP 2x4 HD", "Denon AVR", "Signal Path",
-            "Output routing",
+            "Output routing", "DSP persisted state",
         ]
 
     async def test_result_names_camilladsp_label(self, config):
@@ -807,3 +809,72 @@ class TestCamillaDSPPipelineStateInPreflight:
         # Unknown state should not trigger the Inactive warning
         assert "Inactive" not in result.detail
         assert "not Running" not in result.detail
+
+
+# ── check_dsp_persisted_state ────────────────────────────────────────────────
+
+class TestDspPersistedState:
+    """check_dsp_persisted_state surfaces non-default per-output DSP state."""
+
+    async def test_all_defaults_passes(self, config) -> None:
+        """No persisted overrides → passes cleanly."""
+        checker = PreflightChecker(config)
+        with patch("calibrate.storage.SessionStore") as MockStore:
+            MockStore.return_value.get_active_dsp.return_value = {
+                "processor:camilla:output:5:polarity": {"inverted": False, "timestamp": "t0"},
+                "processor:camilla:output:5:gain": {"gain_db": 0.0, "timestamp": "t0"},
+                "processor:camilla:output:5:delay": {"delay_ms": 0.0, "timestamp": "t0"},
+            }
+            result = await checker.check_dsp_persisted_state()
+        assert result.passed
+        assert "defaults" in result.detail
+
+    async def test_polarity_flip_warns(self, config) -> None:
+        checker = PreflightChecker(config)
+        with patch("calibrate.storage.SessionStore") as MockStore:
+            MockStore.return_value.get_active_dsp.return_value = {
+                "processor:camilla:output:5:polarity": {"inverted": True, "timestamp": "2026-04-24T02:59"},
+            }
+            result = await checker.check_dsp_persisted_state()
+        assert not result.passed
+        assert "polarity=inverted" in result.detail
+        assert "camilla:output:5" in result.detail
+
+    async def test_nonzero_gain_warns(self, config) -> None:
+        checker = PreflightChecker(config)
+        with patch("calibrate.storage.SessionStore") as MockStore:
+            MockStore.return_value.get_active_dsp.return_value = {
+                "processor:camilla:output:6:gain": {"gain_db": 6.0, "timestamp": "t0"},
+            }
+            result = await checker.check_dsp_persisted_state()
+        assert not result.passed
+        assert "gain_db=+6.00" in result.detail
+
+    async def test_nonzero_delay_warns(self, config) -> None:
+        checker = PreflightChecker(config)
+        with patch("calibrate.storage.SessionStore") as MockStore:
+            MockStore.return_value.get_active_dsp.return_value = {
+                "processor:camilla:output:2:delay": {"delay_ms": 6.15, "timestamp": "t0"},
+            }
+            result = await checker.check_dsp_persisted_state()
+        assert not result.passed
+        assert "delay_ms=6.150" in result.detail
+
+    async def test_eq_and_mute_are_ignored(self, config) -> None:
+        """EQ state is expected post-cal; mute is transient — neither triggers a warning."""
+        checker = PreflightChecker(config)
+        with patch("calibrate.storage.SessionStore") as MockStore:
+            MockStore.return_value.get_active_dsp.return_value = {
+                "processor:camilla:output:5:eq": {"filters": [{"type": "hpf", "freq": 18}], "timestamp": "t0"},
+                "processor:camilla:output:5:mute": {"muted": True, "timestamp": "t0"},
+            }
+            result = await checker.check_dsp_persisted_state()
+        assert result.passed
+
+    async def test_storage_error_skips_gracefully(self, config) -> None:
+        """SessionStore failure → graceful skip, not a hard fail."""
+        checker = PreflightChecker(config)
+        with patch("calibrate.storage.SessionStore", side_effect=RuntimeError("db gone")):
+            result = await checker.check_dsp_persisted_state()
+        assert result.passed  # skipped, not failed
+        assert "skipped" in result.detail.lower()

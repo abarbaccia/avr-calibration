@@ -2834,6 +2834,18 @@ async def _tool_optimize_sub_alignment(
             H = np.fft.rfft(combined)
             return 20.0 * np.log10(np.abs(H) + 1e-12)
 
+        # Frequency weights: linear ramp from 1.0 at min_hz to 0.1 at max_hz.
+        # Sub calibration cares overwhelmingly about the low end (20–80 Hz is
+        # where the subs actually live vs. mains taking over around 80 Hz).
+        # Without weighting, the optimizer can happily trade 3 dB at 50 Hz for
+        # 5 dB at 120 Hz — a bad deal for a sub. Weighting steers it toward
+        # fixes in the band that actually matters.
+        in_band_freqs = freqs[in_band]
+        freq_weights = np.clip(
+            1.0 - (in_band_freqs - min_hz) / max(max_hz - min_hz, 1e-9) * 0.9,
+            0.1, 1.0,
+        )
+
         def objective(params: "np.ndarray") -> float:
             fr = combined_fr_db(params)
             in_fr = fr[in_band]
@@ -2845,7 +2857,8 @@ async def _tool_optimize_sub_alignment(
             # to fix. One-sided avoids the "trivially flat at -inf is good"
             # failure mode of a symmetric-RMS objective on a flatness target.
             below = np.maximum(0.0, in_t - in_fr)
-            return float(np.sqrt(np.mean(below ** 2)))
+            weighted = freq_weights * below
+            return float(np.sqrt(np.mean(weighted ** 2)))
 
         # Bounds: delay ∈ [0, max_delay_ms], gain ∈ [±gain], polarity ∈ [0, 1]
         pol_hi = 1.0 if search_polarity else 0.0
