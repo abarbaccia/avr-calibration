@@ -77,6 +77,7 @@ class PreflightChecker:
             ("Denon AVR", self.check_denon_and_playback()),
             ("Signal Path", self.check_signal_path_sync()),
             ("Output routing", self.check_output_routing_safety()),
+            ("DSP persisted state", self.check_dsp_persisted_state()),
         ]
         names = [name for name, _ in checks]
         coros = [coro for _, coro in checks]
@@ -583,5 +584,87 @@ class PreflightChecker:
                 "software indication. Move these cables to Lines 05-10 (direct "
                 "PCM, full software control) and update signal_graph.transducers "
                 "output_index values accordingly."
+            ),
+        )
+
+    async def check_dsp_persisted_state(self) -> CheckResult:
+        """Warn when per-output DSP state persisted in active_dsp_state is non-default.
+
+        `active_dsp_state` re-applies on every container restart — a polarity
+        flip, gain trim, delay, or FIR set in a prior calibration session stays
+        active on the hardware forever. These re-application silently invalidate
+        any subsequent alignment or optimization analysis because a solo-sub IR
+        captured with an active polarity flip (or unequal gain) will NOT reflect
+        the physical sub — it reflects the sub-plus-persisted-state, and any
+        tool that sums those IRs to predict combined response will give wrong
+        answers until the state is acknowledged or cleared.
+
+        This is a WARNING, not a failure — the state may be intentional (e.g.
+        a previously-tuned calibration that should be preserved). Surface the
+        items with their timestamps and let the user decide.
+        """
+        try:
+            from .storage import SessionStore
+            store = SessionStore()
+            state = await asyncio.to_thread(store.get_active_dsp)
+        except Exception as exc:
+            return CheckResult(
+                name="DSP persisted state",
+                passed=True,
+                detail=f"could not inspect active_dsp_state ({exc}); skipped",
+            )
+
+        # What counts as non-default: polarity inverted, gain != 0 dB, delay != 0 ms,
+        # FIR with nonzero taps. EQ and mute are out of scope — EQ is explicitly
+        # expected to be set post-calibration, mute changes during sweeps.
+        non_default: list[str] = []
+        for key, data in state.items():
+            parts = key.split(":")
+            # Shape: processor:<name>:<kind>:<index>:<field>   (output keys)
+            #        processor:<name>:input:<field>            (input keys)
+            if len(parts) < 4 or parts[0] != "processor":
+                continue
+            field = parts[-1]
+            ts = data.get("timestamp", "?")
+            ident = ":".join(parts[1:-1])  # e.g. "camilla:output:5"
+            if field == "polarity" and data.get("inverted"):
+                non_default.append(f"{ident} polarity=inverted (set {ts})")
+            elif field == "gain":
+                gain = float(data.get("gain_db") or 0.0)
+                if abs(gain) > 0.01:
+                    non_default.append(f"{ident} gain_db={gain:+.2f} (set {ts})")
+            elif field == "delay":
+                delay = float(data.get("delay_ms") or 0.0)
+                if abs(delay) > 0.001:
+                    non_default.append(f"{ident} delay_ms={delay:.3f} (set {ts})")
+            elif field == "fir":
+                taps = int(data.get("num_taps") or 0)
+                if taps > 0:
+                    non_default.append(f"{ident} fir_taps={taps} (set {ts})")
+
+        if not non_default:
+            return CheckResult(
+                name="DSP persisted state",
+                passed=True,
+                detail="all per-output polarity/gain/delay/fir at defaults",
+            )
+
+        joined = "; ".join(non_default[:10])
+        if len(non_default) > 10:
+            joined += f"; …and {len(non_default) - 10} more"
+        return CheckResult(
+            name="DSP persisted state",
+            passed=False,
+            detail=f"{len(non_default)} persisted override(s): {joined}",
+            error=(
+                "active_dsp_state contains non-default per-output settings that "
+                "re-apply on every container restart. A solo-sub IR captured "
+                "with an active polarity flip or unequal gain will NOT reflect "
+                "the physical sub — it reflects the sub plus the persisted state. "
+                "Any alignment / optimize_sub_alignment / compare_sub_phase "
+                "analysis run against these IRs will silently return wrong "
+                "answers. Verify these values are intentional before calibrating. "
+                "To clear: set_polarity / set_output_gain / set_delay to defaults, "
+                "or end_sweep_session followed by a fresh calibration run."
             ),
         )
