@@ -47,6 +47,7 @@ from calibrate.mcp_server import (
     _tool_apply_eq,
     _tool_apply_fir,
     _tool_avr_set_volume,
+    _tool_set_speaker_distances,
     _tool_calibrate_level,
     _tool_check_system,
     _tool_clear_fir,
@@ -5888,3 +5889,144 @@ async def test_fit_shelf_session_not_found(mock_dsp) -> None:
         )
     assert not result["ok"]
     assert "not found" in result["error"]
+
+
+# ── design_fir AVR delay budget ────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_design_fir_surfaces_avr_max_delay() -> None:
+    """When AVR advertises MAX_SPEAKER_DELAY_MS, design_fir reports headroom + compensable."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [75.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+    avr = MagicMock()
+    avr.MAX_SPEAKER_DELAY_MS = 65.0
+    with patch("calibrate.storage.SessionStore") as MockStore, \
+         patch("calibrate.mcp_server._avr", avr):
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_fir(
+            session_id=1, num_taps=256, phase_mode="minimum",
+        )
+    assert result["ok"]
+    assert result["avr_max_delay_ms"] == 65.0
+    # min-phase, ~0ms latency, well within budget
+    assert result["avr_compensable"] is True
+    assert result["avr_headroom_ms"] is not None
+    assert result["avr_headroom_ms"] > 60.0
+
+
+@pytest.mark.asyncio
+async def test_design_fir_warns_when_latency_exceeds_avr_budget() -> None:
+    """Linear-phase FIR with N/2/fs > AVR_MAX should report avr_compensable=False with WARNING."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [75.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+    avr = MagicMock()
+    avr.MAX_SPEAKER_DELAY_MS = 5.0  # tight budget so 1024-tap linear blows past it
+    with patch("calibrate.storage.SessionStore") as MockStore, \
+         patch("calibrate.mcp_server._avr", avr):
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_fir(
+            session_id=1, num_taps=1024, phase_mode="linear",
+        )
+    assert result["ok"]
+    assert result["avr_compensable"] is False
+    assert result["avr_headroom_ms"] < 0
+    assert "WARNING" in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_design_fir_avr_fields_unknown_when_driver_lacks_attribute() -> None:
+    """AVRs without MAX_SPEAKER_DELAY_MS get None — caller treats as unknown."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 300).tolist()
+    spls = [75.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+    avr = MagicMock(spec=[])  # no attributes
+    with patch("calibrate.storage.SessionStore") as MockStore, \
+         patch("calibrate.mcp_server._avr", avr):
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_fir(
+            session_id=1, num_taps=256, phase_mode="minimum",
+        )
+    assert result["ok"]
+    assert result["avr_max_delay_ms"] is None
+    assert result["avr_compensable"] is None
+    assert result["avr_headroom_ms"] is None
+
+
+# ── set_speaker_distances MCP tool ─────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_set_speaker_distances_dispatches_to_driver() -> None:
+    avr = AsyncMock()
+    avr.set_speaker_distances.return_value = None
+    avr.MAX_SPEAKER_DELAY_MS = 65.0
+    with patch("calibrate.mcp_server._avr", avr):
+        result = await _tool_set_speaker_distances(
+            distances={"FL": 4.05, "SW1": 30.72},
+            n_positions=3,
+            commit=True,
+        )
+    assert result["ok"]
+    assert result["committed"] is True
+    assert result["distances_cm"] == {"FL": 405, "SW1": 3072}
+    assert result["avr_max_delay_ms"] == 65.0
+    avr.set_speaker_distances.assert_awaited_once_with(
+        {"FL": 4.05, "SW1": 30.72}, n_positions=3, commit=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_speaker_distances_no_avr() -> None:
+    with patch("calibrate.mcp_server._avr", None):
+        result = await _tool_set_speaker_distances(distances={"SW1": 30.72})
+    assert not result["ok"]
+    assert "no AVR driver" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_set_speaker_distances_unsupported_driver() -> None:
+    """AVR drivers without set_speaker_distances (e.g. future YamahaDriver) get a clear error."""
+    class _PlainAvr:
+        pass
+    with patch("calibrate.mcp_server._avr", _PlainAvr()):
+        result = await _tool_set_speaker_distances(distances={"SW1": 30.72})
+    assert not result["ok"]
+    assert "does not support" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_set_speaker_distances_empty_rejected() -> None:
+    avr = AsyncMock()
+    with patch("calibrate.mcp_server._avr", avr):
+        result = await _tool_set_speaker_distances(distances={})
+    assert not result["ok"]
+    assert "empty" in result["error"]
+    avr.set_speaker_distances.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_set_speaker_distances_wraps_driver_error() -> None:
+    avr = AsyncMock()
+    avr.set_speaker_distances.side_effect = DriverError("connection refused")
+    with patch("calibrate.mcp_server._avr", avr):
+        result = await _tool_set_speaker_distances(distances={"SW1": 30.72})
+    assert not result["ok"]
+    assert "distance push failed" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_set_speaker_distances_volatile_message() -> None:
+    """Without commit, the message must warn the change is volatile."""
+    avr = AsyncMock()
+    avr.MAX_SPEAKER_DELAY_MS = 65.0
+    with patch("calibrate.mcp_server._avr", avr):
+        result = await _tool_set_speaker_distances(
+            distances={"SW1": 30.72}, commit=False,
+        )
+    assert result["ok"]
+    assert result["committed"] is False
+    assert "Volatile" in result["message"]

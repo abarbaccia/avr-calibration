@@ -3310,6 +3310,19 @@ async def _tool_design_fir(
         _fir_design_cache[int(session_id)] = coefficients
         peak_abs = float(np.max(np.abs(fir_td))) if num_taps else 0.0
 
+        # Surface the AVR's per-channel delay-buffer ceiling so the LLM can see
+        # immediately whether this FIR's latency is compensable via mains
+        # speaker-distance. Empirical X3800H ceiling is ~65 ms; other models
+        # may differ. ``None`` means the active AVR driver does not advertise
+        # a limit — caller should treat as unknown rather than infinite.
+        avr_max_delay_ms = getattr(_avr, "MAX_SPEAKER_DELAY_MS", None) if _avr else None
+        if avr_max_delay_ms is not None:
+            avr_compensable = latency_ms <= avr_max_delay_ms
+            avr_headroom_ms = round(float(avr_max_delay_ms) - latency_ms, 2)
+        else:
+            avr_compensable = None  # unknown — don't claim either way
+            avr_headroom_ms = None
+
         result = {
             "session_id": session_id,
             "num_taps": num_taps,
@@ -3319,8 +3332,28 @@ async def _tool_design_fir(
             "freq_resolution_hz": freq_resolution,
             "peak_abs": round(peak_abs, 6),
             "predicted_effect": predicted_bands,
+            "avr_max_delay_ms": avr_max_delay_ms,
+            "avr_compensable": avr_compensable,
+            "avr_headroom_ms": avr_headroom_ms,
             "design_cached": True,
         }
+
+        budget_msg = ""
+        if avr_max_delay_ms is not None:
+            if avr_compensable:
+                budget_msg = (
+                    f" AVR can compensate (max {avr_max_delay_ms}ms, "
+                    f"{avr_headroom_ms}ms headroom)."
+                )
+            else:
+                budget_msg = (
+                    f" WARNING: AVR can compensate at most {avr_max_delay_ms}ms — "
+                    f"this FIR exceeds the budget by "
+                    f"{round(latency_ms - avr_max_delay_ms, 2)}ms. "
+                    f"Reduce taps, switch to minimum-phase, or accept residual "
+                    f"sub-mains misalignment."
+                )
+
         if return_coefficients:
             result["coefficients"] = coefficients
             result["note"] = (
@@ -3329,20 +3362,77 @@ async def _tool_design_fir(
                 f"Latency: {latency_ms}ms (compensate via per-channel mains "
                 f"speaker-distance — set mains LARGER than physical so they "
                 f"wait for the FIR-delayed sub; lip-sync/Audio-Delay does NOT "
-                f"help, that delays all audio uniformly). Pass coefficients to "
-                f"apply_fir(output_index, coefficients) or "
+                f"help, that delays all audio uniformly).{budget_msg} "
+                f"Pass coefficients to apply_fir(output_index, coefficients) or "
                 f"apply_fir(output_index, design_session_id={session_id})."
             )
         else:
             result["note"] = (
                 f"FIR at {fir_fs}Hz, {num_taps} taps, {phase_mode} phase. "
                 f"Freq resolution: {freq_resolution}Hz. Pre-ringing: {pre_ringing_ms}ms. "
-                f"Latency: {latency_ms}ms. Coefficients cached server-side; "
-                f"apply via apply_fir(output_index, design_session_id={session_id})."
+                f"Latency: {latency_ms}ms.{budget_msg} Coefficients cached "
+                f"server-side; apply via apply_fir(output_index, "
+                f"design_session_id={session_id})."
             )
         return _ok(**result)
     except Exception as exc:
         return _err(f"design_fir failed: {exc}")
+
+
+async def _tool_set_speaker_distances(
+    distances: dict[str, float],
+    n_positions: int = 1,
+    commit: bool = False,
+) -> dict:
+    """Push per-channel Audyssey distances to the AVR via direct TCP.
+
+    Bypasses the MultEQ Editor app's UI cap (59.1 ft / 18 m on X3800H).
+    Used to compensate sub-only FIR group delay by setting mains
+    distances LARGER than physical, or sub LARGER than mains, so the
+    AVR delays the appropriate channels.
+
+    Channel names are Audyssey commandIds: FL, C, FR, SLA, SRA, TFL,
+    TFR, TRL, TRR, SBL, SBR, SW1, SW2, SW3, SW4. Values in METERS.
+
+    With ``commit=False`` the change is volatile (lost on AVR power
+    cycle). With ``commit=True`` the AVR persists to NVRAM.
+
+    The AVR firmware applies at most ``MAX_SPEAKER_DELAY_MS`` of delay
+    per channel regardless of the configured value — see
+    ``get_state().max_speaker_delay_ms``. Pushing past that is allowed
+    but only the first N ms of delay actually reach the speakers.
+
+    The driver method itself does NOT prompt; recipes/agents must
+    obtain explicit user confirmation before calling this tool, per
+    the signal-path-write rule.
+    """
+    if _avr is None:
+        return _err("no AVR driver loaded")
+    if not hasattr(_avr, "set_speaker_distances"):
+        return _err(f"{type(_avr).__name__} does not support direct distance writes")
+    if not distances:
+        return _err("distances is empty")
+    try:
+        await _avr.set_speaker_distances(  # type: ignore[attr-defined]
+            distances,
+            n_positions=int(n_positions),
+            commit=bool(commit),
+        )
+    except DriverError as exc:
+        return _err(f"distance push failed: {exc}")
+
+    avr_max_delay_ms = getattr(_avr, "MAX_SPEAKER_DELAY_MS", None)
+    return _ok(
+        distances_cm={ch: round(m * 100) for ch, m in distances.items()},
+        n_positions=int(n_positions),
+        committed=bool(commit),
+        avr_max_delay_ms=avr_max_delay_ms,
+        message=(
+            "Distances written. "
+            + ("Persisted to NVRAM." if commit else "Volatile — pass commit=True to persist.")
+            + (f" AVR caps applied delay at {avr_max_delay_ms}ms per channel." if avr_max_delay_ms else "")
+        ),
+    )
 
 
 async def _tool_avr_set_volume(level_db: float) -> dict:
@@ -5603,6 +5693,55 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="set_speaker_distances",
+        description=(
+            "Push per-channel Audyssey speaker distances directly to the AVR via "
+            "TCP, bypassing the MultEQ Editor app's UI cap (59.1 ft / 18 m on "
+            "X3800H). Use to compensate sub-only FIR group delay by setting the "
+            "sub LARGER than physical (so AVR delays mains to wait for the "
+            "FIR-delayed sub) or, equivalently, mains LARGER than physical. "
+            "The configured value persists past the UI cap; the AVR firmware "
+            "still caps the *applied* per-channel delay at "
+            "MAX_SPEAKER_DELAY_MS (see get_state). "
+            "REQUIRES EXPLICIT USER CONFIRMATION before calling — this writes "
+            "Audyssey calibration state. Always summarise distances + commit "
+            "flag and wait for the user to approve."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "distances": {
+                    "type": "object",
+                    "description": (
+                        "Channel→meters map. Keys are Audyssey commandIds: "
+                        "FL, C, FR, SLA, SRA, TFL, TFR, TRL, TRR, SBL, SBR, "
+                        "SW1, SW2, SW3, SW4. Values in METERS as floats."
+                    ),
+                    "additionalProperties": {"type": "number"},
+                },
+                "n_positions": {
+                    "type": "integer",
+                    "description": (
+                        "Number of measurement positions in the AVR's stored "
+                        "calibration. Get from a saved .ady file's responseData "
+                        "size, or pass 1 for single-position. Default: 1."
+                    ),
+                    "default": 1,
+                },
+                "commit": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, send AudyFinFlg=Fin to persist to NVRAM. "
+                        "If false (default), the change is volatile and lost "
+                        "on AVR power cycle."
+                    ),
+                    "default": False,
+                },
+            },
+            "required": ["distances"],
+        },
+    ),
+    Tool(
         name="measure",
         description=(
             "Trigger a frequency response measurement using the UMIK microphone. "
@@ -7386,6 +7525,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         )
     elif name in ("set_volume", "avr_set_volume", "set_denon_volume"):
         result = await _tool_avr_set_volume(float(arguments["level_db"]))
+    elif name == "set_speaker_distances":
+        result = await _tool_set_speaker_distances(
+            distances=dict(arguments["distances"]),
+            n_positions=int(arguments.get("n_positions", 1)),
+            commit=bool(arguments.get("commit", False)),
+        )
     elif name in ("measure", "trigger_measurement"):
         result = await _tool_trigger_measurement(
             label=arguments.get("label"),
