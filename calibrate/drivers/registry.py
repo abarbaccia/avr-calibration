@@ -177,6 +177,10 @@ def _make_camilladsp(config: Config, proc) -> CamillaDSPDriver:
         kwargs["playback_device"] = cam["playback"]
     if cam.get("max_peq_slots") is not None:
         kwargs["max_peq_slots"] = int(cam["max_peq_slots"])
+    if cam.get("capture_channels") is not None:
+        kwargs["capture_channels"] = int(cam["capture_channels"])
+    if cam.get("lfe_input_channel") is not None:
+        kwargs["lfe_input_channel"] = int(cam["lfe_input_channel"])
     return CamillaDSPDriver(**kwargs)
 
 

@@ -2185,3 +2185,166 @@ class TestCamillaDSPPipelineState:
         driver._client.call = AsyncMock(side_effect=DriverError("timeout"))
         state = await driver.pipeline_state()
         assert state == "Unknown"
+
+
+# ── Direct Focusrite capture: physical vs logical channel disambiguation ──────
+
+
+class TestCamillaDSPDirectCapture:
+    """Tests for capture_channels / lfe_input_channel — direct multichannel capture
+    without the ffmpeg bridge. The pre-cal_matrix capture_mixer fans out one
+    physical channel to every logical input."""
+
+    def test_default_capture_channels_match_input_channels(self) -> None:
+        """Backward compat: omitting capture_channels keeps the legacy 1:1 path."""
+        driver = CamillaDSPDriver(input_channels=2)
+        assert driver._capture_channels == 2
+        assert driver._lfe_input_channel is None
+        assert not driver._needs_capture_mixer()
+        assert driver._build_capture_mixer() is None
+
+    def test_capture_channels_without_lfe_channel_raises(self) -> None:
+        """A multichannel capture with no fan-out target is ambiguous; reject early."""
+        with pytest.raises(ValueError, match="lfe_input_channel"):
+            CamillaDSPDriver(input_channels=2, capture_channels=20)
+
+    def test_lfe_input_channel_out_of_range_raises(self) -> None:
+        """lfe_input_channel must be a valid index into the capture stream."""
+        with pytest.raises(ValueError, match="out of range"):
+            CamillaDSPDriver(input_channels=2, capture_channels=20, lfe_input_channel=20)
+        with pytest.raises(ValueError, match="out of range"):
+            CamillaDSPDriver(input_channels=2, capture_channels=20, lfe_input_channel=-1)
+
+    def test_capture_device_channel_count_uses_physical_count(self) -> None:
+        """The CamillaDSP capture device declares physical channels, not logical."""
+        driver = CamillaDSPDriver(
+            input_channels=2,
+            capture_channels=20,
+            lfe_input_channel=2,
+        )
+        assert driver._capture_device["channels"] == 20
+
+    def test_capture_mixer_fans_out_lfe_to_all_logical_inputs(self) -> None:
+        """Each logical input reads from the configured physical LFE channel."""
+        driver = CamillaDSPDriver(
+            input_channels=2,
+            capture_channels=20,
+            lfe_input_channel=2,
+        )
+        mixer = driver._build_capture_mixer()
+        assert mixer is not None
+        assert mixer["channels"] == {"in": 20, "out": 2}
+        assert len(mixer["mapping"]) == 2
+        for entry in mixer["mapping"]:
+            assert len(entry["sources"]) == 1
+            src = entry["sources"][0]
+            assert src["channel"] == 2
+            assert src["mute"] is False
+            assert src["inverted"] is False
+
+    def test_pipeline_includes_capture_mixer_step_first(self) -> None:
+        """When physical != logical, cal_capture is the first pipeline step."""
+        driver = CamillaDSPDriver(
+            input_channels=2, output_channels=4,
+            capture_channels=20, lfe_input_channel=2,
+        )
+        pipeline = driver._build_pipeline()
+        assert pipeline[0] == {"type": "Mixer", "name": "cal_capture"}
+        # cal_matrix still present, after any input PEQ.
+        assert {"type": "Mixer", "name": "cal_matrix"} in pipeline
+
+    def test_pipeline_omits_capture_mixer_on_legacy_path(self) -> None:
+        """Legacy 2:2 Loopback path emits no capture_mixer step."""
+        driver = CamillaDSPDriver(input_channels=2, output_channels=4)
+        pipeline = driver._build_pipeline()
+        assert {"type": "Mixer", "name": "cal_capture"} not in pipeline
+        # cal_matrix is still the routing mixer.
+        names = [s.get("name") for s in pipeline if s.get("type") == "Mixer"]
+        assert names == ["cal_matrix"]
+
+    def test_full_config_contains_both_mixers_on_direct_path(self) -> None:
+        """_build_config emits cal_capture alongside cal_matrix when needed."""
+        driver = CamillaDSPDriver(
+            input_channels=2, output_channels=4,
+            capture_channels=20, lfe_input_channel=2,
+        )
+        cfg = driver._build_config()
+        assert "cal_capture" in cfg["mixers"]
+        assert "cal_matrix" in cfg["mixers"]
+        assert cfg["devices"]["capture"]["channels"] == 20
+
+    def test_registry_passes_through_new_keys(self) -> None:
+        """_make_camilladsp wires capture_channels + lfe_input_channel from config."""
+        from calibrate.config import Config, DEFAULT_CONFIG
+        from calibrate.drivers.registry import load_drivers_from_graph
+        cfg = Config({
+            **DEFAULT_CONFIG,
+            "dsp_driver": "camilladsp",
+            "camilladsp": {
+                **DEFAULT_CONFIG["camilladsp"],
+                "capture_channels": 20,
+                "lfe_input_channel": 2,
+                "capture": {
+                    "type": "Alsa", "device": "plughw:USB,0",
+                    "channels": 20, "format": "S32LE",
+                },
+            },
+        })
+        registry = load_drivers_from_graph(cfg)
+        driver = registry.default_dsp()
+        assert isinstance(driver, CamillaDSPDriver)
+        assert driver._capture_channels == 20
+        assert driver._lfe_input_channel == 2
+
+    def test_sweep_context_skips_loopback_prime_for_direct_capture(self) -> None:
+        """When capture device is non-Loopback, the prime step is disabled."""
+        from calibrate.config import Config, DEFAULT_CONFIG
+        driver = CamillaDSPDriver(
+            input_channels=2, output_channels=4,
+            capture_channels=20, lfe_input_channel=2,
+            capture_device={
+                "type": "Alsa", "device": "plughw:USB,0",
+                "channels": 20, "format": "S32LE",
+            },
+        )
+        cfg = Config({
+            **DEFAULT_CONFIG,
+            "measurement": {**DEFAULT_CONFIG["measurement"], "playback_route": "usb"},
+        })
+        ctx = driver.sweep_context(cfg)
+        assert isinstance(ctx, _BridgeSweepContext)
+        assert ctx._needs_loopback_prime is False
+
+    def test_sweep_context_keeps_loopback_prime_for_legacy_path(self) -> None:
+        """Legacy hw:Loopback,1,0 capture keeps the prime enabled."""
+        from calibrate.config import Config, DEFAULT_CONFIG
+        driver = CamillaDSPDriver(
+            input_channels=2, output_channels=4,
+        )  # default capture is hw:Loopback,1,0
+        cfg = Config({
+            **DEFAULT_CONFIG,
+            "measurement": {**DEFAULT_CONFIG["measurement"], "playback_route": "usb"},
+        })
+        ctx = driver.sweep_context(cfg)
+        assert isinstance(ctx, _BridgeSweepContext)
+        assert ctx._needs_loopback_prime is True
+
+    @pytest.mark.asyncio
+    async def test_bridge_context_skips_prime_when_flag_disabled(self) -> None:
+        """needs_loopback_prime=False prevents sounddevice import + write."""
+        driver = CamillaDSPDriver(input_channels=2, output_channels=4)
+        _stub_client(driver)
+        ctx = _BridgeSweepContext(
+            driver, None, "Focusrite", needs_loopback_prime=False,
+        )
+        mock_sd = MagicMock()
+        with (
+            patch("calibrate.drivers.camilladsp.subprocess.run", return_value=None),
+            patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        ):
+            await ctx.__aenter__()
+            await ctx.__aexit__(None, None, None)
+        # Critical: the device-query and OutputStream must never run on the
+        # direct-capture path — they'd open a device CamillaDSP isn't using.
+        mock_sd.query_devices.assert_not_called()
+        mock_sd.OutputStream.assert_not_called()
