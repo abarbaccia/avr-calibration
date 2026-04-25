@@ -140,27 +140,35 @@ Key MCP tools available on the `avr-calibration` server:
 
 **FR data resolution rule:** Always use `get_measurement_history(min_hz=20, max_hz=120, format="compact")` when designing or verifying sub bass filters. The compact format gives 0.18Hz resolution, ~550 points per session, ~8KB. `get_fr_summary` returns only 11 bands — too coarse to resolve narrow peaks.
 
-### Step 6 — Record each iteration
+### Step 6 — Record each iteration (NON-NEGOTIABLE)
 
-After each EQ iteration:
-1. Call `save_calibration_iteration` with the run_id, iteration number, RMS before/after, and filters proposed/applied
+After EVERY iteration of EVERY phase (Phase 0 baseline, Phase 1 alignment, Phase 2 PEQ,
+Phase 3 FIR, Phase 4 target shaping — every one):
+
+1. **MUST** call `save_calibration_iteration(run_id, iteration=N, rms_before=..., rms_after=..., filters_proposed=..., filters_applied=..., safety_ok=...)`. This is not optional, even if the iteration was a no-op or "just a measurement."
 2. Report what you measured, what you changed, and convergence status
 
-### Step 7 — Convergence or max iterations
+If you skip this call, the run record will look empty in `get_calibration_runs` even though
+you did the work — exactly the bug seen with runs 17/18 on 2026-04-24, where 57 measurement
+sessions completed but `iterations_run` stayed at 0.
 
-When the recipe's convergence criteria are met:
-1. Call `update_calibration_run` with converged=true, final_rms, iterations_run
-2. Report final state: RMS deviation, filters applied, alignment corrections
+### Step 7 — Convergence or max iterations (NON-NEGOTIABLE)
 
-If max iterations reached without convergence:
-1. Call `update_calibration_run` with converged=false, final_rms, iterations_run
-2. Report final state and remaining deviations
-3. Suggest next steps (room treatment, sub repositioning, different recipe)
+On EVERY exit path — convergence, max iterations, halt, error, user abort — BEFORE any
+cleanup or before reporting "done":
+
+1. **MUST** call `update_calibration_run(run_id, converged=bool, final_rms=..., iterations_run=N, error=...)`. Always. Even on abort. Even on error.
+2. Report final state: RMS deviation, filters applied, alignment corrections, remaining deviations
+3. If not converged, suggest next steps (room treatment, sub repositioning, different recipe)
+
+Same class of bug as `feedback_calibration_cleanup.md` (master gain not restored): closing-state
+instrumentation gets silently skipped at the end of long sessions. Don't let it.
 
 ### Step 8 — Cleanup
 
 1. Call `end_sweep_session` to restore miniDSP source
-2. **Unmute everything** — even if calibration failed
+2. Call `set_master_gain(0)` and verify — `end_sweep_session` does NOT do this
+3. **Unmute everything** — even if calibration failed
 
 ## Important rules
 
@@ -171,7 +179,7 @@ If max iterations reached without convergence:
 5. **Unmute everything** when done, even if calibration fails.
 6. **Do not hardcode frequencies or gains.** Read them from the measurement data and recipe.
 7. **Pass simulation_verified=true** to `apply_eq`/`apply_input_eq` when you have just confirmed the predicted response via `simulate_eq`. This allows +6 dB per iteration instead of +3 dB.
-8. **Record every run.** Call `save_calibration_run` at start, `save_calibration_iteration` after each iteration, `update_calibration_run` at end. Pass `device_state` from `get_device_state` to capture equipment state.
+8. **Record every run — NON-NEGOTIABLE.** `save_calibration_run` at start, `save_calibration_iteration` after EVERY iteration of EVERY phase (no exceptions, including no-op phases), `update_calibration_run` on EVERY exit path BEFORE cleanup (converged, halted, errored, aborted — always). Pass `device_state` from `get_device_state` to capture equipment state. Skipping any of these silently turns a successful calibration into an empty run row — the exact bug seen with runs 17/18 on 2026-04-24.
 9. **Describe every hardware action explicitly.** Before each DSP write, say in plain language what you are doing and why — which inputs/outputs are involved, what values are being set, and what problem it solves. Examples:
    - `configure_matrix`: "Routing input 1 (the Denon HDMI analog input) to outputs 1, 2, and 3. This ensures all subs receive signal — the 2x4 HD default matrix can split inputs across outputs unexpectedly."
    - `set_delay`: "Sub 2 (Nearfield, output 2) arrives 16.8ms earlier than Sub 1 at the mic. Adding 16.8ms delay to output 2 so both subs arrive simultaneously."
