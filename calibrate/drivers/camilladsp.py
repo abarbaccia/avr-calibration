@@ -300,6 +300,8 @@ class CamillaDSPDriver(DSPDriver):
         max_peq_slots: int = 16,
         capture_channels: int | None = None,
         lfe_input_channel: int | None = None,
+        capture_samplerate: int | None = None,
+        resampler: dict | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -324,6 +326,21 @@ class CamillaDSPDriver(DSPDriver):
                 f"for capture_channels={self._capture_channels}"
             )
         self._processing_rate = processing_rate
+        # Multi-rate processing: when capture_samplerate is set and differs from
+        # processing_rate, CamillaDSP inserts a synchronous resampler between the
+        # capture device and the pipeline. Use this to run sub-band processing
+        # (long FIRs for room correction) at a low rate (e.g. 8 kHz) while the
+        # capture device runs at a normal rate (48 kHz). The CPU saving is roughly
+        # (capture_rate / processing_rate) for FFT-partitioned convolution work.
+        # Playback always runs at processing_rate; use a `plug` ALSA device on
+        # the playback side so the kernel handles upsampling to the hardware rate.
+        self._capture_samplerate = int(capture_samplerate) if capture_samplerate else None
+        self._resampler = dict(resampler) if resampler else None
+        if self._capture_samplerate is not None and self._capture_samplerate == self._processing_rate:
+            # No-op rate equality — drop both fields so the emitted config stays
+            # minimal and CamillaDSP doesn't insert a pointless resampler.
+            self._capture_samplerate = None
+            self._resampler = None
         self._chunksize = chunksize
         self._capture_device = dict(capture_device) if capture_device else dict(_DEFAULT_CAPTURE_DEVICE)
         self._playback_device = dict(playback_device) if playback_device else dict(_DEFAULT_PLAYBACK_DEVICE)
@@ -791,13 +808,18 @@ class CamillaDSPDriver(DSPDriver):
 
     def _build_config(self) -> dict:
         """Assemble the full CamillaDSP config dict from shadow state."""
+        devices: dict = {
+            "samplerate": self._processing_rate,
+            "chunksize": self._chunksize,
+            "capture": self._capture_device,
+            "playback": self._playback_device,
+        }
+        if self._capture_samplerate is not None:
+            devices["capture_samplerate"] = self._capture_samplerate
+        if self._resampler is not None:
+            devices["resampler"] = dict(self._resampler)
         return {
-            "devices": {
-                "samplerate": self._processing_rate,
-                "chunksize": self._chunksize,
-                "capture": self._capture_device,
-                "playback": self._playback_device,
-            },
+            "devices": devices,
             "filters": self._build_filters(),
             "mixers": self._build_mixer(),
             "pipeline": self._build_pipeline(),

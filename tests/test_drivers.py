@@ -2348,3 +2348,86 @@ class TestCamillaDSPDirectCapture:
         # direct-capture path — they'd open a device CamillaDSP isn't using.
         mock_sd.query_devices.assert_not_called()
         mock_sd.OutputStream.assert_not_called()
+
+
+# ── Multi-rate processing: low-rate sub band, device at 48 kHz ────────────────
+
+
+class TestCamillaDSPMultirate:
+    """capture_samplerate + resampler: enable a low-rate sub-band processing
+    pipeline (e.g. samplerate=8000 with the device running at 48000) so long
+    FIRs can correct deep room modes without the per-chunk FFT cost of running
+    65k+ taps at the full device rate."""
+
+    def test_default_emits_no_multirate_fields(self) -> None:
+        """Backward compat: omitting both keys leaves the device config minimal."""
+        driver = CamillaDSPDriver()
+        cfg = driver._build_config()
+        assert "capture_samplerate" not in cfg["devices"]
+        assert "resampler" not in cfg["devices"]
+
+    def test_capture_samplerate_emitted_when_set(self) -> None:
+        """capture_samplerate at the devices level instructs CamillaDSP to
+        resample from device rate to processing rate at capture."""
+        driver = CamillaDSPDriver(
+            processing_rate=8000,
+            capture_samplerate=48000,
+        )
+        cfg = driver._build_config()
+        assert cfg["devices"]["samplerate"] == 8000
+        assert cfg["devices"]["capture_samplerate"] == 48000
+
+    def test_resampler_emitted_when_set(self) -> None:
+        """resampler config is passed straight through to CamillaDSP."""
+        driver = CamillaDSPDriver(
+            processing_rate=8000,
+            capture_samplerate=48000,
+            resampler={"type": "AsyncSinc", "profile": "Balanced"},
+        )
+        cfg = driver._build_config()
+        assert cfg["devices"]["resampler"] == {"type": "AsyncSinc", "profile": "Balanced"}
+
+    def test_capture_rate_equal_to_processing_rate_drops_resampler(self) -> None:
+        """When the device rate matches the processing rate, the resampler is
+        a no-op — drop both fields so CamillaDSP doesn't insert a useless stage."""
+        driver = CamillaDSPDriver(
+            processing_rate=48000,
+            capture_samplerate=48000,
+            resampler={"type": "AsyncSinc", "profile": "Balanced"},
+        )
+        cfg = driver._build_config()
+        assert "capture_samplerate" not in cfg["devices"]
+        assert "resampler" not in cfg["devices"]
+
+    def test_resampler_dict_is_copied_not_aliased(self) -> None:
+        """Mutating the caller's dict after construction must not mutate the driver."""
+        resampler = {"type": "AsyncSinc", "profile": "Balanced"}
+        driver = CamillaDSPDriver(
+            processing_rate=8000,
+            capture_samplerate=48000,
+            resampler=resampler,
+        )
+        resampler["profile"] = "Fast"
+        cfg = driver._build_config()
+        assert cfg["devices"]["resampler"]["profile"] == "Balanced"
+
+    def test_registry_passes_through_multirate_keys(self) -> None:
+        """_make_camilladsp wires capture_samplerate + resampler from config."""
+        from calibrate.config import Config, DEFAULT_CONFIG
+        from calibrate.drivers.registry import load_drivers_from_graph
+        cfg = Config({
+            **DEFAULT_CONFIG,
+            "dsp_driver": "camilladsp",
+            "camilladsp": {
+                **DEFAULT_CONFIG["camilladsp"],
+                "samplerate": 8000,
+                "capture_samplerate": 48000,
+                "resampler": {"type": "AsyncSinc", "profile": "Balanced"},
+            },
+        })
+        registry = load_drivers_from_graph(cfg)
+        driver = registry.default_dsp()
+        assert isinstance(driver, CamillaDSPDriver)
+        assert driver._processing_rate == 8000
+        assert driver._capture_samplerate == 48000
+        assert driver._resampler == {"type": "AsyncSinc", "profile": "Balanced"}

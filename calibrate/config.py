@@ -135,8 +135,17 @@ minidsp:
 # camilladsp:
 #   host: "127.0.0.1"
 #   port: 1234
-#   samplerate: 48000
+#   samplerate: 48000          # CamillaDSP processing rate (lower it for sub-only multi-rate)
 #   chunksize: 1024
+#   # Multi-rate sub processing: set samplerate: 8000 for sub-band-only chains.
+#   # CamillaDSP downsamples at capture (resampler block) and a `plug:` playback
+#   # device lets the kernel upsample to hardware rate. 8 kHz internally gives
+#   # a 2-second FIR correction window with 16k taps — enough to tame the
+#   # deepest 23 Hz / 46 Hz modes — at ~6× less CPU than 48 kHz processing.
+#   # capture_samplerate: 48000  # device rate when different from processing samplerate
+#   # resampler:
+#   #   type: AsyncSinc
+#   #   profile: Balanced        # Fast | Balanced | Accurate
 #   input_channels: 2          # logical inputs seen by the cal_matrix mixer
 #   output_channels: 10
 #   # Direct-capture path (no ffmpeg bridge): CamillaDSP opens the multichannel
