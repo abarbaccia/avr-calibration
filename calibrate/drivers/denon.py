@@ -127,6 +127,56 @@ class DenonDriver(AVRDriver):
         await receiver.async_update()
         return receiver.volume  # type: ignore[no-any-return]
 
+    async def audyssey_status(self) -> dict:
+        """Report whether Audyssey distance compensation is currently active.
+
+        Audyssey distance/level/EQ only applies when:
+          - Sound mode is NOT "PURE DIRECT" (Pure Direct bypasses all DSP)
+          - MultEQ is NOT "Off"
+
+        Returns a dict with ``active`` (bool|None), ``sound_mode`` (str|None),
+        ``multi_eq`` (str|None), and ``reason`` (str|None) explaining when
+        ``active`` is False. ``active=None`` means we couldn't determine
+        (e.g. fields not yet populated by the denonavr lib) — treat as
+        unknown rather than asserting either way.
+        """
+        if not self._host:
+            raise DriverError("no host configured")
+        receiver = await _connect_receiver(self._host)
+        try:
+            await receiver.audyssey.async_update()
+        except Exception as exc:
+            log.warning("audyssey async_update failed: %s", exc)
+
+        try:
+            sound_mode = receiver.soundmode.sound_mode
+        except Exception:
+            sound_mode = None
+        try:
+            multi_eq = receiver.audyssey.multi_eq
+        except Exception:
+            multi_eq = None
+
+        reason: str | None = None
+        active: bool | None
+        if sound_mode is None and multi_eq is None:
+            active = None
+        elif isinstance(sound_mode, str) and sound_mode.upper() == "PURE DIRECT":
+            active = False
+            reason = "sound mode is Pure Direct — bypasses all DSP including Audyssey"
+        elif isinstance(multi_eq, str) and multi_eq.lower() == "off":
+            active = False
+            reason = "MultEQ is Off — Audyssey distance/level/EQ disabled"
+        else:
+            active = True
+
+        return {
+            "active": active,
+            "sound_mode": sound_mode,
+            "multi_eq": multi_eq,
+            "reason": reason,
+        }
+
     async def discover(self) -> list[str]:
         """SSDP scan for Denon/Marantz AVRs on the local network."""
         try:

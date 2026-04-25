@@ -3422,16 +3422,44 @@ async def _tool_set_speaker_distances(
         return _err(f"distance push failed: {exc}")
 
     avr_max_delay_ms = getattr(_avr, "MAX_SPEAKER_DELAY_MS", None)
+
+    # Check whether Audyssey distance compensation is currently active. The
+    # write itself succeeds in any sound mode, but distance compensation
+    # is only applied when the AVR is using Audyssey (non-Pure-Direct,
+    # MultEQ on). Surfacing this catches the silent "wrote but not applied"
+    # failure that's easy to miss otherwise.
+    audyssey: dict | None = None
+    if hasattr(_avr, "audyssey_status"):
+        try:
+            audyssey = await _avr.audyssey_status()  # type: ignore[attr-defined]
+        except DriverError as exc:
+            audyssey = {"active": None, "error": str(exc)}
+
+    parts = ["Distances written."]
+    parts.append("Persisted to NVRAM." if commit else "Volatile — pass commit=True to persist.")
+    if avr_max_delay_ms:
+        parts.append(f"AVR caps applied delay at {avr_max_delay_ms}ms per channel.")
+    if audyssey is not None:
+        if audyssey.get("active") is False:
+            parts.append(
+                f"WARNING: Audyssey is INACTIVE ({audyssey.get('reason') or 'see sound mode'}); "
+                "distances are stored but NOT being applied to the audio path. "
+                "Switch to a non-Pure-Direct sound mode with MultEQ on to use them."
+            )
+        elif audyssey.get("active") is None and "error" not in audyssey:
+            parts.append(
+                "Could not confirm Audyssey active state — verify with a measurement."
+            )
+        elif "error" in audyssey:
+            parts.append(f"Audyssey state probe failed: {audyssey['error']}")
+
     return _ok(
         distances_cm={ch: round(m * 100) for ch, m in distances.items()},
         n_positions=int(n_positions),
         committed=bool(commit),
         avr_max_delay_ms=avr_max_delay_ms,
-        message=(
-            "Distances written. "
-            + ("Persisted to NVRAM." if commit else "Volatile — pass commit=True to persist.")
-            + (f" AVR caps applied delay at {avr_max_delay_ms}ms per channel." if avr_max_delay_ms else "")
-        ),
+        audyssey=audyssey,
+        message=" ".join(parts),
     )
 
 
@@ -5703,6 +5731,12 @@ _TOOLS: list[Tool] = [
             "The configured value persists past the UI cap; the AVR firmware "
             "still caps the *applied* per-channel delay at "
             "MAX_SPEAKER_DELAY_MS (see get_state). "
+            "IMPORTANT: distances are only APPLIED when Audyssey is active — "
+            "i.e. sound mode is NOT Pure Direct AND MultEQ is NOT Off. The "
+            "tool response includes an `audyssey` field reporting whether the "
+            "current sound mode + MultEQ setting will actually apply the "
+            "distances; if `audyssey.active` is False the write succeeds but "
+            "the audio path silently ignores it. "
             "REQUIRES EXPLICIT USER CONFIRMATION before calling — this writes "
             "Audyssey calibration state. Always summarise distances + commit "
             "flag and wait for the user to approve."

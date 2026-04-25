@@ -5964,6 +5964,9 @@ async def test_set_speaker_distances_dispatches_to_driver() -> None:
     avr = AsyncMock()
     avr.set_speaker_distances.return_value = None
     avr.MAX_SPEAKER_DELAY_MS = 65.0
+    avr.audyssey_status.return_value = {
+        "active": True, "sound_mode": "MOVIE", "multi_eq": "Reference", "reason": None,
+    }
     with patch("calibrate.mcp_server._avr", avr):
         result = await _tool_set_speaker_distances(
             distances={"FL": 4.05, "SW1": 30.72},
@@ -5974,6 +5977,7 @@ async def test_set_speaker_distances_dispatches_to_driver() -> None:
     assert result["committed"] is True
     assert result["distances_cm"] == {"FL": 405, "SW1": 3072}
     assert result["avr_max_delay_ms"] == 65.0
+    assert result["audyssey"]["active"] is True
     avr.set_speaker_distances.assert_awaited_once_with(
         {"FL": 4.05, "SW1": 30.72}, n_positions=3, commit=True,
     )
@@ -6023,6 +6027,7 @@ async def test_set_speaker_distances_volatile_message() -> None:
     """Without commit, the message must warn the change is volatile."""
     avr = AsyncMock()
     avr.MAX_SPEAKER_DELAY_MS = 65.0
+    avr.audyssey_status.return_value = {"active": True, "sound_mode": "MOVIE", "multi_eq": "Reference", "reason": None}
     with patch("calibrate.mcp_server._avr", avr):
         result = await _tool_set_speaker_distances(
             distances={"SW1": 30.72}, commit=False,
@@ -6030,3 +6035,87 @@ async def test_set_speaker_distances_volatile_message() -> None:
     assert result["ok"]
     assert result["committed"] is False
     assert "Volatile" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_set_speaker_distances_warns_when_audyssey_inactive_pure_direct() -> None:
+    """Pure Direct bypasses Audyssey — write succeeds but distances not applied."""
+    avr = AsyncMock()
+    avr.MAX_SPEAKER_DELAY_MS = 65.0
+    avr.audyssey_status.return_value = {
+        "active": False,
+        "sound_mode": "PURE DIRECT",
+        "multi_eq": "Reference",
+        "reason": "sound mode is Pure Direct — bypasses all DSP including Audyssey",
+    }
+    with patch("calibrate.mcp_server._avr", avr):
+        result = await _tool_set_speaker_distances(distances={"SW1": 30.72}, commit=True)
+    assert result["ok"]
+    assert result["audyssey"]["active"] is False
+    assert "WARNING" in result["message"]
+    assert "INACTIVE" in result["message"]
+    assert "Pure Direct" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_set_speaker_distances_warns_when_multi_eq_off() -> None:
+    """MultEQ Off disables Audyssey distance compensation."""
+    avr = AsyncMock()
+    avr.MAX_SPEAKER_DELAY_MS = 65.0
+    avr.audyssey_status.return_value = {
+        "active": False,
+        "sound_mode": "STEREO",
+        "multi_eq": "Off",
+        "reason": "MultEQ is Off — Audyssey distance/level/EQ disabled",
+    }
+    with patch("calibrate.mcp_server._avr", avr):
+        result = await _tool_set_speaker_distances(distances={"SW1": 30.72}, commit=True)
+    assert result["ok"]
+    assert result["audyssey"]["active"] is False
+    assert "WARNING" in result["message"]
+    assert "MultEQ is Off" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_set_speaker_distances_unknown_audyssey_state_warns_softly() -> None:
+    """When we can't determine Audyssey state, surface that — don't silently claim success."""
+    avr = AsyncMock()
+    avr.MAX_SPEAKER_DELAY_MS = 65.0
+    avr.audyssey_status.return_value = {
+        "active": None,
+        "sound_mode": None,
+        "multi_eq": None,
+        "reason": None,
+    }
+    with patch("calibrate.mcp_server._avr", avr):
+        result = await _tool_set_speaker_distances(distances={"SW1": 30.72}, commit=True)
+    assert result["ok"]
+    assert result["audyssey"]["active"] is None
+    assert "Could not confirm" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_set_speaker_distances_audyssey_status_error_surfaced() -> None:
+    """If audyssey_status raises DriverError, the push still succeeds but the error is surfaced."""
+    avr = AsyncMock()
+    avr.MAX_SPEAKER_DELAY_MS = 65.0
+    avr.audyssey_status.side_effect = DriverError("avr unreachable for audyssey probe")
+    with patch("calibrate.mcp_server._avr", avr):
+        result = await _tool_set_speaker_distances(distances={"SW1": 30.72}, commit=True)
+    assert result["ok"]
+    assert result["audyssey"]["active"] is None
+    assert "Audyssey state probe failed" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_set_speaker_distances_skips_audyssey_check_when_unsupported() -> None:
+    """AVR drivers without audyssey_status (future YamahaDriver etc.) don't crash the tool."""
+    class _PlainAvr:
+        MAX_SPEAKER_DELAY_MS = 65.0
+        async def set_speaker_distances(self, distances, *, n_positions=1, commit=False):
+            return None
+        # no audyssey_status method
+    with patch("calibrate.mcp_server._avr", _PlainAvr()):
+        result = await _tool_set_speaker_distances(distances={"SW1": 30.72}, commit=True)
+    assert result["ok"]
+    assert result["audyssey"] is None
