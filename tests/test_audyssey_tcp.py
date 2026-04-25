@@ -169,3 +169,79 @@ async def test_denon_get_state_includes_max_delay() -> None:
         driver = DenonDriver(host="192.168.1.209")
         state = await driver.get_state()
     assert state["max_speaker_delay_ms"] == DenonDriver.MAX_SPEAKER_DELAY_MS
+
+
+# ── DenonDriver.audyssey_status ────────────────────────────────────────────────
+
+
+def _mock_receiver(sound_mode: str | None, multi_eq: str | None):
+    """Build a denonavr receiver mock with given sound_mode and multi_eq."""
+    from unittest.mock import AsyncMock, MagicMock
+    receiver = MagicMock()
+    receiver.async_setup = AsyncMock()
+    receiver.async_update = AsyncMock()
+    receiver.audyssey.async_update = AsyncMock()
+    receiver.soundmode.sound_mode = sound_mode
+    receiver.audyssey.multi_eq = multi_eq
+    return receiver
+
+
+@pytest.mark.asyncio
+async def test_audyssey_status_active_in_movie_with_multeq() -> None:
+    """Normal listening case: MOVIE mode + MultEQ Reference → active."""
+    receiver = _mock_receiver("MOVIE", "Reference")
+    from unittest.mock import MagicMock
+    mod = MagicMock()
+    mod.DenonAVR = MagicMock(return_value=receiver)
+    with patch.dict(sys.modules, {"denonavr": mod}):
+        status = await DenonDriver(host="192.168.1.209").audyssey_status()
+    assert status["active"] is True
+    assert status["sound_mode"] == "MOVIE"
+    assert status["multi_eq"] == "Reference"
+    assert status["reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_audyssey_status_pure_direct_inactive() -> None:
+    """Pure Direct bypasses ALL DSP — distances not applied even if MultEQ is on."""
+    receiver = _mock_receiver("PURE DIRECT", "Reference")
+    from unittest.mock import MagicMock
+    mod = MagicMock()
+    mod.DenonAVR = MagicMock(return_value=receiver)
+    with patch.dict(sys.modules, {"denonavr": mod}):
+        status = await DenonDriver(host="192.168.1.209").audyssey_status()
+    assert status["active"] is False
+    assert "Pure Direct" in status["reason"]
+
+
+@pytest.mark.asyncio
+async def test_audyssey_status_multeq_off_inactive() -> None:
+    """MultEQ Off → distances aren't applied, even outside Pure Direct."""
+    receiver = _mock_receiver("STEREO", "Off")
+    from unittest.mock import MagicMock
+    mod = MagicMock()
+    mod.DenonAVR = MagicMock(return_value=receiver)
+    with patch.dict(sys.modules, {"denonavr": mod}):
+        status = await DenonDriver(host="192.168.1.209").audyssey_status()
+    assert status["active"] is False
+    assert "MultEQ is Off" in status["reason"]
+
+
+@pytest.mark.asyncio
+async def test_audyssey_status_unknown_when_fields_none() -> None:
+    """If denonavr hasn't populated either field, return None — caller treats as unknown."""
+    receiver = _mock_receiver(None, None)
+    from unittest.mock import MagicMock
+    mod = MagicMock()
+    mod.DenonAVR = MagicMock(return_value=receiver)
+    with patch.dict(sys.modules, {"denonavr": mod}):
+        status = await DenonDriver(host="192.168.1.209").audyssey_status()
+    assert status["active"] is None
+    assert status["reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_audyssey_status_no_host_raises() -> None:
+    driver = DenonDriver(host=None)
+    with pytest.raises(DriverError, match="no host"):
+        await driver.audyssey_status()
