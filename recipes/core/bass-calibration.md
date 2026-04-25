@@ -1,5 +1,32 @@
 # Recipe: Bass Calibration
-version: 2.0
+version: 2.1
+
+## Compliance — Run Instrumentation (NON-NEGOTIABLE)
+
+Run-instrumentation is mandatory — never skip the bookkeeping. This is the
+same class of bug as `feedback_calibration_cleanup.md`: the calibration work
+completes, but a closing-state step is silently skipped, leaving no audit
+trail. Runs 17 and 18 from 2026-04-24 each ran 57 measurement sessions but
+recorded `iterations_run=0` and no `calibration_iterations` rows because
+this rule was implicit. Make it explicit.
+
+1. **At START:** `run_id` MUST already be in scope. The `/avr:calibrate`
+   skill calls `save_calibration_run` before invoking this recipe — if
+   `run_id` is not set, abort and surface the missing handshake.
+2. **After EVERY iteration** (Phase 0 level matching, Phase 1 alignment,
+   Phase 2 per-sub PEQ, Phase 3 FIR if applicable, Phase 4 target shaping
+   — every loop pass, including no-op passes that confirm convergence):
+   MUST call
+   `save_calibration_iteration(run_id, iteration=N, rms_before=..., rms_after=..., filters_proposed=..., filters_applied=..., safety_ok=...)`.
+   `filters_proposed` MUST include which recipe step produced the
+   decision, so post-hoc audits can detect skips.
+3. **On EARLY EXIT for ANY reason** (convergence, max iterations,
+   SafetyValidator halt, hardware error, user abort, "looks good enough",
+   recipe deviation): MUST call
+   `update_calibration_run(run_id, converged=<bool>, final_rms=<float>, iterations_run=<N>, error=<str-or-null>)`
+   **BEFORE** running Phase 6 cleanup or telling the user "done."
+4. Reporting "calibration complete" without these calls is a recipe
+   violation, regardless of how good the final FR looks.
 
 ## Goal
 

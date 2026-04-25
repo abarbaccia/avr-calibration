@@ -25,6 +25,28 @@ Rules:
 5. **Record compliance in each `save_calibration_iteration` call.** The
    `filters_proposed` field must include which recipe step produced the
    decision, so post-hoc audits can detect skips.
+6. **Run-instrumentation is mandatory — never skip the bookkeeping.** This
+   is the same class of bug as `feedback_calibration_cleanup.md`: the work
+   completes, but a closing-state step is silently skipped, leaving no
+   audit trail. Concrete enforcement:
+   - **At START:** `run_id` MUST already be in scope. The `/avr:calibrate`
+     skill calls `save_calibration_run` before invoking this recipe — if
+     `run_id` is not set, abort and surface the missing handshake.
+   - **After EVERY iteration** (Phase 0 reset, Phase 1 alignment, Phase 2
+     per-sub FIR, Phase 2.5a mixed-phase decision, Phase 3 target shaping
+     — every loop pass, including no-op passes that confirm convergence):
+     MUST call
+     `save_calibration_iteration(run_id, iteration=N, rms_before=..., rms_after=..., filters_proposed=..., filters_applied=..., safety_ok=...)`.
+     `filters_proposed` MUST include the recipe step (rule 5).
+   - **On EARLY EXIT for ANY reason** (convergence, max iterations,
+     SafetyValidator halt, hardware error, user abort, "looks good
+     enough", recipe deviation): MUST call
+     `update_calibration_run(run_id, converged=<bool>, final_rms=<float>, iterations_run=<N>, error=<str-or-null>)`
+     **BEFORE** running Phase 5 cleanup or telling the user "done."
+   - Runs 17 and 18 from 2026-04-24 completed 57 measurement sessions and
+     applied 65k-tap mixed-phase FIRs but recorded `iterations_run=0` and
+     no `calibration_iterations` rows. That happened because this rule
+     wasn't explicit. Do not repeat it.
 
 If at any point the recipe feels wrong for the hardware in front of you,
 surface the disagreement to the user and amend the recipe — do not silently
