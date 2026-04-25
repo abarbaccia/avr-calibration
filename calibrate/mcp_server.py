@@ -3033,13 +3033,16 @@ async def _tool_design_fir(
         decay. Safe default.
       - "linear": symmetric impulse, full magnitude + phase correction.
         Latency = num_taps / 2 / sample_rate. At 65 536 taps / 48 kHz this
-        is 683 ms, well beyond most AVR lip-sync budgets.
+        is 683 ms, far past the AVR's per-channel speaker-distance
+        compensation range.
       - "mixed": homomorphic decomposition into a min-phase magnitude part
         and a bounded excess-phase all-pass part. The excess-phase component
         is windowed so pre-ringing stays within ``preringing_ms`` (default
-        25 ms). This actively cancels modal decay while keeping latency
-        within typical AVR Audio-Delay/lip-sync budgets. Below ~100 Hz the
-        ear integrates over 20-30 ms so the pre-ringing is inaudible.
+        25 ms). This actively cancels modal decay while keeping the latency
+        compensable via the AVR's MAINS speaker-distance setting (the FIR
+        delays the sub chain only; mains must be set LARGER than physical
+        to wait for the FIR-delayed sub). Below ~100 Hz the ear integrates
+        over 20-30 ms so the pre-ringing is inaudible.
         Latency ≈ ``preringing_ms`` + a few ms for the min-phase core.
         Set ``preringing_ms=0`` to degenerate to minimum-phase.
 
@@ -3323,8 +3326,10 @@ async def _tool_design_fir(
             result["note"] = (
                 f"FIR at {fir_fs}Hz, {num_taps} taps, {phase_mode} phase. "
                 f"Freq resolution: {freq_resolution}Hz. Pre-ringing: {pre_ringing_ms}ms. "
-                f"Latency: {latency_ms}ms (compensate via AVR Audio Delay or "
-                f"speaker-distance settings). Pass coefficients to "
+                f"Latency: {latency_ms}ms (compensate via per-channel mains "
+                f"speaker-distance — set mains LARGER than physical so they "
+                f"wait for the FIR-delayed sub; lip-sync/Audio-Delay does NOT "
+                f"help, that delays all audio uniformly). Pass coefficients to "
                 f"apply_fir(output_index, coefficients) or "
                 f"apply_fir(output_index, design_session_id={session_id})."
             )
@@ -5007,7 +5012,7 @@ async def _tool_recommend_fir_phase(
     peak_db_threshold: float = 0.0,
     freq_min: float = 20.0,
     freq_max: float = 200.0,
-    audio_delay_budget_ms: float = 200.0,
+    mains_distance_budget_ms: float = 53.0,
     preringing_ms: float = 25.0,
 ) -> dict:
     """Recommend FIR phase mode + tap count based on post-FIR decay.
@@ -5107,14 +5112,20 @@ async def _tool_recommend_fir_phase(
 
         # Latency budgeting. With proper mixed-phase, the FIR's added audio
         # latency is ≈ preringing_ms (the windowed excess-phase extent) — NOT
-        # the tap count. The AVR's Audio Delay / lip-sync control must cover
-        # this. Typical home AVRs (Denon X-series) budget 200 ms; if the
-        # requested pre-ringing exceeds that, we cap the pre-ringing window
-        # and advise the user.
+        # the tap count. Because CamillaDSP only processes the LFE/sub chain
+        # in this signal path, the latency is sub-only — the AVR must delay
+        # its MAINS/centre/surrounds by the same amount via per-channel
+        # speaker-distance compensation, NOT via the global "Audio Delay /
+        # lip-sync" slider (which delays *all* audio uniformly relative to
+        # video and does nothing for sub-vs-mains alignment).
+        # Denon X-series UI caps speaker distance at 60 ft ≈ 53 ms. Beyond
+        # that, write the value via MultEQ-X / ratbuddyssey through the OCA
+        # protocol on port 1256 — the firmware accepts larger values than
+        # the UI exposes.
         suggested_preringing_ms = preringing_ms
-        fits_in_budget = suggested_preringing_ms <= audio_delay_budget_ms
+        fits_in_budget = suggested_preringing_ms <= mains_distance_budget_ms
         if not fits_in_budget:
-            suggested_preringing_ms = audio_delay_budget_ms
+            suggested_preringing_ms = mains_distance_budget_ms
         # Estimated latency = preringing window half-width (peak of mixed
         # impulse lands at that offset) + a sample or two for the min-phase
         # core's tiny group delay.
@@ -5124,13 +5135,20 @@ async def _tool_recommend_fir_phase(
             f"{m['freq_hz']:.1f} Hz T60={m['t60_ms']:.0f} ms" for m in offenders[:3]
         )
         budget_note = (
-            f"Latency fits the {audio_delay_budget_ms:.0f} ms AVR Audio-Delay "
-            f"budget — no lip-sync concern."
+            f"Sub-chain latency fits in the mains-distance budget "
+            f"({mains_distance_budget_ms:.0f} ms ≈ "
+            f"{mains_distance_budget_ms * 1.13:.0f} ft). Compensate by "
+            f"setting the AVR mains/centre/surrounds distance LARGER than "
+            f"physical so they wait for the FIR-delayed sub."
         ) if fits_in_budget else (
             f"WARNING: requested pre-ringing {preringing_ms:.0f} ms exceeds "
-            f"the {audio_delay_budget_ms:.0f} ms AVR Audio-Delay budget; "
-            f"clamped to {suggested_preringing_ms:.0f} ms. Some modal decay "
-            f"cancellation will be sacrificed."
+            f"the {mains_distance_budget_ms:.0f} ms mains-distance UI cap "
+            f"(~{mains_distance_budget_ms * 1.13:.0f} ft on Denon X-series). "
+            f"Either clamp pre-ringing to {suggested_preringing_ms:.0f} ms "
+            f"(losing some decay cancellation), or push the per-channel "
+            f"distance past the UI limit via MultEQ-X / ratbuddyssey on "
+            f"port 1256 — the firmware accepts the value, only the UI "
+            f"clamps it."
         )
         return _ok(
             session_id=session_id,
@@ -5139,7 +5157,7 @@ async def _tool_recommend_fir_phase(
             suggested_num_taps=suggested,
             suggested_preringing_ms=suggested_preringing_ms,
             estimated_latency_ms=estimated_latency_ms,
-            audio_delay_budget_ms=audio_delay_budget_ms,
+            mains_distance_budget_ms=mains_distance_budget_ms,
             fits_in_budget=fits_in_budget,
             t60_threshold_ms=t60_threshold_ms,
             peak_db_threshold=peak_db_threshold,
@@ -6384,16 +6402,20 @@ _TOOLS: list[Tool] = [
                 },
                 "freq_min": {"type": "number", "default": 20.0},
                 "freq_max": {"type": "number", "default": 200.0},
-                "audio_delay_budget_ms": {
+                "mains_distance_budget_ms": {
                     "type": "number",
                     "description": (
-                        "Maximum audio latency the downstream AVR can compensate "
-                        "via its Audio-Delay/lip-sync control. Default 200 ms "
-                        "(Denon X-series). If the recommended pre-ringing "
-                        "window exceeds this, it's clamped and the response "
-                        "flags fits_in_budget=false."
+                        "Per-channel mains/centre/surround speaker-distance "
+                        "headroom available to compensate for FIR-induced sub "
+                        "latency. The FIR delays the sub chain only; mains must "
+                        "be delayed by the same amount via DISTANCE settings "
+                        "(not the global 'Audio Delay/lip-sync' slider, which "
+                        "is for video sync). Default 53 ms ≈ 60 ft, the "
+                        "Denon X-series UI cap. The firmware accepts larger "
+                        "values; write them via MultEQ-X / ratbuddyssey on "
+                        "port 1256 to push past the UI clamp."
                     ),
-                    "default": 200.0,
+                    "default": 53.0,
                 },
                 "preringing_ms": {
                     "type": "number",
@@ -7515,7 +7537,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             peak_db_threshold=float(arguments.get("peak_db_threshold", 0.0)),
             freq_min=float(arguments.get("freq_min", 20.0)),
             freq_max=float(arguments.get("freq_max", 200.0)),
-            audio_delay_budget_ms=float(arguments.get("audio_delay_budget_ms", 200.0)),
+            mains_distance_budget_ms=float(arguments.get(
+                "mains_distance_budget_ms",
+                arguments.get("audio_delay_budget_ms", 53.0),  # back-compat alias
+            )),
             preringing_ms=float(arguments.get("preringing_ms", 25.0)),
         )
     elif name == "verify_fir_effect":

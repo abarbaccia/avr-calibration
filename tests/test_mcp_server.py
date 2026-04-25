@@ -2240,7 +2240,7 @@ async def test_call_tool_recommend_fir_phase_dispatch() -> None:
 @pytest.mark.asyncio
 async def test_recommend_fir_phase_suggests_preringing_and_latency() -> None:
     """When recommending mixed, the response includes suggested_preringing_ms,
-    estimated_latency_ms, and whether it fits in the AVR audio-delay budget."""
+    estimated_latency_ms, and whether it fits in the AVR mains-distance budget."""
     session = _make_session_with_ringing_ir(session_id=1)
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
@@ -2248,19 +2248,19 @@ async def test_recommend_fir_phase_suggests_preringing_and_latency() -> None:
             session_id=1,
             t60_threshold_ms=300.0,
             preringing_ms=25.0,
-            audio_delay_budget_ms=200.0,
+            mains_distance_budget_ms=53.0,
         )
     assert result["ok"]
     assert result["recommendation"] == "mixed"
     assert result["suggested_preringing_ms"] == 25.0
     assert result["estimated_latency_ms"] == pytest.approx(25.0, abs=1.0)
     assert result["fits_in_budget"] is True
-    assert result["audio_delay_budget_ms"] == 200.0
+    assert result["mains_distance_budget_ms"] == 53.0
 
 
 @pytest.mark.asyncio
 async def test_recommend_fir_phase_clamps_preringing_to_budget() -> None:
-    """If preringing_ms exceeds audio_delay_budget_ms, clamp and flag."""
+    """If preringing_ms exceeds mains_distance_budget_ms, clamp and flag."""
     session = _make_session_with_ringing_ir(session_id=1)
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
@@ -2268,13 +2268,15 @@ async def test_recommend_fir_phase_clamps_preringing_to_budget() -> None:
             session_id=1,
             t60_threshold_ms=300.0,
             preringing_ms=500.0,
-            audio_delay_budget_ms=200.0,
+            mains_distance_budget_ms=53.0,
         )
     assert result["ok"]
     assert result["recommendation"] == "mixed"
-    assert result["suggested_preringing_ms"] == 200.0  # clamped
+    assert result["suggested_preringing_ms"] == 53.0  # clamped to mains-distance budget
     assert result["fits_in_budget"] is False
-    assert "exceeds" in result["note"].lower() or "warning" in result["note"].lower()
+    note_lower = result["note"].lower()
+    assert "exceeds" in note_lower or "warning" in note_lower
+    assert "ratbuddyssey" in note_lower or "multeq" in note_lower
 
 
 # ── get_measurement_history — frequency filtering ─────────────────────────────

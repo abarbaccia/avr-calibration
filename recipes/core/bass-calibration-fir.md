@@ -453,11 +453,22 @@ post-FIR solo measurement (Phase 2.4):
      audio latency AND the psychoacoustic pre-ringing window — below
      ~100 Hz the ear integrates over 20–30 ms so the pre-ringing is
      inaudible. The `fits_in_budget` flag tells you whether the pre-ringing
-     stays within the AVR's Audio-Delay compensation range.
+     stays within the AVR's per-channel speaker-distance compensation
+     range (default 53 ms ≈ 60 ft, the Denon X-series UI cap).
    - Apply via `apply_fir(output_index=N, design_session_id=<pre_FIR_solo>)`.
-   - **Set the AVR's Audio-Delay / lip-sync** to match the design's reported
-     `latency_ms` so video stays in sync with the bass. On Denon X-series
-     this is under Menu → Audio → Audio Delay.
+   - **Compensate the FIR latency on the MAINS, not via lip-sync.** The
+     CamillaDSP pipeline only processes the LFE/sub chain — mains pass
+     through the AVR's amps directly. Sub is now late by `latency_ms`
+     relative to mains. Increase the per-channel **speaker DISTANCE**
+     setting for mains/centre/surrounds by `latency_ms × 1.13 ft/ms`
+     (or `× 0.343 m/ms`) so the AVR delays them to wait for the FIR-
+     delayed sub. Do NOT use the global "Audio Delay / lip-sync" slider
+     (Menu → Audio → Audio Delay) — that delays *all* audio uniformly
+     relative to video, which preserves the sub-vs-mains misalignment.
+   - **If the required mains distance exceeds 60 ft** (the Denon X-series
+     UI cap), use MultEQ-X / ratbuddyssey on TCP port 1256 to write
+     larger distance values directly via the OCA protocol. The firmware
+     accepts values past the UI clamp; only the on-device UI clamps them.
    - Re-measure that sub solo.
    - Re-run `recommend_fir_phase` on the new post-mixed-FIR measurement. If
      it still returns "mixed" on the second pass, document the residual,
