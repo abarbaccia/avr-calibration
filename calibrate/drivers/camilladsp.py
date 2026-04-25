@@ -172,10 +172,12 @@ class _BridgeSweepContext:
         driver: "CamillaDSPDriver",
         bridge_service: str | None,
         playback_device: str,
+        needs_loopback_prime: bool = True,
     ) -> None:
         self._driver = driver
         self._bridge_service = bridge_service
         self._playback_device = playback_device
+        self._needs_loopback_prime = needs_loopback_prime
         self.active = False
 
     async def enter(self) -> "_BridgeSweepContext":
@@ -189,7 +191,10 @@ class _BridgeSweepContext:
                 ),
             )
 
-        await self._prime_loopback()
+        if self._needs_loopback_prime:
+            await self._prime_loopback()
+        else:
+            log.info("sweep_context: direct-capture path, skipping loopback prime")
         self.active = True
         return self
 
@@ -293,19 +298,38 @@ class CamillaDSPDriver(DSPDriver):
         capture_device: dict | None = None,
         playback_device: dict | None = None,
         max_peq_slots: int = 16,
+        capture_channels: int | None = None,
+        lfe_input_channel: int | None = None,
     ) -> None:
         self._host = host
         self._port = port
         self._sub_outputs = sub_outputs or [0, 1]
         self._output_channels = output_channels
         self._input_channels = input_channels
+        # capture_channels is the PHYSICAL channel count opened on the ALSA
+        # capture device. input_channels is the LOGICAL count seen by the
+        # cal_matrix mixer and routing/PEQ code. They differ when CamillaDSP
+        # captures a multichannel device directly (e.g. Focusrite 18i20, 20ch)
+        # and only a single physical channel carries the signal of interest.
+        self._capture_channels = int(capture_channels) if capture_channels else input_channels
+        self._lfe_input_channel = int(lfe_input_channel) if lfe_input_channel is not None else None
+        if self._capture_channels != self._input_channels and self._lfe_input_channel is None:
+            raise ValueError(
+                f"capture_channels={self._capture_channels} != input_channels={self._input_channels} "
+                f"requires lfe_input_channel to specify which physical channel to fan out"
+            )
+        if self._lfe_input_channel is not None and not (0 <= self._lfe_input_channel < self._capture_channels):
+            raise ValueError(
+                f"lfe_input_channel={self._lfe_input_channel} out of range "
+                f"for capture_channels={self._capture_channels}"
+            )
         self._processing_rate = processing_rate
         self._chunksize = chunksize
         self._capture_device = dict(capture_device) if capture_device else dict(_DEFAULT_CAPTURE_DEVICE)
         self._playback_device = dict(playback_device) if playback_device else dict(_DEFAULT_PLAYBACK_DEVICE)
         # Keep the declared device channel counts aligned with the driver's
         # channel counts — CamillaDSP will reject a mismatched config otherwise.
-        self._capture_device["channels"] = input_channels
+        self._capture_device["channels"] = self._capture_channels
         self._playback_device["channels"] = output_channels
 
         self._lock = asyncio.Lock()
@@ -649,6 +673,42 @@ class CamillaDSPDriver(DSPDriver):
 
         return filters
 
+    def _needs_capture_mixer(self) -> bool:
+        """True when the physical capture stream needs reshaping into logical inputs.
+
+        Today the only reshape is fan-out: one physical channel (the LFE feed
+        from the AVR's sub pre-out) replicated to every logical input so the
+        downstream cal_matrix sees a 2-channel mono signal. When physical and
+        logical counts match (the legacy Loopback path), no reshape is needed.
+        """
+        return self._capture_channels != self._input_channels
+
+    def _build_capture_mixer(self) -> dict | None:
+        """Build the pre-cal_matrix mixer that reshapes physical → logical inputs.
+
+        Returns ``None`` when no reshape is needed (capture_channels == input_channels).
+        Otherwise emits a mixer named ``cal_capture`` with one source per logical
+        input, all reading from ``lfe_input_channel`` of the capture stream.
+        """
+        if not self._needs_capture_mixer():
+            return None
+        assert self._lfe_input_channel is not None
+        mapping: list[dict] = []
+        for logical in range(self._input_channels):
+            mapping.append({
+                "dest": logical,
+                "sources": [{
+                    "channel": self._lfe_input_channel,
+                    "gain": 0.0,
+                    "inverted": False,
+                    "mute": False,
+                }],
+            })
+        return {
+            "channels": {"in": self._capture_channels, "out": self._input_channels},
+            "mapping": mapping,
+        }
+
     def _build_mixer(self) -> dict:
         """Build the input→output routing mixer.
 
@@ -677,12 +737,16 @@ class CamillaDSPDriver(DSPDriver):
                             "mute": False,
                         })
             mapping.append({"dest": out_idx, "sources": sources})
-        return {
+        mixers: dict = {
             "cal_matrix": {
                 "channels": {"in": self._input_channels, "out": self._output_channels},
                 "mapping": mapping,
             }
         }
+        capture_mixer = self._build_capture_mixer()
+        if capture_mixer is not None:
+            mixers["cal_capture"] = capture_mixer
+        return mixers
 
     def _build_pipeline(self) -> list[dict]:
         """Emit pipeline steps: input PEQ → mixer → per-output processing.
@@ -692,6 +756,13 @@ class CamillaDSPDriver(DSPDriver):
         single step apply identical filters to several channels at once.
         """
         steps: list[dict] = []
+
+        # Capture mixer (when present) reshapes physical capture channels into
+        # logical inputs before any per-input processing runs. Subsequent steps
+        # see exactly self._input_channels channels, identical to the legacy
+        # Loopback path.
+        if self._needs_capture_mixer():
+            steps.append({"type": "Mixer", "name": "cal_capture"})
 
         # Input-side PEQ, per input channel (pre-mixer).
         for inp_idx in range(self._input_channels):
@@ -981,7 +1052,15 @@ class CamillaDSPDriver(DSPDriver):
         # USB route: wrap bridge stop/start + loopback primer.
         bridge_service = config.camilladsp.get("bridge_service")
         playback_device = config.measurement.get("playback_device", "")
-        return _BridgeSweepContext(self, bridge_service, playback_device)
+        # Loopback prime is only meaningful when CamillaDSP captures from the
+        # ALSA Loopback device — it wakes the loopback's read side. With direct
+        # USB capture (Focusrite et al.), the prime opens an unrelated device
+        # and is skipped.
+        capture_dev = str(self._capture_device.get("device", ""))
+        needs_prime = capture_dev.startswith("hw:Loopback")
+        return _BridgeSweepContext(
+            self, bridge_service, playback_device, needs_loopback_prime=needs_prime,
+        )
 
     async def pipeline_state(self) -> str:
         """Return the CamillaDSP pipeline state string.
