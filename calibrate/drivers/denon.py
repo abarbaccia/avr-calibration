@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Mapping
 
+from . import audyssey_tcp
 from .avr_driver import AVRDriver
 from .base import DriverError
 
@@ -47,6 +49,14 @@ async def _connect_receiver(host: str):
 class DenonDriver(AVRDriver):
     """AVRDriver for Denon X-series (and Marantz) receivers via denonavr."""
 
+    # Per-channel applied-delay ceiling enforced by the AVR firmware DSP. The
+    # configured Audyssey distance can exceed this (we can store any value via
+    # direct TCP), but the AVR will only apply at most this much delay to a
+    # speaker — calibration code that needs to compensate FIR group delay
+    # via mains distance MUST budget against this. Empirical X3800H value;
+    # other models likely differ.
+    MAX_SPEAKER_DELAY_MS: float = audyssey_tcp.MAX_APPLIED_DELAY_MS
+
     def __init__(self, host: str | None) -> None:
         self._host = host  # sync — no network; safe in constructor
 
@@ -61,7 +71,51 @@ class DenonDriver(AVRDriver):
             "volume": receiver.volume,
             "input": receiver.input_func,
             "mute": receiver.muted,
+            "max_speaker_delay_ms": self.MAX_SPEAKER_DELAY_MS,
         }
+
+    async def set_speaker_distances(
+        self,
+        channel_distances_m: Mapping[str, float],
+        *,
+        n_positions: int = 1,
+        commit: bool = False,
+    ) -> None:
+        """Push per-channel Audyssey distances directly to the AVR.
+
+        Bypasses the MultEQ Editor app's UI cap (59.1 ft / 18 m on X3800H)
+        by speaking the Audyssey TCP protocol on port 1256. Use this to
+        compensate sub-path FIR latency by setting the sub channel's
+        distance well above the mains.
+
+        IMPORTANT: this writes Audyssey calibration state. With
+        ``commit=True`` the change persists to NVRAM. Callers should
+        obtain explicit user confirmation before pushing — per the
+        "signal-path writes need human approval" rule. Failure to reach
+        the AVR or malformed data will raise ``DriverError``.
+
+        See ``MAX_SPEAKER_DELAY_MS`` for the ceiling on actually-applied
+        delay regardless of the configured value.
+
+        Args:
+            channel_distances_m: e.g. ``{"FL": 4.05, "SW1": 30.72}``.
+                Channel names match Audyssey commandIds (FL/FR/C/SLA/...).
+            n_positions: measurement-position count from the AVR's stored
+                calibration. Get this from a saved .ady file's
+                ``responseData`` map size, or pass 1 for a single position.
+            commit: if True, send ``AudyFinFlg=Fin`` to persist to NVRAM.
+        """
+        if not self._host:
+            raise DriverError("no host configured")
+        try:
+            await audyssey_tcp.push_speaker_distances(
+                self._host,
+                channel_distances_m,
+                n_positions=n_positions,
+                commit=commit,
+            )
+        except (OSError, ValueError) as exc:
+            raise DriverError(f"audyssey push failed: {exc}")
 
     async def set_volume(self, level_db: float) -> float:
         """Set volume to *level_db* dB. Returns confirmed level from hardware."""
