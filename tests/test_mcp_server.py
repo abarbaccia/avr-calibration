@@ -3936,6 +3936,113 @@ async def test_design_fir_coefficients_normalized() -> None:
 
 
 @pytest.mark.asyncio
+async def test_design_fir_min_phase_magnitude_matches_target() -> None:
+    """Regression: ``design_fir`` was applying HALF the requested correction.
+
+    Root cause: ``scipy.signal.minimum_phase(h, half=True)`` (the default!)
+    returns a min-phase filter whose magnitude is the *square root* of the
+    input's magnitude — i.e. the design's dB correction is halved.
+    Combined with ``n_fft = len(h)`` (no FFT oversampling), at large
+    ``num_taps`` the cepstrum also aliased, further degrading magnitude.
+    A requested -8 dB cut at 50 Hz showed up as ≈ -3.7 dB; the requested
+    +5 dB at 80 Hz showed up as ≈ +2.8 dB. Two production runs on
+    2026-04-23 (run 16 "converged") and 2026-04-24 saved 65 536-tap FIRs
+    to active_dsp_state and pushed them to CamillaDSP — the subs were
+    receiving roughly half the modal correction the recipe asked for, so
+    the room sounded "muddy / boomy" with modes only partially tamed.
+
+    The fix builds the min-phase impulse directly from the desired
+    magnitude spectrum via a cepstral construction on a heavily
+    oversampled FFT grid. The output's magnitude matches the requested
+    correction (not its square root).
+
+    This test exercises both small (256, where the old test suite ran)
+    and production (8 192) tap counts at minimum-phase mode. The focus is
+    the FIR's frequency-domain magnitude response, which is what
+    CamillaDSP applies — not the time-domain "shape" (a min-phase impulse
+    for a narrow correction band IS delta-like in the time domain; that's
+    mathematically correct).
+    """
+    import numpy as np
+    from calibrate.drivers.dsp_driver import DSPCapabilities
+    import calibrate.mcp_server as srv
+
+    # Realistic bass-band FR with a strong peak at 50 Hz and a dip at 80 Hz.
+    # Designed correction: -8 dB at 50 Hz, +5 dB at 80 Hz.
+    freqs = np.logspace(np.log10(15), np.log10(200), 800).tolist()
+    spls = []
+    for f in freqs:
+        peak = 8.0 * np.exp(-((f - 50) ** 2) / (2 * 6 ** 2))
+        dip = -5.0 * np.exp(-((f - 80) ** 2) / (2 * 5 ** 2))
+        spls.append(75.0 + peak + dip)
+    session = _make_fr_session(freqs, spls)
+
+    class _StubDSP:
+        capabilities = DSPCapabilities(
+            max_delay_ms=1000.0,
+            max_preset_index=-1,
+            valid_sources=frozenset(),
+            processing_rate=48_000,
+            max_peq_slots=32,
+            fir_capable=True,
+            fir_min_taps=64,
+            fir_max_taps_per_output=65_536,
+            fir_shared_tap_pool=None,
+            fir_sample_rate_hz=48_000,
+        )
+
+    prev = srv._dsp
+    srv._dsp = _StubDSP()  # type: ignore[assignment]
+    try:
+        # 8192 taps gives ~6 Hz resolution at 48 kHz, enough to resolve
+        # a modal correction at 50 Hz. 65536 taps is the production size
+        # that triggered the original bug. Skip 65536 in CI for speed.
+        for num_taps in (4_096, 8_192):
+            with patch("calibrate.storage.SessionStore") as MockStore:
+                MockStore.return_value.list_sessions.return_value = [session]
+                result = await _tool_design_fir(
+                    session_id=1,
+                    num_taps=num_taps,
+                    phase_mode="minimum",
+                    freq_focus_hz=[20.0, 120.0],
+                )
+            assert result["ok"], result
+            coeffs = np.array(result["coefficients"])
+            assert len(coeffs) == num_taps
+
+            # Inspect the FIR's magnitude response on a fine grid.
+            n_fft = max(32_768, num_taps * 2)
+            H_fir = np.fft.rfft(coeffs, n=n_fft)
+            fir_freqs = np.fft.rfftfreq(n_fft, d=1.0 / 48_000)
+            mag_db = 20.0 * np.log10(np.abs(H_fir) + 1e-12)
+
+            # Out-of-band reference: median dB level outside the focus
+            # band's notch/peak. Peak-normalisation in design_fir means
+            # the absolute level is arbitrary — what matters is the
+            # delta between in-band correction and out-of-band level.
+            ref_mask = ((fir_freqs > 200) & (fir_freqs < 400))
+            ref_db = float(np.median(mag_db[ref_mask]))
+
+            band_50 = float(mag_db[(fir_freqs > 45) & (fir_freqs < 55)].mean()) - ref_db
+            band_80 = float(mag_db[(fir_freqs > 75) & (fir_freqs < 85)].mean()) - ref_db
+
+            # Pre-fix behaviour: -8 dB requested → -3.7 dB applied (half).
+            # Post-fix: -8 dB requested → -7.x dB applied (within 1.5 dB).
+            assert band_50 < -6.0, (
+                f"num_taps={num_taps}: 50 Hz cut is only {band_50:.2f} dB; "
+                f"requested -8 dB. Less than -6 dB means we're back to "
+                f"the half-magnitude scipy.minimum_phase bug."
+            )
+            assert band_80 > 3.5, (
+                f"num_taps={num_taps}: 80 Hz boost is only {band_80:.2f} dB; "
+                f"requested +5 dB. Less than +3.5 dB means the cepstral "
+                f"construction lost magnitude."
+            )
+    finally:
+        srv._dsp = prev
+
+
+@pytest.mark.asyncio
 async def test_call_tool_design_fir_dispatch() -> None:
     from calibrate.mcp_server import call_tool
     import numpy as np
