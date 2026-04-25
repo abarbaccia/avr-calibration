@@ -29,3 +29,4 @@ build/
 # SQLite database
 *.db
 *.sqlite3
+.claude/worktrees/
