@@ -335,27 +335,66 @@ set_output_gain(target=<transducer-name>, gain_db=<rec.gain_db>)  # if nonzero
 set_polarity(target=<transducer-name>, inverted=<rec.polarity_inverted>)  # if changed
 ```
 
+**Polarity is canonical-form**: `optimize_sub_alignment` anchors sub_0
+(the first session_id passed) to `polarity_inverted=false` because
+absolute polarity is unobservable in sub-only optimization. Any sub
+returned with `polarity_inverted=true` is flipped RELATIVE to sub_0
+— that's the only acoustically meaningful signal the optimizer can
+produce. Just apply what the tool returns.
+
 **Describe every hardware action explicitly.** Example:
 "optimize_sub_alignment recommends sub_nearfield delay=9.3 ms,
 gain=+0.5 dB, polarity=normal; sub_front_right delay=0 ms, gain=0 dB,
 polarity=normal. Applying these to align the two subs at MLP."
 
-### 1.4 Polarity test (measurement-based)
+### 1.4 Polarity verification (measurement-based, per-band)
 
-Do NOT trust `peak_sign` alone — room reflections can flip it.
+The optimizer's prediction uses linear summation of solo measurements,
+which can miss real-room cancellation patterns at the listening
+position. Verify by measurement, comparing **per band** — aggregate
+SPL averages can hide narrow-band cancellation that's audible.
 
-1. Unmute all subs. `measure(label="combined-pol-normal")`.
-2. Flip polarity on the non-reference sub: `set_polarity(output_index=N, inverted=true)`.
-3. `measure(label="combined-pol-flipped")`.
-4. `compare_sessions(normal_id, flipped_id)` — keep whichever has higher
-   combined SPL in the bass range.
-5. If difference < 1 dB: keep normal (simpler). Restore the losing setting.
+1. Apply optimizer's recommendation. `measure(label="combined-as-recommended")`.
+2. Flip polarity on the non-reference sub. `measure(label="combined-pol-flipped")`.
+3. **Per-band comparison** across at least three bands:
+   - **20-40 Hz** (deep bass)
+   - **40-80 Hz** (mid bass / punch)
+   - **80-120 Hz** (upper bass / crossover region)
+4. Decision rule:
+   - If one polarity wins ALL bands → keep it.
+   - If polarities split per band → **keep the one that wins 20-40 Hz**.
+     Cancellation in the deep bass is unrecoverable; mid-bass loss is
+     recoverable via PEQ/FIR.
+   - If difference < 1 dB in every band → keep the optimizer's recommendation.
 
-### 1.5 Verify alignment
+**Why per-band**: aggregate SPL can show "polarity A is better" while
+hiding a 15+ dB cancellation in a narrow band (20-40 Hz). Real
+example: a session with polarity-A winning aggregate SPL by 2 dB
+while losing 16 dB at 31 Hz because of position-induced cancellation.
+Aggregate test passed; user couldn't feel any deep bass.
 
-Measure combined. Should be louder than any individual sub across most of the
-target band (reinforcement). If combined is quieter than solo at some
-frequencies → subs still cancel. Revisit using `compare_sub_phase`.
+### 1.5 Verify alignment — solo-vs-combined per band
+
+Aggregate "combined louder than any solo" is too lenient — narrow-band
+cancellation hides in the average. Stricter check:
+
+1. Take a combined measurement.
+2. For each 1/3-octave band in the target range, compute
+   `max(solo_SPL_per_sub)` and compare to `combined_SPL`.
+3. **At every band** in target range, combined ≥ max(solo). If any
+   band has combined < max(solo), you have **destructive interference**
+   at MLP — distinct failure mode requiring different remediation
+   than alignment imperfection.
+
+If combined < max(solo) in any band:
+- **First**: try the polarity verification (Phase 1.4) again — may
+  reveal a sub-vs-sub polarity mismatch the optimizer missed.
+- **Then**: consider sub repositioning (changes which frequencies
+  cancel at MLP).
+- **Last**: high-pass filter on the cancelling sub's chain at the
+  band where it cancels — e.g. roll off the rear sub below 40 Hz so
+  only the front sub carries the deep bass. Loses spatial averaging
+  in that band, but eliminates the cancellation.
 
 Max 3 alignment iterations.
 
@@ -377,27 +416,68 @@ For each sub:
 
 ### 2.2 Design the FIR
 
-For each sub:
+There are two valid architectures for combining per-sub correction with
+the target curve. Pick based on the target shape and the room:
 
-1. Call `design_fir` with:
-   - `session_id` = the sub's solo measurement from 2.1
-   - `phase_mode="minimum"` (default — no pre-ring)
-   - `num_taps=8192` (default; bump to 16384 if T60 > 600 ms on a major mode)
-   - `freq_focus_hz=[port_tune+3, crossover+10]` — e.g. `[25, 90]`
-   - **Do NOT pass `target_curve`** — omitting defaults to flat correction,
-     which is what we want for Phase 2
+**Architecture A — FIR=flat + Input PEQ=shape** (recipe default, layered)
 
-2. Inspect the returned predicted magnitude response:
-   - Max boost below `port_tune+3` must be ≤ +6 dB. If exceeded, raise the
-     lower bound of `freq_focus_hz` by 1 Hz and retry.
-   - Max boost in target band must be ≤ +8 dB. If exceeded, reduce `num_taps`
-     or accept a softer correction.
-   - Check pre-ringing estimate (returned by `design_fir`). For minimum-phase
-     it should be effectively zero.
+Per-sub FIRs flatten each sub's solo response to flat across the target
+band. Input PEQ in Phase 3 then shapes the combined response to the
+chosen target. Pros: easy target-curve swaps (re-run Phase 3 only),
+clean separation of per-sub and target concerns. Cons: per-sub FIR cuts
+at modal peaks compete with input PEQ shape boosts in nearby bands —
+the FIR cut at, say, 70 Hz reduces the response that input PEQ then
+tries to lift for a Harman bass shape.
 
-3. For bands marked `fixable=False` by `analyze_phase` (cancellation nulls):
-   the FIR will try and fail to correct them. This is unavoidable in one pass,
-   but the recipe must note these bands in the retrospective as unfixable.
+**Architecture B — FIR=target_shape + Input PEQ=narrow modal cuts only**
+
+Per-sub FIRs are designed against the same target curve (each sub
+plays its share of the target). Input PEQ is HPF + narrow-Q (Q4-5)
+cuts at any modes that still ring after the FIR. Pros: target shape
+baked in, no shape conflict between layers, no per-sub flat-cut
+fighting per-sub target boost. Cons: asymmetric subs (one delivers
+deep bass much better than another) may trip the safety validator
+when an aggressive target asks the weaker sub to boost more than it
+physically can. Target swap requires FIR redesign.
+
+**When to use each**:
+
+| Situation | Use |
+|---|---|
+| Flat target curve | A (always — there's nothing to swap) |
+| Gentle target (Harman, House+3), symmetric subs | A |
+| Aggressive target (Harman+4, Cinema-Bass) | B |
+| Strongly asymmetric subs (one weak in deep bass) | A — let the layered approach take what each sub can deliver |
+| Modal-heavy room with long T60s | A with mixed-phase FIR (modal cuts via PEQ) |
+| Well-treated room | B (FIR can target shape directly without fighting modes) |
+
+**For each sub, call `design_fir` with**:
+- `session_id` = the sub's solo measurement from 2.1
+- `phase_mode="minimum"` (default — no pre-ring)
+- `num_taps=8192` (default; bump to 16384 if T60 > 600 ms on a major mode)
+- `freq_focus_hz=[port_tune+3, crossover+10]` — e.g. `[25, 90]`
+- **For Architecture A**: omit `target_curve` (defaults to flat). Skip
+  to step 2 below.
+- **For Architecture B**: pass `target_curve` matching the chosen
+  target shape (anchored to a reasonable reference). The FIR will
+  attempt to match each sub to that shape.
+
+**Inspect the returned predicted magnitude response**:
+- Max boost below `port_tune+3` must be ≤ +6 dB. If exceeded, raise the
+  lower bound of `freq_focus_hz` by 1 Hz and retry.
+- Max boost in target band must be ≤ +8 dB. If exceeded:
+  - Architecture A: reduce `num_taps` or accept softer correction
+  - Architecture B: the target is too aggressive for this sub at
+    these frequencies. Either soften the target curve, narrow the
+    `freq_focus_hz`, OR fall back to Architecture A (which lets each
+    sub deliver what it physically can without forcing target shape).
+- Check pre-ringing estimate (returned by `design_fir`). For
+  minimum-phase it should be effectively zero.
+
+**For bands marked `fixable=False` by `analyze_phase`** (cancellation
+nulls): the FIR will try and fail to correct them. This is unavoidable
+in one pass, but the recipe must note these bands in the retrospective
+as unfixable.
 
 ### 2.3 Apply the FIR
 
@@ -498,13 +578,34 @@ After all subs have FIR applied:
 
 ## Phase 3 — Target curve (Input PEQ)
 
-Shape the combined, FIR-corrected response to the user's target curve using
-the shared input PEQ.
+Phase 3 behavior depends on which architecture was chosen in Phase 2.2:
 
-Why PEQ instead of FIR here: target curves (Harman, flat, house) are smooth
-low-order shapes. Biquad PEQ handles them with 3-5 filters. FIR would use
-thousands of taps for the same result. Using PEQ also makes target-curve
-swap cheap: redesign a few biquads, leave the per-sub FIRs untouched.
+**If Architecture A (FIR=flat + Input PEQ=shape) was used in Phase 2.2**:
+do this whole Phase 3 — biquad shaping of the combined response to the
+target curve. Why PEQ instead of FIR here: target curves (Harman, flat,
+house) are smooth low-order shapes. Biquad PEQ handles them with 3-5
+filters. FIR would use thousands of taps for the same result.
+
+**If Architecture B (FIR=target_shape + Input PEQ=narrow modal cuts)
+was used**: the target shape is already in the FIRs. Phase 3 is
+truncated — DO NOT design biquad shaping in input PEQ. Instead:
+
+1. Clear input PEQ to HPF only: `apply_input_eq([{type: "hpf", freq:
+   18, gain_db: 0, q: 0.707}])`.
+2. Measure combined.
+3. Identify any modes still ringing visibly (T60 > 500 ms or peak >
+   target by 3+ dB).
+4. Add **only narrow Q4-5 peaking cuts** at those mode frequencies
+   (typically -2 to -4 dB). These are surgical cuts, not shape work.
+5. Skip Phase 3.2-3.4 (anchor / design / iterate). The target shape
+   is already in the FIRs.
+
+**Architecture-A rationale**: PEQ is cheaper to redesign than FIR for
+target-curve swaps, and lets you separate "what the room does to each
+sub" (FIR) from "what shape I want" (PEQ). The risk is that FIR cuts
+at modal peaks fight PEQ boosts at adjacent frequencies — the recipe
+mitigates this by keeping per-sub FIR cuts narrow (which `freq_focus`
+already does) and by testing the layered result before iterating.
 
 ### 3.1 Baseline: HPF-only input
 

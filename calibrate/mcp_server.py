@@ -2939,13 +2939,26 @@ async def _tool_optimize_sub_alignment(
             weighted = combined_weights * below
             return float(np.sqrt(np.mean(weighted ** 2)))
 
-        # Bounds: delay ∈ [0, max_delay_ms], gain ∈ [±gain], polarity ∈ [0, 1]
+        # Bounds: delay ∈ [0, max_delay_ms], gain ∈ [±gain], polarity ∈ [0, 1].
+        # Polarity is fixed to false for sub_0 — absolute polarity is
+        # unobservable in sub-only optimization (inverting all subs gives an
+        # acoustically identical predicted combined response), so we collapse
+        # the 2^N polarity space to 2^(N-1) by anchoring sub_0. This makes
+        # the result CANONICAL: any sub with polarity_inverted=true in the
+        # output is flipped RELATIVE to sub_0, which is the only meaningful
+        # signal the optimizer can produce. Without this, the search can
+        # arbitrarily return all-inverted (numerically equivalent to all-
+        # normal) and confuse callers into applying an absolute polarity
+        # flip that does nothing for sub-vs-sub interaction.
         pol_hi = 1.0 if search_polarity else 0.0
         bounds = []
-        for _ in range(N_subs):
+        for i in range(N_subs):
             bounds.append((0.0, float(max_delay_ms)))
             bounds.append((-float(gain_search_db), float(gain_search_db)))
-            bounds.append((0.0, pol_hi))
+            if i == 0:
+                bounds.append((0.0, 0.0))  # sub_0 polarity anchored to false
+            else:
+                bounds.append((0.0, pol_hi))
 
         # Baseline: everyone aligned at 0 / 0 / 0 — current pre-optimization state.
         baseline_params = np.zeros(3 * N_subs)
