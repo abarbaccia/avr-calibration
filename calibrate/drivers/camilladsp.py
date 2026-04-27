@@ -71,6 +71,18 @@ _DEFAULT_PLAYBACK_DEVICE: dict[str, Any] = {
     "format": "S32_LE",
 }
 
+# Cal-mode capture: ALSA loopback (snd-aloop). Sweep player writes to
+# hw:Loopback,0,0; CamillaDSP captures from hw:Loopback,1,0. This bypasses
+# the AVR entirely so Audyssey/MultEQ filters cannot color the cal stimulus.
+# The cal-mode capture is always 2-channel mono-fan-out (lfe_input_channel=0).
+_DEFAULT_CAL_CAPTURE_DEVICE: dict[str, Any] = {
+    "type": "Alsa",
+    "device": "hw:Loopback,1,0",
+    "channels": 2,
+    "format": "S32_LE",
+}
+_DEFAULT_CAL_PLAYBACK_LOOPBACK: str = "hw:Loopback,0,0"
+
 
 class _CamillaWSClient:
     """Thin async JSON-RPC wrapper over a single CamillaDSP websocket.
@@ -302,6 +314,10 @@ class CamillaDSPDriver(DSPDriver):
         lfe_input_channel: int | None = None,
         capture_samplerate: int | None = None,
         resampler: dict | None = None,
+        cal_capture_device: dict | None = None,
+        cal_capture_channels: int | None = None,
+        cal_lfe_input_channel: int | None = None,
+        cal_playback_device: str | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -348,6 +364,24 @@ class CamillaDSPDriver(DSPDriver):
         # channel counts — CamillaDSP will reject a mismatched config otherwise.
         self._capture_device["channels"] = self._capture_channels
         self._playback_device["channels"] = output_channels
+
+        # Cal-mode capture state — preserved alongside the live config so we can
+        # swap atomically via set_cal_mode() without losing the live settings.
+        # Live config is what's currently in _capture_device / _capture_channels /
+        # _lfe_input_channel above. Cal config defaults to the snd-aloop loopback.
+        self._live_capture_device = dict(self._capture_device)
+        self._live_capture_channels = self._capture_channels
+        self._live_lfe_input_channel = self._lfe_input_channel
+        self._cal_capture_device = (
+            dict(cal_capture_device) if cal_capture_device else dict(_DEFAULT_CAL_CAPTURE_DEVICE)
+        )
+        self._cal_capture_channels = int(cal_capture_channels) if cal_capture_channels else 2
+        self._cal_lfe_input_channel = (
+            int(cal_lfe_input_channel) if cal_lfe_input_channel is not None else 0
+        )
+        self._cal_capture_device["channels"] = self._cal_capture_channels
+        self._cal_playback_device = cal_playback_device or _DEFAULT_CAL_PLAYBACK_LOOPBACK
+        self._cal_mode_active: bool = False
 
         self._lock = asyncio.Lock()
         self._max_peq_slots = max_peq_slots
@@ -833,6 +867,56 @@ class CamillaDSPDriver(DSPDriver):
         config = self._build_config()
         config_yaml = yaml.safe_dump(config, default_flow_style=False, sort_keys=False)
         await self._client.call("SetConfig", config_yaml)
+
+    # ── Cal-mode capture (loopback) ───────────────────────────────────────────
+
+    @property
+    def cal_mode_active(self) -> bool:
+        return self._cal_mode_active
+
+    @property
+    def cal_playback_device(self) -> str:
+        """ALSA device measure() should write the sweep to in cal mode."""
+        return self._cal_playback_device
+
+    async def set_cal_mode(self, enabled: bool) -> None:
+        """Swap CamillaDSP capture between live and calibration sources.
+
+        Live: captures from the AVR/Focusrite analog input (normal listening).
+        Cal:  captures from the snd-aloop loopback so a sweep player can write
+              directly into CamillaDSP, bypassing the AVR. The AVR's Audyssey/
+              MultEQ filters and sub-trim cannot color the cal stimulus on this
+              path — what enters the FIR/PEQ chain is exactly what the sweep
+              generator produced.
+
+        Idempotent. Pushes a fresh config to CamillaDSP on transition.
+        """
+        if enabled == self._cal_mode_active:
+            return
+        async with self._lock:
+            if enabled:
+                # Snapshot live config before swapping, in case the caller
+                # mutated capture state through other paths since construction.
+                self._live_capture_device = dict(self._capture_device)
+                self._live_capture_channels = self._capture_channels
+                self._live_lfe_input_channel = self._lfe_input_channel
+                self._capture_device = dict(self._cal_capture_device)
+                self._capture_channels = self._cal_capture_channels
+                self._lfe_input_channel = self._cal_lfe_input_channel
+            else:
+                self._capture_device = dict(self._live_capture_device)
+                self._capture_channels = self._live_capture_channels
+                self._lfe_input_channel = self._live_lfe_input_channel
+            self._capture_device["channels"] = self._capture_channels
+            self._cal_mode_active = enabled
+            log.info(
+                "set_cal_mode: enabled=%s capture=%s channels=%d lfe_ch=%s",
+                enabled,
+                self._capture_device.get("device"),
+                self._capture_channels,
+                self._lfe_input_channel,
+            )
+            await self._push_config_locked()
 
     # ── EQ ────────────────────────────────────────────────────────────────────
 

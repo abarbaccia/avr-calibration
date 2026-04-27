@@ -1241,6 +1241,79 @@ async def test_camilladsp_setup_closes_ws_on_probe_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_camilladsp_set_cal_mode_swaps_capture_device_and_pushes() -> None:
+    """set_cal_mode(True) swaps capture to the loopback and pushes a fresh config.
+
+    Live capture (e.g. Focusrite analog input fed by AVR LFE pre-out) is preserved
+    so a subsequent set_cal_mode(False) restores it without losing channel-count
+    or lfe-input mappings.
+    """
+    driver = CamillaDSPDriver(
+        capture_device={
+            "type": "Alsa", "device": "plughw:USB,0", "channels": 20, "format": "S32_LE",
+        },
+        capture_channels=20,
+        input_channels=2,
+        lfe_input_channel=2,
+    )
+    driver._client.call = AsyncMock(return_value=None)
+
+    assert driver.cal_mode_active is False
+    assert driver._capture_device["device"] == "plughw:USB,0"
+
+    await driver.set_cal_mode(True)
+    assert driver.cal_mode_active is True
+    assert driver._capture_device["device"] == "hw:Loopback,1,0"
+    assert driver._capture_channels == 2
+    assert driver._lfe_input_channel == 0
+    pushed = [c.args[0] for c in driver._client.call.await_args_list if c.args[0] == "SetConfig"]
+    assert len(pushed) == 1
+
+    await driver.set_cal_mode(False)
+    assert driver.cal_mode_active is False
+    assert driver._capture_device["device"] == "plughw:USB,0"
+    assert driver._capture_channels == 20
+    assert driver._lfe_input_channel == 2
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_set_cal_mode_idempotent() -> None:
+    """Calling set_cal_mode with the current state is a no-op (no SetConfig push)."""
+    driver = CamillaDSPDriver()
+    driver._client.call = AsyncMock(return_value=None)
+
+    await driver.set_cal_mode(False)  # already in live mode
+    assert driver._client.call.await_count == 0
+
+    await driver.set_cal_mode(True)
+    push_count_after_enable = driver._client.call.await_count
+    await driver.set_cal_mode(True)  # already in cal mode
+    assert driver._client.call.await_count == push_count_after_enable
+
+
+def test_camilladsp_cal_playback_device_default_is_loopback_write_side() -> None:
+    """The cal-mode playback device is the snd-aloop write side by default."""
+    driver = CamillaDSPDriver()
+    assert driver.cal_playback_device == "hw:Loopback,0,0"
+
+
+def test_camilladsp_cal_capture_overrides_via_constructor() -> None:
+    """Custom cal-mode capture/playback can be supplied (e.g. different loopback names)."""
+    driver = CamillaDSPDriver(
+        cal_capture_device={
+            "type": "Alsa", "device": "hw:CalLoop,1,0", "channels": 4, "format": "S32_LE",
+        },
+        cal_capture_channels=4,
+        cal_lfe_input_channel=1,
+        cal_playback_device="hw:CalLoop,0,0",
+    )
+    assert driver._cal_capture_device["device"] == "hw:CalLoop,1,0"
+    assert driver._cal_capture_channels == 4
+    assert driver._cal_lfe_input_channel == 1
+    assert driver.cal_playback_device == "hw:CalLoop,0,0"
+
+
+@pytest.mark.asyncio
 async def test_camilladsp_close_closes_ws() -> None:
     driver = CamillaDSPDriver()
     driver._client.close = AsyncMock()
