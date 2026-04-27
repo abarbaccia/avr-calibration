@@ -44,6 +44,102 @@ that sd.default.device (a sounddevice module-level global) is never overwritten 
 concurrent caller mid-measurement."""
 
 
+# ── Onset detection helpers (room-mode-resistant peak finding) ────────────────
+
+XCORR_ONSET_NOISE_WINDOW_MS: float = 0.5
+"""Window before lo_idx (in ms) used to estimate noise floor for onset detection.
+
+Cross-correlation of a sweep against itself produces a bright peak at zero lag
+followed by silence in the gap before any real speaker arrival. We treat the
+first XCORR_ONSET_NOISE_WINDOW_MS preceding the search window as noise; the
+median absolute envelope there sets a noise floor.
+"""
+
+XCORR_ONSET_SNR_RATIO: float = 6.0
+"""Ratio of envelope to noise floor that defines the onset threshold.
+
+6× above noise ≈ +15 dB, which is the standard "first arrival" criterion used
+by REW and other measurement tools. Below this ratio we fall back to argmax.
+"""
+
+
+def _parabolic_subsample(arr, idx) -> float:
+    """Refine a peak/onset position to subsample precision via parabolic fit.
+
+    Standard 3-point parabolic interpolation on (idx-1, idx, idx+1). Returns
+    a float index, clamped to ±1 sample around idx. At array edges, returns
+    idx unchanged. Sub-sample TOA is recoverable to ~1/10 sample (~2 µs at
+    48 kHz) when the underlying signal is smooth at the peak.
+    """
+    if idx <= 0 or idx >= len(arr) - 1:
+        return float(idx)
+    y0 = float(arr[idx - 1])
+    y1 = float(arr[idx])
+    y2 = float(arr[idx + 1])
+    denom = y0 - 2.0 * y1 + y2
+    if abs(denom) < 1e-15:
+        return float(idx)
+    delta = 0.5 * (y0 - y2) / denom
+    if delta > 1.0:
+        delta = 1.0
+    elif delta < -1.0:
+        delta = -1.0
+    return float(idx) + delta
+
+
+def _find_xcorr_onset(np, envelope, lo_idx: int, hi_idx: int, sample_rate: int) -> tuple[int, float]:
+    """Find the first envelope crossing above noise floor in [lo_idx, hi_idx).
+
+    Returns (integer_index, subsample_index_float). The integer index is the
+    nearest discrete sample for downstream IR indexing (polarity, SPL); the
+    subsample value is for time-of-arrival reporting.
+
+    Falls back to argmax if no crossing is found (e.g. very low SNR or empty
+    pre-window for noise estimation). The fallback preserves the legacy
+    behaviour for synthetic IRs in the existing test suite.
+    """
+    if hi_idx <= lo_idx:
+        return lo_idx, float(lo_idx)
+    # Estimate noise floor from a short window BEFORE the search range.
+    noise_n = max(1, int(XCORR_ONSET_NOISE_WINDOW_MS / 1000.0 * sample_rate))
+    noise_lo = max(0, lo_idx - noise_n)
+    if noise_lo >= lo_idx:
+        # Pathological case (lo_idx == 0); fall through to argmax.
+        rel = int(np.argmax(envelope[lo_idx:hi_idx]))
+        peak_idx = lo_idx + rel
+        return peak_idx, _parabolic_subsample(envelope, peak_idx)
+
+    noise_floor = float(np.median(np.abs(envelope[noise_lo:lo_idx])))
+    threshold = max(noise_floor * XCORR_ONSET_SNR_RATIO, 1e-12)
+
+    window = envelope[lo_idx:hi_idx]
+    above = np.where(window > threshold)[0]
+    if len(above) == 0:
+        # No clean onset — fall back to argmax of the search window. This
+        # preserves legacy behaviour on synthetic IRs (test fixtures) where
+        # the noise floor pre-window is zero, every sample is "above
+        # threshold", or the signal has no crossing at all.
+        rel = int(np.argmax(window))
+        peak_idx = lo_idx + rel
+        return peak_idx, _parabolic_subsample(envelope, peak_idx)
+    peak_idx = lo_idx + int(above[0])
+    # Linear interpolate the threshold crossing between peak_idx-1 and peak_idx
+    # for subsample TOA. (Parabolic fit on a rising flank would not be the right
+    # geometry — we want the time of crossing, not the local peak.)
+    if peak_idx > 0:
+        y_below = float(envelope[peak_idx - 1])
+        y_above = float(envelope[peak_idx])
+        if y_above > y_below:
+            frac = (threshold - y_below) / (y_above - y_below)
+            frac = max(0.0, min(1.0, frac))
+            subsample = (peak_idx - 1) + frac
+        else:
+            subsample = float(peak_idx)
+    else:
+        subsample = float(peak_idx)
+    return peak_idx, subsample
+
+
 class MeasurementQualityError(RuntimeError):
     """Raised when a recording fails quality validation before deconvolution.
 
@@ -684,8 +780,15 @@ class MeasurementEngine:
         # energy at low frequencies, so the cross-correlation is dominated
         # by a broad low-frequency hump that peaks at lag 0 regardless of
         # actual travel time. We bandlimit to the sub's operating range
-        # (30–150 Hz) and peak on the Hilbert envelope within a physical
-        # travel-time window (≥1 ms, ≤20 ms → 0.3–6.9 m path).
+        # (30–150 Hz) and detect the *onset* (first crossing above the noise
+        # floor) on the Hilbert envelope within the physical travel window.
+        #
+        # Why onset instead of argmax: with a strong room mode (T60 > 300 ms
+        # at e.g. 117 Hz), the bandpassed envelope grows for tens of ms after
+        # direct arrival as modal energy builds up. argmax then locks onto
+        # the mode-buildup peak, NOT the direct arrival, and reports a peak
+        # time biased late by 10–60 ms. First-rise-above-noise-floor
+        # detection picks up the leading edge instead, immune to that bias.
         C_full = np.fft.irfft(np.conj(X) * Y, n=n)
         try:
             from scipy.signal import butter, sosfiltfilt, hilbert
@@ -703,13 +806,14 @@ class MeasurementEngine:
         hi_idx = min(n, int(0.200 * sample_rate))
         if hi_idx <= lo_idx:
             hi_idx = min(n, lo_idx + 1)
-        rel_idx = int(np.argmax(envelope[lo_idx:hi_idx]))
-        xcorr_peak_idx = lo_idx + rel_idx
-        xcorr_peak_ms = round(xcorr_peak_idx / sample_rate * 1000.0, 3)
-        xcorr_peak_sign = 1 if C_full[xcorr_peak_idx] >= 0.0 else -1
+        xcorr_peak_idx_int, xcorr_peak_subsample = _find_xcorr_onset(
+            np, envelope, lo_idx, hi_idx, sample_rate
+        )
+        xcorr_peak_ms = round(xcorr_peak_subsample / sample_rate * 1000.0, 3)
+        xcorr_peak_sign = 1 if C_full[xcorr_peak_idx_int] >= 0.0 else -1
         log.info(
-            "xcorr peak: %.3f ms (sample %d of window [%d,%d)), sign=%+d",
-            xcorr_peak_ms, xcorr_peak_idx, lo_idx, hi_idx, xcorr_peak_sign,
+            "xcorr onset: %.3f ms (sample %.2f of window [%d,%d)), sign=%+d",
+            xcorr_peak_ms, xcorr_peak_subsample, lo_idx, hi_idx, xcorr_peak_sign,
         )
 
         # Regularised deconvolution (Wiener-style).

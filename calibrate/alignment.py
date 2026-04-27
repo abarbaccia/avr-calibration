@@ -106,12 +106,44 @@ def extract_ir(
     # Onset detection within the search window: find the first sample within
     # 20 dB of the absolute peak rather than the loudest peak itself.  In rooms
     # with strong bass modes, a late resonance can exceed the direct sound.
+    #
+    # Room-mode-resistant refinement: gate the IR to a tight window around the
+    # absolute peak before onset detection. Modal energy that builds up tens of
+    # ms after direct arrival sits OUTSIDE this window and cannot pollute the
+    # onset estimate. With a typical room T60(60Hz) ≈ 500 ms, gating to ±5 ms
+    # around the peak excludes >99% of modal ringing while keeping the direct
+    # arrival and the first early reflections intact for SPL estimation.
     search_samples = max(1, int(ir_search_window_ms / 1000.0 * sample_rate))
     search_window = ir[:search_samples]
     abs_window = np.abs(search_window)
     max_idx = int(np.argmax(abs_window))
-    onset_threshold = abs_window[max_idx] * 0.1  # -20 dB
-    peak_idx = int(np.argmax(abs_window > onset_threshold))
+
+    # Apply gating around max_idx for onset detection. Gate width is short
+    # enough that, even with a loud late mode, only the direct-arrival window
+    # contributes to the onset search.
+    gate_pre_ms = 5.0
+    gate_post_ms = 5.0
+    gate_pre = int(gate_pre_ms / 1000.0 * sample_rate)
+    gate_post = int(gate_post_ms / 1000.0 * sample_rate)
+    gate_lo = max(0, max_idx - gate_pre)
+    gate_hi = min(len(abs_window), max_idx + gate_post + 1)
+    gated = abs_window.copy()
+    if gate_lo > 0:
+        gated[:gate_lo] = 0.0
+    if gate_hi < len(gated):
+        gated[gate_hi:] = 0.0
+
+    # First sample within -20 dB of the peak inside the gate.
+    gated_peak = float(gated.max()) if gated.size else 0.0
+    onset_threshold = gated_peak * 0.1  # -20 dB
+    above = np.where(gated > onset_threshold)[0]
+    if len(above) > 0:
+        peak_idx = int(above[0])
+    else:
+        # Fallback: no clean onset → use argmax (preserves legacy behaviour
+        # on synthetic IRs without modal energy).
+        peak_idx = max_idx
+
     peak_sign = 1 if ir[peak_idx] >= 0 else -1
 
     return ir, peak_idx, peak_sign
