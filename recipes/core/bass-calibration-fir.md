@@ -403,6 +403,30 @@ If combined < max(solo) in any band:
 
 Max 3 alignment iterations.
 
+### 1.6 Deep-bass-priority re-alignment + delay sweep (REQUIRED for 2+ subs)
+
+The default `optimize_sub_alignment` minimizes flatness across the full target
+band. That can leave a **narrow cancellation null in the boost zone** (e.g.
+30-40 Hz) because flatness elsewhere offsets it on RMS. The null is the
+audible problem ("subs not digging deep") even when RMS reads fine.
+
+1. Re-run `optimize_sub_alignment(session_ids=[...], min_hz=20, max_hz=50)`
+   to weight the optimizer toward deep bass. Compare to the wideband
+   recommendation. If relative timing flips or moves > 2 ms, the wideband
+   answer was a false-flat global minimum that hid a narrow null.
+
+2. Apply the deep-bass-priority recommendation. Measure combined.
+
+3. **Manual delay sweep on the trailing sub** ±2 ms in 0.5-1 ms steps.
+   Pick the step where the deepest null in 28-50 Hz is shallowest. Mid-bass
+   evenness barely shifts under ±2 ms moves; only deep-bass null position
+   changes meaningfully. The right answer is "no narrow catastrophic null
+   anywhere in 28-50 Hz" — accept slight RMS cost for shallower max-error.
+
+4. After Phase 2 designs FIRs against the new-alignment solos, **redo the
+   delay sweep at ±0.5 ms granularity once more** — the new FIRs have
+   different phase response and the optimal inter-sub delay shifts slightly.
+
 ## Phase 2 — Per-sub correction FIR
 
 For each sub, design a minimum-phase FIR that flattens that sub's solo response
