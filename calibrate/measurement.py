@@ -361,6 +361,7 @@ class MeasurementEngine:
     async def measure(
         self,
         input_device_name: str | None = None,
+        playback_device_override: str | None = None,
     ) -> FrequencyResponse:
         """Run a full sweep measurement. Hardware-agnostic.
 
@@ -487,8 +488,31 @@ class MeasurementEngine:
                 try:
                     import sounddevice as sd
                     devices = sd.query_devices()
+                    # Cal-mode override takes precedence over config-defined USB device.
+                    # The override is the ALSA device string the active DSP driver
+                    # exposes (e.g. "hw:Loopback,0,0") so the sweep is written into
+                    # CamillaDSP's capture loopback rather than directly to the DAC.
                     usb_idx_cfg = cfg.get("usb_device_index")
-                    if usb_idx_cfg is not None:
+                    if playback_device_override:
+                        ov = playback_device_override.lower()
+                        candidates = [
+                            (idx, dev) for idx, dev in enumerate(devices)
+                            if dev.get("max_output_channels", 0) > 0 and ov in dev["name"].lower()
+                        ]
+                        if candidates:
+                            idx, dev = candidates[0]
+                            in_idx = int(sd.default.device[0])
+                            sd.default.device = (in_idx, idx)
+                            log.info(
+                                "Output device (USB cal-mode override %r): %s (index %d)",
+                                playback_device_override, dev["name"], idx,
+                            )
+                        else:
+                            log.warning(
+                                "Output device (USB cal-mode override %r): no match in PortAudio device list — falling back",
+                                playback_device_override,
+                            )
+                    elif usb_idx_cfg is not None:
                         idx = int(usb_idx_cfg)
                         in_idx = int(sd.default.device[0])
                         sd.default.device = (in_idx, idx)

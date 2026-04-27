@@ -3521,6 +3521,12 @@ async def _tool_trigger_measurement(
         engine = MeasurementEngine(cfg)
         route = cfg.measurement.get("playback_route", "usb")
 
+        # When the DSP driver is in cal mode, route the sweep into its loopback
+        # capture device so the sweep enters CamillaDSP via snd-aloop. Bypasses
+        # the AVR — Audyssey/MultEQ filters cannot color the cal stimulus.
+        cal_active = bool(getattr(_dsp, "cal_mode_active", False))
+        cal_playback = getattr(_dsp, "cal_playback_device", None) if cal_active else None
+
         # Graph composes the right stack: HDMI route → AVR neutralisation
         # (DenonSweepContext) + DSP HDMI-mode context (source=Analog +
         # master_gain_hdmi_db). USB route → DSP USB sweep context only.
@@ -3530,7 +3536,7 @@ async def _tool_trigger_measurement(
 
         if route == "hdmi" and _drivers is not None:
             async with graph.sweep_context_for_route(route, targets, cfg, _drivers):
-                fr = await engine.measure()
+                fr = await engine.measure(playback_device_override=cal_playback)
         elif route == "hdmi":
             # Legacy path used when the driver registry isn't populated (older
             # test setups that patch `_dsp` directly without the lifespan).
@@ -3538,16 +3544,16 @@ async def _tool_trigger_measurement(
             denon_ctx = DenonSweepContext.from_config(cfg)
             if denon_ctx:
                 async with denon_ctx:
-                    fr = await engine.measure()
+                    fr = await engine.measure(playback_device_override=cal_playback)
             else:
-                fr = await engine.measure()
+                fr = await engine.measure(playback_device_override=cal_playback)
         else:
             # USB mode keeps the persistent-session pattern so repeat
             # measurements don't thrash the DSP source switch. The persistent
             # session is equivalent to entering the DSP's sweep context once
             # and holding it open across measurements.
             await _ensure_sweep_session()
-            fr = await engine.measure()
+            fr = await engine.measure(playback_device_override=cal_playback)
 
         # Compute IR-derived metadata at capture time
         metadata = compute_session_metadata(fr)
@@ -5009,6 +5015,33 @@ async def _tool_set_master_gain(gain_db: float) -> dict:
         return _err(f"set_master_gain error: {exc}")
 
 
+async def _tool_set_cal_mode(enabled: bool) -> dict:
+    """Switch CamillaDSP capture between live and calibration sources.
+
+    enabled=True: capture from snd-aloop loopback (hw:Loopback,1,0). The sweep
+                  player writes to hw:Loopback,0,0 → CamillaDSP processes (FIR,
+                  PEQ, gain, delay) → Focusrite outputs → subs. AVR is bypassed
+                  so Audyssey/MultEQ filters cannot color the cal stimulus.
+    enabled=False: restore live capture (e.g. Focusrite analog input fed by AVR
+                   LFE pre-out) for normal listening.
+
+    No-op if already in the requested mode. Always pair an enable with a
+    disable when the calibration finishes — leaving cal mode active will
+    silence the system for movies/music.
+    """
+    try:
+        if not hasattr(_dsp, "set_cal_mode"):
+            return _err("set_cal_mode: active DSP driver does not support cal-mode capture")
+        await _dsp.set_cal_mode(bool(enabled))  # type: ignore[union-attr]
+        active = getattr(_dsp, "cal_mode_active", None)
+        playback = getattr(_dsp, "cal_playback_device", None)
+        return _ok(cal_mode_active=bool(active), cal_playback_device=playback)
+    except DriverError as exc:
+        return _err(str(exc))
+    except Exception as exc:
+        return _err(f"set_cal_mode error: {exc}")
+
+
 async def _tool_configure_matrix(active_input: int | None = None) -> dict:
     """Route the active DSP input to enabled outputs, skipping defective/unused ones."""
     try:
@@ -6398,6 +6431,30 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="set_cal_mode",
+        description=(
+            "Switch CamillaDSP capture between live and calibration sources. "
+            "Cal mode (enabled=true) routes capture from snd-aloop loopback so a "
+            "sweep player can inject directly into CamillaDSP, bypassing the AVR — "
+            "Audyssey/MultEQ filters cannot color the cal stimulus on this path. "
+            "Live mode (enabled=false) restores capture from the AVR/Focusrite line "
+            "for normal listening. Always pair enable→disable around a calibration "
+            "session; leaving cal mode on silences the system for movies/music. "
+            "Returns the active mode and the loopback playback device measure() "
+            "writes to in cal mode."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "description": "True to enter cal mode (loopback capture); False to return to live capture.",
+                },
+            },
+            "required": ["enabled"],
+        },
+    ),
+    Tool(
         name="set_master_gain",
         description=(
             "Set the miniDSP master output gain in dB. Range: -127 to 0 dB. "
@@ -7688,6 +7745,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             dry_run=bool(arguments.get("dry_run", False)),
             preserve_eq=bool(arguments.get("preserve_eq", False)),
         )
+    elif name == "set_cal_mode":
+        result = await _tool_set_cal_mode(enabled=bool(arguments["enabled"]))
     elif name == "set_master_gain":
         result = await _tool_set_master_gain(gain_db=float(arguments["gain_db"]))
     elif name == "set_output_gain":
