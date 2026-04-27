@@ -109,23 +109,28 @@ Three layers, all of them simultaneously active in the DSP pipeline:
 
 | Layer | Tool | Purpose | Required? |
 |-------|------|---------|-----------|
-| Per-sub FIR | `apply_fir` with `output_index` | Room-mode flattening (magnitude + some decay reduction) | Always |
+| Per-sub FIR | `apply_fir` with `output_index` | Per-sub correction (magnitude + decay reduction) AND target-curve shape (default: Architecture B) | Always |
 | Per-sub PEQ | `apply_eq` with `output_index` | **HPF only** (18 Hz 4th-order infrasonic protection) | Always |
-| Input PEQ | `apply_input_eq` | Target curve shape across the combined response | Always |
+| Input PEQ | `apply_input_eq` | Narrow modal cuts only (Architecture B) — no broad shaping | Optional |
 
 **DSP signal chain:**
 ```
-Input → Input PEQ (target curve) → Routing → Output PEQ (HPF) → Output FIR (per-sub correction) → DAC
+Input → Input PEQ (modal cuts only) → Routing → Output PEQ (HPF) → Output FIR (per-sub correction + target shape) → DAC
 ```
 
-**Recipe ordering** (correction layers applied in this order so each one is
-designed against the state produced by the previous layer):
+**Default architecture: B (FIR carries target shape; input PEQ for narrow
+modal cuts only).** Use Architecture A (FIR=flat + input PEQ shelf for shape)
+only when the per-sub solo response makes B trip SafetyValidator and tightening
+`freq_focus_hz` doesn't recover.
+
+**Recipe ordering** (Architecture B):
 
 ```
 1. Per-sub HPF only (Phase 0 reset)
 2. Alignment via delay + polarity (Phase 1)
-3. Per-sub FIR flattening (Phase 2)
-4. Input PEQ target curve (Phase 3)
+3. Per-sub FIR with target_curve baked in (Phase 2)
+4. (Optional) Narrow input PEQ modal cuts (Phase 3) — only for residual peaks
+   the FIR couldn't tame within safety bounds
 ```
 
 ## Configuration
@@ -381,11 +386,18 @@ For each sub:
 
 1. Call `design_fir` with:
    - `session_id` = the sub's solo measurement from 2.1
-   - `phase_mode="minimum"` (default — no pre-ring)
+   - `phase_mode="mixed"` with `preringing_ms=38` (default — shortens modal T60
+     and fits within the AVR's distance-budget headroom; switch to `"minimum"`
+     only if AVR-side delay compensation isn't available)
    - `num_taps=8192` (default; bump to 16384 if T60 > 600 ms on a major mode)
-   - `freq_focus_hz=[port_tune+3, crossover+10]` — e.g. `[25, 90]`
-   - **Do NOT pass `target_curve`** — omitting defaults to flat correction,
-     which is what we want for Phase 2
+   - `freq_focus_hz=[port_tune+18, crossover+5]` — e.g. `[40, 85]`. Lower bound
+     starts above the deepest-bass null because Architecture B asks the FIR to
+     LIFT toward the target curve in this band; the steepest target lift sits
+     just above port tune, and the bigger the lift, the more likely the FIR's
+     narrow-band peak trips SafetyValidator. Tighten the lower bound by 2 Hz
+     each retry until the max boost lands within profile limits.
+   - **Pass `target_curve` matching the chosen target shape** (Architecture B
+     default). For Architecture A (FIR=flat + input PEQ shelf), omit it.
 
 2. Inspect the returned predicted magnitude response:
    - Max boost below `port_tune+3` must be ≤ +6 dB. If exceeded, raise the
@@ -570,7 +582,37 @@ For each iteration:
 **Step C — Check convergence:**
 1. `compute_deviation(session, target_curve, resolution="sixth_octave", convergence_threshold=1.5)`
 2. If converged → proceed to Phase 4
-3. If not: audit filters (see Step D), redesign, iterate. Max 3 iterations.
+3. If not: audit filters (Step D), redesign, iterate. Max 3 iterations.
+
+**Step C.1 — Diagnose dominating residual (REQUIRED before iterating):**
+
+Before designing more filters, classify the residual error:
+
+- **Geometry-dominated** (`excluded_geometry_points` ≫ `included_points`,
+  e.g. >80% of band): EQ cannot fix the residual. Most of the band's error
+  is cancellation at the listener position. Stop adding input PEQ; instead,
+  evaluate **per-sub band-limit** remediation:
+  - Identify the deepest geometry null in the boost band from `null_zones`
+    or the `summary` `max_error_db` entry. If it's in the deep-bass region
+    (<50 Hz) and the room has 2+ subs, run the Phase 1.5 per-band cancellation
+    re-check on the latest combined: `combined_SPL` vs `max(solo_SPL)` per
+    1/3-octave. If `combined < max(solo) − 6 dB` at the null frequency, the
+    null is sub-vs-sub destructive (band-limit one sub), not pure geometry.
+    Apply `apply_eq(target=cancelling_sub, filters=[{type:hpf, freq:18, ...},
+    {type:low_shelf, freq:<null_band_top>, gain_db:-10, q:0.7}])` to remove
+    that sub from the cancellation band, then re-measure.
+  - If `combined ≈ max(solo)` at the null, the null is room geometry at MLP
+    and EQ cannot fix it. Document and proceed to Phase 4 — do not chase it
+    with more filters; you will only add unwanted activity in correctable
+    bands without changing the null depth.
+- **Modal residual** (`excluded_geometry_points` < 50% of band, summary shows
+  positive `error_db` peaks above target): proceed to Step D — narrow PEQ
+  cuts at the peak frequencies are appropriate.
+- **Level offset** (mean_error_db magnitude > 4 dB, distributed across band):
+  the target curve is anchored at a different SPL than the measurement.
+  Re-anchor the target_curve reference_spl to the measurement's mean SPL in
+  the upper-bass band (60-80 Hz) and re-run `compute_deviation`. Don't add
+  filters to chase a mis-anchored target.
 
 **Step D — Filter audit (before designing new corrections):**
 1. For each existing filter: simulate the set with this filter removed. If
