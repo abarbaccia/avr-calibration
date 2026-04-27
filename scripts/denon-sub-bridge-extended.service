@@ -1,0 +1,17 @@
+[Unit]
+Description=Denon LFE → CamillaDSP loopback bridge + 20-ch raw exposure
+After=sound.target
+Wants=sound.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/ffmpeg -f alsa -channels 20 -sample_rate 48000 -i plughw:USB,0 -map 0:a -acodec pcm_s32le -f alsa hw:Loopback,0,0 -map 0:a -acodec pcm_s32le -f alsa hw:Loopback,0,1 -nostats -hide_banner -loglevel warning
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=80
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
