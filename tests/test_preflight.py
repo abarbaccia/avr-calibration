@@ -262,12 +262,13 @@ class TestRunAll:
             patch.object(checker, "check_denon_and_playback", return_value=CheckResult("Denon AVR", True, "X3800H; USB: miniDSP")),
             patch.object(checker, "check_signal_path_sync", return_value=CheckResult("Signal Path", True, "not configured (skipped)")),
             patch.object(checker, "check_output_routing_safety", return_value=CheckResult("Output routing", True, "not applicable")),
+            patch.object(checker, "check_audio_stack_clean", return_value=CheckResult("Audio stack", True, "no PipeWire holders")),
             patch.object(checker, "check_dsp_persisted_state", return_value=CheckResult("DSP persisted state", True, "all defaults")),
             patch.object(checker, "check_capture_path_consistency", return_value=CheckResult("Capture path", True, "not applicable")),
         ):
             results = await checker.run_all()
         assert all(r.passed for r in results)
-        assert len(results) == 8
+        assert len(results) == 9
 
     async def test_unhandled_exception_becomes_failed_result(self, config):
         checker = PreflightChecker(config)
@@ -293,6 +294,7 @@ class TestRunAll:
             patch.object(checker, "check_denon_and_playback", side_effect=RuntimeError("err")),
             patch.object(checker, "check_signal_path_sync", side_effect=RuntimeError("err")),
             patch.object(checker, "check_output_routing_safety", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_audio_stack_clean", side_effect=RuntimeError("err")),
             patch.object(checker, "check_dsp_persisted_state", side_effect=RuntimeError("err")),
             patch.object(checker, "check_capture_path_consistency", side_effect=RuntimeError("err")),
         ):
@@ -301,7 +303,7 @@ class TestRunAll:
         # dsp_driver: minidsp (the test fixture default).
         assert [r.name for r in results] == [
             "Config", "Microphone", "miniDSP 2x4 HD", "Denon AVR", "Signal Path",
-            "Output routing", "DSP persisted state", "Capture path",
+            "Output routing", "Audio stack", "DSP persisted state", "Capture path",
         ]
 
     async def test_result_names_camilladsp_label(self, config):
@@ -654,6 +656,76 @@ class TestSignalPathSyncEdgeCases:
             result = await PreflightChecker(config).check_signal_path_sync()
         assert not result.passed
         assert "Cannot read device state" in result.error
+
+
+# ── Audio stack health (PipeWire/PulseAudio interception) ──────────────────
+
+@pytest.mark.asyncio
+class TestAudioStackClean:
+    """A userspace audio manager (PipeWire, PulseAudio, wireplumber) holding
+    /dev/snd handles can silently auto-route the cal-mode sweep to other
+    sinks (HDMI, Scarlett monitor outputs) — observed during cal-mode
+    debugging where the sweep was reaching the AVR via a path we couldn't
+    trace until we disabled PipeWire on the host.
+    """
+
+    async def test_passes_when_only_camilladsp_holds_snd_devices(self, config, monkeypatch):
+        from calibrate.preflight import PreflightChecker
+        import subprocess
+
+        clean_output = (
+            "                     USER        PID ACCESS COMMAND\n"
+            "/dev/snd/controlC2:  pi        12345 F.... camilladsp\n"
+            "/dev/snd/controlC3:  pi        12345 F.... camilladsp\n"
+        )
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(args=cmd, returncode=0,
+                                                stdout=clean_output, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        checker = PreflightChecker(config)
+        result = await checker.check_audio_stack_clean()
+        assert result.passed
+        assert "No PipeWire" in result.detail
+
+    async def test_fails_when_pipewire_holds_snd_device(self, config, monkeypatch):
+        from calibrate.preflight import PreflightChecker
+        import subprocess
+
+        dirty_output = (
+            "                     USER        PID ACCESS COMMAND\n"
+            "/dev/snd/controlC2:  pi          805 F.... wireplumber\n"
+            "                     pi        60728 F.... camilladsp\n"
+            "/dev/snd/controlC3:  pi        60728 F.... camilladsp\n"
+            "/dev/snd/controlC4:  pi          805 F.... wireplumber\n"
+        )
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(args=cmd, returncode=0,
+                                                stdout=dirty_output, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        checker = PreflightChecker(config)
+        result = await checker.check_audio_stack_clean()
+        assert not result.passed
+        assert "wireplumber" in result.detail.lower()
+        # Error message contains an actionable systemctl recipe.
+        assert "systemctl" in (result.error or "")
+
+    async def test_skips_gracefully_when_fuser_unavailable(self, config, monkeypatch):
+        from calibrate.preflight import PreflightChecker
+        import subprocess
+
+        def fake_run(cmd, **kwargs):
+            raise FileNotFoundError("fuser not installed")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        checker = PreflightChecker(config)
+        result = await checker.check_audio_stack_clean()
+        # When we can't inspect, we don't block — pass with explanatory detail.
+        assert result.passed
+        assert "skipping" in result.detail.lower()
 
 
 # ── Output routing safety (Focusrite Monitor-bus detection) ─────────────────

@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.8.4] - 2026-04-28
+
+### Fixed
+- **IR onset detection no longer locks onto room-mode resonance:** when a sub sits in a room null at the listening position, the direct arrival can be heavily attenuated and the resonance build-up that follows becomes the largest |ir| feature. The previous primary path used the cross-correlation envelope's `argmax` for `peak_time_ms`, which then reported the resonance time (e.g. 167 ms) instead of the actual time-of-flight (e.g. ~5 ms). Two solo subs measured under that geometry could appear to be 115 ms apart when the real delta was a few ms — entirely a peak-detector artifact. The fix runs IR-domain onset detection (skip 1 ms of DC region, find first sample crossing −20 dB from the in-window peak) on every measurement instead of trusting the xcorr envelope's argmax. Polarity still reads from the dominant impulse so the existing alignment heuristic doesn't change.
+
+### Added
+- **Preflight `Audio stack` check:** detects PipeWire/wireplumber/PulseAudio holders on `/dev/snd` controls. cal-mode routing is unreliable when these userspace audio managers are active — they hold ALSA control handles and may auto-route audio between sinks unpredictably. Reports a failure with the disable command when offenders are found.
+
 ## [0.6.8.3] - 2026-04-28
 
 ### Fixed

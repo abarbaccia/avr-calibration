@@ -537,7 +537,40 @@ class MeasurementEngine:
                 pass
 
             # Select output device based on route — prefer explicit index, fall back to name search
-            if route == "hdmi":
+            # Cal-mode override takes priority over the configured route — when
+            # a DSP driver is in cal mode, the sweep must be written into the
+            # driver's loopback regardless of whether the configured route is
+            # USB or HDMI. Without this the HDMI route would happily send the
+            # sweep to the AVR while the caller assumed it was bypassing.
+            override_handled = False
+            if playback_device_override:
+                try:
+                    import sounddevice as sd
+                    devices = sd.query_devices()
+                    idx, dev = _resolve_alsa_device_in_portaudio(
+                        playback_device_override, devices, want_output=True,
+                    )
+                    if idx is not None:
+                        in_idx = int(sd.default.device[0])
+                        sd.default.device = (in_idx, idx)
+                        log.info(
+                            "Output device (cal-mode override %r): %s (index %d)",
+                            playback_device_override, dev["name"], idx,
+                        )
+                        override_handled = True
+                    else:
+                        raise RuntimeError(
+                            f"cal-mode playback override {playback_device_override!r} "
+                            f"did not resolve to any PortAudio output device. "
+                            f"Available outputs: "
+                            f"{[(i, d['name']) for i, d in enumerate(devices) if d.get('max_output_channels', 0) > 0]}"
+                        )
+                except ImportError:
+                    pass
+
+            if override_handled:
+                pass  # device already set above
+            elif route == "hdmi":
                 try:
                     import sounddevice as sd
                     devices = sd.query_devices()
@@ -566,36 +599,8 @@ class MeasurementEngine:
                 try:
                     import sounddevice as sd
                     devices = sd.query_devices()
-                    # Cal-mode override takes precedence over config-defined USB device.
-                    # The override is the ALSA device string the active DSP driver
-                    # exposes (e.g. "hw:Loopback,0,0") so the sweep is written into
-                    # CamillaDSP's capture loopback rather than directly to the DAC.
                     usb_idx_cfg = cfg.get("usb_device_index")
-                    if playback_device_override:
-                        idx, dev = _resolve_alsa_device_in_portaudio(
-                            playback_device_override, devices, want_output=True,
-                        )
-                        if idx is not None:
-                            in_idx = int(sd.default.device[0])
-                            sd.default.device = (in_idx, idx)
-                            log.info(
-                                "Output device (USB cal-mode override %r): %s (index %d)",
-                                playback_device_override, dev["name"], idx,
-                            )
-                        else:
-                            # CRITICAL: do NOT silently fall back. If the cal-mode
-                            # override fails, the sweep would go to the system default
-                            # output (HDMI/AVR/etc), bypassing CamillaDSP entirely —
-                            # caller thinks they're measuring the DSP path but they're
-                            # measuring something else. Fail loudly so the bug is
-                            # caught at measurement time, not via mysterious data.
-                            raise RuntimeError(
-                                f"cal-mode playback override {playback_device_override!r} "
-                                f"did not resolve to any PortAudio output device. "
-                                f"Available outputs: "
-                                f"{[(i, d['name']) for i, d in enumerate(devices) if d.get('max_output_channels', 0) > 0]}"
-                            )
-                    elif usb_idx_cfg is not None:
+                    if usb_idx_cfg is not None:
                         idx = int(usb_idx_cfg)
                         in_idx = int(sd.default.device[0])
                         sd.default.device = (in_idx, idx)
@@ -932,39 +937,52 @@ def detect_ir_onset(
     """
     import numpy as np
 
-    if xcorr_peak_ms is not None:
-        # Primary path: cross-correlation timing (no DC artifact).
-        # Clamp to the stored IR length to avoid out-of-bounds indexing.
-        peak_idx = min(int(xcorr_peak_ms / 1000.0 * sample_rate), len(ir) - 1)
-        peak_sign = 1 if ir[peak_idx] >= 0.0 else -1
-        spl_db = float(20.0 * np.log10(np.abs(ir[peak_idx]) + 1e-12))
-        return {
-            "peak_time_ms": xcorr_peak_ms,
-            "peak_sign": peak_sign,
-            "spl_db": round(spl_db, 1),
-            "sample_rate": sample_rate,
-        }
+    # IR-domain onset detection: bandpass the deconvolved IR to suppress the
+    # Wiener-deconvolution DC artifact, find the largest absolute peak in the
+    # bandpassed result (the dominant feature — direct arrival when not
+    # masked, room mode resonance when the listening position sits in a
+    # null), then walk back to the FIRST sample whose absolute envelope
+    # crosses ``IR_ONSET_THRESHOLD_DB`` below that peak. That ``first
+    # crossing'' is the direct arrival.
+    #
+    # We deliberately DO NOT short-circuit on ``xcorr_peak_ms``. The xcorr
+    # cross-correlation envelope's argmax tracks the LARGEST envelope
+    # feature, which on transients-vs-resonance comparisons becomes the
+    # resonance time, not the direct arrival. Using the IR-domain onset
+    # threshold gives the right answer in both cases.
+    # Skip the first ~1 ms of the IR to avoid the Wiener-deconvolution DC
+    # artifact at t=0 without bandpassing. We previously bandpassed the IR to
+    # suppress the DC artifact, but that destroys transient amplitudes —
+    # a 60 Hz resonance burst (sustained tone, in-band) survives bandpass at
+    # near-full magnitude while a sub's direct-arrival impulse loses 40+ dB.
+    # The result was that any IR with a strong room mode would have its
+    # bandpassed onset land in the resonance, not on the direct arrival.
+    # Skipping the leading 1 ms gives us the same DC protection without the
+    # transient destruction.
+    skip_samples = int(0.001 * sample_rate)
+    if len(ir) <= skip_samples + 8:
+        # Pathological: IR too short to skip — use full array.
+        skip_samples = 0
+    ir_search = ir[skip_samples:]
 
-    # Fallback: bandpass the deconvolved IR to suppress DC artifact.
-    # Search the full IR (not just search_window_ms) so legacy sessions whose
-    # IR contains leading pre-sweep silence produce a non-zero peak_time_ms.
-    from scipy.signal import butter, sosfiltfilt
-
-    lo, hi = IR_ONSET_BAND_HZ
-    sos = butter(2, [lo, hi], btype="band", fs=sample_rate, output="sos")
-    filtered = sosfiltfilt(sos, ir)
-
-    abs_filtered = np.abs(filtered)
-    max_idx = int(np.argmax(abs_filtered))
+    abs_ir = np.abs(ir_search)
+    max_idx_local = int(np.argmax(abs_ir))
+    max_idx = max_idx_local + skip_samples
 
     onset_ratio = 10.0 ** (IR_ONSET_THRESHOLD_DB / 20.0)  # 0.1 for -20 dB
-    onset_threshold = abs_filtered[max_idx] * onset_ratio
-    onset_candidates = np.where(abs_filtered >= onset_threshold)[0]
-    peak_idx = int(onset_candidates[0]) if len(onset_candidates) > 0 else max_idx
+    onset_threshold = abs_ir[max_idx_local] * onset_ratio
+    onset_candidates_local = np.where(abs_ir >= onset_threshold)[0]
+    peak_idx_local = (
+        int(onset_candidates_local[0])
+        if len(onset_candidates_local) > 0
+        else max_idx_local
+    )
+    peak_idx = peak_idx_local + skip_samples
 
-    peak_sign = 1 if ir[peak_idx] >= 0.0 else -1
+    # Polarity reads the dominant impulse, not the onset crossing.
+    peak_sign = 1 if ir[max_idx] >= 0.0 else -1
     peak_time_s = peak_idx / sample_rate
-    spl_db = float(20.0 * np.log10(abs_filtered[max_idx] + 1e-12))
+    spl_db = float(20.0 * np.log10(abs_ir[max_idx_local] + 1e-12))
 
     return {
         "peak_time_ms": round(peak_time_s * 1000.0, 3),

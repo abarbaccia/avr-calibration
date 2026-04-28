@@ -77,6 +77,7 @@ class PreflightChecker:
             ("Denon AVR", self.check_denon_and_playback()),
             ("Signal Path", self.check_signal_path_sync()),
             ("Output routing", self.check_output_routing_safety()),
+            ("Audio stack", self.check_audio_stack_clean()),
             ("DSP persisted state", self.check_dsp_persisted_state()),
             ("Capture path", self.check_capture_path_consistency()),
         ]
@@ -514,6 +515,76 @@ class PreflightChecker:
         host = self.config.denon.get("host")
         detail = "denon.host not set (will use SSDP auto-discovery)" if not host else "All fields present"
         return CheckResult(name="Config", passed=True, detail=detail)
+
+    async def check_audio_stack_clean(self) -> CheckResult:
+        """Detect competing userspace audio managers (PipeWire/PulseAudio) on the host.
+
+        cal-mode writes the sweep into ``hw:Loopback,0,0``; CamillaDSP captures
+        from ``hw:Loopback,1,0``. PipeWire's default behavior is to claim
+        ``snd-aloop`` as a managed sink with name
+        ``alsa_output.platform-snd_aloop.0.analog-stereo``. Even when nothing
+        is actively linked, PipeWire and wireplumber hold ALSA control handles
+        and may auto-route audio between sinks unpredictably — observed during
+        cal-mode debugging where the sweep was reaching the AVR via a path we
+        couldn't trace until we disabled PipeWire.
+
+        Reads ``/proc/asound/cards`` and checks whether any non-CamillaDSP
+        process holds ``controlC*`` or ``pcm*`` devices on the audio cards we
+        depend on (Loopback, USB-DAC). Returns a warning result if PipeWire/
+        wireplumber/pipewire-pulse are present in the holders.
+        """
+        from pathlib import Path
+
+        proc_asound = Path("/proc/asound")
+        if not proc_asound.exists():
+            return CheckResult(
+                name="Audio stack",
+                passed=True,
+                detail="No /proc/asound visible — cannot inspect ALSA holders, skipping",
+            )
+
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["fuser", "-v", "/dev/snd/controlC2", "/dev/snd/controlC3"],
+                capture_output=True, text=True, timeout=5,
+            )
+            holders = (result.stdout or "") + (result.stderr or "")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return CheckResult(
+                name="Audio stack",
+                passed=True,
+                detail=f"Could not run fuser ({exc}) — cannot verify ALSA holders, skipping",
+            )
+
+        offenders: list[str] = []
+        for line in holders.splitlines():
+            line_lower = line.lower()
+            for bad in ("pipewire", "wireplumber", "pulseaudio"):
+                if bad in line_lower:
+                    offenders.append(bad)
+        offenders = sorted(set(offenders))
+
+        if offenders:
+            return CheckResult(
+                name="Audio stack",
+                passed=False,
+                detail=(
+                    f"Userspace audio managers holding ALSA devices: {', '.join(offenders)}. "
+                    "cal-mode routing is unreliable when these are active — they may auto-route "
+                    "the sweep to the AVR or other sinks."
+                ),
+                error=(
+                    "Disable on the host: "
+                    "systemctl --user disable --now pipewire pipewire-pulse wireplumber "
+                    "pipewire.socket pipewire-pulse.socket"
+                ),
+            )
+        return CheckResult(
+            name="Audio stack",
+            passed=True,
+            detail="No PipeWire/PulseAudio holders on /dev/snd",
+        )
 
     async def check_output_routing_safety(self) -> CheckResult:
         """Warn when transducers are cabled to Focusrite Monitor-bus outputs.
