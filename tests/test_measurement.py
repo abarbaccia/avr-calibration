@@ -632,6 +632,97 @@ class TestComputeSessionMetadata:
         assert spl[idx_50] > spl[idx_100] - 3, "50 Hz room mode not preserved by IR gate"
 
 
+class TestCoherenceMetric:
+    """The reported coherence is a per-bin reliability score derived from
+    the IR's signal-vs-noise ratio (early IR window vs late tail). Welch
+    coherence is invalid for sweep stimuli — these tests pin the new metric.
+    """
+
+    def _engine(self):
+        return MeasurementEngine(make_config())
+
+    def _log_sweep(self, n: int, sr: int) -> "np.ndarray":
+        """Real log sweep covering 20 Hz to sr/4, with leading silence."""
+        lead = n // 8
+        body = n - lead
+        f0, f1 = 20.0, sr / 4
+        t = np.arange(body) / sr
+        T = body / sr
+        phase = 2.0 * np.pi * f0 * T / np.log(f1 / f0) * (
+            (f1 / f0) ** (t / T) - 1.0
+        )
+        sweep = np.zeros(n)
+        sweep[lead:lead + body] = np.sin(phase)
+        return sweep
+
+    def test_clean_ir_yields_high_coherence(self):
+        """Single-tap IR with no tail noise → coherence near 1 across the band."""
+        engine = self._engine()
+        n, sr = 2 ** 16, 48000
+        sweep = self._log_sweep(n, sr)
+        ir_room = np.zeros(n)
+        ir_room[200] = 1.0  # clean direct arrival, nothing else
+        rec = np.real(np.fft.ifft(np.fft.fft(sweep) * np.fft.fft(ir_room)))
+
+        _, _, _, _, coh, _ = engine._compute_fr_arrays(
+            np, sweep, rec, 20, 200, sr,
+        )
+        assert coh is not None
+        # The IR is a clean delta with zeros in the tail, so SNR is huge and
+        # coherence should sit at the upper bound across the whole band.
+        assert min(coh) > 0.9, f"clean IR coherence too low: min={min(coh)}"
+
+    def test_noise_only_recording_yields_mid_coherence(self):
+        """Recording is pure noise → mean coherence near 0.5 (SNR ≈ 1)."""
+        engine = self._engine()
+        n, sr = 2 ** 16, 48000
+        sweep = self._log_sweep(n, sr)
+        rng = np.random.default_rng(7)
+        rec = rng.standard_normal(n)
+
+        _, _, _, _, coh, _ = engine._compute_fr_arrays(
+            np, sweep, rec, 20, 200, sr,
+        )
+        assert coh is not None
+        # Pure-noise recording produces uniformly-distributed deconvolved IR;
+        # early-window vs tail-window powers are comparable so SNR ≈ 1 and
+        # γ²=SNR/(1+SNR) ≈ 0.5 on average. The important regression is that
+        # noise no longer reads near zero (Welch bug) AND doesn't pin near 1
+        # (would mean the metric is uninformative).
+        mean_coh = sum(coh) / len(coh)
+        assert 0.2 < mean_coh < 0.7, f"noise coherence unexpected: mean={mean_coh}"
+
+    def test_added_tail_noise_drops_coherence(self):
+        """Coherence falls monotonically as recording noise level rises."""
+        engine = self._engine()
+        n, sr = 2 ** 16, 48000
+        sweep = self._log_sweep(n, sr)
+        ir_room = np.zeros(n)
+        ir_room[200] = 1.0
+        rec_clean = np.real(np.fft.ifft(np.fft.fft(sweep) * np.fft.fft(ir_room)))
+        rng = np.random.default_rng(123)
+        noise = rng.standard_normal(n)
+
+        results = []
+        # Sweep needs to span a wide range to overcome the deconvolution's
+        # noise rejection at low levels — at 0.5× noise the SNR is still
+        # comfortable, only at 5× and 20× does it bite.
+        for noise_level in [0.0, 1.0, 5.0, 20.0]:
+            rec = rec_clean + noise * noise_level
+            _, _, _, _, coh, _ = engine._compute_fr_arrays(
+                np, sweep, rec, 20, 200, sr,
+            )
+            results.append(sum(coh) / len(coh))
+
+        # Mean coherence must monotonically decrease as noise rises.
+        for i in range(len(results) - 1):
+            assert results[i] >= results[i + 1] - 1e-6, (
+                f"coherence did not decrease with tail noise: {results}"
+            )
+        assert results[0] > 0.9, f"clean baseline too low: {results[0]}"
+        assert results[-1] < 0.5, f"heavy noise should drop coherence: {results[-1]}"
+
+
 class TestPreDelayCompensation:
     """
     USBPlayback records PRE_DELAY_S seconds of room noise before playing the sweep
