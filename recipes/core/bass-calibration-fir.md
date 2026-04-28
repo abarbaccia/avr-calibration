@@ -103,6 +103,79 @@ Show the active signal path based on `get_config.measurement.playback_route`:
 Build the diagram dynamically from config — sub labels from `output_slots`,
 mic from `config.mic.name`, AVR from `config.denon`, DSP name from `config.dsp_driver`.
 
+## Sanity preflight — DO NOT SKIP
+
+Three failure modes silently corrupted months of calibration work before
+v0.6.8.x. Each one produces measurements that look plausible but are based
+on a broken signal chain. If any of these checks fail, **stop and fix
+before measuring anything** — you'll be optimizing noise.
+
+### 1. Confirm the sweep is going where you think
+
+`set_cal_mode(true)` then `mute_output` both subs and run `measure(label="silence-test")`.
+Expected: the measurement fails with `"Sweep not detected in recording (cross-correlation peak too low)"`. That failure means the DSP path is silenced
+correctly; the mic captured no signal correlated with the sweep.
+
+If the measurement succeeds with normal-looking data when both subs are
+muted, the sweep is reaching the mic by some other path (HDMI to AVR,
+PipeWire mirroring, etc.). Stop. Diagnose:
+- `playback_route` MUST be `"usb"` for cal-mode bypass to engage. `hdmi`
+  routes through the AVR regardless of `cal_mode_active`.
+- `check_system` includes an `Audio stack` check that flags PipeWire/
+  wireplumber/PulseAudio holding `/dev/snd` handles. Disable them on the
+  host: `systemctl --user mask pipewire wireplumber pipewire-pulse`.
+- Verify the cal-mode loopback resolves to the right PortAudio device —
+  `_resolve_alsa_device_in_portaudio` reads `/proc/asound/cards` to map
+  `hw:Loopback,0,0` → the actual ALSA card index. If this fails, cal-mode
+  silently falls back to system default (HDMI on a Pi).
+
+### 2. Trust coherence as the data quality signal
+
+The post-v0.6.8.2 coherence metric is per-bin SNR (not Welch — Welch is
+invalid on non-stationary sweeps). Reading rules:
+- ≥ **0.95**: gold standard. Optimize against this freely.
+- **0.7 – 0.95**: usable, but expect ±1-2 dB jitter run-to-run. Don't fit
+  precise filters here.
+- **0.3 – 0.7**: marginal. Use group delay rather than IR peak for timing
+  in this band; don't trust SPL deltas under ~3 dB as meaningful.
+- **< 0.3**: noise. **Do not optimize against this band.** A 10 dB SPL
+  swing here is invisible to the ear and reflects ambient noise, not
+  acoustic cancellation. Most common at 20-25 Hz when the sub is below
+  port tuning or sitting in a deep null.
+
+A 3-second sweep is enough for ≥0.95 coherence at 31.5 Hz and up on the
+USB-direct cal-mode path. Bump to 5-10s only when chasing 20 Hz
+specifically. Longer sweeps don't help when the bottleneck is geometry,
+not SNR.
+
+### 3. IR peak time can lie when a room mode dominates
+
+When the listening position sits in a destructive-cancellation null for
+one sub, the direct arrival is heavily attenuated and the room-mode
+resonance that follows is the largest |IR| feature. Naive `argmax(|ir|)`
+locks onto the resonance time (e.g. 167 ms) instead of the
+time-of-flight (e.g. ~5 ms). The post-v0.6.8.4 onset detector handles
+the typical case (find first sample ≥ −20 dB from peak) but **it
+cannot recover the direct arrival when it's buried 30+ dB below the
+resonance**. If two solo subs in the same room appear ≥30 ms apart at
+MLP, the geometry of one is masking direct arrival — physically move
+the sub or use group delay at coherent frequencies (50-100 Hz) for
+alignment, not IR peak time.
+
+### 4. Sub placement beats every software lever
+
+If the combined response at MLP shows a 20+ dB null at 25-31 Hz with
+high coherence, that's not an EQ problem — it's destructive
+interference between the two subs at the listening seat. EQ cannot
+fill a null; it just dumps power into the room without changing the
+cancellation at MLP. The fixes are physical:
+- Sub crawl (move one sub by 1-2 ft and re-measure)
+- Move MLP by 6-12 inches
+- Add a third sub (distributed bass array)
+
+Note this in the run log if the geometry is the bottleneck. Don't waste
+filter slots trying to compensate.
+
 ## Filter strategy
 
 Three layers, all of them simultaneously active in the DSP pipeline:
