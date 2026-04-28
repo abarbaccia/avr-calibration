@@ -879,6 +879,51 @@ class CamillaDSPDriver(DSPDriver):
         """ALSA device measure() should write the sweep to in cal mode."""
         return self._cal_playback_device
 
+    async def _sync_fir_state_from_active_locked(self) -> None:
+        """Pull Conv FIR coefficients from the running CamillaDSP config into shadow state.
+
+        Caller must hold ``self._lock``. Used before a full pipeline rebuild
+        (e.g. ``set_cal_mode``) to preserve FIR coefficients that were applied
+        outside this driver — for example, an external script that called
+        ``SetConfigJson`` directly to avoid the round-trip token cost of
+        passing 4096-tap arrays through the MCP layer. Without this sync, the
+        rebuild would silently revert those filters to whatever shadow state
+        last knew about (often the initial linear-phase coefficients).
+
+        Only Conv filters named ``cal_out{N}_fir`` are synced — those are the
+        per-output FIR slots this driver owns. Other Conv filters are ignored.
+        """
+        try:
+            raw = await self._client.call("GetConfigJson")
+        except DriverError as exc:
+            log.warning("FIR resync: GetConfigJson failed (%s); skipping", exc)
+            return
+        if not isinstance(raw, str):
+            return
+        try:
+            cfg = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        filters = (cfg or {}).get("filters") or {}
+        if not isinstance(filters, dict):
+            return
+        for name, spec in filters.items():
+            if not isinstance(spec, dict) or spec.get("type") != "Conv":
+                continue
+            if not (name.startswith("cal_out") and name.endswith("_fir")):
+                continue
+            try:
+                idx = int(name[len("cal_out"):-len("_fir")])
+            except ValueError:
+                continue
+            params = spec.get("parameters") or {}
+            if params.get("type") != "Values":
+                continue
+            values = params.get("values")
+            if not isinstance(values, list) or not values:
+                continue
+            self._fir_state[idx] = [float(c) for c in values]
+
     async def set_cal_mode(self, enabled: bool) -> None:
         """Swap CamillaDSP capture between live and calibration sources.
 
@@ -889,11 +934,14 @@ class CamillaDSPDriver(DSPDriver):
               path — what enters the FIR/PEQ chain is exactly what the sweep
               generator produced.
 
-        Idempotent. Pushes a fresh config to CamillaDSP on transition.
+        Idempotent. Pushes a fresh config to CamillaDSP on transition. FIR
+        coefficients on the running daemon are synced into shadow state before
+        the push so externally-applied filters survive the toggle.
         """
         if enabled == self._cal_mode_active:
             return
         async with self._lock:
+            await self._sync_fir_state_from_active_locked()
             if enabled:
                 # Snapshot live config before swapping, in case the caller
                 # mutated capture state through other paths since construction.

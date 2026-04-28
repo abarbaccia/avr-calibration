@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.8.1] - 2026-04-28
+
+### Fixed
+- **`set_cal_mode` no longer clobbers externally-applied FIR coefficients:** Toggling cal-mode used to rebuild the entire CamillaDSP pipeline from the driver's shadow state. FIRs written to the daemon by another path (e.g. an external `SetConfigJson` call to dodge the token cost of passing 4096-tap arrays through MCP) were not in shadow state and got silently reverted to the driver's last-known coefficients. The driver now syncs Conv `cal_out{N}_fir` filters from `GetConfigJson` into shadow state before the push, so externally-applied FIRs survive the toggle. Defensive: failed `GetConfigJson` calls log a warning and the swap still completes.
+
 ## [0.6.8.0] - 2026-04-24
 
 ### Fixed
