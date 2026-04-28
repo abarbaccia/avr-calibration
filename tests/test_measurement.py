@@ -632,6 +632,129 @@ class TestComputeSessionMetadata:
         assert spl[idx_50] > spl[idx_100] - 3, "50 Hz room mode not preserved by IR gate"
 
 
+class TestResolveAlsaDeviceInPortAudio:
+    """ALSA hw: names don't substring-match PortAudio device names directly.
+
+    Regression: cal-mode used to lookup ``hw:Loopback,0,0`` against PortAudio
+    names like ``"Loopback: PCM (hw:2,0)"`` — literal substring match fails,
+    cal-mode silently fell back to system default device, sweep went to AVR
+    instead of into CamillaDSP, every cal-mode measurement produced bogus data.
+    These tests pin the new resolver that maps ALSA card names → PortAudio
+    matches via /proc/asound/cards.
+    """
+
+    def _devices(self):
+        return [
+            {"name": "vc4-hdmi-0: MAI PCM i2s-hifi-0 (hw:0,0)", "max_output_channels": 8, "max_input_channels": 0},
+            {"name": "Loopback: PCM (hw:2,0)", "max_output_channels": 2, "max_input_channels": 0},
+            {"name": "Loopback: PCM (hw:2,1)", "max_output_channels": 32, "max_input_channels": 0},
+            {"name": "default", "max_output_channels": 128, "max_input_channels": 128},
+        ]
+
+    def test_literal_substring_still_works_when_match_present(self):
+        """If the ALSA name happens to be a literal substring (older configs), prefer it."""
+        from calibrate.measurement import _resolve_alsa_device_in_portaudio
+
+        devs = [
+            {"name": "Some Device hw:Loopback,0,0 alias", "max_output_channels": 2},
+            {"name": "Other", "max_output_channels": 2},
+        ]
+        idx, dev = _resolve_alsa_device_in_portaudio("hw:Loopback,0,0", devs, want_output=True)
+        assert idx == 0
+
+    def test_resolves_loopback_via_asound_cards(self, tmp_path, monkeypatch):
+        """The real-world case: PortAudio names use ``(hw:<card_idx>,<dev>)``."""
+        from calibrate import measurement
+
+        # Stub /proc/asound/cards so the resolver knows Loopback → card 2
+        cards_text = """0 [vc4hdmi0       ]: vc4-hdmi - vc4-hdmi-0
+                      vc4-hdmi-0 (hw:0,0)
+ 2 [Loopback       ]: Loopback - Loopback
+                      Loopback 1
+ 3 [USB            ]: USB-Audio - Scarlett 18i20 USB
+                      Focusrite Scarlett 18i20 USB at usb-...
+"""
+        cards_file = tmp_path / "cards"
+        cards_file.write_text(cards_text)
+        # Patch Path("/proc/asound/cards") read_text via monkeypatching pathlib.Path
+        import pathlib
+        real_read_text = pathlib.Path.read_text
+
+        def patched_read_text(self, *args, **kwargs):
+            if str(self) == "/proc/asound/cards":
+                return cards_text
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "read_text", patched_read_text)
+
+        devs = self._devices()
+        idx, dev = measurement._resolve_alsa_device_in_portaudio(
+            "hw:Loopback,0,0", devs, want_output=True,
+        )
+        assert idx == 1, f"expected loopback playback (hw:2,0), got {idx} {dev}"
+        assert "Loopback" in dev["name"]
+        assert "(hw:2,0)" in dev["name"]
+
+    def test_returns_none_when_card_name_unknown(self, monkeypatch):
+        """Unknown ALSA card name → None, never a wrong-device fallback."""
+        from calibrate import measurement
+        import pathlib
+
+        def patched_read_text(self, *args, **kwargs):
+            if str(self) == "/proc/asound/cards":
+                return ""  # empty
+            return pathlib.Path.read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "read_text", patched_read_text)
+
+        devs = self._devices()
+        idx, dev = measurement._resolve_alsa_device_in_portaudio(
+            "hw:NonexistentCard,0,0", devs, want_output=True,
+        )
+        assert idx is None and dev is None
+
+    def test_returns_none_when_proc_asound_unavailable(self, monkeypatch):
+        """If /proc/asound/cards can't be read, fall back to None (don't pick wrong device)."""
+        from calibrate import measurement
+        import pathlib
+
+        def patched_read_text(self, *args, **kwargs):
+            if str(self) == "/proc/asound/cards":
+                raise OSError("simulated filesystem error")
+            return pathlib.Path.read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "read_text", patched_read_text)
+
+        devs = self._devices()
+        idx, dev = measurement._resolve_alsa_device_in_portaudio(
+            "hw:Loopback,0,0", devs, want_output=True,
+        )
+        assert idx is None and dev is None
+
+    def test_skips_wrong_direction(self, monkeypatch):
+        """Asking for output won't match an input-only device with the same name."""
+        from calibrate import measurement
+        import pathlib
+
+        cards_text = " 2 [Loopback       ]: Loopback - Loopback\n"
+
+        def patched_read_text(self, *args, **kwargs):
+            if str(self) == "/proc/asound/cards":
+                return cards_text
+            return pathlib.Path.read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "read_text", patched_read_text)
+
+        # Capture-only loopback presented in the device list
+        devs = [
+            {"name": "Loopback: PCM (hw:2,0)", "max_output_channels": 0, "max_input_channels": 32},
+        ]
+        idx, dev = measurement._resolve_alsa_device_in_portaudio(
+            "hw:Loopback,0,0", devs, want_output=True,
+        )
+        assert idx is None
+
+
 class TestCoherenceMetric:
     """The reported coherence is a per-bin reliability score derived from
     the IR's signal-vs-noise ratio (early IR window vs late tail). Welch

@@ -214,6 +214,84 @@ def apply_mic_correction(
     return corrected
 
 
+def _resolve_alsa_device_in_portaudio(
+    alsa_name: str,
+    devices,
+    want_output: bool = True,
+) -> tuple[int | None, dict | None]:
+    """Resolve an ALSA-style device string (``hw:CardName,Dev,Sub``) to a PortAudio device.
+
+    PortAudio names ALSA hw devices with the friendly form
+    ``"<CardName>: <Description> (hw:<card_idx>,<dev>)"``, so a literal substring
+    match for the original ALSA string ``"hw:CardName,Dev,Sub"`` fails. This
+    helper reads ``/proc/asound/cards`` to map CardName → numeric index, then
+    matches PortAudio devices by both card name (substring) and the
+    ``(hw:<idx>,<dev>)`` suffix.
+
+    Falls back to plain substring match if ``/proc/asound/cards`` is unavailable
+    or the alsa_name has unexpected shape.
+
+    Returns ``(idx, device_dict)`` on match, or ``(None, None)`` if no device
+    in ``devices`` corresponds to the requested ALSA path. Caller is responsible
+    for raising / logging — this helper never silently returns a wrong device.
+    """
+    if not alsa_name:
+        return None, None
+    needed_channels = "max_output_channels" if want_output else "max_input_channels"
+    candidates_lit = [
+        (idx, dev) for idx, dev in enumerate(devices)
+        if dev.get(needed_channels, 0) > 0
+        and alsa_name.lower() in str(dev.get("name", "")).lower()
+    ]
+    if candidates_lit:
+        idx, dev = candidates_lit[0]
+        return idx, dev
+
+    if not alsa_name.lower().startswith("hw:"):
+        return None, None
+    parts = alsa_name[3:].split(",")
+    if len(parts) < 2:
+        return None, None
+    card_name, dev_num = parts[0], parts[1]
+
+    card_idx: int | None = None
+    try:
+        from pathlib import Path
+        cards_text = Path("/proc/asound/cards").read_text()
+    except (OSError, IOError):
+        cards_text = ""
+    for line in cards_text.splitlines():
+        line = line.strip()
+        if not line or not line[0].isdigit():
+            continue
+        bracket_open = line.find("[")
+        bracket_close = line.find("]")
+        if bracket_open == -1 or bracket_close == -1:
+            continue
+        idx_token = line[:bracket_open].strip().split()[0]
+        name_token = line[bracket_open + 1:bracket_close].strip()
+        if name_token.lower() == card_name.lower():
+            try:
+                card_idx = int(idx_token)
+                break
+            except ValueError:
+                continue
+
+    if card_idx is None:
+        return None, None
+
+    suffix = f"(hw:{card_idx},{dev_num})"
+    name_substr = card_name.lower()
+    for idx, dev in enumerate(devices):
+        if dev.get(needed_channels, 0) <= 0:
+            continue
+        dname = str(dev.get("name", "")).lower()
+        if name_substr in dname and suffix in dname:
+            return idx, dev
+
+    return None, None
+
+
 def _find_umik_device(devices, name_substring: str = "UMIK") -> int | None:
     """Return the index of the first input device whose name contains name_substring.
 
@@ -494,13 +572,10 @@ class MeasurementEngine:
                     # CamillaDSP's capture loopback rather than directly to the DAC.
                     usb_idx_cfg = cfg.get("usb_device_index")
                     if playback_device_override:
-                        ov = playback_device_override.lower()
-                        candidates = [
-                            (idx, dev) for idx, dev in enumerate(devices)
-                            if dev.get("max_output_channels", 0) > 0 and ov in dev["name"].lower()
-                        ]
-                        if candidates:
-                            idx, dev = candidates[0]
+                        idx, dev = _resolve_alsa_device_in_portaudio(
+                            playback_device_override, devices, want_output=True,
+                        )
+                        if idx is not None:
                             in_idx = int(sd.default.device[0])
                             sd.default.device = (in_idx, idx)
                             log.info(
@@ -508,9 +583,17 @@ class MeasurementEngine:
                                 playback_device_override, dev["name"], idx,
                             )
                         else:
-                            log.warning(
-                                "Output device (USB cal-mode override %r): no match in PortAudio device list — falling back",
-                                playback_device_override,
+                            # CRITICAL: do NOT silently fall back. If the cal-mode
+                            # override fails, the sweep would go to the system default
+                            # output (HDMI/AVR/etc), bypassing CamillaDSP entirely —
+                            # caller thinks they're measuring the DSP path but they're
+                            # measuring something else. Fail loudly so the bug is
+                            # caught at measurement time, not via mysterious data.
+                            raise RuntimeError(
+                                f"cal-mode playback override {playback_device_override!r} "
+                                f"did not resolve to any PortAudio output device. "
+                                f"Available outputs: "
+                                f"{[(i, d['name']) for i, d in enumerate(devices) if d.get('max_output_channels', 0) > 0]}"
                             )
                     elif usb_idx_cfg is not None:
                         idx = int(usb_idx_cfg)

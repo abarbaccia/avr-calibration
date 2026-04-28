@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.8.3] - 2026-04-28
+
+### Fixed
+- **cal_mode silently routed sweep through the AVR instead of CamillaDSP loopback:** the cal-mode override looked up the ALSA device string ``hw:Loopback,0,0`` against PortAudio device names via literal substring match, but PortAudio renames ALSA hw devices using the numeric card index — the actual name is ``"Loopback: PCM (hw:2,0)"`` (where 2 is the ALSA card index for snd-aloop). Match returned zero, the code logged a "no match — falling back" warning, and ``sd.default.device[1]`` (system default = HDMI/AVR or whatever) received the sweep. Every cal-mode measurement was bypassing CamillaDSP entirely, producing FR/IR data that reflected the AVR-driven mains rather than the DSP path. Symptoms that flagged the bug: "out5 solo" and "out6 solo" gave byte-identical FR at 11/11 bands, combined ≈ solo (no constructive sum), both subs muted still produced a strong signal. Fixed by adding ``_resolve_alsa_device_in_portaudio`` which reads ``/proc/asound/cards`` to map card names to indices and matches PortAudio's ``"(hw:N,M)"`` suffix. Cal-mode now raises ``RuntimeError`` instead of silent fallback when the resolver fails — broken routing must be loud.
+
 ## [0.6.8.2] - 2026-04-28
 
 ### Fixed
