@@ -984,13 +984,16 @@ class TestOnsetDetection:
             f"Expected onset near 10ms (fallback path), got {peak_ms}ms"
         )
 
-    def test_xcorr_primary_path_used_when_available(self):
-        """When FrequencyResponse has xcorr_peak_ms, onset detection uses it
-        directly — bypassing the deconvolved IR entirely."""
+    def test_ir_onset_ignores_misleading_xcorr_hint(self):
+        """IR-domain onset detection ignores misleading xcorr_peak_ms hints.
+
+        The xcorr_peak_ms parameter is no longer used as a short-circuit;
+        the bandpassed IR onset detection runs always so the reported peak
+        reflects the actual direct arrival, not the (potentially wrong)
+        cross-correlation argmax which can lock onto room-mode resonance."""
         sr = 48000
         ir = np.zeros(24000)
-        ir[0] = 100.0                   # giant DC artifact
-        ir[int(0.015 * sr)] = 0.5       # real onset
+        ir[int(0.015 * sr)] = 1.0       # real onset at 15 ms
 
         fr = FrequencyResponse(
             frequencies=[20.0, 100.0],
@@ -999,14 +1002,16 @@ class TestOnsetDetection:
             sweep_duration=1.0,
             timestamp="2026-01-01T00:00:00Z",
             impulse_response=ir.tolist(),
-            xcorr_peak_ms=15.0,          # from cross-correlation
+            xcorr_peak_ms=80.0,          # misleading hint — should be ignored
         )
 
         meta = compute_session_metadata(fr, search_window_ms=50.0)
 
+        # Expect the bandpass + onset detection to land near 15 ms (some
+        # group-delay slack from sosfiltfilt — typically a few ms).
         peak_ms = meta["ir"]["peak_time_ms"]
-        assert peak_ms == 15.0, (
-            f"Expected exact xcorr peak of 15ms, got {peak_ms}ms"
+        assert 8.0 < peak_ms < 25.0, (
+            f"Expected onset near 15 ms (real impulse), got {peak_ms} ms"
         )
 
 
@@ -1016,24 +1021,47 @@ class TestOnsetDetection:
 class TestDetectIrOnset:
     """Direct unit tests for the extracted detect_ir_onset function."""
 
-    def test_xcorr_primary_path(self):
-        """When xcorr_peak_ms is provided, uses it directly (no IR processing)."""
+    def test_finds_clean_impulse(self):
+        """Clean impulse at 15 ms → onset detection returns near 15 ms."""
         sr = 48000
         ir = np.zeros(24000)
         ir[int(0.015 * sr)] = 1.0  # real peak at 15ms
-        # Also place a giant DC artifact — should be ignored when xcorr provided
-        ir[0] = 100.0
         result = detect_ir_onset(ir, sr, search_window_ms=50.0, xcorr_peak_ms=15.0)
-        assert result["peak_time_ms"] == 15.0
+        # Expect onset near 15 ms with some bandpass group-delay slack.
+        assert 8.0 < result["peak_time_ms"] < 25.0
         assert result["peak_sign"] == 1
 
-    def test_xcorr_negative_polarity(self):
-        """Cross-correlation path reads polarity from the original IR."""
+    def test_negative_polarity_preserved(self):
+        """Onset detection reads polarity from the original IR even when
+        xcorr_peak_ms is provided as a (now-ignored) hint."""
         sr = 48000
         ir = np.zeros(24000)
         ir[int(0.010 * sr)] = -1.0  # inverted
         result = detect_ir_onset(ir, sr, search_window_ms=50.0, xcorr_peak_ms=10.0)
         assert result["peak_sign"] == -1
+
+    def test_picks_direct_arrival_over_louder_late_resonance(self):
+        """Direct arrival (transient) at 5 ms + much louder resonance burst at
+        120 ms — onset must pick the direct arrival, not resonance.
+
+        This is the regression case from real measurements: when a sub sits
+        in a room null at MLP, the resonance build-up after direct arrival
+        can be 25-100× larger than the direct sound itself, and naive
+        argmax(|ir|) reports the resonance time as the peak.
+        """
+        sr = 48000
+        ir = np.zeros(24000)
+        ir[int(0.005 * sr)] = 0.3
+        # 60 Hz resonance burst at 120 ms with peak ~0.5 (well above direct)
+        t = np.arange(int(0.080 * sr)) / sr
+        burst = np.sin(2 * np.pi * 60 * t) * np.exp(-t * 8) * 0.5
+        late = int(0.120 * sr)
+        ir[late:late + len(burst)] += burst
+        result = detect_ir_onset(ir, sr, search_window_ms=50.0)
+        assert 1.0 < result["peak_time_ms"] < 30.0, (
+            f"Expected onset near 5 ms direct arrival, not late resonance — "
+            f"got {result['peak_time_ms']} ms"
+        )
 
     def test_fallback_finds_direct_sound(self):
         """Without xcorr_peak_ms, bandpass fallback finds broadband impulse.
