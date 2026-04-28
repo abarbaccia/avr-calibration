@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.8.2] - 2026-04-28
+
+### Fixed
+- **Coherence metric was meaningless for swept-sine measurements:** the previous implementation called `scipy.signal.coherence` (Welch's method) on the sweep stimulus and recording. Welch averages cross-power across time segments and assumes the signal is stationary. A swept sine is the opposite — at any given frequency bin only one segment of the sweep contains real signal; the other 28 contain only noise. The averaged cross-power gets diluted while the recording's autopower stays inflated by ambient noise, pinning reported coherence near zero independently of measurement quality. The effect was worst at low frequency (where each band is visited briefly during a log sweep) — exactly where reliability mattered most for sub work. Replaced with a per-bin SNR derived from the early IR window (signal) vs the late IR tail (noise floor), mapped to a [0, 1] reliability via the standard γ² = SNR/(1+SNR). This is what REW and Smaart report as "coherence" for swept-sine measurements.
+
 ## [0.6.8.1] - 2026-04-28
 
 ### Fixed

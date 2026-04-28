@@ -749,20 +749,37 @@ class MeasurementEngine:
         if cal_curve:
             spl_list = apply_mic_correction(freq_list, spl_list, cal_curve)
 
-        # Compute coherence using Welch's method
+        # Per-frequency reliability via IR-tail SNR.
+        #
+        # Welch coherence on a sweep stimulus is invalid: a swept sine is
+        # non-stationary, so within any single sweep most Welch segments
+        # contain no signal at any given frequency bin. The averaged
+        # cross-power gets diluted by silent segments while the recording's
+        # autopower stays inflated by ambient noise, pinning coherence near
+        # zero independently of measurement quality. The effect worsens at
+        # low frequency, where each band is visited briefly during the
+        # sweep — exactly where reliability matters most for sub work.
+        #
+        # The right metric for a deconvolved sweep is per-bin SNR comparing
+        # the early IR (signal) against the late IR tail (noise floor),
+        # mapped to a coherence-like [0, 1] reliability via the standard
+        # γ² = SNR / (1 + SNR). This is what REW and Smaart report as
+        # "coherence" for swept-sine measurements.
         coh_list: list[float] | None = None
         try:
-            from scipy.signal import coherence as _scipy_coherence
-            nperseg = min(n // 4, sample_rate)  # ~1s segments
-            if nperseg >= 256:
-                coh_freqs, coh_vals = _scipy_coherence(
-                    sweep_array[:n], rec_array[:n],
-                    fs=sample_rate, nperseg=nperseg,
-                )
-                # Interpolate coherence to our frequency grid
-                coh_interp = np.interp(freqs[mask], coh_freqs, coh_vals)
-                coh_list = [round(float(c), 3) for c in coh_interp]
-        except (ImportError, Exception) as exc:
+            tail_start = gate_samples
+            tail_len = gate_samples
+            if tail_start + tail_len <= n:
+                sig_window = ir_full[:gate_samples]
+                noise_window = ir_full[tail_start:tail_start + tail_len]
+                H_sig = np.fft.rfft(sig_window, n=n)
+                H_noise = np.fft.rfft(noise_window, n=n)
+                sig_pow = np.abs(H_sig) ** 2
+                noise_pow = np.abs(H_noise) ** 2
+                snr = sig_pow / (noise_pow + 1e-30)
+                gamma_sq = snr / (1.0 + snr)
+                coh_list = [round(float(c), 3) for c in gamma_sq[mask]]
+        except Exception as exc:
             log.warning("coherence computation failed: %s", exc)
 
         return freq_list, spl_list, ir_samples, phase_rad[mask].tolist(), coh_list, xcorr_peak_ms
