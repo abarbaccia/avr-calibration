@@ -533,16 +533,6 @@ class PreflightChecker:
         depend on (Loopback, USB-DAC). Returns a warning result if PipeWire/
         wireplumber/pipewire-pulse are present in the holders.
         """
-        from pathlib import Path
-
-        proc_asound = Path("/proc/asound")
-        if not proc_asound.exists():
-            return CheckResult(
-                name="Audio stack",
-                passed=True,
-                detail="No /proc/asound visible — cannot inspect ALSA holders, skipping",
-            )
-
         try:
             import subprocess
             result = subprocess.run(
@@ -551,6 +541,9 @@ class PreflightChecker:
             )
             holders = (result.stdout or "") + (result.stderr or "")
         except (OSError, subprocess.TimeoutExpired) as exc:
+            # fuser missing or no /dev/snd present (CI runners, sandboxes,
+            # systems without audio hardware). Don't block on a check we
+            # can't perform; report a passing result with a clear note.
             return CheckResult(
                 name="Audio stack",
                 passed=True,
