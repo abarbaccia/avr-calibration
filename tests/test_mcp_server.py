@@ -58,6 +58,7 @@ from calibrate.mcp_server import (
     _tool_compute_deviation,
     _tool_configure_matrix,
     _tool_design_fir,
+    _tool_design_modal_fir,
     _tool_fetch_recipe,
     _tool_get_device_state,
     _tool_get_fr_summary,
@@ -5651,6 +5652,43 @@ async def test_optimize_sub_alignment_three_subs() -> None:
 
 
 @pytest.mark.asyncio
+async def test_optimize_sub_alignment_min_latency_form() -> None:
+    """Returned delays must be normalized: trailing sub at 0 ms, leading subs
+    only get the inter-sub delta. The differential_evolution search bounds
+    [0, max_delay_ms] are symmetric and the cost surface is flat with respect
+    to a common offset, so without normalization the optimizer can return
+    e.g. {15 ms, 25 ms} for two subs that only need 10 ms differential —
+    burning 15 ms of pure latency on the sub chain. That latency then pushes
+    sub-vs-mains alignment out and consumes the AVR's distance-push budget.
+    Inter-sub alignment depends only on the delta; the absolute offset is
+    arbitrary, so we anchor it to the minimum."""
+    import numpy as np
+    sr = 48000
+    n = int(0.5 * sr)
+    # Three subs spread over 5 ms. After min-latency normalization at least
+    # one of them MUST be at 0 ms.
+    irs = [_synthetic_sub_ir(sr, n, arrival_s=0.002 + i * 0.005) for i in range(3)]
+    sessions = [
+        _make_session_with_synth_ir(i + 1, ir, sr) for i, ir in enumerate(irs)
+    ]
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = sessions
+        result = await _tool_optimize_sub_alignment(
+            session_ids=[1, 2, 3], min_hz=30.0, max_hz=150.0, max_delay_ms=20.0,
+        )
+
+    assert result["ok"], result
+    delays = [r["delay_ms"] for r in result["per_sub"]]
+    # Min must be exactly zero (not "near zero") — the normalization is exact.
+    assert min(delays) == 0.0, (
+        f"min-latency form violated: at least one sub must be at 0 ms, got {delays}"
+    )
+    # The note string explains the new contract.
+    assert "MINIMUM-LATENCY" in result["note"] or "min-latency" in result["note"].lower()
+
+
+@pytest.mark.asyncio
 async def test_optimize_sub_alignment_missing_session() -> None:
     """Unknown session_id → error."""
     with patch("calibrate.storage.SessionStore") as MockStore:
@@ -5955,6 +5993,162 @@ async def test_design_fir_avr_fields_unknown_when_driver_lacks_attribute() -> No
     assert result["avr_max_delay_ms"] is None
     assert result["avr_compensable"] is None
     assert result["avr_headroom_ms"] is None
+
+
+# ── design_modal_fir ────────────────────────────────────────────────────────
+
+
+def _make_modal_session(decay_modes: list[dict], session_id: int = 1) -> MagicMock:
+    """Build a session whose metadata.decay_modes drives modal design."""
+    mock_fr = MagicMock()
+    mock_fr.frequencies = [20.0, 50.0, 100.0]
+    mock_fr.spl = [0.0, 0.0, 0.0]
+    mock_fr.impulse_response = None
+    mock_fr.phase = None
+    session = MagicMock()
+    session.id = session_id
+    session.timestamp = "2026-04-28T00:00:00Z"
+    session.label = f"modal-test-{session_id}"
+    session.start_fr = mock_fr
+    session.metadata = {"decay_modes": decay_modes}
+    return session
+
+
+@pytest.mark.asyncio
+async def test_design_modal_fir_auto_classifies_when_intents_omitted() -> None:
+    """Without intents, the tool auto-classifies modes by T60+peak vs the
+    target T60 (default 300 ms)."""
+    decay_modes = [
+        {"freq_hz": 70.3,  "t60_ms": 1100, "peak_db": 9.0},   # 3.7× target → anti_pulse
+        {"freq_hz": 117.0, "t60_ms": 100,  "peak_db": 17.0},  # short loud → linear_notch
+        {"freq_hz": 187.5, "t60_ms": 700,  "peak_db": 2.0},   # peak<3 → skip
+        {"freq_hz": 47.0,  "t60_ms": 450,  "peak_db": 8.0},   # 1.5× target → min_phase
+        {"freq_hz": 25.0,  "t60_ms": 250,  "peak_db": 8.0},   # ≤target → skip
+    ]
+    session = _make_modal_session(decay_modes)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_modal_fir(session_id=1, num_taps=2048)
+    assert result["ok"], result
+    treatments = {t["freq_hz"]: t["treatment"] for t in result["per_mode_treatments"]}
+    assert treatments[70.3] == "anti_pulse"
+    assert treatments[117.0] == "linear_notch"
+    assert treatments[187.5] == "skip"
+    assert treatments[47.0] == "min_phase"
+    assert treatments[25.0] == "skip"
+
+
+@pytest.mark.asyncio
+async def test_design_modal_fir_target_t60_changes_classification() -> None:
+    """Same modes get classified differently as the user shifts target_t60_ms.
+    A 700 ms mode is "long ringy" against a 300 ms target but "already fine"
+    against a 700 ms target."""
+    decay_modes = [
+        {"freq_hz": 70.0, "t60_ms": 700, "peak_db": 9.0},
+    ]
+    session = _make_modal_session(decay_modes)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        # Strict target: 300 ms — 700 ms is 2.3× over → anti_pulse
+        strict = await _tool_design_modal_fir(
+            session_id=1, target_t60_ms=300.0, num_taps=2048,
+        )
+        # Loose target: 700 ms — already meets → skip
+        loose = await _tool_design_modal_fir(
+            session_id=1, target_t60_ms=700.0, num_taps=2048,
+        )
+    assert strict["per_mode_treatments"][0]["treatment"] == "anti_pulse"
+    assert loose["per_mode_treatments"][0]["treatment"] == "skip"
+
+
+@pytest.mark.asyncio
+async def test_design_modal_fir_uses_supplied_intents_verbatim() -> None:
+    """LLM-supplied intents override auto-classification."""
+    decay_modes = [
+        {"freq_hz": 70.0, "t60_ms": 1500, "peak_db": 12.0},
+    ]
+    intents = [
+        {"freq_hz": 70.0, "t60_ms": 1500, "peak_db": 12.0,
+         "treatment": "skip", "rationale": "user knows better"},
+    ]
+    session = _make_modal_session(decay_modes)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_modal_fir(
+            session_id=1, intents=intents, num_taps=1024,
+        )
+    assert result["ok"]
+    assert result["per_mode_treatments"][0]["treatment"] == "skip"
+
+
+@pytest.mark.asyncio
+async def test_design_modal_fir_anti_pulse_uses_pre_ring_budget() -> None:
+    """An anti_pulse mode at 70 Hz consumes ~7 ms pre-ring (half-wavelength)."""
+    decay_modes = [{"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0}]
+    intents = [{"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0,
+                "treatment": "anti_pulse", "cancel_strength": 0.6}]
+    session = _make_modal_session(decay_modes)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_modal_fir(
+            session_id=1, intents=intents, num_taps=4096, max_pre_ring_ms=25.0,
+        )
+    assert result["ok"]
+    # Half-wavelength of 70 Hz = 7.14 ms; tool uses half + tail/2
+    assert 5.0 < result["pre_delay_ms"] < 15.0
+    treatment = result["per_mode_treatments"][0]
+    assert treatment["treatment"] == "anti_pulse"
+    assert "anti_pulse_pre_ms" in treatment
+    assert treatment["predicted_t60_reduction_pct"] > 0
+
+
+@pytest.mark.asyncio
+async def test_design_modal_fir_no_anti_pulse_means_zero_pre_ring() -> None:
+    """When no mode gets anti_pulse treatment, pre-ring budget collapses to 0."""
+    decay_modes = [{"freq_hz": 70.0, "t60_ms": 200, "peak_db": 4.0}]
+    intents = [{"freq_hz": 70.0, "t60_ms": 200, "peak_db": 4.0,
+                "treatment": "min_phase"}]
+    session = _make_modal_session(decay_modes)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_modal_fir(
+            session_id=1, intents=intents, num_taps=1024,
+        )
+    assert result["ok"]
+    assert result["pre_delay_ms"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_design_modal_fir_caches_coefficients_for_apply_fir() -> None:
+    """return_coefficients=False caches server-side; apply_fir picks them up."""
+    import calibrate.mcp_server as srv
+    decay_modes = [{"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0}]
+    session = _make_modal_session(decay_modes, session_id=42)
+    srv._fir_design_cache.pop(42, None)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_modal_fir(
+            session_id=42, num_taps=1024, return_coefficients=False,
+        )
+    assert result["ok"]
+    assert "coefficients" not in result  # not in response
+    assert 42 in srv._fir_design_cache    # but in cache
+    assert len(srv._fir_design_cache[42]) == 1024
+
+
+@pytest.mark.asyncio
+async def test_design_modal_fir_missing_decay_modes_errors() -> None:
+    """Session without decay_modes metadata returns a clear error."""
+    session = MagicMock()
+    session.id = 1
+    session.metadata = None
+    session.start_fr = MagicMock()
+    session.start_fr.impulse_response = None
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_modal_fir(session_id=1)
+    assert not result["ok"]
+    assert "decay_modes" in result["error"]
 
 
 # ── set_speaker_distances MCP tool ─────────────────────────────────────────────

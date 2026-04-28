@@ -2990,6 +2990,25 @@ async def _tool_optimize_sub_alignment(
                 "polarity_inverted": polarity_inverted,
             })
 
+        # Normalize to MINIMUM-LATENCY form. Inter-sub alignment depends only
+        # on the *delta* between subs; an absolute offset added to every sub's
+        # delay shifts the whole sub-chain in time without changing how the
+        # subs sum at the listening position. The differential_evolution
+        # optimizer often returns recommendations with all delays > 0 because
+        # the search bounds [0, max_delay_ms] are symmetric and the cost
+        # surface is flat with respect to the common offset. Returning those
+        # absolute delays as-is means the caller adds 15-25 ms of pure latency
+        # to the sub chain for nothing — that latency then pushes the
+        # sub-vs-mains offset out of alignment and burns Audyssey distance-
+        # push budget. Subtract the minimum so the trailing sub gets 0 and
+        # leading subs get only the delta needed to catch up. The combined FR
+        # is mathematically identical; only the absolute time anchor changes.
+        delays = [r["delay_ms"] for r in per_sub]
+        if delays:
+            min_delay = min(delays)
+            for r in per_sub:
+                r["delay_ms"] = round(r["delay_ms"] - min_delay, 3)
+
         optimized_err = float(result.fun)
         improvement_db = round(baseline_err - optimized_err, 2)
 
@@ -3017,8 +3036,13 @@ async def _tool_optimize_sub_alignment(
                 "Per-sub recommendations minimize predicted combined-FR error in-band. "
                 "Apply delay via set_delay, gain via set_output_gain, polarity via "
                 "set_polarity per session_id. Then measure combined to verify "
-                "improvement_db shows up. Delay floor is 0 — trailing subs stay put, "
-                "leading subs get delayed to align."
+                "improvement_db shows up. Delays are returned in MINIMUM-LATENCY "
+                "form: the trailing sub is anchored at 0 ms; leading subs receive "
+                "only the inter-sub delta needed to align. This avoids burning "
+                "10-25 ms of pure latency on the sub chain (which would push the "
+                "sub-vs-mains offset out of alignment and consume Audyssey "
+                "distance-push budget). The combined FR is invariant to absolute "
+                "time offset — only the inter-sub delta matters."
             ),
         )
     except Exception as exc:
@@ -3390,6 +3414,200 @@ async def _tool_design_fir(
         return _ok(**result)
     except Exception as exc:
         return _err(f"design_fir failed: {exc}")
+
+
+async def _tool_design_modal_fir(
+    session_id: int,
+    intents: list[dict] | None = None,
+    target_curve: dict | None = None,
+    target_t60_ms: float = 300.0,
+    peak_action_db: float = 3.0,
+    short_loud_t60_factor: float = 0.5,
+    short_loud_peak_db: float = 12.0,
+    long_ringy_t60_factor: float = 2.0,
+    anti_pulse_cancel_strength: float = 0.6,
+    num_taps: int = 4096,
+    max_pre_ring_ms: float = 25.0,
+    return_coefficients: bool = False,
+) -> dict:
+    """Design a modal-aware mixed-phase FIR with explicit per-mode treatment.
+
+    Unlike ``design_fir`` (magnitude correction with allowed non-causality),
+    this tool **actively cancels modal ringing** in the time domain by
+    placing band-limited anti-pulses one half-wavelength before the main
+    impulse for each mode flagged as ``anti_pulse``. Anti-pulse cancellation
+    reduces both the modal peak magnitude AND the T60 decay tail, where
+    pure magnitude correction only reduces the peak.
+
+    Per-mode treatment (LLM-supplied via ``intents``, or auto-classified
+    against ``target_t60_ms``):
+      - ``anti_pulse``: T60 > 2× target → place inverted band-limited
+        impulse half-wavelength before main. Cancels both peak and T60.
+        Costs half-wavelength of pre-ring per mode (e.g. 7.14 ms at 70 Hz).
+      - ``linear_notch``: T60 < 0.5× target AND peak > 12 dB → linear-phase
+        precise notch. Costs ~3-5 ms pre-ring; surgical magnitude cut.
+      - ``min_phase``: T60 moderately above target → conservative min-phase
+        magnitude EQ. Zero pre-ring cost; reduces peak but not T60.
+      - ``skip``: T60 already ≤ target, OR peak < 3 dB — leave alone.
+
+    The ``target_t60_ms`` parameter is the room-quality target — modes
+    already meeting it are skipped; modes far above it get aggressive
+    treatment. Industry references:
+      - 250 ms — mastering / control room
+      - 300 ms — THX / Dolby reference (default)
+      - 500 ms — acceptable home theater
+      - >700 ms — untreated room
+
+    The total pre-ring budget is bounded by ``max_pre_ring_ms`` (default
+    25 ms — psychoacoustic threshold for sub-band content). The actual
+    pre-ring used is the maximum half-wavelength + bandpass tail across
+    all anti-pulse-treated modes.
+
+    Args:
+        session_id: measurement session whose ``decay_modes`` and
+            ``impulse_response`` provide the modal data and base
+            magnitude correction.
+        intents: list of per-mode design intents. Each entry:
+            ``{freq_hz, t60_ms, peak_db, treatment, cancel_strength?,
+            rationale?}``. ``treatment`` ∈ {anti_pulse, linear_notch,
+            min_phase, skip}. ``cancel_strength`` (0-1, default 0.6)
+            controls how aggressively to cancel. If ``intents`` is None,
+            the tool classifies each ``decay_mode`` from the session
+            metadata using the default heuristic (T60>800ms+peak>6 →
+            anti_pulse; T60<400ms+peak>12 → linear_notch; peak<3 → skip;
+            else min_phase).
+        target_curve: ignored at present; the base correction comes from
+            the session's IR. Reserved for future use.
+        target_t60_ms: room-quality target T60 (default 300 ms). Modes
+            already meeting this are skipped; modes far above it (T60 >
+            2× target) get anti-pulse treatment. Used only for
+            auto-classification when ``intents`` is None. See the
+            "T60 references" table above the args.
+        num_taps: FIR length (default 4096 at 8 kHz internal = 512 ms span).
+        max_pre_ring_ms: maximum pre-ringing budget across all anti-pulses
+            (default 25 ms). Larger budget = more aggressive modal
+            cancellation but more sub-chain latency.
+        return_coefficients: when False (default), coefficient array is
+            cached server-side keyed by session_id and omitted from the
+            response. Apply via apply_fir(output_index,
+            design_session_id=session_id).
+
+    Returns:
+        per_mode_treatments: list of {freq_hz, treatment, rationale,
+            anti_pulse_pre_ms?, anti_pulse_amplitude?, predicted_t60_reduction_pct?}
+        pre_delay_ms: actual pre-ring used (≤ max_pre_ring_ms).
+        peak_amplitude: max |coefficient| after composition + normalization.
+        total_taps, sample_rate: FIR shape.
+        notes: warnings (e.g. anti-pulse clipped to fit budget).
+        coefficients: only when return_coefficients=True.
+    """
+    from .storage import SessionStore
+    from .modal_fir import (
+        ModalAwareFIRDesigner,
+        ModeIntent,
+        classify_mode_default,
+        latency_budget_breakdown,
+    )
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        session = next((s for s in sessions if s.id == session_id), None)
+        if session is None:
+            return _err(f"session {session_id} not found")
+
+        meta = session.metadata or {}
+        if isinstance(meta, str):
+            import json as _json
+            meta = _json.loads(meta)
+
+        decay_modes = meta.get("decay_modes") or []
+        if not decay_modes:
+            return _err(
+                f"session {session_id} has no decay_modes in metadata; "
+                f"re-measure or run analyze_decay first"
+            )
+
+        # Build base correction from the session's IR (passthrough impulse if absent)
+        ir = session.start_fr.impulse_response if session.start_fr else None
+        if not ir:
+            base_correction = [0.0] * num_taps
+            base_correction[0] = 1.0
+        else:
+            base_correction = list(ir[:num_taps]) + [0.0] * max(0, num_taps - len(ir))
+
+        # Translate intents (dicts) to ModeIntent objects, or auto-classify
+        if intents:
+            intent_objs = [
+                ModeIntent(
+                    freq_hz=float(i["freq_hz"]),
+                    t60_ms=float(i.get("t60_ms", 0)),
+                    peak_db=float(i.get("peak_db", 0)),
+                    treatment=str(i["treatment"]),
+                    cancel_strength=float(i.get("cancel_strength", 0.6)),
+                    bp_q=float(i.get("bp_q", 1.5)),
+                    rationale=str(i.get("rationale", "")),
+                )
+                for i in intents
+            ]
+        else:
+            intent_objs = [
+                classify_mode_default(
+                    float(m["freq_hz"]),
+                    float(m["t60_ms"]),
+                    float(m["peak_db"]),
+                    target_t60_ms=float(target_t60_ms),
+                    peak_action_db=float(peak_action_db),
+                    short_loud_t60_factor=float(short_loud_t60_factor),
+                    short_loud_peak_db=float(short_loud_peak_db),
+                    long_ringy_t60_factor=float(long_ringy_t60_factor),
+                    anti_pulse_cancel_strength=float(anti_pulse_cancel_strength),
+                )
+                for m in decay_modes
+            ]
+
+        designer = ModalAwareFIRDesigner(
+            sample_rate=8000,
+            n_taps=int(num_taps),
+            max_pre_ring_ms=float(max_pre_ring_ms),
+        )
+        coeffs, summary = designer.design(
+            decay_modes=decay_modes,
+            base_correction=base_correction,
+            intents=intent_objs,
+            target_t60_ms=float(target_t60_ms),
+            peak_action_db=float(peak_action_db),
+            short_loud_t60_factor=float(short_loud_t60_factor),
+            short_loud_peak_db=float(short_loud_peak_db),
+            long_ringy_t60_factor=float(long_ringy_t60_factor),
+            anti_pulse_cancel_strength=float(anti_pulse_cancel_strength),
+        )
+
+        _fir_design_cache[int(session_id)] = list(coeffs)
+
+        result = {
+            "session_id": session_id,
+            "num_taps": summary.total_taps,
+            "sample_rate": summary.sample_rate,
+            "pre_delay_ms": round(summary.pre_delay_ms, 3),
+            "pre_delay_samples": summary.pre_delay_samples,
+            "peak_amplitude": round(summary.peak_amplitude, 4),
+            "per_mode_treatments": summary.mode_treatments,
+            "notes": summary.notes,
+            "latency_budget": latency_budget_breakdown(summary),
+            "design_cached": True,
+            "note": (
+                f"Modal-aware FIR at 8000Hz, {summary.total_taps} taps. "
+                f"Pre-ring: {summary.pre_delay_ms:.1f}ms (budget {max_pre_ring_ms:.0f}ms). "
+                f"{len([t for t in summary.mode_treatments if t['treatment']=='anti_pulse'])} anti-pulses. "
+                f"Apply via apply_fir(output_index, design_session_id={session_id})."
+            ),
+        }
+        if return_coefficients:
+            result["coefficients"] = list(coeffs)
+        return _ok(**result)
+    except Exception as exc:
+        return _err(f"design_modal_fir failed: {exc}")
 
 
 async def _tool_set_speaker_distances(
@@ -7130,18 +7348,22 @@ _TOOLS: list[Tool] = [
     Tool(
         name="design_fir",
         description=(
-            "**Preferred tool for per-sub modal correction on FIR-capable hardware.** "
-            "FIR simultaneously flattens magnitude AND shortens T60 decay (which PEQ cannot do — "
-            "PEQ only reduces the peak, the mode still rings). Designed against a solo-sub "
-            "measurement, applied per-output via apply_fir. Follow with recommend_fir_phase "
-            "to decide if a mixed-phase redesign would better attack long modes. "
-            "Compose this pattern across all subs independently before any input EQ work. "
-            "You decide the strategy: phase mode "
-            "(minimum/linear/mixed), tap count, and frequency focus. The tool computes "
-            "coefficients and returns them with a predicted effect and pre-ringing estimate. "
-            "Pass coefficients to apply_fir(output_index, coefficients) to write to hardware. "
-            "Read fir_min_taps, fir_max_taps_per_output, and fir_sample_rate_hz from "
-            "eq_capabilities in get_config — limits depend on the active DSP."
+            "**Magnitude-correction FIR.** Designed against a session's FR; produces a "
+            "filter whose magnitude response is the inverse of the measured response "
+            "(scaled to the target curve). Phase mode is one of: "
+            "``minimum`` (zero pre-ring; flattens magnitude only — leaves T60 untouched), "
+            "``linear`` (symmetric impulse; full magnitude+phase correction; substantial latency), "
+            "``mixed`` (homomorphic decomposition with bounded pre-ring; reduces some "
+            "modal resonance via phase correction but does NOT actively cancel modes). "
+            "\n\n"
+            "**WHEN TO USE THIS:** baseline magnitude shaping per sub. Smooth FR targets "
+            "(Harman shelf, flat). Modes with short T60 (<400 ms) where peak reduction "
+            "is enough. \n\n"
+            "**WHEN TO USE design_modal_fir INSTEAD:** rooms with long modal ringing "
+            "(any mode T60 > 500 ms at peak > +6 dB). The phase_mode='mixed' option here "
+            "does NOT actively cancel modes — it just allows non-causal magnitude correction. "
+            "Active anti-pulse cancellation (which actually shortens T60, not just the peak) "
+            "is design_modal_fir's job."
         ),
         inputSchema={
             "type": "object",
@@ -7198,6 +7420,162 @@ _TOOLS: list[Tool] = [
                         "degenerate to minimum-phase. Ignored by minimum/linear modes."
                     ),
                     "default": 25.0,
+                },
+            },
+            "required": ["session_id"],
+        },
+    ),
+    Tool(
+        name="design_modal_fir",
+        description=(
+            "**Active modal-cancellation FIR.** Designs a mixed-phase FIR that "
+            "places band-limited anti-pulses one half-wavelength before the main "
+            "impulse for each room mode flagged as ``anti_pulse``. This actively "
+            "cancels modal ringing in the time domain — both the peak magnitude "
+            "AND the T60 decay tail are reduced. \n\n"
+            "**WHEN TO USE THIS** (over plain ``design_fir``): \n"
+            "- Combined or solo measurement shows mode T60 > 500 ms at peak > +6 dB \n"
+            "- Multiple ringy modes (47, 70, 94 Hz, etc) — handles all in one FIR \n"
+            "- You want T60 reduction, not just magnitude flattening \n\n"
+            "**WHEN NOT TO USE** (use ``design_fir`` instead): \n"
+            "- Rooms with already-short T60 (< 400 ms) — anti-pulse adds latency for "
+            "marginal benefit \n"
+            "- Pure target-curve shaping with no modal problem \n"
+            "- Tight latency budgets (< 5 ms) — anti-pulse needs half-wavelength of "
+            "pre-ring per mode (e.g. 7.14 ms at 70 Hz) \n\n"
+            "Per-mode treatments via the ``intents`` argument: ``anti_pulse`` (cancel "
+            "T60), ``linear_notch`` (precise magnitude cut), ``min_phase`` (gentle "
+            "magnitude EQ), ``skip``. Omit ``intents`` to auto-classify based on "
+            "T60+peak heuristics."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "integer",
+                    "description": (
+                        "Measurement session whose decay_modes drive the design. "
+                        "Use combined-sub session for shared correction; per-sub "
+                        "session if each sub needs distinct treatment."
+                    ),
+                },
+                "intents": {
+                    "type": "array",
+                    "description": (
+                        "Optional per-mode intents. If omitted, auto-classify via "
+                        "default heuristic. Each entry: "
+                        "{freq_hz, t60_ms, peak_db, treatment, cancel_strength?, rationale?}"
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "freq_hz": {"type": "number"},
+                            "t60_ms": {"type": "number"},
+                            "peak_db": {"type": "number"},
+                            "treatment": {
+                                "type": "string",
+                                "enum": ["anti_pulse", "linear_notch", "min_phase", "skip"],
+                            },
+                            "cancel_strength": {
+                                "type": "number",
+                                "description": "0-1, default 0.6 — how aggressively to cancel.",
+                            },
+                            "bp_q": {
+                                "type": "number",
+                                "description": (
+                                    "Bandpass Q on the anti-pulse envelope. "
+                                    "Higher = narrower band = less adjacent-band "
+                                    "spectral leakage (lets safety caps pass) but "
+                                    "longer time-domain tail. Default 1.5; raise "
+                                    "to 3-4 if a per-band thermal cap trips."
+                                ),
+                            },
+                            "rationale": {"type": "string"},
+                        },
+                        "required": ["freq_hz", "treatment"],
+                    },
+                },
+                "target_t60_ms": {
+                    "type": "number",
+                    "description": (
+                        "Room-quality target T60 — modes already meeting it "
+                        "are skipped, modes far above (T60 > target × "
+                        "long_ringy_t60_factor) get anti-pulse treatment. "
+                        "Industry references: 250 ms mastering, 300 ms "
+                        "THX/Dolby (default), 500 ms HT, >700 ms untreated. "
+                        "Used for auto-classification when ``intents`` is "
+                        "omitted."
+                    ),
+                    "default": 300.0,
+                },
+                "peak_action_db": {
+                    "type": "number",
+                    "description": (
+                        "Below this peak magnitude, modes are skipped "
+                        "regardless of T60 (too quiet to bother)."
+                    ),
+                    "default": 3.0,
+                },
+                "short_loud_t60_factor": {
+                    "type": "number",
+                    "description": (
+                        "Multiplier on target_t60_ms defining 'short' for "
+                        "the linear_notch rule. T60 < target × this AND "
+                        "peak > short_loud_peak_db → linear_notch."
+                    ),
+                    "default": 0.5,
+                },
+                "short_loud_peak_db": {
+                    "type": "number",
+                    "description": (
+                        "Peak threshold for the linear_notch rule. Loud "
+                        "short peaks get a precise magnitude cut instead "
+                        "of an anti-pulse."
+                    ),
+                    "default": 12.0,
+                },
+                "long_ringy_t60_factor": {
+                    "type": "number",
+                    "description": (
+                        "Multiplier on target_t60_ms defining 'long ringy' "
+                        "for the anti_pulse rule. T60 > target × this → "
+                        "anti_pulse."
+                    ),
+                    "default": 2.0,
+                },
+                "anti_pulse_cancel_strength": {
+                    "type": "number",
+                    "description": (
+                        "How aggressively each anti_pulse cancels its mode. "
+                        "0-1; default 0.6. Higher = more T60 reduction but "
+                        "risks over-cancellation creating dips. Predicted "
+                        "T60 reduction ≈ 60% × this."
+                    ),
+                    "default": 0.6,
+                },
+                "num_taps": {
+                    "type": "integer",
+                    "description": "FIR length. Default 4096 at 8 kHz internal = 512 ms span.",
+                    "default": 4096,
+                },
+                "max_pre_ring_ms": {
+                    "type": "number",
+                    "description": (
+                        "Pre-ring budget across all anti-pulses. Default 25 ms "
+                        "(psychoacoustic threshold for sub-band content). The "
+                        "actual pre-ring used = max half-wavelength of the "
+                        "anti_pulse modes + a tail."
+                    ),
+                    "default": 25.0,
+                },
+                "return_coefficients": {
+                    "type": "boolean",
+                    "description": (
+                        "When false (default), coefficients are cached server-side "
+                        "and applied via apply_fir(design_session_id=...). When true, "
+                        "the array is returned in the response."
+                    ),
+                    "default": False,
                 },
             },
             "required": ["session_id"],
@@ -7887,6 +8265,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             freq_focus_hz=arguments.get("freq_focus_hz"),
             return_coefficients=bool(arguments.get("return_coefficients", True)),
             preringing_ms=float(arguments.get("preringing_ms", 25.0)),
+        )
+    elif name == "design_modal_fir":
+        result = await _tool_design_modal_fir(
+            session_id=int(arguments["session_id"]),
+            intents=arguments.get("intents"),
+            target_curve=arguments.get("target_curve"),
+            target_t60_ms=float(arguments.get("target_t60_ms", 300.0)),
+            peak_action_db=float(arguments.get("peak_action_db", 3.0)),
+            short_loud_t60_factor=float(arguments.get("short_loud_t60_factor", 0.5)),
+            short_loud_peak_db=float(arguments.get("short_loud_peak_db", 12.0)),
+            long_ringy_t60_factor=float(arguments.get("long_ringy_t60_factor", 2.0)),
+            anti_pulse_cancel_strength=float(arguments.get("anti_pulse_cancel_strength", 0.6)),
+            num_taps=int(arguments.get("num_taps", 4096)),
+            max_pre_ring_ms=float(arguments.get("max_pre_ring_ms", 25.0)),
+            return_coefficients=bool(arguments.get("return_coefficients", False)),
         )
     # ── LLM filter-design math tools ────────────────────────────────────────
     elif name == "evaluate_transfer_function":

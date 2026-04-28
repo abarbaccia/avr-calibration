@@ -413,6 +413,28 @@ set_output_gain(target=<transducer-name>, gain_db=<rec.gain_db>)  # if nonzero
 set_polarity(target=<transducer-name>, inverted=<rec.polarity_inverted>)  # if changed
 ```
 
+**Apply the delays as returned — do not manually subtract a baseline.**
+``optimize_sub_alignment`` already returns delays in MINIMUM-LATENCY form:
+the trailing sub is anchored at 0 ms; leading subs receive only the
+inter-sub delta. Adding a uniform offset would just push the entire sub
+chain back in time, burning latency on the AVR's distance-push budget
+without changing how the subs sum at the listening position. Inter-sub
+alignment depends only on the delta between subs, not the absolute
+offset; the tool enforces that contract.
+
+**Apply the delays to the subs the tool indicates — do not swap based on
+your own IR-peak interpretation.** The optimizer uses the full IR data
+(not just the dominant-peak time) to predict combined response. In
+geometries where one sub sits in a deep null at MLP, the IR's "peak" is
+the room-mode resonance ringing AFTER the direct arrival, not the direct
+arrival itself — so naive `argmax(|ir|)` reading gives a misleading sense
+of which sub is "leading" vs "trailing". Empirical A/B (recal session
+755 vs 751, 2026-04-28): swapping the optimizer's delay assignment
+between subs gave essentially equivalent FR but cost 11 ms additional
+sub-chain latency. **Trust the optimizer's literal output. Apply
+`per_sub[i].delay_ms` to the sub identified by `per_sub[i].session_id`,
+nothing else.**
+
 **Polarity is canonical-form**: `optimize_sub_alignment` anchors sub_0
 (the first session_id passed) to `polarity_inverted=false` because
 absolute polarity is unobservable in sub-only optimization. Any sub
@@ -451,18 +473,45 @@ example: a session with polarity-A winning aggregate SPL by 2 dB
 while losing 16 dB at 31 Hz because of position-induced cancellation.
 Aggregate test passed; user couldn't feel any deep bass.
 
-### 1.5 Verify alignment — solo-vs-combined per band
+### 1.5 Verify alignment — deep-bass priority + no major nulls
 
-Aggregate "combined louder than any solo" is too lenient — narrow-band
-cancellation hides in the average. Stricter check:
+Two priorities, in this order:
+
+1. **Maximize deep bass strength (20-40 Hz).** This is the band the user
+   *feels*, where room cancellations are typically deepest, and where
+   recovery via EQ is least possible. Optimization should prioritize
+   keeping this band high before any other concern.
+
+2. **No major narrow nulls anywhere in 20-100 Hz.** A "major null" is a
+   1/3-octave band where the combined response drops more than 6 dB
+   below the trend in adjacent bands, OR more than 3 dB below
+   `max(solo_per_sub)`. Either signature indicates destructive
+   interference at MLP. Mid-bass nulls (50-100 Hz) are partially
+   recoverable via EQ; deep-bass nulls (20-40 Hz) are not — moving the
+   sub or the listener is the only reliable fix.
+
+Concretely, after applying the optimizer's recommendation:
 
 1. Take a combined measurement.
-2. For each 1/3-octave band in the target range, compute
-   `max(solo_SPL_per_sub)` and compare to `combined_SPL`.
-3. **At every band** in target range, combined ≥ max(solo). If any
-   band has combined < max(solo), you have **destructive interference**
-   at MLP — distinct failure mode requiring different remediation
-   than alignment imperfection.
+2. **First check deep bass (20-40 Hz):** what's the minimum SPL in the
+   1/3-octave bands at 20, 25, 31.5, 40 Hz? If any is more than 6 dB
+   below the 50-80 Hz mid-bass trend, that's a deep-bass null. Try the
+   polarity flip (Phase 1.4); if neither polarity recovers it, escalate
+   to physical placement.
+3. **Then check 50-100 Hz for narrow nulls.** If a single band drops
+   more than 3 dB below the trend, flag as a candidate for FIR
+   correction in Phase 2.
+
+Bands above 100 Hz are informational only at this stage — the mains
+will mask any sub imperfection there at the typical 80 Hz crossover.
+Bands below 20 Hz are below port tuning for most subs and reflect
+noise more than signal.
+
+**Why deep-bass-priority instead of full-band RMS:** wideband flatness
+optimization can leave a 10+ dB null at 30 Hz while reading "flat" on
+RMS because the rest of the band offsets it. The null is the audible
+problem ("subs not digging deep") even when RMS reads fine — see also
+Phase 1.6.
 
 If combined < max(solo) in any band:
 - **First**: try the polarity verification (Phase 1.4) again — may
