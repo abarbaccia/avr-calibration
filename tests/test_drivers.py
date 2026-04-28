@@ -1291,6 +1291,73 @@ async def test_camilladsp_set_cal_mode_idempotent() -> None:
     assert driver._client.call.await_count == push_count_after_enable
 
 
+@pytest.mark.asyncio
+async def test_camilladsp_set_cal_mode_preserves_externally_applied_fir() -> None:
+    """FIR coefficients on the running daemon survive a cal_mode toggle.
+
+    Regression: an external script that called SetConfigJson directly to write
+    Conv FIR coefficients (e.g. to dodge the token cost of passing 4096-tap
+    arrays through MCP) used to lose those coefficients on the next cal_mode
+    transition — the driver rebuilt the pipeline from its shadow state, which
+    didn't know about the externally-applied filter. set_cal_mode now syncs
+    Conv ``cal_out{N}_fir`` filters from GetConfigJson into shadow state
+    before pushing, so the rebuild faithfully re-emits them.
+    """
+    import json as _json
+
+    driver = CamillaDSPDriver(output_channels=8)
+    external_fir = [0.1, -0.2, 0.3, -0.4, 0.5]
+    daemon_cfg = {
+        "devices": {},
+        "filters": {
+            "cal_out5_fir": {
+                "type": "Conv",
+                "parameters": {"type": "Values", "values": external_fir},
+            },
+            "some_other_filter": {
+                "type": "Biquad",
+                "parameters": {"type": "Peaking", "freq": 60, "gain": -3, "q": 1.0},
+            },
+        },
+    }
+
+    async def call_mock(command, value=None):
+        if command == "GetConfigJson":
+            return _json.dumps(daemon_cfg)
+        return None
+
+    driver._client.call = AsyncMock(side_effect=call_mock)
+
+    assert driver._fir_state.get(5) is None  # shadow state empty
+    await driver.set_cal_mode(True)
+    assert driver._fir_state[5] == external_fir  # synced from daemon
+    # Non-FIR filters and unrelated names are ignored — only cal_out{N}_fir
+    # Conv slots are pulled into shadow state.
+    assert 60 not in driver._fir_state
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_set_cal_mode_tolerates_getconfigjson_failure() -> None:
+    """If GetConfigJson fails or returns junk, set_cal_mode still completes.
+
+    Defensive: a daemon hiccup during sync must not block the capture swap.
+    Shadow state is left untouched in that case.
+    """
+    driver = CamillaDSPDriver()
+    driver._fir_state[5] = [0.9, 0.1]  # pre-existing shadow state
+
+    async def call_mock(command, value=None):
+        if command == "GetConfigJson":
+            raise DriverError("simulated transport failure")
+        return None
+
+    driver._client.call = AsyncMock(side_effect=call_mock)
+
+    await driver.set_cal_mode(True)
+    assert driver.cal_mode_active is True
+    assert driver._fir_state[5] == [0.9, 0.1]  # untouched
+
+
 def test_camilladsp_cal_playback_device_default_is_loopback_write_side() -> None:
     """The cal-mode playback device is the snd-aloop write side by default."""
     driver = CamillaDSPDriver()
