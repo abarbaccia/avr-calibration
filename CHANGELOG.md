@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.9.4] - 2026-04-29
+
+### Changed
+- **`analyze_ir` description + docstring tightened to flag cross-path misuse:** the tool's `peak_time_s` only equals acoustic travel time when the compared measurements share an identical processing chain. With a long FIR (e.g. 4096-tap modal-FIR @ 48 kHz ≈ 85 ms window) on the sub chain, the detected peak sits inside the FIR's non-causal region — its absolute value reflects FIR shape and buffer latency, not arrival time. Every cross-path use (sub-vs-mains, FIR-chain vs no-FIR-chain, cal-mode vs HDMI) was returning misleading numbers without warning. Docstring + tool description now name the valid (solo-sub) and invalid (cross-path) use cases explicitly and route cross-path callers to `compare_sub_phase` or the loopback alignment rig.
+
+### Added
+- **`cross_path_warning` field in `analyze_ir` response:** when `peak_time_ms` exceeds 80 ms (well beyond any realistic solo-sub acoustic range), the response includes a string warning that the value reflects FIR/buffer latency rather than acoustic arrival, and that cross-path comparisons against this number are invalid. Solo-sub callers (peak in normal 0–30 ms range) see `cross_path_warning: null` and behave unchanged.
+
 ## [0.6.8.4] - 2026-04-28
 
 ### Fixed

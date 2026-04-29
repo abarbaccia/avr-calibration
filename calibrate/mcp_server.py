@@ -25,7 +25,7 @@ Tools:
   set_output_gain        — set gain for a single DSP output (dB)
   apply_fir              — write FIR coefficients to a DSP output (via CLI, WAV temp file)
   clear_fir              — clear FIR and reset to passthrough
-  analyze_ir             — IR peak time, polarity, SPL from stored session (sub alignment)
+  analyze_ir             — IR onset time, polarity, SPL (solo-sub alignment ONLY — invalid cross-path)
   analyze_decay          — T60 decay analysis on stored IR; returns ringing modes with priority
   configure_matrix       — configure miniDSP routing matrix (active input → all outputs)
   check_system           — pre-flight hardware checks
@@ -5235,10 +5235,19 @@ async def _tool_analyze_ir(
     session_id: int | None = None,
     search_window_ms: float = 50.0,
 ) -> dict:
-    """Extract IR peak time, polarity sign, and SPL from a stored session.
+    """Extract IR onset time, polarity sign, and SPL from a stored session.
 
-    Used for sub alignment: measure each sub solo, call this on each session,
-    compute delay offsets from peak_time_s differences, apply via set_delay.
+    Valid use: solo-sub time alignment — measure each sub solo with identical
+    DSP processing on each, then subtract the earliest peak_time_s from the
+    latest to get the delay offset. Both measurements share the same FIR and
+    buffer latency, so those terms cancel.
+
+    INVALID use: cross-path comparisons (sub-vs-mains, FIR-chain vs no-FIR-chain,
+    cal-mode vs HDMI). The detected peak sits inside the sub chain's FIR
+    non-causal window (~42 ms for a 4096-tap linear-phase filter @ 48 kHz);
+    its absolute value reflects FIR shape + buffer latency, not acoustic
+    arrival. Use ``compare_sub_phase`` (phase-slope fit) or the loopback
+    alignment rig for sub-vs-mains timing instead.
     """
     from .storage import SessionStore
 
@@ -5270,9 +5279,24 @@ async def _tool_analyze_ir(
         ir_arr = np.array(ir, dtype=np.float64)
         onset = detect_ir_onset(ir_arr, sample_rate, search_window_ms, xcorr_peak_ms=xcorr_ms)
 
+        # Solo subs at room-realistic distances peak in the 0–30 ms range
+        # (mic ≤10 m). A peak past ~80 ms means the chain has a long FIR or
+        # buffer in the path — analyze_ir's absolute number is then a property
+        # of that processing, not acoustic arrival, and is invalid for
+        # cross-path comparison (sub vs mains, FIR-chain vs no-FIR).
+        cross_path_warning: str | None = None
+        if onset["peak_time_ms"] > 80.0:
+            cross_path_warning = (
+                f"peak_time_ms={onset['peak_time_ms']:.1f} exceeds typical solo-sub "
+                "acoustic range — likely reflects FIR/buffer latency on the chain. "
+                "Do NOT use this value to compare against measurements with different "
+                "processing (e.g. mains via HDMI). Use compare_sub_phase for cross-path timing."
+            )
+
         return _ok(
             session_id=session.id,
             peak_time_s=round(onset["peak_time_ms"] / 1000.0, 6),
+            cross_path_warning=cross_path_warning,
             **onset,
         )
     except Exception as exc:
@@ -7155,12 +7179,14 @@ _TOOLS: list[Tool] = [
     Tool(
         name="analyze_ir",
         description=(
-            "Extract IR peak time, polarity sign, and SPL from a stored measurement session. "
-            "Use this after measuring each sub solo to get the data needed for alignment: "
-            "peak_time_s is the travel-time from sub to mic; "
-            "subtract the earliest arrival from the latest to get the delay offset to apply; "
-            "peak_sign tells you polarity (if it differs from the reference sub, flip it); "
+            "Extract IR onset time, polarity sign, and SPL from a stored measurement session. "
+            "VALID for solo-sub alignment ONLY (each measurement must share the same DSP chain). "
+            "Subtract the earliest peak_time_s from the latest to get the delay offset between subs; "
+            "peak_sign tells you polarity (flip if it differs from the reference sub); "
             "spl_db is the relative level for gain matching. "
+            "INVALID for cross-path comparisons (sub-vs-mains, FIR-chain vs no-FIR, "
+            "cal-mode vs HDMI) — peak_time_s reflects FIR shape and buffer latency, not "
+            "acoustic arrival. Use compare_sub_phase or the loopback rig for cross-path timing. "
             "Workflow: mute_output → measure → analyze_ir → unmute_output → repeat per sub → "
             "compute offsets → set_delay / set_polarity / set_output_gain."
         ),

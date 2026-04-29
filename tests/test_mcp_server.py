@@ -1723,6 +1723,29 @@ async def test_analyze_ir_missing_ir() -> None:
 
 
 @pytest.mark.asyncio
+async def test_analyze_ir_solo_sub_no_cross_path_warning() -> None:
+    """Solo-sub measurements (peak in normal acoustic range) emit no warning."""
+    session = _make_session_with_ir(session_id=1, peak_time_s=0.008)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_analyze_ir()
+    assert result["ok"]
+    assert result.get("cross_path_warning") is None
+
+
+@pytest.mark.asyncio
+async def test_analyze_ir_long_chain_emits_cross_path_warning() -> None:
+    """A peak past 80 ms means FIR/buffer latency dominates — flag for cross-path misuse."""
+    session = _make_session_with_ir(session_id=1, peak_time_s=0.140)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_analyze_ir(search_window_ms=200.0)
+    assert result["ok"]
+    assert result["cross_path_warning"] is not None
+    assert "cross-path" in result["cross_path_warning"].lower() or "compare_sub_phase" in result["cross_path_warning"]
+
+
+@pytest.mark.asyncio
 async def test_analyze_ir_delay_computation() -> None:
     """Validate that peak_time_s differences give correct delay offsets."""
     sub1 = _make_session_with_ir(session_id=1, peak_time_s=0.005)
