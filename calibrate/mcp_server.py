@@ -3546,6 +3546,7 @@ async def _tool_design_modal_fir(
                     treatment=str(i["treatment"]),
                     cancel_strength=float(i.get("cancel_strength", 0.6)),
                     bp_q=float(i.get("bp_q", 1.5)),
+                    envelope=str(i.get("envelope", "gabor")),
                     rationale=str(i.get("rationale", "")),
                 )
                 for i in intents
@@ -7488,6 +7489,19 @@ _TOOLS: list[Tool] = [
                                     "spectral leakage (lets safety caps pass) but "
                                     "longer time-domain tail. Default 1.5; raise "
                                     "to 3-4 if a per-band thermal cap trips."
+                                ),
+                            },
+                            "envelope": {
+                                "type": "string",
+                                "enum": ["gabor", "butterworth"],
+                                "description": (
+                                    "Anti-pulse envelope shape. ``gabor`` "
+                                    "(default) is a Gaussian-windowed sinusoid "
+                                    "with optimal time-frequency localization "
+                                    "— minimal adjacent-band skirts. "
+                                    "``butterworth`` is the legacy filtered-"
+                                    "impulse with wider skirts; kept for "
+                                    "regression / A-B testing only."
                                 ),
                             },
                             "rationale": {"type": "string"},
