@@ -510,21 +510,50 @@ If combined < max(solo) in any band:
   only the front sub carries the deep bass. Loses spatial averaging
   in that band, but eliminates the cancellation.
 
-**Required deep-bass re-pass for 2+ subs.** The default
-`optimize_sub_alignment` minimizes flatness across the full target
-band — that can leave a narrow cancellation null in the boost zone
-(e.g. 30-40 Hz) because flatness elsewhere offsets it on RMS. Run:
+**Required deep-bass re-pass for 2+ subs.** Default `optimize_sub_alignment`
+minimizes flatness across the full target band — that can leave a narrow
+cancellation null in the boost zone (e.g. 30-40 Hz) because flatness
+elsewhere offsets it on RMS. Two paths, pick one:
+
+**Single-call path (preferred, v0.6.9.3+):**
+
+```
+optimize_sub_alignment(session_ids=[...], priority_band=[20, 50])
+```
+
+The `priority_band` argument weights that range 3× in the objective so
+the optimizer attacks deep-bass nulls without a separate narrowband call.
+Inspect the `per_band_polarity` field in the response — bands listed
+there indicate per-band cancellations the wideband objective averaged
+out and would benefit from a polarity flip on a specific sub.
+
+**Two-call path (legacy / hardware lacking v0.6.9.3 tools):**
 
 1. `optimize_sub_alignment(session_ids=[...], min_hz=20, max_hz=50)`
    weighted toward deep bass. If relative timing flips or moves > 2 ms
    from the wideband answer, the wideband was hiding a narrow null.
 2. Apply the deep-bass-priority recommendation. Measure combined.
-3. Manual delay sweep ±2 ms in 0.5-1 ms steps on the trailing sub.
-   Mid-bass evenness barely moves under ±2 ms; only deep-bass null
-   position shifts. Pick the step with the shallowest 28-50 Hz null.
-4. **After Phase 2** designs FIRs, redo this sweep at ±0.5 ms — the
-   FIRs change phase response, so the optimal inter-sub delay shifts
-   slightly.
+
+**Then in either path: refine inter-sub delay with the automated sweep.**
+
+```
+sweep_inter_sub_delay(
+    session_ids=[<sub_a>, <sub_b>],
+    base_delays_ms=[<current>, <current>],
+    priority_band=[28, 50],
+    sweep_range_ms=2.0,
+    step_ms=0.25,
+)
+```
+
+The tool predicts deepest-null depth for each delay step and reports the
+delay that shallowest the deepest 1/3-octave null in the priority band.
+Replaces the manual 5-9-measurement sweep. Apply via
+`set_delay(output_index=<trailing_sub>, delay_ms=<recommended>)`.
+
+**After Phase 2** designs FIRs, re-run `sweep_inter_sub_delay` with
+`step_ms=0.1` — the FIRs change phase response, so the optimal inter-sub
+delay shifts slightly (typically ≤0.5 ms).
 
 Max 3 alignment iterations total (wideband + deep-bass + post-FIR).
 
