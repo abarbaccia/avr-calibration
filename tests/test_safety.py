@@ -107,15 +107,15 @@ def test_boost_at_6db_passes(validator: SafetyValidator) -> None:
 
 
 def test_boost_above_limit_at_80hz_fails(validator: SafetyValidator) -> None:
-    """80 Hz is above 30 Hz → limit is +8 dB. 8.1 dB should fail."""
-    filters = [hpf(), make_filter(80.0, 8.1)]
+    """80 Hz is above 30 Hz → limit is +12 dB. 12.1 dB should fail."""
+    filters = [hpf(), make_filter(80.0, 12.1)]
     result = validator.validate(filters)
     assert not result.ok
-    assert "8" in result.error
+    assert "12" in result.error
 
 
 def test_boost_7db_at_80hz_passes(validator: SafetyValidator) -> None:
-    """80 Hz is above 30 Hz → +7 dB is under the +8 dB limit."""
+    """80 Hz is above 30 Hz → +7 dB is under the +12 dB limit."""
     filters = [hpf(), make_filter(80.0, 7.0)]
     result = validator.validate(filters)
     assert result.ok
@@ -314,8 +314,8 @@ def test_validate_fir_boost_below_port_tune_fails(validator: SafetyValidator) ->
 
 
 def test_validate_fir_boost_thermal_ceiling_fails(validator: SafetyValidator) -> None:
-    """+10 dB at 60 Hz exceeds the +8 dB thermal ceiling (SVS profile)."""
-    taps = _fir_boost_at(freq_hz=63.0, gain_db=10.0)
+    """+14 dB at 60 Hz exceeds the +12 dB thermal ceiling (SVS profile)."""
+    taps = _fir_boost_at(freq_hz=63.0, gain_db=14.0)
     with pytest.raises(SafetyValidationError) as excinfo:
         validator.validate_fir(taps, sample_rate=_FIR_RATE)
     msg = str(excinfo.value)

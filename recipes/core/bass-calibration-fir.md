@@ -103,6 +103,79 @@ Show the active signal path based on `get_config.measurement.playback_route`:
 Build the diagram dynamically from config — sub labels from `output_slots`,
 mic from `config.mic.name`, AVR from `config.denon`, DSP name from `config.dsp_driver`.
 
+## Sanity preflight — DO NOT SKIP
+
+Three failure modes silently corrupted months of calibration work before
+v0.6.8.x. Each one produces measurements that look plausible but are based
+on a broken signal chain. If any of these checks fail, **stop and fix
+before measuring anything** — you'll be optimizing noise.
+
+### 1. Confirm the sweep is going where you think
+
+`set_cal_mode(true)` then `mute_output` both subs and run `measure(label="silence-test")`.
+Expected: the measurement fails with `"Sweep not detected in recording (cross-correlation peak too low)"`. That failure means the DSP path is silenced
+correctly; the mic captured no signal correlated with the sweep.
+
+If the measurement succeeds with normal-looking data when both subs are
+muted, the sweep is reaching the mic by some other path (HDMI to AVR,
+PipeWire mirroring, etc.). Stop. Diagnose:
+- `playback_route` MUST be `"usb"` for cal-mode bypass to engage. `hdmi`
+  routes through the AVR regardless of `cal_mode_active`.
+- `check_system` includes an `Audio stack` check that flags PipeWire/
+  wireplumber/PulseAudio holding `/dev/snd` handles. Disable them on the
+  host: `systemctl --user mask pipewire wireplumber pipewire-pulse`.
+- Verify the cal-mode loopback resolves to the right PortAudio device —
+  `_resolve_alsa_device_in_portaudio` reads `/proc/asound/cards` to map
+  `hw:Loopback,0,0` → the actual ALSA card index. If this fails, cal-mode
+  silently falls back to system default (HDMI on a Pi).
+
+### 2. Trust coherence as the data quality signal
+
+The post-v0.6.8.2 coherence metric is per-bin SNR (not Welch — Welch is
+invalid on non-stationary sweeps). Reading rules:
+- ≥ **0.95**: gold standard. Optimize against this freely.
+- **0.7 – 0.95**: usable, but expect ±1-2 dB jitter run-to-run. Don't fit
+  precise filters here.
+- **0.3 – 0.7**: marginal. Use group delay rather than IR peak for timing
+  in this band; don't trust SPL deltas under ~3 dB as meaningful.
+- **< 0.3**: noise. **Do not optimize against this band.** A 10 dB SPL
+  swing here is invisible to the ear and reflects ambient noise, not
+  acoustic cancellation. Most common at 20-25 Hz when the sub is below
+  port tuning or sitting in a deep null.
+
+A 3-second sweep is enough for ≥0.95 coherence at 31.5 Hz and up on the
+USB-direct cal-mode path. Bump to 5-10s only when chasing 20 Hz
+specifically. Longer sweeps don't help when the bottleneck is geometry,
+not SNR.
+
+### 3. IR peak time can lie when a room mode dominates
+
+When the listening position sits in a destructive-cancellation null for
+one sub, the direct arrival is heavily attenuated and the room-mode
+resonance that follows is the largest |IR| feature. Naive `argmax(|ir|)`
+locks onto the resonance time (e.g. 167 ms) instead of the
+time-of-flight (e.g. ~5 ms). The post-v0.6.8.4 onset detector handles
+the typical case (find first sample ≥ −20 dB from peak) but **it
+cannot recover the direct arrival when it's buried 30+ dB below the
+resonance**. If two solo subs in the same room appear ≥30 ms apart at
+MLP, the geometry of one is masking direct arrival — physically move
+the sub or use group delay at coherent frequencies (50-100 Hz) for
+alignment, not IR peak time.
+
+### 4. Sub placement beats every software lever
+
+If the combined response at MLP shows a 20+ dB null at 25-31 Hz with
+high coherence, that's not an EQ problem — it's destructive
+interference between the two subs at the listening seat. EQ cannot
+fill a null; it just dumps power into the room without changing the
+cancellation at MLP. The fixes are physical:
+- Sub crawl (move one sub by 1-2 ft and re-measure)
+- Move MLP by 6-12 inches
+- Add a third sub (distributed bass array)
+
+Note this in the run log if the geometry is the bottleneck. Don't waste
+filter slots trying to compensate.
+
 ## Filter strategy
 
 Three layers, all of them simultaneously active in the DSP pipeline:
@@ -340,6 +413,28 @@ set_output_gain(target=<transducer-name>, gain_db=<rec.gain_db>)  # if nonzero
 set_polarity(target=<transducer-name>, inverted=<rec.polarity_inverted>)  # if changed
 ```
 
+**Apply the delays as returned — do not manually subtract a baseline.**
+``optimize_sub_alignment`` already returns delays in MINIMUM-LATENCY form:
+the trailing sub is anchored at 0 ms; leading subs receive only the
+inter-sub delta. Adding a uniform offset would just push the entire sub
+chain back in time, burning latency on the AVR's distance-push budget
+without changing how the subs sum at the listening position. Inter-sub
+alignment depends only on the delta between subs, not the absolute
+offset; the tool enforces that contract.
+
+**Apply the delays to the subs the tool indicates — do not swap based on
+your own IR-peak interpretation.** The optimizer uses the full IR data
+(not just the dominant-peak time) to predict combined response. In
+geometries where one sub sits in a deep null at MLP, the IR's "peak" is
+the room-mode resonance ringing AFTER the direct arrival, not the direct
+arrival itself — so naive `argmax(|ir|)` reading gives a misleading sense
+of which sub is "leading" vs "trailing". Empirical A/B (recal session
+755 vs 751, 2026-04-28): swapping the optimizer's delay assignment
+between subs gave essentially equivalent FR but cost 11 ms additional
+sub-chain latency. **Trust the optimizer's literal output. Apply
+`per_sub[i].delay_ms` to the sub identified by `per_sub[i].session_id`,
+nothing else.**
+
 **Polarity is canonical-form**: `optimize_sub_alignment` anchors sub_0
 (the first session_id passed) to `polarity_inverted=false` because
 absolute polarity is unobservable in sub-only optimization. Any sub
@@ -378,18 +473,45 @@ example: a session with polarity-A winning aggregate SPL by 2 dB
 while losing 16 dB at 31 Hz because of position-induced cancellation.
 Aggregate test passed; user couldn't feel any deep bass.
 
-### 1.5 Verify alignment — solo-vs-combined per band
+### 1.5 Verify alignment — deep-bass priority + no major nulls
 
-Aggregate "combined louder than any solo" is too lenient — narrow-band
-cancellation hides in the average. Stricter check:
+Two priorities, in this order:
+
+1. **Maximize deep bass strength (20-40 Hz).** This is the band the user
+   *feels*, where room cancellations are typically deepest, and where
+   recovery via EQ is least possible. Optimization should prioritize
+   keeping this band high before any other concern.
+
+2. **No major narrow nulls anywhere in 20-100 Hz.** A "major null" is a
+   1/3-octave band where the combined response drops more than 6 dB
+   below the trend in adjacent bands, OR more than 3 dB below
+   `max(solo_per_sub)`. Either signature indicates destructive
+   interference at MLP. Mid-bass nulls (50-100 Hz) are partially
+   recoverable via EQ; deep-bass nulls (20-40 Hz) are not — moving the
+   sub or the listener is the only reliable fix.
+
+Concretely, after applying the optimizer's recommendation:
 
 1. Take a combined measurement.
-2. For each 1/3-octave band in the target range, compute
-   `max(solo_SPL_per_sub)` and compare to `combined_SPL`.
-3. **At every band** in target range, combined ≥ max(solo). If any
-   band has combined < max(solo), you have **destructive interference**
-   at MLP — distinct failure mode requiring different remediation
-   than alignment imperfection.
+2. **First check deep bass (20-40 Hz):** what's the minimum SPL in the
+   1/3-octave bands at 20, 25, 31.5, 40 Hz? If any is more than 6 dB
+   below the 50-80 Hz mid-bass trend, that's a deep-bass null. Try the
+   polarity flip (Phase 1.4); if neither polarity recovers it, escalate
+   to physical placement.
+3. **Then check 50-100 Hz for narrow nulls.** If a single band drops
+   more than 3 dB below the trend, flag as a candidate for FIR
+   correction in Phase 2.
+
+Bands above 100 Hz are informational only at this stage — the mains
+will mask any sub imperfection there at the typical 80 Hz crossover.
+Bands below 20 Hz are below port tuning for most subs and reflect
+noise more than signal.
+
+**Why deep-bass-priority instead of full-band RMS:** wideband flatness
+optimization can leave a 10+ dB null at 30 Hz while reading "flat" on
+RMS because the rest of the band offsets it. The null is the audible
+problem ("subs not digging deep") even when RMS reads fine — see also
+Phase 1.6.
 
 If combined < max(solo) in any band:
 - **First**: try the polarity verification (Phase 1.4) again — may

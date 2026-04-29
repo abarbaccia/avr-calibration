@@ -1,7 +1,7 @@
 name: svs_pb12_nsd
 min_boost_freq_hz: 25
 max_boost_per_band_db: 6
-max_boost_above_threshold_db: 8
+max_boost_above_threshold_db: 12
 freq_dependent_boost_threshold_hz: 30
 max_cumulative_boost_db: 9
 max_change_per_iter_db: 3
@@ -15,3 +15,9 @@ notes: |
   to a thermal-only cap. Mandatory 4th-order Butterworth HPF at 18 Hz keeps
   infrasonic content out of the driver. Used as the default profile when none
   is explicitly declared.
+
+  max_boost_above_threshold_db raised from 8 → 12 dB on 2026-04-28 to admit
+  modal-FIR anti-pulse designs whose adjacent-band spectral lobes briefly
+  exceed +8 dB. The cap is conservative for sustained PEQ boost (driver
+  thermal/excursion limits); transient FIR pulses do not produce sustained
+  output at the boosted band. See TODO: transient-aware safety check.
