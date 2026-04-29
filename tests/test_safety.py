@@ -370,3 +370,69 @@ def test_validate_fir_uses_passed_profile_over_validator_default() -> None:
     SafetyValidator().validate_fir(
         taps, sample_rate=_FIR_RATE, profile=loose,
     )
+
+
+# ── Transient-aware FIR check ──────────────────────────────────────────────────
+
+
+def _realistic_gabor_anti_pulse_fir(
+    freq_hz: float,
+    sample_rate: int,
+    target_peak_db: float,
+    bp_q: float = 3.0,
+) -> list[float]:
+    """Build a realistic anti-pulse FIR with peak amplitude normalized to <=1.
+
+    Returns a 4096-sample FIR with a main impulse + a Gabor pulse, scaled so
+    its FFT magnitude at ``freq_hz`` equals approximately ``target_peak_db``.
+    Matches the production normalization in ``calibrate.modal_fir``.
+    """
+    sigma = bp_q * sample_rate / (math.pi * freq_hz)
+    n_pulse = max(64, int(8 * sigma))
+    if n_pulse % 2 == 1:
+        n_pulse += 1
+    t = np.arange(n_pulse) - (n_pulse - 1) / 2.0
+    env = np.exp(-0.5 * (t / sigma) ** 2)
+    carrier = np.cos(2.0 * math.pi * freq_hz * t / sample_rate)
+    pulse_template = env * carrier
+    fir = np.zeros(4096)
+    main_idx = 2048
+    fir[main_idx] = 1.0
+    pulse_centre = main_idx - int(0.5 * sample_rate / freq_hz)
+    start = pulse_centre - n_pulse // 2
+    n_fft = 8192
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
+    bin_idx = int(np.argmin(np.abs(freqs - freq_hz)))
+    base_at_bin = float(np.abs(np.fft.rfft(fir, n_fft))[bin_idx])
+    pad = np.zeros_like(fir)
+    pad[start : start + n_pulse] = pulse_template
+    pulse_at_bin = float(np.abs(np.fft.rfft(pad, n_fft))[bin_idx])
+    target_mag = 10.0 ** (target_peak_db / 20.0)
+    scale = (target_mag - base_at_bin) / max(pulse_at_bin, 1e-12)
+    fir = fir + scale * pad
+    peak = float(np.max(np.abs(fir)))
+    if peak > 1.0:
+        fir /= peak
+    return fir.tolist()
+
+
+def test_transient_anti_pulse_passes_above_thermal_below_transient_cap() -> None:
+    """+11 dB Gabor anti-pulse at 70 Hz must pass (over +8 dB sustained, under +15 dB transient)."""
+    fir = _realistic_gabor_anti_pulse_fir(70.0, 8000, target_peak_db=11.0)
+    SafetyValidator().validate_fir(fir, sample_rate=8000)
+
+
+def test_sustained_boost_at_thermal_ceiling_still_rejects() -> None:
+    """+14 dB sustained-shape FIR at 63 Hz must still reject (regression)."""
+    taps = _fir_boost_at(freq_hz=63.0, gain_db=14.0)
+    with pytest.raises(SafetyValidationError) as excinfo:
+        SafetyValidator().validate_fir(taps, sample_rate=_FIR_RATE)
+    msg = str(excinfo.value).lower()
+    assert "sustained" in msg or "thermal" in msg
+
+
+def test_transient_cap_still_rejects_when_pulse_amplitude_too_high() -> None:
+    """Transient pulse exceeding +15 dB transient cap must still reject."""
+    fir = _realistic_gabor_anti_pulse_fir(70.0, 8000, target_peak_db=18.0)
+    with pytest.raises(SafetyValidationError):
+        SafetyValidator().validate_fir(fir, sample_rate=8000)

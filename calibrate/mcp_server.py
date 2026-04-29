@@ -3476,8 +3476,16 @@ async def _tool_design_modal_fir(
             metadata using the default heuristic (T60>800ms+peak>6 →
             anti_pulse; T60<400ms+peak>12 → linear_notch; peak<3 → skip;
             else min_phase).
-        target_curve: ignored at present; the base correction comes from
-            the session's IR. Reserved for future use.
+        target_curve: optional unified target-curve correction. When supplied,
+            a min-phase magnitude correction layer is convolved into the
+            modal-cancellation FIR so a single FIR delivers both T60
+            reduction AND target-curve shaping. Without it the caller must
+            stack PEQ on top, which can fight the anti-pulses. Shape:
+            ``{"points": [{"freq": 25, "spl": 5}, ...], "band": [20, 100]}``.
+            ``points`` is the absolute target SPL (anchored to the
+            measurement's midband 60-100 Hz so absolute SPL drops out).
+            ``band`` (optional) restricts the magnitude correction to the
+            sub band; outside it, correction tapers to 0 dB.
         target_t60_ms: room-quality target T60 (default 300 ms). Modes
             already meeting this are skipped; modes far above it (T60 >
             2× target) get anti-pulse treatment. Used only for
@@ -3567,6 +3575,45 @@ async def _tool_design_modal_fir(
                 for m in decay_modes
             ]
 
+        # Optional unified target-curve correction. When ``target_curve`` is
+        # provided, build the source-FR points (1/3-octave SPL from the
+        # session) so the designer can compute the residual error and add
+        # a min-phase magnitude correction layer in the same FIR.
+        target_curve_db: list[tuple[float, float]] | None = None
+        source_fr_db: list[tuple[float, float]] | None = None
+        magnitude_focus_hz: tuple[float, float] | None = None
+        if target_curve and isinstance(target_curve, dict):
+            pts = target_curve.get("points") or []
+            if pts:
+                target_curve_db = [
+                    (float(p.get("freq", p.get("freq_hz", 0))), float(p.get("spl", p.get("spl_db", 0))))
+                    for p in pts
+                ]
+            band = target_curve.get("band") or target_curve.get("focus_hz")
+            if isinstance(band, (list, tuple)) and len(band) == 2:
+                magnitude_focus_hz = (float(band[0]), float(band[1]))
+            # Pull session's 1/3-octave FR for the source side.
+            try:
+                fr_summary = (
+                    session.start_fr.third_octave_spl
+                    if session.start_fr is not None
+                    else None
+                )
+                if fr_summary:
+                    source_fr_db = [
+                        (float(b["freq_hz"]), float(b["spl_db"])) for b in fr_summary
+                    ]
+            except Exception:
+                source_fr_db = None
+            if not source_fr_db:
+                # Fallback: pull from session metadata if FR object lacks it.
+                fr_bands = meta.get("third_octave_spl") or meta.get("fr_bands") or []
+                if fr_bands:
+                    source_fr_db = [
+                        (float(b["freq_hz"]), float(b["spl_db"]))
+                        for b in fr_bands
+                    ]
+
         designer = ModalAwareFIRDesigner(
             sample_rate=8000,
             n_taps=int(num_taps),
@@ -3582,6 +3629,9 @@ async def _tool_design_modal_fir(
             short_loud_peak_db=float(short_loud_peak_db),
             long_ringy_t60_factor=float(long_ringy_t60_factor),
             anti_pulse_cancel_strength=float(anti_pulse_cancel_strength),
+            target_curve_db=target_curve_db,
+            source_fr_db=source_fr_db,
+            magnitude_focus_hz=magnitude_focus_hz,
         )
 
         _fir_design_cache[int(session_id)] = list(coeffs)

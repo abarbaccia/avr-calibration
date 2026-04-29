@@ -6151,6 +6151,74 @@ async def test_design_modal_fir_missing_decay_modes_errors() -> None:
     assert "decay_modes" in result["error"]
 
 
+@pytest.mark.asyncio
+async def test_design_modal_fir_target_curve_adds_magnitude_correction() -> None:
+    """Passing a target_curve invokes the unified magnitude-correction layer.
+
+    With a target_curve and a session FR that's flat at 0 dB, the residual
+    correction toward Harman+4 (deep-bass-priority) should boost the FIR's
+    magnitude at 25 Hz vs the no-target baseline.
+    """
+    decay_modes = [{"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0}]
+    session = _make_modal_session(decay_modes)
+    # Provide a flat source FR so the magnitude correction is purely target-driven.
+    fr_bands = [
+        {"freq_hz": 20.0, "spl_db": 0.0},
+        {"freq_hz": 25.0, "spl_db": 0.0},
+        {"freq_hz": 31.5, "spl_db": 0.0},
+        {"freq_hz": 40.0, "spl_db": 0.0},
+        {"freq_hz": 50.0, "spl_db": 0.0},
+        {"freq_hz": 63.0, "spl_db": 0.0},
+        {"freq_hz": 80.0, "spl_db": 0.0},
+        {"freq_hz": 100.0, "spl_db": 0.0},
+    ]
+    session.metadata = {"decay_modes": decay_modes, "third_octave_spl": fr_bands}
+    target_curve = {
+        "points": [
+            {"freq": 25, "spl": 5},
+            {"freq": 31.5, "spl": 4},
+            {"freq": 40, "spl": 3},
+            {"freq": 50, "spl": 2},
+            {"freq": 63, "spl": 1},
+            {"freq": 80, "spl": 0},
+        ],
+        "band": [20, 100],
+    }
+    intents = [{"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0,
+                "treatment": "anti_pulse", "cancel_strength": 0.4, "bp_q": 3.0}]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        with_target = await _tool_design_modal_fir(
+            session_id=1, intents=intents, target_curve=target_curve,
+            num_taps=4096, max_pre_ring_ms=25.0, return_coefficients=True,
+        )
+        without_target = await _tool_design_modal_fir(
+            session_id=1, intents=intents,
+            num_taps=4096, max_pre_ring_ms=25.0, return_coefficients=True,
+        )
+    assert with_target["ok"] and without_target["ok"]
+    # The unified design should append a note about the magnitude layer.
+    assert any("unified target-curve" in n.lower() for n in with_target["notes"])
+    # Compare 25 Hz magnitude between the two FIRs. The target asks for
+    # +5 dB at 25 Hz vs the flat source, so with_target should track higher.
+    import numpy as np
+    coeffs_with = np.asarray(with_target["coefficients"], dtype=float)
+    coeffs_without = np.asarray(without_target["coefficients"], dtype=float)
+    n_fft = 8192
+    sr = 8000
+    spec_with = np.abs(np.fft.rfft(coeffs_with, n_fft))
+    spec_without = np.abs(np.fft.rfft(coeffs_without, n_fft))
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    bin_25 = int(np.argmin(np.abs(freqs - 25.0)))
+    delta_db = 20.0 * np.log10(
+        (spec_with[bin_25] + 1e-9) / (spec_without[bin_25] + 1e-9)
+    )
+    # Magnitude correction toward Harman+4 should lift 25 Hz by at least +1 dB.
+    # The threshold absorbs window/decomposition losses; live hardware test
+    # is the authoritative check on absolute magnitude tracking.
+    assert delta_db > 1.0, f"expected ≥+1 dB lift at 25 Hz, got {delta_db:.2f}"
+
+
 def test_gabor_anti_pulse_has_less_adjacent_band_leakage_than_butterworth() -> None:
     """Gabor envelope must have steeper spectral skirts than Butterworth.
 

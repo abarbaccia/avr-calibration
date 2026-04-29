@@ -222,6 +222,9 @@ class ModalAwareFIRDesigner:
                 short_loud_peak_db: float = 12.0,
                 long_ringy_t60_factor: float = 2.0,
                 anti_pulse_cancel_strength: float = 0.6,
+                target_curve_db: list[tuple[float, float]] | None = None,
+                source_fr_db: list[tuple[float, float]] | None = None,
+                magnitude_focus_hz: tuple[float, float] | None = None,
                 ) -> tuple[list[float], DesignSummary]:
         """Generate a modal-aware mixed-phase FIR.
 
@@ -325,7 +328,31 @@ class ModalAwareFIRDesigner:
 
             summary.mode_treatments.append(entry)
 
-        # 6. Normalize peak ≤ 1.0
+        # 6. Optional magnitude-correction layer for target-curve tracking.
+        # When target_curve_db + source_fr_db are provided, the unified design
+        # adds a min-phase magnitude correction FIR that tracks
+        #     target − source − modal_fir_response
+        # so a single FIR delivers both modal cancellation AND target-curve
+        # shaping. Without this layer the caller must add a separate magnitude
+        # FIR or PEQ on top, which can fight the modal cancellation.
+        if target_curve_db is not None and source_fr_db is not None:
+            mag_fir = _design_magnitude_correction_fir(
+                fir=fir,
+                target_db=target_curve_db,
+                source_fr_db=source_fr_db,
+                sample_rate=self.sr,
+                n_taps=min(self.n_taps, 1024),
+                focus_hz=magnitude_focus_hz,
+            )
+            # Convolve and truncate to n_taps
+            combined = np.convolve(fir, mag_fir)[: self.n_taps].astype(np.float32)
+            fir = combined
+            summary.notes.append(
+                f"unified target-curve correction layer applied "
+                f"(min-phase magnitude FIR, {len(mag_fir)} taps convolved)"
+            )
+
+        # 7. Normalize peak ≤ 1.0
         peak = float(np.max(np.abs(fir)))
         if peak > 1.0:
             fir = fir / (peak * 1.001)
@@ -333,6 +360,98 @@ class ModalAwareFIRDesigner:
         summary.peak_amplitude = float(np.max(np.abs(fir)))
 
         return fir.tolist(), summary
+
+
+def _design_magnitude_correction_fir(
+    fir: np.ndarray,
+    target_db: list[tuple[float, float]],
+    source_fr_db: list[tuple[float, float]],
+    sample_rate: int,
+    n_taps: int = 1024,
+    focus_hz: tuple[float, float] | None = None,
+) -> np.ndarray:
+    """Design a min-phase FIR that corrects ``source + fir`` toward ``target``.
+
+    Computes the residual error in dB at each frequency in the union of
+    ``target_db`` and ``source_fr_db`` grids, then returns a min-phase FIR
+    whose magnitude response tracks that residual.
+
+    Outside ``focus_hz`` (default: full sub band) the correction tapers to
+    0 dB to avoid lifting noise floors or boosting frequencies the sub
+    can't reproduce.
+    """
+    n_fft = max(2048, int(2 ** np.ceil(np.log2(max(n_taps, len(fir))))))
+    fir_spec_db = 20.0 * np.log10(np.maximum(np.abs(np.fft.rfft(fir, n_fft)), 1e-9))
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
+
+    # Interpolate source FR and target onto the FFT grid (log-frequency).
+    src_pts = sorted(source_fr_db, key=lambda p: p[0])
+    tgt_pts = sorted(target_db, key=lambda p: p[0])
+    src_freqs = np.array([p[0] for p in src_pts], dtype=float)
+    src_db = np.array([p[1] for p in src_pts], dtype=float)
+    tgt_freqs = np.array([p[0] for p in tgt_pts], dtype=float)
+    tgt_db = np.array([p[1] for p in tgt_pts], dtype=float)
+    log_freqs = np.log10(np.maximum(freqs, 1.0))
+    src_interp = np.interp(log_freqs, np.log10(src_freqs), src_db,
+                            left=src_db[0], right=src_db[-1])
+    tgt_interp = np.interp(log_freqs, np.log10(tgt_freqs), tgt_db,
+                            left=tgt_db[0], right=tgt_db[-1])
+
+    # Anchor target to source at a midband reference so absolute SPL drops out.
+    ref_lo, ref_hi = 60.0, 100.0
+    ref_mask = (freqs >= ref_lo) & (freqs <= ref_hi)
+    if np.any(ref_mask):
+        src_ref = float(np.mean(src_interp[ref_mask]))
+        tgt_ref = float(np.mean(tgt_interp[ref_mask]))
+        tgt_interp = tgt_interp - tgt_ref + src_ref
+
+    # Residual: how much more boost the magnitude FIR must add.
+    residual_db = tgt_interp - src_interp - fir_spec_db
+
+    # Apply focus window: outside it, residual smoothly goes to 0.
+    lo, hi = focus_hz if focus_hz else (15.0, sample_rate * 0.4)
+    window = np.ones_like(freqs)
+    edge_lo = max(lo * 0.6, 1.0)
+    edge_hi = min(hi * 1.4, freqs[-1])
+    window[freqs < edge_lo] = 0.0
+    window[freqs > edge_hi] = 0.0
+    in_lo = (freqs >= edge_lo) & (freqs < lo)
+    if np.any(in_lo):
+        window[in_lo] = 0.5 * (
+            1.0 - np.cos(np.pi * (freqs[in_lo] - edge_lo) / (lo - edge_lo + 1e-9))
+        )
+    in_hi = (freqs > hi) & (freqs <= edge_hi)
+    if np.any(in_hi):
+        window[in_hi] = 0.5 * (
+            1.0 + np.cos(np.pi * (freqs[in_hi] - hi) / (edge_hi - hi + 1e-9))
+        )
+    residual_db = residual_db * window
+
+    # Cap residual to safety-friendly magnitudes; downstream SafetyValidator
+    # is the final gatekeeper but we keep the design conservative.
+    residual_db = np.clip(residual_db, -24.0, 12.0)
+    target_mag = 10.0 ** (residual_db / 20.0)
+
+    # Frequency-sampling design → linear-phase FIR → minimum-phase via
+    # homomorphic decomposition (so the magnitude correction adds zero pre-ring).
+    linear_phase = np.fft.irfft(target_mag, n=n_fft)
+    linear_phase = np.fft.fftshift(linear_phase)
+    # Apply Hann window to suppress sidelobes, length n_taps centered.
+    if n_taps < n_fft:
+        start = (n_fft - n_taps) // 2
+        linear_phase = linear_phase[start : start + n_taps]
+    win = np.hanning(len(linear_phase))
+    linear_phase = linear_phase * win
+    # Convert to min-phase. minimum_phase requires symmetric input; the
+    # windowed linear-phase IR is symmetric by construction.
+    try:
+        min_phase = minimum_phase(linear_phase, method="homomorphic",
+                                  n_fft=4 * len(linear_phase))
+    except Exception:
+        # Fallback: just return the linear-phase windowed IR (caller will
+        # see slightly more pre-ring but the design is still safe).
+        min_phase = linear_phase
+    return np.asarray(min_phase, dtype=np.float32)
 
 
 def latency_budget_breakdown(summary: DesignSummary, current_pre_delay_ms: float = 38.0) -> dict:
