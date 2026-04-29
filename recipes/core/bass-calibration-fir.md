@@ -635,6 +635,91 @@ nulls): the FIR will try and fail to correct them. This is unavoidable
 in one pass, but the recipe must note these bands in the retrospective
 as unfixable.
 
+### 2.2a Modal-aware FIR (`design_modal_fir`) — when ringing dominates magnitude
+
+When `analyze_decay` reports modes with `T60 > 500 ms` AND `peak > +6 dB`,
+plain `design_fir` (magnitude correction only) cuts the peak but does **not**
+shorten T60 — the mode still rings at reduced level. `design_modal_fir`
+adds **active anti-pulse cancellation**: a band-limited pulse placed one
+half-wavelength before the main impulse, opposite-signed, so the modal
+ringing is destructively cancelled in the time domain.
+
+**Use it when:**
+- Combined or solo measurement has multiple modes with T60 > 500 ms
+- Peak reduction alone (PEQ or `design_fir`) isn't enough — you want
+  T60 reduction
+- You have ≥10 ms of pre-ring latency budget (Audyssey distance push
+  on mains works; UI-clamp at ~38 ms)
+
+**Don't use it when:**
+- Room T60s are already < 400 ms (anti-pulse adds latency for negligible
+  gain — fall back to `design_fir` minimum-phase)
+- Tight latency budget (< 5 ms — anti-pulse needs half-wavelength of
+  pre-ring per mode, e.g. 7 ms at 70 Hz, 11 ms at 47 Hz)
+- Modal frequency is in or near a band you cannot afford to lose
+  magnitude in (the protected deep-bass band — see lesson below)
+
+**Anti-pulse leakage and the 47 Hz lesson** (validated 2026-04-28):
+
+Anti-pulses produce some spectral content outside their nominal modal
+band. With `envelope="butterworth"` (legacy), a 47 Hz anti-pulse leaked
+~12 dB into the 25 Hz band and forced sacrificing deep-bass priority.
+With `envelope="gabor"` (default since v0.6.8.6, Gaussian-windowed
+sinusoid) the same anti-pulse leaks **15 dB less** at 25 Hz. Gabor
+should be the default; only use `butterworth` for regression A-B tests.
+
+Even with Gabor, anti-pulse fundamentally adds energy at the mode
+frequency itself. If the protected priority band overlaps the mode's
+1/3-octave bin, prefer `linear_notch` (precise magnitude cut, no
+spectral leakage) over `anti_pulse` for that mode.
+
+**Per-mode treatments** (pass via `intents` for verbatim control, or
+omit to auto-classify by T60+peak):
+
+| treatment | what it does | when to pick |
+|---|---|---|
+| `anti_pulse` | half-wavelength inverted band-limited pulse → cancels T60 in time domain | T60 > target × 2, peak > 6 dB, mode is OUTSIDE protected priority band |
+| `linear_notch` | symmetric magnitude cut at the mode | T60 < target/2 but loud peak; OR mode overlaps protected band |
+| `min_phase` | gentle minimum-phase magnitude EQ | mild peaks/dips not strongly ringy |
+| `skip` | no treatment | below port tune (< 25 Hz on PB12-NSD); above sub crossover; mains-driven modes |
+
+**Per-mode parameters** (each intent dict accepts):
+- `cancel_strength` (0–1, default 0.6): aggressiveness of the anti-pulse.
+  Lower if SafetyValidator trips on adjacent-band boost.
+- `bp_q` (default 1.5): bandpass Q on the anti-pulse envelope. Raise to
+  3–5 if adjacent bands trip the thermal cap. Diminishing returns above
+  Q ≈ 5 with Gabor envelope.
+- `envelope` (default `"gabor"`): keep `"gabor"` unless A-B testing.
+
+**Worked example (combined sub, two ringy modes, room with ~500 ms T60):**
+
+```python
+design_modal_fir(
+    session_id=<combined_session>,
+    intents=[
+        # Below port tune — never anti_pulse.
+        {"freq_hz": 23.4, "treatment": "skip"},
+        # 47 Hz overlaps protected deep-bass priority — magnitude only.
+        {"freq_hz": 46.9, "t60_ms": 443, "peak_db": 13.1,
+         "treatment": "linear_notch"},
+        # 70 Hz — well above protected band, ideal anti_pulse target.
+        {"freq_hz": 70.3, "t60_ms": 482, "peak_db": 11.0,
+         "treatment": "anti_pulse", "cancel_strength": 0.6, "bp_q": 3},
+        # 94 Hz — also above protected band.
+        {"freq_hz": 93.8, "t60_ms": 524, "peak_db": 6.6,
+         "treatment": "anti_pulse", "cancel_strength": 0.5, "bp_q": 3},
+        # Above sub crossover — mains handle.
+        {"freq_hz": 117, "treatment": "skip"},
+    ],
+    max_pre_ring_ms=25,
+    num_taps=4096,
+)
+```
+
+Apply via `apply_fir(output_index=N, design_session_id=<session>)`
+to each sub. Verify with a fresh combined measurement: T60 should
+drop ~25–35 % at the targeted modes.
+
 ### 2.3 Apply the FIR
 
 1. `apply_fir(output_index=N, coefficients=[...])` with the designed FIR

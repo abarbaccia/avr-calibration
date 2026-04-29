@@ -45,6 +45,7 @@ class ModeIntent:
     treatment: Literal["anti_pulse", "linear_notch", "min_phase", "skip"]
     cancel_strength: float = 0.6   # 0-1, fraction of mode amplitude to cancel
     bp_q: float = 1.5              # bandpass Q for anti-pulse envelope
+    envelope: str = "gabor"        # "gabor" (default) or "butterworth" (legacy)
     rationale: str = ""
 
 
@@ -61,28 +62,47 @@ class DesignSummary:
 
 def design_anti_pulse(freq_hz: float, peak_db: float, cancel_strength: float,
                        sample_rate: int, n_cycles: int = 3,
-                       bp_q: float = 1.5) -> np.ndarray:
+                       bp_q: float = 1.5,
+                       envelope: str = "gabor") -> np.ndarray:
     """Generate a band-limited anti-pulse for modal cancellation.
 
     Returns an N-sample array where N = n_cycles × wavelength(freq).
-    The anti-pulse is a bandpass-filtered impulse centered in its window.
     Caller is responsible for placing/scaling and inverting polarity.
 
-    bp_q controls the bandpass envelope's selectivity (Q = freq / (2 × bw)).
-    Higher Q = narrower band = less adjacent-band spectral leakage but a
-    longer time-domain tail. Default 1.5 keeps the modal band wide enough
-    to land the cancel within ±50% of mode freq; raise to ~3-4 when
-    adjacent-band leakage trips per-band safety caps.
+    Two envelope shapes available:
+
+    ``gabor`` (default) — Gaussian-windowed sinusoid (Gabor wavelet). Optimal
+    time-frequency localization (Heisenberg lower bound), so adjacent-band
+    spectral skirts decay much faster than the Butterworth equivalent. The
+    pulse has analytical bandwidth ≈ ``freq_hz / bp_q`` (3 dB), with
+    Gaussian rolloff outside.
+
+    ``butterworth`` — legacy 4th-order bandpass-filtered impulse. Wider
+    skirts; kept for regression / A-B comparison.
+
+    bp_q controls the bandwidth (Q = freq / bandwidth). Higher Q = narrower
+    band = less leakage but longer time-domain tail. Default 1.5; raise to
+    3-5 when adjacent-band leakage trips per-band safety caps.
     """
     n = int(n_cycles * sample_rate / freq_hz)
     if n < 8:
         n = 8
-    impulse = np.zeros(n)
-    impulse[n // 2] = 1.0
-    bw = freq_hz / max(2.0 * bp_q, 0.5)
-    lo, hi = max(1.0, freq_hz - bw), min(sample_rate / 2 - 1, freq_hz + bw)
-    sos = butter(4, [lo, hi], btype="band", fs=sample_rate, output="sos")
-    bp = sosfilt(sos, impulse)
+    if envelope == "gabor":
+        # Gaussian-windowed cosine. σ chosen so the 3 dB bandwidth is
+        # freq_hz / bp_q. For a Gabor wavelet, BW_Hz ≈ 1 / (π × σ_t),
+        # so σ_t = bp_q / (π × freq_hz). σ_samples = σ_t × sample_rate.
+        sigma_samples = bp_q * sample_rate / (np.pi * freq_hz)
+        t = np.arange(n) - (n - 1) / 2.0
+        envelope_arr = np.exp(-0.5 * (t / sigma_samples) ** 2)
+        carrier = np.cos(2.0 * np.pi * freq_hz * t / sample_rate)
+        bp = envelope_arr * carrier
+    else:  # legacy butterworth
+        impulse = np.zeros(n)
+        impulse[n // 2] = 1.0
+        bw = freq_hz / max(2.0 * bp_q, 0.5)
+        lo, hi = max(1.0, freq_hz - bw), min(sample_rate / 2 - 1, freq_hz + bw)
+        sos = butter(4, [lo, hi], btype="band", fs=sample_rate, output="sos")
+        bp = sosfilt(sos, impulse)
     bp = bp / (float(np.max(np.abs(bp))) + 1e-12)
     # Linear amplitude proportional to mode strength × cancel_strength
     # Use partial cancellation: don't try to fully invert (over-correction risk)
@@ -283,6 +303,7 @@ class ModalAwareFIRDesigner:
                     cancel_strength=intent.cancel_strength,
                     sample_rate=self.sr,
                     bp_q=intent.bp_q,
+                    envelope=intent.envelope,
                 )
                 # Anti-pulse position: pre_samples - half_cycle
                 half_cycle_samples = int(0.5 * self.sr / intent.freq_hz)

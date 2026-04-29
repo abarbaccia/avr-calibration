@@ -6151,6 +6151,36 @@ async def test_design_modal_fir_missing_decay_modes_errors() -> None:
     assert "decay_modes" in result["error"]
 
 
+def test_gabor_anti_pulse_has_less_adjacent_band_leakage_than_butterworth() -> None:
+    """Gabor envelope must have steeper spectral skirts than Butterworth.
+
+    Regression for the v0.6.8.6 lesson: butterworth-filtered impulse leaked
+    ~15 dB more into the 25 Hz band when targeting 70 Hz than the Gaussian-
+    windowed sinusoid. We assert >= 6 dB advantage at 25 Hz to keep wide
+    margin on numerical drift; the empirical gap is ~15 dB.
+    """
+    import numpy as np
+    from calibrate.modal_fir import design_anti_pulse
+
+    sr = 8000
+    g = design_anti_pulse(70.0, 11.0, 0.6, sr, bp_q=3.0, envelope="gabor")
+    b = design_anti_pulse(70.0, 11.0, 0.6, sr, bp_q=3.0, envelope="butterworth")
+    n_fft = 8192
+    G = np.abs(np.fft.rfft(g, n_fft))
+    B = np.abs(np.fft.rfft(b, n_fft))
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+
+    def db_at(arr, f):
+        i = int(np.argmin(np.abs(freqs - f)))
+        return 20.0 * np.log10((arr[i] + 1e-12) / arr.max())
+
+    # Both must peak near 70 Hz (within 1 dB of 0 dB ref)
+    assert db_at(G, 70.0) > -1.0
+    assert db_at(B, 70.0) > -1.0
+    # Gabor must be at least 6 dB lower at 25 Hz (a full octave below)
+    assert db_at(G, 25.0) - db_at(B, 25.0) < -6.0
+
+
 # ── set_speaker_distances MCP tool ─────────────────────────────────────────────
 
 @pytest.mark.asyncio
