@@ -3432,6 +3432,7 @@ async def _tool_design_modal_fir(
     anti_pulse_cancel_strength: float = 0.6,
     num_taps: int = 4096,
     max_pre_ring_ms: float = 25.0,
+    phase_flatten_below_hz: float | None = 35.0,
     return_coefficients: bool = False,
 ) -> dict:
     """Design a modal-aware mixed-phase FIR with explicit per-mode treatment.
@@ -3634,6 +3635,7 @@ async def _tool_design_modal_fir(
             target_curve_db=target_curve_db,
             source_fr_db=source_fr_db,
             magnitude_focus_hz=magnitude_focus_hz,
+            phase_flatten_below_hz=phase_flatten_below_hz,
         )
 
         _fir_design_cache[int(session_id)] = list(coeffs)
@@ -5023,7 +5025,11 @@ async def _tool_apply_fir(
             )
         coefficients = cached
         source = f"design_session_id={design_session_id}"
-        intent = _fir_design_intent.get(int(design_session_id), "general")
+        # Default to modal_cancel for cached designs (only design_modal_fir
+        # populates the cache with intent today; design_fir doesn't use
+        # the design_session_id path). The explicit lookup keeps room for
+        # future per-design intents.
+        intent = _fir_design_intent.get(int(design_session_id), "modal_cancel")
     else:
         source = "inline"
 
