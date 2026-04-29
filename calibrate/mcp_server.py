@@ -148,6 +148,10 @@ _drivers = None  # DriverRegistry | None
 # source session_id in apply_fir(design_session_id=...). Cleared implicitly
 # on process restart — callers must re-design if the server has been bounced.
 _fir_design_cache: dict[int, list[float]] = {}
+# Tracks the design intent of cached coefficients so apply_fir can pass the
+# right ``intent`` to SafetyValidator (e.g., ``modal_cancel`` for FIRs from
+# ``design_modal_fir`` to admit their intentionally hot modal-band gain).
+_fir_design_intent: dict[int, str] = {}
 
 
 def _default_dsp_name() -> str | None:
@@ -3536,13 +3540,12 @@ async def _tool_design_modal_fir(
                 f"re-measure or run analyze_decay first"
             )
 
-        # Build base correction from the session's IR (passthrough impulse if absent)
-        ir = session.start_fr.impulse_response if session.start_fr else None
-        if not ir:
-            base_correction = [0.0] * num_taps
-            base_correction[0] = 1.0
-        else:
-            base_correction = list(ir[:num_taps]) + [0.0] * max(0, num_taps - len(ir))
+        # Base correction is a passthrough impulse — the modal FIR's job is
+        # to add anti-pulses (and, when ``target_curve`` is supplied, a
+        # min-phase magnitude correction layer). Using the room IR here
+        # would re-inject the room's resonances rather than flatten them.
+        base_correction = [0.0] * num_taps
+        base_correction[0] = 1.0
 
         # Translate intents (dicts) to ModeIntent objects, or auto-classify
         if intents:
@@ -3592,21 +3595,20 @@ async def _tool_design_modal_fir(
             band = target_curve.get("band") or target_curve.get("focus_hz")
             if isinstance(band, (list, tuple)) and len(band) == 2:
                 magnitude_focus_hz = (float(band[0]), float(band[1]))
-            # Pull session's 1/3-octave FR for the source side.
+            # Pull session's source FR. FrequencyResponse stores raw
+            # ``frequencies`` and ``spl`` arrays; the magnitude designer
+            # interpolates onto its own grid so we forward them as-is.
             try:
-                fr_summary = (
-                    session.start_fr.third_octave_spl
-                    if session.start_fr is not None
-                    else None
-                )
-                if fr_summary:
-                    source_fr_db = [
-                        (float(b["freq_hz"]), float(b["spl_db"])) for b in fr_summary
-                    ]
+                fr = session.start_fr
+                if fr is not None and getattr(fr, "frequencies", None):
+                    source_fr_db = list(zip(
+                        [float(f) for f in fr.frequencies],
+                        [float(s) for s in fr.spl],
+                    ))
             except Exception:
                 source_fr_db = None
             if not source_fr_db:
-                # Fallback: pull from session metadata if FR object lacks it.
+                # Fallback: pull a 1/3-octave summary from metadata if present.
                 fr_bands = meta.get("third_octave_spl") or meta.get("fr_bands") or []
                 if fr_bands:
                     source_fr_db = [
@@ -3635,6 +3637,7 @@ async def _tool_design_modal_fir(
         )
 
         _fir_design_cache[int(session_id)] = list(coeffs)
+        _fir_design_intent[int(session_id)] = "modal_cancel"
 
         result = {
             "session_id": session_id,
@@ -5010,6 +5013,7 @@ async def _tool_apply_fir(
         return _err("apply_fir: provide either coefficients or design_session_id")
 
     source: str
+    intent = "general"
     if design_session_id is not None:
         cached = _fir_design_cache.get(int(design_session_id))
         if not cached:
@@ -5019,6 +5023,7 @@ async def _tool_apply_fir(
             )
         coefficients = cached
         source = f"design_session_id={design_session_id}"
+        intent = _fir_design_intent.get(int(design_session_id), "general")
     else:
         source = "inline"
 
@@ -5042,7 +5047,7 @@ async def _tool_apply_fir(
         except Exception:
             fir_rate = 96_000
         SafetyValidator(profile).validate_fir(
-            list(coefficients), sample_rate=fir_rate,
+            list(coefficients), sample_rate=fir_rate, intent=intent,
         )
     except SafetyValidationError as exc:
         return _err(str(exc))

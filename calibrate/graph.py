@@ -169,18 +169,17 @@ class TransducerProfile:
     max_change_simulated_db: float = 6.0
     hpf_freq_hz: float | None = 18.0
     hpf_order: int = 4
-    # Transient-aware FIR boost: anti-pulse modal cancellation produces
-    # short Gaussian-windowed bursts at the mode frequency. Their per-band
-    # peak FFT magnitude can exceed ``max_boost_above_threshold_db`` while
-    # the time-domain envelope is far too brief to drive thermal/excursion
-    # damage. ``transient_max_pulse_ms`` is the width-above-half-amplitude
-    # threshold separating "transient pulse" from "sustained boost"; FIRs
-    # whose bandpassed envelope sits above half-amplitude for less than this
-    # use ``transient_max_boost_db`` instead of the thermal cap. Default
-    # ``transient_max_boost_db = max_boost_above_threshold_db`` (no looser
-    # transient budget unless a profile opts in).
-    transient_max_pulse_ms: float = 30.0
-    transient_max_boost_db: float = 8.0
+    # Modal-cancellation FIR boost cap. ``design_modal_fir`` produces FIRs
+    # whose magnitude response is intentionally hot at the room's modal
+    # frequencies — that is how anti-pulse cancellation works. Physically
+    # the driver receives that boost AT the input but the room mode at the
+    # listener cancels it out, so net SPL at the listening position is
+    # near-flat. At typical calibrated levels (master gain ~-25 to -15 dB)
+    # the driver has ample headroom for the implied excursion/thermal load.
+    # The validator applies this cap only when explicitly called with
+    # ``intent="modal_cancel"``; generic FIRs and PEQ writes still respect
+    # the stricter ``max_boost_above_threshold_db`` cap.
+    modal_cancel_max_boost_db: float = 14.0
     notes: str = ""
 
 
@@ -227,8 +226,7 @@ SVS_PB12_NSD_PROFILE = TransducerProfile(
     max_change_simulated_db=6.0,
     hpf_freq_hz=18.0,
     hpf_order=4,
-    transient_max_pulse_ms=30.0,
-    transient_max_boost_db=15.0,
+    modal_cancel_max_boost_db=14.0,
     notes="Default SVS PB12-NSD ported sub. Matches legacy safety.py constants.",
 )
 
@@ -268,12 +266,8 @@ def _profile_from_dict(data: dict) -> TransducerProfile:
         max_change_simulated_db=float(data.get("max_change_simulated_db", 6.0)),
         hpf_freq_hz=hpf_freq,
         hpf_order=hpf_order,
-        transient_max_pulse_ms=float(data.get("transient_max_pulse_ms", 30.0)),
-        transient_max_boost_db=float(
-            data.get(
-                "transient_max_boost_db",
-                data.get("max_boost_above_threshold_db", 8.0),
-            )
+        modal_cancel_max_boost_db=float(
+            data.get("modal_cancel_max_boost_db", 14.0)
         ),
         notes=data.get("notes", ""),
     )
