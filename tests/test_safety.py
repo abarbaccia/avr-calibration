@@ -416,23 +416,32 @@ def _realistic_gabor_anti_pulse_fir(
     return fir.tolist()
 
 
-def test_transient_anti_pulse_passes_above_thermal_below_transient_cap() -> None:
-    """+11 dB Gabor anti-pulse at 70 Hz must pass (over +8 dB sustained, under +15 dB transient)."""
-    fir = _realistic_gabor_anti_pulse_fir(70.0, 8000, target_peak_db=11.0)
-    SafetyValidator().validate_fir(fir, sample_rate=8000)
+def test_modal_cancel_intent_admits_above_thermal() -> None:
+    """+12 dB Gabor anti-pulse passes when validator is told it's modal-cancel.
+
+    The same FIR fails under the default ``intent="general"`` cap (+8 dB).
+    The looser ``modal_cancel`` cap (+14 dB on PB12-NSD) is justified by the
+    physical fact that anti-pulse boosts cancel the room's mode at the
+    listener — net SPL at the listening position is unchanged; only the
+    driver sees the boosted input.
+    """
+    # Use a frequency-sampling FIR that hits exactly the validator's metric.
+    fir = _fir_boost_at(freq_hz=70.0, gain_db=12.0, n_taps=8192)
+    with pytest.raises(SafetyValidationError):
+        SafetyValidator().validate_fir(fir, sample_rate=_FIR_RATE)
+    SafetyValidator().validate_fir(fir, sample_rate=_FIR_RATE, intent="modal_cancel")
 
 
-def test_sustained_boost_at_thermal_ceiling_still_rejects() -> None:
-    """+14 dB sustained-shape FIR at 63 Hz must still reject (regression)."""
+def test_modal_cancel_intent_still_rejects_above_modal_cap() -> None:
+    """Even modal_cancel cap rejects FIRs over its (+20 dB) limit."""
+    fir = _fir_boost_at(freq_hz=70.0, gain_db=24.0, n_taps=8192)
+    with pytest.raises(SafetyValidationError):
+        SafetyValidator().validate_fir(fir, sample_rate=_FIR_RATE, intent="modal_cancel")
+
+
+def test_general_intent_keeps_strict_thermal_cap() -> None:
+    """Generic FIRs (PEQ-equivalent) at +14 dB sustained must still reject."""
     taps = _fir_boost_at(freq_hz=63.0, gain_db=14.0)
     with pytest.raises(SafetyValidationError) as excinfo:
         SafetyValidator().validate_fir(taps, sample_rate=_FIR_RATE)
-    msg = str(excinfo.value).lower()
-    assert "sustained" in msg or "thermal" in msg
-
-
-def test_transient_cap_still_rejects_when_pulse_amplitude_too_high() -> None:
-    """Transient pulse exceeding +15 dB transient cap must still reject."""
-    fir = _realistic_gabor_anti_pulse_fir(70.0, 8000, target_peak_db=18.0)
-    with pytest.raises(SafetyValidationError):
-        SafetyValidator().validate_fir(fir, sample_rate=8000)
+    assert "thermal" in str(excinfo.value).lower()

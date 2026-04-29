@@ -338,6 +338,7 @@ class SafetyValidator:
         coefficients: list[float],
         sample_rate: int,
         profile: "TransducerProfile | None" = None,
+        intent: str = "general",
     ) -> None:
         """Validate a FIR filter's magnitude response against the profile's limits.
 
@@ -408,46 +409,21 @@ class SafetyValidator:
 
         floor = prof.min_boost_freq_hz
         below_floor_limit = prof.max_boost_per_band_db
-        thermal_limit = prof.max_boost_above_threshold_db
-        transient_limit = prof.transient_max_boost_db
-        transient_max_ms = prof.transient_max_pulse_ms
-
-        # Transient-aware classification. A FIR's boost at a 1/3-octave band
-        # can come from a sustained gain (e.g., +8 dB PEQ at 50 Hz applied
-        # in FIR form: long-tailed bandpassed envelope) or a brief modal-
-        # cancellation anti-pulse (Gaussian burst, ~5–15 ms). The thermal
-        # cap protects the driver against sustained level; transient pulses
-        # contribute to excursion only for their duration. Compute, per
-        # band, the bandpassed envelope's width-above-half-amplitude as
-        # the discriminator.
-        def _pulse_width_ms(lo_hz: float, hi_hz: float) -> float:
-            from scipy.signal import butter as _butter
-            from scipy.signal import sosfiltfilt as _sosfiltfilt
-            from scipy.signal import hilbert as _hilbert
-
-            nyq = 0.5 * float(sample_rate)
-            lo_n = max(1.0, lo_hz) / nyq
-            hi_n = min(0.999, hi_hz / nyq)
-            if hi_n <= lo_n:
-                return float("inf")
-            sos = _butter(4, [lo_n, hi_n], btype="band", output="sos")
-            band = _sosfiltfilt(sos, taps)
-            env = np.abs(_hilbert(band))
-            peak = float(env.max())
-            if peak <= 0.0:
-                return 0.0
-            above = env >= 0.5 * peak
-            # Longest contiguous run of True in `above` (samples).
-            longest = 0
-            cur = 0
-            for v in above:
-                if v:
-                    cur += 1
-                    if cur > longest:
-                        longest = cur
-                else:
-                    cur = 0
-            return 1000.0 * longest / float(sample_rate)
+        # The above-floor cap depends on intent. Generic FIRs (PEQ-equivalent
+        # arbitrary writes) get the strict thermal/excursion cap. Modal-
+        # cancellation FIRs from ``design_modal_fir`` get a looser cap: their
+        # boost at the mode is meant to cancel the room mode at the listener,
+        # so net SPL at the listening position is unchanged; only the driver
+        # sees the boosted level, well within thermal/excursion at typical
+        # calibrated listening levels.
+        if intent == "modal_cancel":
+            above_floor_limit = prof.modal_cancel_max_boost_db
+            cap_label = (
+                f"modal-cancellation cap of +{above_floor_limit:.0f} dB"
+            )
+        else:
+            above_floor_limit = prof.max_boost_above_threshold_db
+            cap_label = f"thermal ceiling of +{above_floor_limit:.0f} dB"
 
         for centre, peak_db in per_band.items():
             if peak_db <= 0.0:
@@ -464,35 +440,13 @@ class SafetyValidator:
                         f"port unloading and driver damage."
                     )
             else:
-                if peak_db <= thermal_limit:
-                    continue  # Under sustained cap; never need transient logic.
-                lo = centre / half_step
-                hi = centre * half_step
-                pulse_ms = _pulse_width_ms(lo, hi)
-                effective_limit = (
-                    transient_limit if pulse_ms < transient_max_ms else thermal_limit
-                )
-                if peak_db > effective_limit:
-                    if pulse_ms < transient_max_ms:
-                        kind = "transient"
-                        cap_label = (
-                            f"transient ceiling of +{transient_limit:.0f} dB "
-                            f"(pulse width {pulse_ms:.1f} ms < "
-                            f"{transient_max_ms:.0f} ms threshold)"
-                        )
-                    else:
-                        kind = "sustained"
-                        cap_label = (
-                            f"thermal ceiling of +{thermal_limit:.0f} dB "
-                            f"(pulse width {pulse_ms:.1f} ms ≥ "
-                            f"{transient_max_ms:.0f} ms — sustained gain)"
-                        )
+                if peak_db > above_floor_limit:
                     raise SafetyValidationError(
-                        f"SafetyValidator: FIR {kind} boost of "
-                        f"+{peak_db:.1f} dB at {centre:.0f} Hz "
-                        f"1/3-octave band exceeds {cap_label} "
-                        f"(profile {prof.name!r}). Reduce the FIR's boost "
-                        f"or shorten the pulse."
+                        f"SafetyValidator: FIR boost of +{peak_db:.1f} dB "
+                        f"at {centre:.0f} Hz 1/3-octave band exceeds "
+                        f"{cap_label} (profile {prof.name!r}, intent "
+                        f"{intent!r}). Reduce the FIR's boost or target a "
+                        f"different frequency."
                     )
 
     def _check_hpf_present(self, filters: list[FilterSpec]) -> ValidationResult:

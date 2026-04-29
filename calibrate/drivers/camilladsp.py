@@ -1242,6 +1242,7 @@ class CamillaDSPDriver(DSPDriver):
         output_index: int,
         coefficients: list[float],
         sample_rate: int | None = None,
+        intent: str = "general",
     ) -> None:
         """Write FIR coefficients to a single output.
 
@@ -1270,6 +1271,7 @@ class CamillaDSPDriver(DSPDriver):
             SafetyValidator().validate_fir(
                 list(coefficients),
                 sample_rate=int(sample_rate or caps.fir_sample_rate_hz),
+                intent=intent,
             )
         except SafetyValidationError as exc:
             raise DriverError(str(exc))
