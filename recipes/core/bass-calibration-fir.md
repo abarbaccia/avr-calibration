@@ -720,6 +720,34 @@ Apply via `apply_fir(output_index=N, design_session_id=<session>)`
 to each sub. Verify with a fresh combined measurement: T60 should
 drop ~25–35 % at the targeted modes.
 
+**Unified target + modal FIR (v0.6.8.7+).** ``design_modal_fir`` accepts a
+``target_curve`` argument that adds a min-phase magnitude correction layer
+in the same FIR. Use this when you want a single FIR to deliver both modal
+T60 reduction AND target-curve shaping (e.g. Harman+4) without stacking
+input PEQ on top — input PEQ shape can fight the anti-pulses, since the
+PEQ is blind to the FIR's spectrum.
+
+```python
+design_modal_fir(
+    session_id=<combined>,
+    intents=[...],
+    target_curve={
+        "points": [{"freq": 25, "spl": 5}, {"freq": 31.5, "spl": 4},
+                   {"freq": 40, "spl": 3}, {"freq": 50, "spl": 2},
+                   {"freq": 63, "spl": 1}, {"freq": 80, "spl": 0}],
+        "band": [20, 100],   # taper magnitude correction outside this band
+    },
+)
+```
+
+The session's third-octave SPL is the source FR; target − source − modal_fir
+becomes the magnitude correction. Anchored to the 60–100 Hz midband so
+absolute SPL drops out. Outside ``band`` the correction tapers to 0 dB.
+**Transient-aware safety** (v0.6.8.7+) lets brief Gabor anti-pulses exceed
+the +8 dB sustained cap up to +15 dB transient, distinguished by the
+bandpassed envelope's width-above-half-amplitude (>30 ms ⇒ sustained,
+<30 ms ⇒ transient).
+
 ### 2.3 Apply the FIR
 
 1. `apply_fir(output_index=N, coefficients=[...])` with the designed FIR
