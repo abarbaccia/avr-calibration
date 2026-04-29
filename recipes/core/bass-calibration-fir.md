@@ -513,28 +513,19 @@ If combined < max(solo) in any band:
 **Required deep-bass re-pass for 2+ subs.** Default `optimize_sub_alignment`
 minimizes flatness across the full target band — that can leave a narrow
 cancellation null in the boost zone (e.g. 30-40 Hz) because flatness
-elsewhere offsets it on RMS. Two paths, pick one:
-
-**Single-call path (preferred, v0.6.9.3+):**
+elsewhere offsets it on RMS. Single-call workflow:
 
 ```
 optimize_sub_alignment(session_ids=[...], priority_band=[20, 50])
 ```
 
 The `priority_band` argument weights that range 3× in the objective so
-the optimizer attacks deep-bass nulls without a separate narrowband call.
-Inspect the `per_band_polarity` field in the response — bands listed
-there indicate per-band cancellations the wideband objective averaged
-out and would benefit from a polarity flip on a specific sub.
+the optimizer attacks deep-bass nulls in one call. Inspect the
+`per_band_polarity` field in the response — bands listed there indicate
+per-band cancellations that would benefit from a polarity flip on a
+specific sub.
 
-**Two-call path (legacy / hardware lacking v0.6.9.3 tools):**
-
-1. `optimize_sub_alignment(session_ids=[...], min_hz=20, max_hz=50)`
-   weighted toward deep bass. If relative timing flips or moves > 2 ms
-   from the wideband answer, the wideband was hiding a narrow null.
-2. Apply the deep-bass-priority recommendation. Measure combined.
-
-**Then in either path: refine inter-sub delay with the automated sweep.**
+**Then refine inter-sub delay with the automated sweep:**
 
 ```
 sweep_inter_sub_delay(
@@ -548,8 +539,7 @@ sweep_inter_sub_delay(
 
 The tool predicts deepest-null depth for each delay step and reports the
 delay that shallowest the deepest 1/3-octave null in the priority band.
-Replaces the manual 5-9-measurement sweep. Apply via
-`set_delay(output_index=<trailing_sub>, delay_ms=<recommended>)`.
+Apply via `set_delay(output_index=<trailing_sub>, delay_ms=<recommended>)`.
 
 **After Phase 2** designs FIRs, re-run `sweep_inter_sub_delay` with
 `step_ms=0.1` — the FIRs change phase response, so the optimal inter-sub
