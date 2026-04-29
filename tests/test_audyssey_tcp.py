@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
-from calibrate.drivers import audyssey_tcp
+from calibrate.drivers.denon import audyssey_tcp
 from calibrate.drivers.base import DriverError
 from calibrate.drivers.denon import DenonDriver
 

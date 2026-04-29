@@ -22,8 +22,8 @@ import logging
 from typing import Mapping
 
 from . import audyssey_tcp
-from .avr_driver import AVRDriver
-from .base import DriverError
+from ..avr_driver import AVRDriver
+from ..base import DriverError
 
 log = logging.getLogger(__name__)
 
