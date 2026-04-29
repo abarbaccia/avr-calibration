@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.9.5] - 2026-04-29
+
+### Added
+- **`samplerate` param on `design_modal_fir`:** previously the tool hardcoded `sample_rate=8000` regardless of the CamillaDSP processing rate. When the daemon runs at 48 kHz native (no internal resampler), the 8 kHz coefficients applied 1:6 — modal frequencies shifted 6× higher, anti-pulse positions garbled. The new `samplerate` param (default 8000 to preserve backward behavior) plumbs through to `ModalAwareFIRDesigner(sample_rate=...)`. Use `samplerate=48000, num_taps=24576` to match the `8000 + 4096` 512 ms filter window at 48 kHz native. Function signature, tool inputSchema, and dispatcher all updated.
+
 ## [0.6.9.4] - 2026-04-29
 
 ### Changed

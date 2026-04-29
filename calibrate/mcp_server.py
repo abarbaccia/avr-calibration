@@ -3705,6 +3705,7 @@ async def _tool_design_modal_fir(
     anti_pulse_cancel_strength: float = 0.6,
     num_taps: int = 4096,
     max_pre_ring_ms: float = 25.0,
+    samplerate: int = 8000,
     return_coefficients: bool = False,
 ) -> dict:
     """Design a modal-aware mixed-phase FIR with explicit per-mode treatment.
@@ -3890,7 +3891,7 @@ async def _tool_design_modal_fir(
                     ]
 
         designer = ModalAwareFIRDesigner(
-            sample_rate=8000,
+            sample_rate=int(samplerate),
             n_taps=int(num_taps),
             max_pre_ring_ms=float(max_pre_ring_ms),
         )
@@ -8382,6 +8383,16 @@ _TOOLS: list[Tool] = [
                     ),
                     "default": 25.0,
                 },
+                "samplerate": {
+                    "type": "integer",
+                    "description": (
+                        "FIR design sample rate. Must match CamillaDSP processing "
+                        "rate for coefficients to apply 1:1. Default 8000 (matches "
+                        "current 8 kHz processing). Set to 48000 when running "
+                        "48 kHz native (requires num_taps=24576 for same 512 ms window)."
+                    ),
+                    "default": 8000,
+                },
                 "return_coefficients": {
                     "type": "boolean",
                     "description": (
@@ -9122,6 +9133,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             anti_pulse_cancel_strength=float(arguments.get("anti_pulse_cancel_strength", 0.6)),
             num_taps=int(arguments.get("num_taps", 4096)),
             max_pre_ring_ms=float(arguments.get("max_pre_ring_ms", 25.0)),
+            samplerate=int(arguments.get("samplerate", 8000)),
             return_coefficients=bool(arguments.get("return_coefficients", False)),
         )
     # ── LLM filter-design math tools ────────────────────────────────────────
