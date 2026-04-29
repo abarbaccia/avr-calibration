@@ -950,6 +950,20 @@ async def _tool_compute_deviation(
                 "excluded_band_diagnostics will be empty", exc,
             )
 
+        # Geometry-dominated flag: when more than half the in-band points
+        # are excluded as geometry nulls, the RMS / mean / max stats are
+        # computed from < 50% of the band and are not representative.
+        # Surface a single boolean so callers can branch (e.g. recommend
+        # sub repositioning instead of further EQ iteration) without
+        # comparing counts to thresholds themselves.
+        total_points = (
+            len(included_errors) + len(excluded_null)
+            + len(excluded_rolloff) + len(excluded_geometry)
+        )
+        geometry_dominated = (
+            total_points > 0
+            and len(excluded_geometry) > total_points * 0.5
+        )
         return _ok(
             session_id=session_id,
             rms_db=round(rms, 2),
@@ -970,6 +984,7 @@ async def _tool_compute_deviation(
             excluded_null_points=len(excluded_null),
             excluded_rolloff_points=len(excluded_rolloff),
             excluded_geometry_points=len(excluded_geometry),
+            geometry_dominated=geometry_dominated,
             geometry_bands=[
                 {"lo_hz": round(lo, 1), "hi_hz": round(hi, 1)}
                 for lo, hi in geometry_ranges
@@ -2788,6 +2803,7 @@ async def _tool_optimize_sub_alignment(
     max_delay_ms: float = 30.0,
     search_polarity: bool = True,
     gain_search_db: float = 3.0,
+    priority_band: list[float] | None = None,
     seed: int = 42,
 ) -> dict:
     """MSO-style numerical sub alignment.
@@ -2800,6 +2816,13 @@ async def _tool_optimize_sub_alignment(
     band (flatness objective). Pass a target_curve = {"points":[{"freq","spl"},…]}
     to optimize against e.g. Harman or cinema-bass.
 
+    ``priority_band``: optional [lo_hz, hi_hz]. When supplied, the objective
+    weights points inside this band 3× higher than baseline, so the optimizer
+    preferentially drives the deepest-null elimination in that range. Use to
+    collapse the deep-bass-priority + wideband 2-call workflow (recipe
+    Phase 1.5) into one call: pass ``priority_band=[20, 50]`` and the
+    optimizer attacks deep-bass nulls without a separate narrow re-pass.
+
     Bounds:
       delay_ms  ∈ [0, max_delay_ms]  (lower-bound 0: optimizer delays leading
                                        subs rather than negatively delaying
@@ -2807,7 +2830,11 @@ async def _tool_optimize_sub_alignment(
       gain_db   ∈ [-gain_search_db, +gain_search_db]  (level match)
       polarity  ∈ {0, 1}             (continuous in DE, snapped on return)
 
-    Returns per-sub recommendations + predicted combined FR + improvement_db.
+    Returns per-sub recommendations + predicted combined FR + improvement_db
+    + per_band_polarity diagnostic (for each 1/3-octave band, indicates
+    whether flipping each sub's polarity individually would IMPROVE the
+    band's SPL — surfaces the polarity insight that the global optimizer
+    can miss when its objective averages across the full band).
     """
     try:
         from .storage import SessionStore
@@ -2902,6 +2929,19 @@ async def _tool_optimize_sub_alignment(
             1.0 - (in_band_freqs - min_hz) / max(max_hz - min_hz, 1e-9) * 0.9,
             0.1, 1.0,
         )
+
+        # Priority-band boost: when caller specifies ``priority_band``,
+        # multiply weights inside that band by 3.0 so the optimizer
+        # prefers fixing nulls there over flatness elsewhere. Collapses
+        # the wideband + narrowband 2-call workflow into one call
+        # (recipe Phase 1.5).
+        if priority_band is not None:
+            try:
+                pb_lo, pb_hi = float(priority_band[0]), float(priority_band[1])
+                pb_mask = (in_band_freqs >= pb_lo) & (in_band_freqs <= pb_hi)
+                freq_weights = np.where(pb_mask, freq_weights * 3.0, freq_weights)
+            except (IndexError, TypeError, ValueError):
+                pass  # invalid priority_band — silently ignore
 
         # Coherence weights: bins with low coherence (<0.7) carry substantial
         # measurement noise and should influence the optimizer proportionally
@@ -3023,9 +3063,52 @@ async def _tool_optimize_sub_alignment(
         in_band_freqs = freqs[in_band].tolist()
         in_band_pred = [float(x) for x in combined_fr_db(best)[in_band]]
 
+        # Per-band polarity diagnostic. For each 1/3-octave centre,
+        # compute the combined SPL with the optimizer's recommendation
+        # vs the same recommendation with each non-anchored sub flipped
+        # individually. If a flip improves SPL by >2 dB in a band, the
+        # global optimizer's polarity choice is suboptimal at that band
+        # — usually because the wideband objective averaged across bands
+        # masked a per-band cancellation. Surfacing this lets the LLM
+        # decide per-band rather than only seeing the global answer.
+        third_octave = [25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0]
+        half_step = 2 ** (1 / 6)
+        per_band_polarity: list[dict] = []
+        try:
+            current_fr = combined_fr_db(best)
+            for centre in third_octave:
+                if centre < min_hz or centre > max_hz:
+                    continue
+                lo, hi = centre / half_step, centre * half_step
+                mask = (freqs >= lo) & (freqs < hi)
+                if not np.any(mask):
+                    continue
+                current_band_spl = float(np.mean(current_fr[mask]))
+                flips = []
+                for i in range(1, N_subs):  # sub_0 is anchored
+                    flipped = best.copy()
+                    flipped[3 * i + 2] = 1.0 - best[3 * i + 2]
+                    flipped_fr = combined_fr_db(flipped)
+                    flipped_band_spl = float(np.mean(flipped_fr[mask]))
+                    delta = flipped_band_spl - current_band_spl
+                    if delta > 2.0:
+                        flips.append({
+                            "session_id": subs[i].id,
+                            "spl_gain_if_flipped_db": round(delta, 1),
+                        })
+                if flips:
+                    per_band_polarity.append({
+                        "freq_hz": centre,
+                        "current_spl_db": round(current_band_spl, 1),
+                        "flips_that_help": flips,
+                    })
+        except Exception:
+            per_band_polarity = []
+
         return _ok(
             per_sub=per_sub,
             band_hz=[min_hz, max_hz],
+            priority_band=priority_band if priority_band else None,
             baseline_error_db=round(baseline_err, 3),
             optimized_error_db=round(optimized_err, 3),
             improvement_db=improvement_db,
@@ -3034,23 +3117,213 @@ async def _tool_optimize_sub_alignment(
                 "frequencies": in_band_freqs,
                 "spl_db": in_band_pred,
             },
+            per_band_polarity=per_band_polarity,
             converged=bool(result.success),
             n_evaluations=int(result.nfev),
             note=(
                 "Per-sub recommendations minimize predicted combined-FR error in-band. "
                 "Apply delay via set_delay, gain via set_output_gain, polarity via "
-                "set_polarity per session_id. Then measure combined to verify "
-                "improvement_db shows up. Delays are returned in MINIMUM-LATENCY "
-                "form: the trailing sub is anchored at 0 ms; leading subs receive "
-                "only the inter-sub delta needed to align. This avoids burning "
-                "10-25 ms of pure latency on the sub chain (which would push the "
-                "sub-vs-mains offset out of alignment and consume Audyssey "
-                "distance-push budget). The combined FR is invariant to absolute "
-                "time offset — only the inter-sub delta matters."
+                "set_polarity per session_id. Delays are in MINIMUM-LATENCY form: "
+                "the trailing sub is anchored at 0 ms; leading subs get only the "
+                "inter-sub delta. ``per_band_polarity`` lists bands where flipping "
+                "an individual sub would gain >2 dB SPL vs the global recommendation "
+                "— useful for catching cancellations the wideband objective averaged "
+                "out. ``priority_band`` (if set) weighted that range 3× in the "
+                "objective for deep-bass-priority alignment."
             ),
         )
     except Exception as exc:
         return _err(f"optimize_sub_alignment failed: {exc}")
+
+
+async def _tool_sweep_inter_sub_delay(
+    session_ids: list[int],
+    sub_polarity: list[bool] | None = None,
+    sub_gain_db: list[float] | None = None,
+    base_delays_ms: list[float] | None = None,
+    priority_band: list[float] = [28.0, 50.0],
+    sweep_range_ms: float = 2.0,
+    step_ms: float = 0.25,
+) -> dict:
+    """Automated inter-sub delay sweep — predicts deepest-null depth in
+    the priority band for each delay step on the trailing sub.
+
+    Replaces the manual ±2 ms human-driven sweep in recipe Phase 1.5.
+    Takes post-alignment solo session_ids (one per sub), the polarity /
+    gain / base-delay state already applied to each sub, and sweeps the
+    *non-leading* sub's delay across ``[base − sweep_range, base + sweep_range]``
+    in ``step_ms`` increments. For each step, predicts the combined FR
+    by shift-and-summing the IRs and computes the deepest 1/3-octave-band
+    null depth in ``priority_band`` (default 28-50 Hz). Returns the step
+    that minimizes the deepest null.
+
+    Args:
+        session_ids: solo measurement session IDs (2 subs assumed; for
+            3+ subs, pass the two whose inter-delay you want to sweep).
+        sub_polarity: list of bools, one per sub. Defaults to all False.
+        sub_gain_db: list of floats, one per sub. Defaults to all 0.
+        base_delays_ms: list of floats, one per sub — the current delay
+            already applied. The trailing sub's delay is swept around
+            its base value; the leading sub's stays put. Defaults to
+            all 0.
+        priority_band: ``[lo_hz, hi_hz]`` for null detection. Default
+            [28, 50] = the deep-bass priority band.
+        sweep_range_ms: ± range around the trailing sub's base delay.
+        step_ms: sweep granularity. Default 0.25 ms = 9 measurements
+            for ±2 ms range.
+
+    Returns each step's predicted deepest-null depth and the optimal
+    delta. Apply the recommended delta via ``set_delay`` on the
+    trailing sub.
+    """
+    try:
+        from .storage import SessionStore
+        import numpy as np
+
+        if not session_ids or len(session_ids) < 2:
+            return _err("sweep_inter_sub_delay: need at least 2 session_ids")
+
+        store = SessionStore()
+        sessions = store.list_sessions()
+        by_id = {s.id: s for s in sessions}
+        subs = []
+        for sid in session_ids:
+            s = by_id.get(sid)
+            if s is None:
+                return _err(f"session {sid} not found")
+            if not s.impulse_response:
+                return _err(f"session {sid} has no impulse_response")
+            if not s.start_fr or not s.start_fr.sample_rate:
+                return _err(f"session {sid} has no sample_rate")
+            subs.append(s)
+
+        N = len(subs)
+        sr = int(subs[0].start_fr.sample_rate)
+        for s in subs:
+            if int(s.start_fr.sample_rate) != sr:
+                return _err(
+                    f"session {s.id}: sample_rate mismatch "
+                    f"({s.start_fr.sample_rate} vs {sr})"
+                )
+
+        polarity = list(sub_polarity) if sub_polarity else [False] * N
+        gain_db = list(sub_gain_db) if sub_gain_db else [0.0] * N
+        base_delays = list(base_delays_ms) if base_delays_ms else [0.0] * N
+        if len(polarity) != N or len(gain_db) != N or len(base_delays) != N:
+            return _err(
+                f"polarity/gain/base_delays must each have {N} elements"
+            )
+
+        # Identify the trailing sub (the one whose base delay is highest —
+        # min-latency form puts trailing sub at 0, but if both are at 0
+        # we pick sub_1 by convention).
+        trailing_idx = int(max(range(N), key=lambda i: base_delays[i]))
+        if all(d == base_delays[0] for d in base_delays):
+            trailing_idx = 1  # default to sub_1 when no leader is identifiable
+
+        # Pad IRs to the longest length.
+        irs = [np.asarray(s.impulse_response, dtype=np.float64) for s in subs]
+        n = max(len(ir) for ir in irs) + int(
+            (max(base_delays) + sweep_range_ms + 5.0) * sr / 1000.0
+        )
+        irs_padded = np.stack([
+            np.pad(ir, (0, n - len(ir))) for ir in irs
+        ])
+
+        freqs = np.fft.rfftfreq(n, d=1.0 / sr)
+        pb_lo, pb_hi = float(priority_band[0]), float(priority_band[1])
+
+        # Build 1/3-octave centres in the priority band.
+        third_octave_all = [25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0]
+        centres = [c for c in third_octave_all if pb_lo <= c <= pb_hi]
+        half_step = 2 ** (1 / 6)
+
+        def predict_null(trailing_delay_ms: float) -> dict:
+            combined = np.zeros(n, dtype=np.float64)
+            for i in range(N):
+                d_ms = (
+                    trailing_delay_ms if i == trailing_idx else base_delays[i]
+                )
+                d_samples = int(round(d_ms * sr / 1000.0))
+                if d_samples >= n:
+                    d_samples = n - 1
+                shifted = np.zeros(n, dtype=np.float64)
+                if d_samples == 0:
+                    shifted = irs_padded[i].copy()
+                else:
+                    shifted[d_samples:] = irs_padded[i][:n - d_samples]
+                sign = -1.0 if polarity[i] else 1.0
+                g_lin = 10.0 ** (gain_db[i] / 20.0)
+                combined += sign * g_lin * shifted
+            H = np.abs(np.fft.rfft(combined)) + 1e-12
+            spl_db = 20.0 * np.log10(H)
+            band_mean = float(np.mean(spl_db[(freqs >= pb_lo) & (freqs <= pb_hi)]))
+            band_minima = []
+            for centre in centres:
+                lo, hi = centre / half_step, centre * half_step
+                mask = (freqs >= lo) & (freqs < hi)
+                if not np.any(mask):
+                    continue
+                band_minima.append(float(np.min(spl_db[mask])))
+            if not band_minima:
+                return {"deepest_null_db": 0.0, "band_mean_db": band_mean}
+            return {
+                "deepest_null_db": min(band_minima),
+                "band_mean_db": band_mean,
+                "depth_below_mean_db": min(band_minima) - band_mean,
+            }
+
+        # Sweep around the trailing sub's base delay.
+        steps = []
+        center = base_delays[trailing_idx]
+        n_steps = int(round(sweep_range_ms / step_ms))
+        for k in range(-n_steps, n_steps + 1):
+            d = max(0.0, center + k * step_ms)
+            pred = predict_null(d)
+            steps.append({
+                "trailing_delay_ms": round(d, 3),
+                "delta_from_base_ms": round(d - center, 3),
+                **{k: round(v, 2) for k, v in pred.items()},
+            })
+
+        # Pick the step with the SHALLOWEST deepest null (highest min SPL).
+        # Tie-break by smallest |delta_from_base| to prefer minimal change.
+        steps_sorted = sorted(
+            steps,
+            key=lambda x: (
+                -x["deepest_null_db"],
+                abs(x["delta_from_base_ms"]),
+            ),
+        )
+        best = steps_sorted[0]
+
+        return _ok(
+            session_ids=session_ids,
+            trailing_sub_session_id=subs[trailing_idx].id,
+            trailing_sub_label=subs[trailing_idx].label,
+            priority_band_hz=[pb_lo, pb_hi],
+            base_delay_ms=center,
+            recommended_delay_ms=best["trailing_delay_ms"],
+            recommended_delta_ms=best["delta_from_base_ms"],
+            recommended_deepest_null_db=best["deepest_null_db"],
+            baseline_deepest_null_db=next(
+                (s["deepest_null_db"] for s in steps
+                 if s["delta_from_base_ms"] == 0.0),
+                None,
+            ),
+            steps=steps,
+            note=(
+                f"Swept {len(steps)} delay steps in "
+                f"±{sweep_range_ms} ms / {step_ms} ms-step. Recommended "
+                f"delay {best['trailing_delay_ms']:.3f} ms shallowest the "
+                f"deepest null in {pb_lo:.0f}-{pb_hi:.0f} Hz to "
+                f"{best['deepest_null_db']:.1f} dB. Apply via "
+                f"set_delay(output_index=<trailing_sub>, delay_ms="
+                f"{best['trailing_delay_ms']:.3f})."
+            ),
+        )
+    except Exception as exc:
+        return _err(f"sweep_inter_sub_delay failed: {exc}")
 
 
 async def _tool_design_fir(
@@ -7780,6 +8053,69 @@ _TOOLS: list[Tool] = [
                     "type": "number",
                     "description": "±range for per-sub gain trim search (default: 3 dB)",
                 },
+                "priority_band": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": (
+                        "Optional [lo_hz, hi_hz]. Weights this band 3× in the "
+                        "objective so the optimizer preferentially eliminates "
+                        "deep-bass nulls. Use to collapse the wideband + "
+                        "narrowband 2-call workflow into one call (recipe Phase 1.5)."
+                    ),
+                },
+            },
+            "required": ["session_ids"],
+        },
+    ),
+    Tool(
+        name="sweep_inter_sub_delay",
+        description=(
+            "Automated inter-sub delay sweep. Replaces the manual ±2 ms "
+            "human-driven sweep in recipe Phase 1.5. Takes post-alignment "
+            "solo session IDs, the polarity / gain / base-delay state already "
+            "applied, and sweeps the trailing sub's delay in fine steps to "
+            "find the value that shallowest the deepest 1/3-octave null in "
+            "the priority band (default 28-50 Hz)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Solo session IDs (2 subs).",
+                },
+                "sub_polarity": {
+                    "type": "array",
+                    "items": {"type": "boolean"},
+                    "description": "Polarity per sub (default all false).",
+                },
+                "sub_gain_db": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "Gain dB per sub (default all 0).",
+                },
+                "base_delays_ms": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": (
+                        "Currently-applied delay per sub. Trailing sub is the "
+                        "one with the largest base delay; its delay is swept."
+                    ),
+                },
+                "priority_band": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "[lo_hz, hi_hz] for null detection (default [28, 50]).",
+                },
+                "sweep_range_ms": {
+                    "type": "number",
+                    "description": "± range around base delay (default 2.0).",
+                },
+                "step_ms": {
+                    "type": "number",
+                    "description": "Step granularity (default 0.25).",
+                },
             },
             "required": ["session_ids"],
         },
@@ -8725,6 +9061,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             max_delay_ms=float(arguments.get("max_delay_ms", 30.0)),
             search_polarity=bool(arguments.get("search_polarity", True)),
             gain_search_db=float(arguments.get("gain_search_db", 3.0)),
+            priority_band=arguments.get("priority_band"),
+        )
+    elif name == "sweep_inter_sub_delay":
+        result = await _tool_sweep_inter_sub_delay(
+            session_ids=[int(x) for x in arguments["session_ids"]],
+            sub_polarity=arguments.get("sub_polarity"),
+            sub_gain_db=arguments.get("sub_gain_db"),
+            base_delays_ms=arguments.get("base_delays_ms"),
+            priority_band=arguments.get("priority_band", [28.0, 50.0]),
+            sweep_range_ms=float(arguments.get("sweep_range_ms", 2.0)),
+            step_ms=float(arguments.get("step_ms", 0.25)),
         )
     elif name == "design_fir":
         result = await _tool_design_fir(
