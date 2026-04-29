@@ -357,6 +357,7 @@ class MinidspDriver(DSPDriver):
         output_index: int,
         coefficients: list[float],
         sample_rate: int = FIR_SAMPLE_RATE,
+        intent: str = "general",
     ) -> None:
         """Write FIR coefficients to a single output via the minidsp CLI.
 
@@ -386,7 +387,7 @@ class MinidspDriver(DSPDriver):
         from ..safety import SafetyValidationError, SafetyValidator
         try:
             SafetyValidator().validate_fir(
-                list(coefficients), sample_rate=int(sample_rate)
+                list(coefficients), sample_rate=int(sample_rate), intent=intent,
             )
         except SafetyValidationError as exc:
             raise DriverError(str(exc))

@@ -225,7 +225,6 @@ class ModalAwareFIRDesigner:
                 target_curve_db: list[tuple[float, float]] | None = None,
                 source_fr_db: list[tuple[float, float]] | None = None,
                 magnitude_focus_hz: tuple[float, float] | None = None,
-                phase_flatten_below_hz: float | None = 35.0,
                 ) -> tuple[list[float], DesignSummary]:
         """Generate a modal-aware mixed-phase FIR.
 
