@@ -910,6 +910,8 @@ def detect_ir_onset(
     sample_rate: int,
     search_window_ms: float = 50.0,
     xcorr_peak_ms: float | None = None,
+    min_sustained_ms: float = 4.0,
+    fir_pre_delay_ms: float = 0.0,
 ) -> dict:
     """Detect the onset of an impulse response, returning peak timing and level.
 
@@ -959,9 +961,10 @@ def detect_ir_onset(
     # bandpassed onset land in the resonance, not on the direct arrival.
     # Skipping the leading 1 ms gives us the same DC protection without the
     # transient destruction.
+    # Skip the leading 1 ms to avoid the Wiener-deconvolution DC artifact
+    # at t=0.
     skip_samples = int(0.001 * sample_rate)
     if len(ir) <= skip_samples + 8:
-        # Pathological: IR too short to skip — use full array.
         skip_samples = 0
     ir_search = ir[skip_samples:]
 
@@ -972,12 +975,31 @@ def detect_ir_onset(
     onset_ratio = 10.0 ** (IR_ONSET_THRESHOLD_DB / 20.0)  # 0.1 for -20 dB
     onset_threshold = abs_ir[max_idx_local] * onset_ratio
     onset_candidates_local = np.where(abs_ir >= onset_threshold)[0]
+    # FIR-pre-ring guard (opt-in via fir_pre_delay_ms > 0): the FIR's
+    # anti-pulse content sits in the window
+    # ``[main_peak - fir_pre_delay_ms, main_peak]`` and would otherwise be
+    # mistaken for the room's direct arrival. Drop any onset candidate
+    # inside that window, leaving either (a) candidates earlier than the
+    # FIR window (a legitimate earlier room arrival, e.g., a closer sub)
+    # or (b) the main peak itself. Only applies when caller hints the FIR
+    # pre-delay; default 0 preserves legacy behavior.
+    if fir_pre_delay_ms > 0 and len(onset_candidates_local) > 0:
+        fir_pre_samples = int(float(fir_pre_delay_ms) * 1e-3 * sample_rate)
+        zone_start = max(0, max_idx_local - fir_pre_samples)
+        in_zone = (onset_candidates_local >= zone_start) & (
+            onset_candidates_local < max_idx_local
+        )
+        cleaned = onset_candidates_local[~in_zone]
+        if len(cleaned) > 0:
+            onset_candidates_local = cleaned
     peak_idx_local = (
         int(onset_candidates_local[0])
         if len(onset_candidates_local) > 0
         else max_idx_local
     )
     peak_idx = peak_idx_local + skip_samples
+    # ``min_sustained_ms`` is reserved for a future sustained-energy gate.
+    _ = min_sustained_ms
 
     # Polarity reads the dominant impulse, not the onset crossing.
     peak_sign = 1 if ir[max_idx] >= 0.0 else -1
@@ -998,6 +1020,7 @@ def compute_session_metadata(
     decay_freq_min: float = 20.0,
     decay_freq_max: float = 200.0,
     t60_threshold_ms: float = 300.0,
+    fir_pre_delay_ms: float = 0.0,
 ) -> dict:
     """Compute IR-derived metadata from a FrequencyResponse at capture time.
 
@@ -1017,6 +1040,7 @@ def compute_session_metadata(
         metadata["ir"] = detect_ir_onset(
             ir_arr, sample_rate, search_window_ms,
             xcorr_peak_ms=fr.xcorr_peak_ms,
+            fir_pre_delay_ms=fir_pre_delay_ms,
         )
 
     # ── Decay analysis (replaces analyze_decay) ──────────────────────────

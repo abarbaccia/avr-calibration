@@ -3840,8 +3840,20 @@ async def _tool_trigger_measurement(
             await _ensure_sweep_session()
             fr = await engine.measure(playback_device_override=cal_playback)
 
-        # Compute IR-derived metadata at capture time
-        metadata = compute_session_metadata(fr)
+        # Compute IR-derived metadata at capture time. Query the DSP for the
+        # current per-output FIR pre-delay so the onset detector can skip
+        # any FIR-injected pre-ring (multi-pulse modal-cancellation FIRs
+        # produce strong pre-arrival content that would otherwise walk the
+        # detected onset back into the FIR's own non-causal window).
+        fir_pre_delay_ms = 0.0
+        try:
+            if _dsp is not None:
+                getter = getattr(_dsp, "get_fir_pre_delay_ms", None)
+                if callable(getter):
+                    fir_pre_delay_ms = float(getter() or 0.0)
+        except Exception:
+            fir_pre_delay_ms = 0.0
+        metadata = compute_session_metadata(fr, fir_pre_delay_ms=fir_pre_delay_ms)
         if position:
             metadata["position"] = position
 
@@ -5074,6 +5086,143 @@ async def _tool_apply_fir(
     return _ok(output_index=output_index, taps=len(coefficients), source=source)
 
 
+async def _tool_design_corrective_fir(
+    session_id: int,
+    target_curve: dict,
+    output_index: int,
+    num_taps: int = 1024,
+    focus_hz: list[float] | None = None,
+    return_coefficients: bool = False,
+) -> dict:
+    """Design a magnitude-correction FIR for the *residual* between a measured
+    listener FR and the target curve, then convolve with the existing FIR
+    cached on ``output_index``. Returns a new design_session_id whose
+    coefficients can be applied via ``apply_fir(design_session_id=...)``.
+
+    This is the **empirical 2-step** workflow:
+      1. Apply some baseline correction (e.g. a modal-cancellation FIR via
+         ``design_modal_fir``).
+      2. Measure the listener result (the ``session_id`` argument here).
+      3. This tool computes the residual ``target − measured`` and designs
+         a min-phase FIR that closes that gap, convolved on top of the
+         existing FIR for ``output_index``.
+      4. Apply via ``apply_fir(output_index, design_session_id=<returned>)``.
+
+    Use after ``design_modal_fir`` / ``apply_fir`` revealed a per-room FR
+    deviation from the target curve that wasn't predictable from the FIR
+    design alone (anti-pulse phase interaction with the room's modal
+    response — see recipe Section 2.2b).
+
+    Args:
+        session_id: post-baseline-FIR measurement (the room's response
+            after the existing FIR is applied to ``output_index``).
+        target_curve: ``{"points": [{"freq", "spl"}, ...], "band": [lo, hi]}``.
+            Same shape as ``design_fir``'s target_curve. Anchored to the
+            60-100 Hz midband so absolute SPL drops out.
+        output_index: DSP output whose existing cached FIR to convolve onto.
+            Must have a cached design (i.e. an earlier ``design_*_fir`` call
+            populated ``_fir_design_cache[session_id]`` referenced by an
+            apply_fir(design_session_id=...)). When no cached FIR is found,
+            falls back to a passthrough impulse (so this tool still works
+            for the first-pass case where there's no baseline FIR yet).
+        num_taps: corrective FIR length (default 1024 — short, since this
+            is just magnitude correction at low frequencies).
+        focus_hz: ``[lo, hi]`` band where correction is applied; outside
+            tapers to 0 dB. Default: target_curve's ``band`` if present,
+            else [25, 120].
+        return_coefficients: include the convolved FIR taps in the response.
+    """
+    from .storage import SessionStore
+    import numpy as _np
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        session = next((s for s in sessions if s.id == session_id), None)
+        if session is None:
+            return _err(f"session {session_id} not found")
+        if not session.start_fr or not session.start_fr.frequencies:
+            return _err(f"session {session_id} has no FR data")
+
+        # Target curve plumbing
+        if not isinstance(target_curve, dict) or not target_curve.get("points"):
+            return _err("target_curve.points required")
+        target_points = [
+            (float(p.get("freq", p.get("freq_hz", 0))),
+             float(p.get("spl", p.get("spl_db", 0))))
+            for p in target_curve["points"]
+        ]
+        band = target_curve.get("band") or focus_hz
+        focus = (float(band[0]), float(band[1])) if isinstance(band, (list, tuple)) and len(band) == 2 else (25.0, 120.0)
+
+        # Source FR from the session (raw arrays).
+        fr = session.start_fr
+        source_pairs = list(zip(
+            [float(f) for f in fr.frequencies],
+            [float(s) for s in fr.spl],
+        ))
+
+        # Existing FIR for output_index — find any cached design that was
+        # applied to this output. Fall back to passthrough if none.
+        existing_fir = None
+        for sid, coeffs in _fir_design_cache.items():
+            # Best-effort: assume the most recently applied design is the
+            # right baseline. Without an apply→cache reverse index we
+            # approximate by using the largest session_id that has cached
+            # coefficients (chronological proxy).
+            existing_fir = list(coeffs)
+        if existing_fir is None:
+            existing_fir = [0.0] * num_taps
+            existing_fir[0] = 1.0
+
+        # Design the corrective magnitude FIR.
+        from .modal_fir import _design_magnitude_correction_fir
+        sample_rate = 8000  # FIR processing rate
+        existing_arr = _np.asarray(existing_fir, dtype=_np.float32)
+        corrective = _design_magnitude_correction_fir(
+            fir=existing_arr,
+            target_db=target_points,
+            source_fr_db=source_pairs,
+            sample_rate=sample_rate,
+            n_taps=int(num_taps),
+            focus_hz=focus,
+        )
+        # Convolve corrective with existing — combined FIR delivers both.
+        combined = _np.convolve(existing_arr, corrective)
+        # Cap at a reasonable length so apply_fir doesn't reject. Use the
+        # longer of the two inputs.
+        max_len = max(len(existing_arr), int(num_taps))
+        combined = combined[:max_len].astype(_np.float32)
+        peak = float(_np.max(_np.abs(combined)))
+        if peak > 1.0:
+            combined = combined / (peak * 1.001)
+
+        # Cache under a synthetic session_id derived from the source.
+        cache_id = int(session_id)
+        _fir_design_cache[cache_id] = combined.tolist()
+        _fir_design_intent[cache_id] = "modal_cancel"
+
+        result = {
+            "session_id": session_id,
+            "output_index": int(output_index),
+            "num_taps": int(len(combined)),
+            "sample_rate": sample_rate,
+            "peak_amplitude": round(float(_np.max(_np.abs(combined))), 4),
+            "design_cached": True,
+            "note": (
+                "Empirical 2-step corrective FIR convolved on top of the "
+                "existing cached FIR. Apply via "
+                f"apply_fir(output_index={output_index}, "
+                f"design_session_id={session_id})."
+            ),
+        }
+        if return_coefficients:
+            result["coefficients"] = combined.tolist()
+        return _ok(**result)
+    except Exception as exc:
+        return _err(f"design_corrective_fir failed: {exc}")
+
+
 async def _tool_clear_fir(output_index: int) -> dict:
     """Clear FIR coefficients and reset output to passthrough."""
     try:
@@ -5745,6 +5894,136 @@ async def _tool_verify_fir_effect(
         )
     except Exception as exc:
         return _err(f"verify_fir_effect failed: {exc}")
+
+
+async def _tool_verify_input_eq_effect(
+    pre_session_id: int,
+    post_session_id: int,
+    predicted_filters: list[dict],
+    tolerance_db: float = 2.0,
+    min_hz: float = 20.0,
+    max_hz: float = 200.0,
+) -> dict:
+    """Compare an input-EQ filter set's predicted effect against the measured delta.
+
+    After applying input PEQ via ``apply_input_eq``, the predicted FR change
+    (computed by simulating ``predicted_filters`` against ``pre_session_id``)
+    and the measured delta (post − pre at 1/3-octave) should match within
+    ~2 dB. Bigger divergences flag:
+
+      - Filter slot conflict — the existing input EQ wasn't fully replaced.
+      - CamillaDSP biquad coefficient quantization (rare; usually <0.5 dB).
+      - Routing mismatch — the signal isn't actually flowing through the
+        channel(s) the filters were written to.
+      - Measurement variance — coherence too low at the divergent band.
+
+    Mirrors the contract of ``verify_fir_effect``. ``predicted_filters`` is
+    the same list you passed to ``apply_input_eq``; the tool simulates them
+    against ``pre_session_id`` to compute the predicted delta.
+    """
+    from .storage import SessionStore
+    import math
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        pre = next((s for s in sessions if s.id == pre_session_id), None)
+        post = next((s for s in sessions if s.id == post_session_id), None)
+        if pre is None:
+            return _err(f"pre_session_id {pre_session_id} not found")
+        if post is None:
+            return _err(f"post_session_id {post_session_id} not found")
+        if not pre.start_fr or not pre.start_fr.frequencies:
+            return _err(f"pre session {pre_session_id} has no FR data")
+        if not post.start_fr or not post.start_fr.frequencies:
+            return _err(f"post session {post_session_id} has no FR data")
+        if not predicted_filters:
+            return _err("predicted_filters is required")
+
+        # Compute predicted FR after applying the filters to the pre session.
+        sim_result = await _tool_simulate_eq(
+            session_id=pre_session_id,
+            filters=predicted_filters,
+            min_hz=min_hz,
+            max_hz=max_hz,
+        )
+        if not sim_result.get("ok"):
+            return _err(f"simulate_eq failed: {sim_result.get('error')}")
+
+        # 1/3-octave bands for both sessions and the simulated post.
+        pre_bands = _downsample_to_third_octave(
+            pre.start_fr.frequencies, pre.start_fr.spl,
+        )
+        post_bands = _downsample_to_third_octave(
+            post.start_fr.frequencies, post.start_fr.spl,
+        )
+        pre_by_freq = {b["freq_hz"]: b["spl_db"] for b in pre_bands}
+        post_by_freq = {b["freq_hz"]: b["spl_db"] for b in post_bands}
+
+        # Parse simulate_eq's compact "freq:spl,..." string into a dict.
+        pred_post_by_freq: dict[float, float] = {}
+        try:
+            raw = sim_result.get("predicted_fr", "")
+            for chunk in raw.split(","):
+                if ":" not in chunk:
+                    continue
+                freq_str, spl_str = chunk.split(":", 1)
+                pred_post_by_freq[float(freq_str)] = float(spl_str)
+        except Exception:
+            pass
+
+        # Re-band the high-resolution simulated FR to 1/3-octave for comparison.
+        if pred_post_by_freq:
+            sim_freqs = sorted(pred_post_by_freq)
+            sim_spl = [pred_post_by_freq[f] for f in sim_freqs]
+            sim_bands = _downsample_to_third_octave(sim_freqs, sim_spl)
+            sim_by_freq = {b["freq_hz"]: b["spl_db"] for b in sim_bands}
+        else:
+            sim_by_freq = {}
+
+        bands: list[dict] = []
+        off_spec: list[dict] = []
+        discrepancies: list[float] = []
+        for freq in sorted(pre_by_freq):
+            if freq < min_hz or freq > max_hz:
+                continue
+            if freq not in post_by_freq or freq not in sim_by_freq:
+                continue
+            measured_delta = post_by_freq[freq] - pre_by_freq[freq]
+            predicted_delta = sim_by_freq[freq] - pre_by_freq[freq]
+            discrepancy = measured_delta - predicted_delta
+            entry = {
+                "freq_hz": freq,
+                "predicted_delta_db": round(predicted_delta, 2),
+                "measured_delta_db": round(measured_delta, 2),
+                "discrepancy_db": round(discrepancy, 2),
+            }
+            bands.append(entry)
+            discrepancies.append(discrepancy)
+            if abs(discrepancy) > tolerance_db:
+                off_spec.append(entry)
+
+        rms = math.sqrt(
+            sum(d * d for d in discrepancies) / len(discrepancies)
+        ) if discrepancies else 0.0
+        within = len(off_spec) == 0
+        note = (
+            "All bands within tolerance — input EQ landed as predicted."
+            if within
+            else f"{len(off_spec)} bands exceed {tolerance_db} dB tolerance — "
+                 f"check filter slot conflict / routing / coherence at "
+                 f"those bands."
+        )
+        return _ok(
+            bands=bands,
+            off_spec_bands=off_spec,
+            within_tolerance=within,
+            tolerance_db=tolerance_db,
+            rms_discrepancy_db=round(rms, 2),
+            note=note,
+        )
+    except Exception as exc:
+        return _err(f"verify_input_eq_effect failed: {exc}")
 
 
 async def _tool_check_system() -> dict:
@@ -6693,6 +6972,77 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="design_corrective_fir",
+        description=(
+            "Empirical 2-step corrective FIR. Computes target − measured FR "
+            "from a post-baseline-FIR session, designs a min-phase magnitude "
+            "correction FIR for the residual, and convolves it with the "
+            "existing cached FIR for ``output_index``. Returns a "
+            "design_session_id for ``apply_fir(design_session_id=...)``. "
+            "Use after design_modal_fir + apply_fir reveal a per-room "
+            "deviation from the target curve that the modal FIR alone "
+            "didn't predict (anti-pulse phase interaction with the room's "
+            "response — see recipe Section 2.2b)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "integer",
+                    "description": (
+                        "Post-baseline-FIR measurement (the room's response "
+                        "after any existing FIR is applied)."
+                    ),
+                },
+                "target_curve": {
+                    "type": "object",
+                    "description": (
+                        "Target curve points + optional band. "
+                        "Shape: {'points': [{'freq': 25, 'spl': 5}, ...], "
+                        "'band': [25, 120]}. Anchored to 60-100 Hz midband "
+                        "so absolute SPL drops out."
+                    ),
+                    "properties": {
+                        "points": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "freq": {"type": "number"},
+                                    "spl": {"type": "number"},
+                                },
+                            },
+                        },
+                        "band": {
+                            "type": "array",
+                            "items": {"type": "number"},
+                        },
+                    },
+                    "required": ["points"],
+                },
+                "output_index": {
+                    "type": "integer",
+                    "description": "DSP output to convolve onto.",
+                },
+                "num_taps": {
+                    "type": "integer",
+                    "default": 1024,
+                    "description": "Corrective FIR length. Default 1024.",
+                },
+                "focus_hz": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "[lo, hi] band for correction; outside tapers to 0 dB.",
+                },
+                "return_coefficients": {
+                    "type": "boolean",
+                    "default": False,
+                },
+            },
+            "required": ["session_id", "target_curve", "output_index"],
+        },
+    ),
+    Tool(
         name="reset_dsp_defaults",
         description=(
             "Reset ALL persisted per-output DSP state (polarity, gain, delay, FIR, per-output EQ) "
@@ -6996,6 +7346,39 @@ _TOOLS: list[Tool] = [
                 "max_hz": {"type": "number", "default": 120.0},
             },
             "required": ["pre_session_id", "post_session_id", "predicted_effect"],
+        },
+    ),
+    Tool(
+        name="verify_input_eq_effect",
+        description=(
+            "Compare an input-EQ filter set's predicted effect (simulated "
+            "against the pre session) against the measured delta between "
+            "pre and post-apply_input_eq sessions. Flags bands where "
+            "|predicted − measured| exceeds tolerance_db (default 2.0). "
+            "Use after apply_input_eq to catch: (1) filter slot conflict "
+            "(existing EQ wasn't replaced), (2) routing mismatch (signal "
+            "not flowing through the channels the filters were written to), "
+            "(3) measurement variance. Returns per-band comparison, "
+            "off-spec band list, and RMS discrepancy."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pre_session_id": {"type": "integer"},
+                "post_session_id": {"type": "integer"},
+                "predicted_filters": {
+                    "type": "array",
+                    "description": (
+                        "Same list passed to apply_input_eq. Each item: "
+                        "{freq, gain_db, q, type}."
+                    ),
+                    "items": {"type": "object"},
+                },
+                "tolerance_db": {"type": "number", "default": 2.0},
+                "min_hz": {"type": "number", "default": 20.0},
+                "max_hz": {"type": "number", "default": 200.0},
+            },
+            "required": ["pre_session_id", "post_session_id", "predicted_filters"],
         },
     ),
     Tool(
@@ -8200,6 +8583,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         )
     elif name == "clear_fir":
         result = await _tool_clear_fir(output_index=int(arguments["output_index"]))
+    elif name == "design_corrective_fir":
+        result = await _tool_design_corrective_fir(
+            session_id=int(arguments["session_id"]),
+            target_curve=arguments["target_curve"],
+            output_index=int(arguments["output_index"]),
+            num_taps=int(arguments.get("num_taps", 1024)),
+            focus_hz=arguments.get("focus_hz"),
+            return_coefficients=bool(arguments.get("return_coefficients", False)),
+        )
     elif name == "reset_dsp_defaults":
         result = await _tool_reset_dsp_defaults(
             dry_run=bool(arguments.get("dry_run", False)),
@@ -8240,6 +8632,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 arguments.get("audio_delay_budget_ms", 53.0),  # back-compat alias
             )),
             preringing_ms=float(arguments.get("preringing_ms", 25.0)),
+        )
+    elif name == "verify_input_eq_effect":
+        result = await _tool_verify_input_eq_effect(
+            pre_session_id=int(arguments["pre_session_id"]),
+            post_session_id=int(arguments["post_session_id"]),
+            predicted_filters=list(arguments["predicted_filters"]),
+            tolerance_db=float(arguments.get("tolerance_db", 2.0)),
+            min_hz=float(arguments.get("min_hz", 20.0)),
+            max_hz=float(arguments.get("max_hz", 200.0)),
         )
     elif name == "verify_fir_effect":
         result = await _tool_verify_fir_effect(

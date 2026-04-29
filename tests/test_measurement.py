@@ -1288,3 +1288,60 @@ class TestParseUmikSensitivity:
         cal.write_text("not a valid header\n20.0 -0.3\n")
         with pytest.raises(ValueError, match="Cannot parse"):
             parse_umik_sensitivity(str(cal))
+
+
+class TestDetectIrOnsetWithFirPreDelay:
+    """Onset detection must skip a known FIR-injected pre-ring window.
+
+    Anti-pulse modal-cancellation FIRs inject content BEFORE the main impulse
+    (one half-wavelength before the modal carrier). When the FIR is convolved
+    with the room IR, that pre-ring shows up in the measured IR as -3 to -10 dB
+    pre-arrival. Without skipping the FIR's known pre-delay window, the onset
+    detector walks the reported peak back into the FIR's own non-causal zone
+    instead of the room's actual direct arrival.
+    """
+
+    def test_skips_fir_pre_ring_window(self):
+        from calibrate.measurement import detect_ir_onset
+
+        sr = 48000
+        # Simulate: 14 ms of FIR pre-ring (small content), then main arrival
+        # at 130 ms with sustained room mode tail.
+        ir = np.zeros(int(sr * 0.5))
+        # Anti-pulse pre-ring at ~119 ms (peak time 130 - 11 ms)
+        pre_idx = int(0.119 * sr)
+        ir[pre_idx:pre_idx + 80] = 0.3 * np.cos(
+            2 * np.pi * 47.0 * (np.arange(80) - 40) / sr
+        )
+        # Main direct arrival at 130 ms
+        main_idx = int(0.130 * sr)
+        ir[main_idx] = 1.0
+        # Decaying room mode tail
+        tail = np.exp(-np.arange(int(sr * 0.05)) / (sr * 0.02))
+        ir[main_idx:main_idx + len(tail)] += 0.5 * tail
+
+        # Without FIR pre-delay hint, detector walks back to the pre-ring.
+        result_no_skip = detect_ir_onset(ir, sr, fir_pre_delay_ms=0.0)
+        assert result_no_skip["peak_time_ms"] < 125.0, (
+            f"baseline (no FIR hint) should detect the pre-ring as onset; "
+            f"got {result_no_skip['peak_time_ms']:.1f} ms"
+        )
+
+        # With a 14 ms FIR pre-delay hint, detector skips past the pre-ring
+        # and lands on the actual main arrival at 130 ms.
+        result_with_skip = detect_ir_onset(ir, sr, fir_pre_delay_ms=14.0)
+        assert 125.0 < result_with_skip["peak_time_ms"] < 135.0, (
+            f"with FIR pre-delay hint, onset should skip pre-ring and land "
+            f"on direct arrival near 130 ms; got "
+            f"{result_with_skip['peak_time_ms']:.1f} ms"
+        )
+
+    def test_zero_pre_delay_preserves_legacy_behavior(self):
+        from calibrate.measurement import detect_ir_onset
+
+        sr = 48000
+        ir = np.zeros(int(sr * 0.05))
+        ir[int(sr * 0.005)] = 1.0  # direct arrival at 5 ms
+        result = detect_ir_onset(ir, sr)
+        # No pre-delay arg (defaults to 0); 1 ms skip + onset at 5 ms.
+        assert 4.0 < result["peak_time_ms"] < 6.0
