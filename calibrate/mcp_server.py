@@ -4240,10 +4240,80 @@ async def _tool_avr_set_volume(level_db: float) -> dict:
         return _err(f"avr unreachable: {exc}")
 
 
+def _resolve_sweep_range(
+    cfg: object,
+    target: str | None,
+    freq_min: int | None,
+    freq_max: int | None,
+) -> tuple[int | None, int | None, str]:
+    """Pick the right sweep range for a measurement.
+
+    Resolution order:
+      1. Explicit ``freq_min``/``freq_max`` from the caller (any one of them
+         can be set independently — partial overrides supported)
+      2. ``target`` parameter — looks up the named speaker / sub group in
+         config.yaml and uses its ``sweep_range_hz`` if present
+      3. Falls back to None (caller / measurement engine uses
+         ``measurement.freq_min`` / ``measurement.freq_max`` defaults —
+         currently 20–200 Hz, the right value for sub-only sweeps).
+
+    Returns (lo, hi, source_description) where ``source_description``
+    explains where the values came from for the response metadata.
+    """
+    source_parts: list[str] = []
+    resolved_min = freq_min
+    resolved_max = freq_max
+    if freq_min is not None or freq_max is not None:
+        source_parts.append("explicit")
+
+    if (resolved_min is None or resolved_max is None) and target:
+        # Resolve target → speaker config (or sub config) → sweep_range_hz
+        target_norm = str(target).strip().upper()
+        speakers = getattr(cfg, "speakers", [])
+        sub_cfg = getattr(cfg, "sub", {}) or {}
+
+        sweep_range = None
+        # Match against speaker ``positions`` (e.g. "FL", "C") or ``model`` /
+        # group keywords like "main"/"mains"/"atmos"/"sub"/"subs".
+        keyword_map = {
+            "MAIN": "main", "MAINS": "main", "FRONT": "main",
+            "ATMOS": "atmos", "HEIGHT": "atmos", "HEIGHTS": "atmos",
+            "SURROUND": "surround", "SURROUNDS": "surround",
+            "SUB": "sub", "SUBS": "sub", "LFE": "sub",
+        }
+        wanted_type = keyword_map.get(target_norm)
+
+        if wanted_type == "sub":
+            sweep_range = sub_cfg.get("sweep_range_hz")
+        else:
+            for sp in speakers:
+                positions = [p.upper() for p in sp.get("positions", [])]
+                sp_type = (sp.get("type") or "").lower()
+                matches_position = target_norm in positions
+                matches_type = wanted_type and sp_type == wanted_type
+                if matches_position or matches_type:
+                    sweep_range = sp.get("sweep_range_hz")
+                    if sweep_range:
+                        break
+        if sweep_range and len(sweep_range) >= 2:
+            if resolved_min is None:
+                resolved_min = int(sweep_range[0])
+            if resolved_max is None:
+                resolved_max = int(sweep_range[1])
+            source_parts.append(f"speaker_config[{target!r}]")
+
+    if not source_parts:
+        source_parts.append("measurement.freq_min/freq_max defaults")
+    return resolved_min, resolved_max, " + ".join(source_parts)
+
+
 async def _tool_trigger_measurement(
     label: str | None = None,
     position: str | None = None,
     target_curve: dict | None = None,
+    target: str | None = None,
+    freq_min: int | None = None,
+    freq_max: int | None = None,
 ) -> dict:
     """Trigger a measurement via UMIK-1 + PyTTa.
 
@@ -4254,6 +4324,18 @@ async def _tool_trigger_measurement(
     loop — include the reference_spl and band used to compute the filters for
     this iteration. Leave None for raw/diagnostic captures; those sessions will
     not show a delta on the dashboard.
+
+    Sweep range:
+      - ``freq_min`` / ``freq_max`` are explicit per-call overrides.
+      - ``target`` (e.g. "FL", "mains", "subs", "atmos") resolves to the
+        speaker / sub group's ``sweep_range_hz`` from config.yaml.
+      - With neither, falls back to the global
+        ``measurement.freq_min``/``freq_max`` defaults (currently 20–200 Hz —
+        ideal for sub work, blind for mains).
+
+    For mains calibration always pass either an explicit range or
+    ``target="mains"`` — mains play 60 Hz–20 kHz; the default 200 Hz cap
+    can't characterise them.
     """
     try:
         import sounddevice as sd
@@ -4279,6 +4361,11 @@ async def _tool_trigger_measurement(
         engine = MeasurementEngine(cfg)
         route = cfg.measurement.get("playback_route", "usb")
 
+        # Resolve sweep range from explicit args / target / config defaults.
+        resolved_min, resolved_max, sweep_range_source = _resolve_sweep_range(
+            cfg, target, freq_min, freq_max,
+        )
+
         # When the DSP driver is in cal mode, route the sweep into its loopback
         # capture device so the sweep enters CamillaDSP via snd-aloop. Bypasses
         # the AVR — Audyssey/MultEQ filters cannot color the cal stimulus.
@@ -4294,7 +4381,11 @@ async def _tool_trigger_measurement(
 
         if route == "hdmi" and _drivers is not None:
             async with graph.sweep_context_for_route(route, targets, cfg, _drivers):
-                fr = await engine.measure(playback_device_override=cal_playback)
+                fr = await engine.measure(
+                    playback_device_override=cal_playback,
+                    freq_min=resolved_min,
+                    freq_max=resolved_max,
+                )
         elif route == "hdmi":
             # Legacy path used when the driver registry isn't populated (older
             # test setups that patch `_dsp` directly without the lifespan).
@@ -4302,9 +4393,17 @@ async def _tool_trigger_measurement(
             denon_ctx = DenonSweepContext.from_config(cfg)
             if denon_ctx:
                 async with denon_ctx:
-                    fr = await engine.measure(playback_device_override=cal_playback)
+                    fr = await engine.measure(
+                    playback_device_override=cal_playback,
+                    freq_min=resolved_min,
+                    freq_max=resolved_max,
+                )
             else:
-                fr = await engine.measure(playback_device_override=cal_playback)
+                fr = await engine.measure(
+                    playback_device_override=cal_playback,
+                    freq_min=resolved_min,
+                    freq_max=resolved_max,
+                )
         else:
             # USB mode keeps the persistent-session pattern so repeat
             # measurements don't thrash the DSP source switch. The persistent
@@ -7079,6 +7178,37 @@ _TOOLS: list[Tool] = [
                         "points: [{freq, spl}, ...]}"
                     ),
                 },
+                "target": {
+                    "type": "string",
+                    "description": (
+                        "Speaker / group identifier for sweep-range resolution. "
+                        "Looks up config.yaml's `speakers[].sweep_range_hz` (or "
+                        "`sub.sweep_range_hz`) to pick the right frequency band. "
+                        "Accepts position codes ('FL', 'C', 'TFL'), speaker types "
+                        "('main'/'mains', 'atmos', 'sub'/'subs', 'surround'), or "
+                        "'LFE'. Examples: target='subs' → 15-150 Hz, "
+                        "target='mains' → 60-20000 Hz, target='FL' → looks up the "
+                        "main speaker config. Ignored if explicit "
+                        "freq_min/freq_max are also passed."
+                    ),
+                },
+                "freq_min": {
+                    "type": "integer",
+                    "description": (
+                        "Lower frequency bound for the sweep in Hz. Overrides "
+                        "any value resolved from `target`. Default behavior: "
+                        "use the global measurement.freq_min config (currently "
+                        "20 Hz — sub-only)."
+                    ),
+                },
+                "freq_max": {
+                    "type": "integer",
+                    "description": (
+                        "Upper frequency bound for the sweep in Hz. Overrides "
+                        "any value resolved from `target`. For mains "
+                        "calibration use 20000; for sub use 200 or less."
+                    ),
+                },
             },
         },
     ),
@@ -9229,6 +9359,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             label=arguments.get("label"),
             position=arguments.get("position"),
             target_curve=arguments.get("target_curve"),
+            target=arguments.get("target"),
+            freq_min=(int(arguments["freq_min"]) if arguments.get("freq_min") is not None else None),
+            freq_max=(int(arguments["freq_max"]) if arguments.get("freq_max") is not None else None),
         )
     elif name == "calibrate_level":
         result = await _tool_calibrate_level(

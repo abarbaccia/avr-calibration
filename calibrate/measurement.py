@@ -440,6 +440,8 @@ class MeasurementEngine:
         self,
         input_device_name: str | None = None,
         playback_device_override: str | None = None,
+        freq_min: int | None = None,
+        freq_max: int | None = None,
     ) -> FrequencyResponse:
         """Run a full sweep measurement. Hardware-agnostic.
 
@@ -462,6 +464,13 @@ class MeasurementEngine:
         Args:
             input_device_name: optional substring to select the recording device by name
                 (e.g. "UMIK"). If None, uses config.mic.name (default "UMIK").
+            freq_min: optional lower frequency bound for the sweep. If None,
+                falls back to ``config.measurement.freq_min`` (default 20 Hz —
+                the right value for sub-only sweeps). Per-call override lets
+                a recipe sweep wider for full-range mains characterization.
+            freq_max: optional upper frequency bound for the sweep. If None,
+                falls back to ``config.measurement.freq_max`` (default 200 Hz —
+                sub-only band). Mains calibration should pass 20000 Hz here.
         """
         try:
             import pytta
@@ -478,8 +487,14 @@ class MeasurementEngine:
             ) from exc
 
         cfg = self.config.measurement
-        freq_min: int = cfg.get("freq_min", 20)
-        freq_max: int = cfg.get("freq_max", 200)
+        if freq_min is None:
+            freq_min = int(cfg.get("freq_min", 20))
+        else:
+            freq_min = int(freq_min)
+        if freq_max is None:
+            freq_max = int(cfg.get("freq_max", 200))
+        else:
+            freq_max = int(freq_max)
         duration: float = cfg.get("sweep_duration", 3.0)
         sample_rate: int = cfg.get("sample_rate", 48000)
         in_channel: int = cfg.get("input_channel", 1)

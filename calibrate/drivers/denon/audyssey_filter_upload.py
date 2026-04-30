@@ -294,7 +294,22 @@ def query_avr_status(
     Returned dict has keys including ``AmpAssign``, ``AssignBin``,
     ``ChSetup``, ``SWSetup`` (from GET_AVRSTS) and ``EQType``,
     ``DType``, ``CoefWaitTime`` (from GET_AVRINF).
+
+    Raises ConnectionError if the Audyssey TCP service is wedged. The
+    AVR's Audyssey daemon occasionally stops responding after a soft
+    power-on from standby — HTTP / denonavr keep working, but every
+    SET_SETDAT / SET_COEFDT / GET_AVR* command silently returns no data.
+    Recovery: pull the AVR's power cord, wait 30 s, plug back in. Soft
+    power-cycle (denonavr.async_power_on) does NOT fix this.
     """
+    from . import audyssey_tcp
+    if audyssey_tcp.probe_audyssey_service(host, port=port, timeout=3.0) is None:
+        raise ConnectionError(
+            f"Audyssey TCP service on {host}:{port} is unresponsive. "
+            "AVR's Audyssey daemon is wedged — hard power-cycle the AVR "
+            "(pull the power cord, wait 30 s, plug back in)."
+        )
+
     sock = socket.create_connection((host, port), timeout=timeout)
     sock.settimeout(timeout)
     rxbuf = bytearray()

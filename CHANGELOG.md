@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.10.0] - 2026-04-30
+
+### Added
+- **Per-speaker `sweep_range_hz` in config.yaml** drives sweep band selection. Each entry under `speakers:` and `sub:` can now declare `sweep_range_hz: [lo, hi]`. The `measure` MCP tool resolves the right band when given a `target` parameter (e.g. `target="mains"` → 60-20000 Hz, `target="subs"` → 15-150 Hz, `target="FL"` → looks up the main speaker's range). Avoids the recipe author having to remember which range to use per speaker class.
+- **`measure` tool gained `target`, `freq_min`, `freq_max` parameters.** Resolution order: explicit `freq_min`/`freq_max` (any one of them, partial overrides supported) → `target` → speaker config → global `measurement.freq_min`/`freq_max` defaults. The default behaviour (no params) is unchanged: 20-200 Hz sub-only sweep.
+- **`MeasurementEngine.measure()` accepts `freq_min`/`freq_max` overrides.** Engine falls back to config defaults when None is passed.
+- **New helper `_resolve_sweep_range()`** with 16 unit tests covering explicit overrides, partial overrides (only `freq_min`), target-based lookups (subs / mains / atmos / position codes / aliases), fallback when no target / no speaker has the range configured, and the diagnostic `source` string returned alongside.
+
+### Why
+Mains play 48 Hz - 32 kHz. The default 20-200 Hz sweep was sub-only and produced essentially no useful data above the crossover. Mains calibration via the AVR's MultEQ filter banks (the SET_COEFDT path landed in v0.6.9.7-8) needs full-range FR data to design filters across the audible band. With this change a recipe can do `measure(target="FL")` and Just Get Right.
+
+### Notes for callers
+- The 1/3-octave summary returned by `get_fr_summary` is currently still pinned to 20-200 Hz bins. Wider sweeps capture full data into the session store; the summary will be extended to 20-20000 Hz in a follow-up.
+
 ## [0.6.9.9] - 2026-04-30
 
 ### Fixed

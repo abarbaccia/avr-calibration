@@ -72,6 +72,76 @@ def build_frame(cmd: str, data: bytes = b"") -> bytes:
     return bytes(buf)
 
 
+def probe_audyssey_service(
+    host: str,
+    *,
+    port: int = DEFAULT_PORT,
+    timeout: float = 3.0,
+    try_release_lock: bool = True,
+) -> dict | None:
+    """Quick health probe for the AVR's Audyssey TCP/1256 service.
+
+    Sends a single GET_AVRINF and returns the parsed JSON response if the
+    AVR replies, or None if the service is unresponsive (silent socket
+    after timeout).
+
+    The Audyssey TCP service holds an exclusive session lock per
+    connection. If a previous client opened ENTER_AUDY and didn't send
+    EXIT_AUDMD before disconnecting (e.g. crash, SET_SETDAT NACK that
+    skipped the cleanup path), the lock stays held and subsequent
+    connections receive zero bytes. Soft power-cycle does NOT release
+    the lock; only a hard power-cycle (pull cord, wait 30 s, plug back
+    in) reliably clears it.
+
+    With ``try_release_lock=True`` (default), a first-pass silent reply
+    triggers one stale-lock-release attempt: open a fresh socket, send
+    EXIT_AUDMD only, close, then retry GET_AVRINF. Costs ~1 extra
+    second when the service IS healthy (the second probe is fast); can
+    save a hard cycle when a previous client left the lock held.
+
+    Returns:
+        Parsed GET_AVRINF response dict on success
+        ({EQType, DType, CoefWaitTime, ...}), or None if no reply
+        even after the release attempt.
+    """
+    import json as _json
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError:
+        return None
+    sock.settimeout(timeout)
+    try:
+        sock.sendall(build_frame("GET_AVRINF"))
+        buf = bytearray()
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            try:
+                sock.settimeout(max(0.1, end - time.monotonic()))
+                chunk = sock.recv(8192)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if len(buf) > 0:
+                    # Got something — parse the first frame's payload as JSON.
+                    if len(buf) >= 19 and buf[5:15].decode(
+                        "ascii", errors="replace"
+                    ).strip().rstrip("\x00") == "GET_AVRINF":
+                        data_len = struct.unpack(">H", bytes(buf[16:18]))[0]
+                        body = bytes(buf[18:18 + data_len])
+                        try:
+                            return _json.loads(body)
+                        except _json.JSONDecodeError:
+                            return {"_raw": body.decode("ascii", errors="replace")}
+            except (socket.timeout, TimeoutError):
+                break
+        return None
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 def build_distance_payload(
     channel_distances_m: Mapping[str, float],
     n_positions: int = 1,
