@@ -245,6 +245,128 @@ def test_without_simulation_verified_4db_rejected(validator: SafetyValidator) ->
     assert not result.ok
 
 
+# ── Shelf-aware per-band magnitude (regression for shelf mis-binning) ─────────
+
+def test_shelf_magnitude_high_shelf_below_corner_is_near_zero(
+    validator: SafetyValidator,
+) -> None:
+    """high_shelf with negative gain attenuates ABOVE corner, not below.
+
+    Pre-fix the validator attributed the filter's full ``gain_db`` to the
+    1/3-octave centre nearest the corner — so a high_shelf at 35 Hz with
+    -10 dB gain showed up as -10 dB at the 31.5 Hz centre. That was
+    physically wrong; below the corner the filter's magnitude approaches
+    0 dB. Regression test for the bug that produced spurious "+10 dB
+    per-iteration increase" rejections when the filter was removed.
+    """
+    from calibrate.safety import _per_band_magnitudes
+    filters = [
+        hpf(18.0),
+        FilterSpec(freq=35.0, gain_db=-10.0, q=0.5, type="high_shelf"),
+        FilterSpec(freq=45.0, gain_db=-3.0, q=2.0, type="peaking"),
+        FilterSpec(freq=55.0, gain_db=-2.0, q=2.0, type="peaking"),
+        FilterSpec(freq=70.0, gain_db=-2.0, q=2.0, type="peaking"),
+        FilterSpec(freq=90.0, gain_db=-2.0, q=2.0, type="peaking"),
+    ]
+    bands = _per_band_magnitudes(filters)
+    # Pre-fix bug: 31.5 Hz band would read -10 dB. New math: shelf is well
+    # below its full attenuation here, so ≥ -6 dB (i.e. closer to 0 than
+    # to the shelf gain). The exact value depends on Q; just assert we're
+    # not pinned to the gain magnitude.
+    assert bands[31.5] > -7.0, f"31.5 Hz band={bands[31.5]:.2f} should not read full shelf gain"
+    # Far above the corner, the high_shelf approaches its full gain.
+    assert bands[125.0] < -6.0
+
+
+def test_shelf_magnitude_low_shelf_above_corner_is_near_zero() -> None:
+    """low_shelf with negative gain attenuates BELOW corner, not above."""
+    from calibrate.safety import _per_band_magnitudes
+    filters = [
+        hpf(18.0),
+        FilterSpec(freq=50.0, gain_db=-6.0, q=0.7, type="low_shelf"),
+    ]
+    bands = _per_band_magnitudes(filters)
+    # Below the corner: close to the shelf gain.
+    assert bands[25.0] < -3.0
+    # Above the corner: close to 0.
+    assert bands[100.0] > -2.0
+    assert bands[200.0] > -1.0
+
+
+def test_shelf_per_band_magnitude_not_pinned_to_filter_gain(
+    validator: SafetyValidator,
+) -> None:
+    """Regression for the shelf mis-binning bug.
+
+    Pre-fix, a high_shelf with -10 dB gain at corner 35 Hz reported -10 dB
+    at the 31.5 Hz 1/3-octave centre — same magnitude as the filter's
+    declared gain. Physically wrong: a high_shelf attenuates ABOVE its
+    corner, so at 31.5 Hz (below the 35 Hz corner) magnitude is much
+    closer to 0 dB than to the shelf gain. With the buggy math, removing
+    or replacing this shelf produced a spurious "+10 dB at 31.5 Hz"
+    per-iteration delta. With correct biquad math, the residual at 31.5
+    Hz is only a few dB.
+    """
+    from calibrate.safety import _per_band_magnitudes
+    filters = [
+        hpf(18.0),
+        FilterSpec(freq=35.0, gain_db=-10.0, q=0.5, type="high_shelf"),
+        FilterSpec(freq=45.0, gain_db=-3.0, q=2.0, type="peaking"),
+        FilterSpec(freq=55.0, gain_db=-2.0, q=2.0, type="peaking"),
+        FilterSpec(freq=70.0, gain_db=-2.0, q=2.0, type="peaking"),
+        FilterSpec(freq=90.0, gain_db=-2.0, q=2.0, type="peaking"),
+    ]
+    bands = _per_band_magnitudes(filters)
+    # Pre-fix bug: bands[31.5] would be -10 dB. Correct math: nowhere near.
+    assert bands[31.5] > -7.0, (
+        f"31.5 Hz band={bands[31.5]:.2f} should be much closer to 0 than to "
+        "the shelf gain of -10 dB (pre-fix bug attributed -10 dB here)"
+    )
+    # And well above the corner the shelf does reach near its full gain.
+    assert bands[200.0] < -8.0
+
+
+def test_shelf_unchanged_no_iteration_violation(
+    validator: SafetyValidator,
+) -> None:
+    """When the shelf is unchanged across iterations, no spurious delta fires.
+
+    Regression: with the buggy magnitude math, even a tweak to a single
+    peaking filter could trigger a "+10 dB at 31.5 Hz" rejection because
+    the shelf was being mis-binned to that band. With correct math, an
+    unchanged shelf contributes zero delta at every band, and the only
+    delta comes from the actual peaking change.
+    """
+    shelf = FilterSpec(freq=35.0, gain_db=-10.0, q=0.5, type="high_shelf")
+    prev = [
+        hpf(18.0), shelf,
+        FilterSpec(freq=45.0, gain_db=-3.0, q=2.0, type="peaking"),
+    ]
+    curr = [
+        hpf(18.0), shelf,
+        # Move the peaking cut deeper — a *cut*, no boost anywhere.
+        FilterSpec(freq=45.0, gain_db=-5.0, q=2.0, type="peaking"),
+    ]
+    result = validator.validate(curr, prev)
+    assert result.ok, f"shelf-unchanged + peaking deeper-cut: {result.error}"
+
+
+def test_peaking_filter_per_iteration_unchanged(validator: SafetyValidator) -> None:
+    """Peaking filters were correct before the shelf-math fix; verify still correct.
+
+    A +3 dB peaking at 80 Hz from a 0 dB baseline must still pass the
+    +3 dB-per-iteration cap exactly the same as before.
+    """
+    prev = [hpf(), FilterSpec(freq=80.0, gain_db=0.0, q=2.0, type="peaking")]
+    curr = [hpf(), FilterSpec(freq=80.0, gain_db=3.0, q=2.0, type="peaking")]
+    result = validator.validate(curr, prev)
+    assert result.ok
+    # And +4 dB still rejected.
+    curr2 = [hpf(), FilterSpec(freq=80.0, gain_db=4.0, q=2.0, type="peaking")]
+    result2 = validator.validate(curr2, prev)
+    assert not result2.ok
+
+
 # ── ValidationResult ───────────────────────────────────────────────────────────
 
 def test_validation_result_passed() -> None:
