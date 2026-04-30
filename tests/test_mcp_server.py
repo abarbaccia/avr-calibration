@@ -127,10 +127,10 @@ def mock_dsp():
         "mute": False,
     }
 
-    async def apply_eq(preset: int, filters: list[dict], output_index: int | None = None, simulation_verified: bool = False) -> None:
+    async def apply_eq(preset: int, filters: list[dict], output_index: int | None = None, simulation_verified: bool = False, bypass_iteration_limit: bool = False) -> None:
         return None
 
-    async def apply_input_eq(preset: int, filters: list[dict], input_index: int | None = None, simulation_verified: bool = False) -> None:
+    async def apply_input_eq(preset: int, filters: list[dict], input_index: int | None = None, simulation_verified: bool = False, bypass_iteration_limit: bool = False) -> None:
         return None
 
     dsp.apply_eq.side_effect = apply_eq

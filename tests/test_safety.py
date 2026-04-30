@@ -367,6 +367,54 @@ def test_peaking_filter_per_iteration_unchanged(validator: SafetyValidator) -> N
     assert not result2.ok
 
 
+# ── bypass_iteration_limit ────────────────────────────────────────────────────
+
+def test_bypass_iteration_limit_allows_large_change(
+    validator: SafetyValidator,
+) -> None:
+    """bypass_iteration_limit=True skips the +3 dB delta cap.
+
+    The proposed change still has to pass absolute boost caps; +5 dB at
+    80 Hz is well within the +8 dB above-threshold cap.
+    """
+    prev = [hpf(), FilterSpec(freq=80.0, gain_db=0.0, q=2.0, type="peaking")]
+    curr = [hpf(), FilterSpec(freq=80.0, gain_db=5.0, q=2.0, type="peaking")]
+    # Default: rejected.
+    assert not validator.validate(curr, prev).ok
+    # With bypass: accepted.
+    assert validator.validate(curr, prev, bypass_iteration_limit=True).ok
+
+
+def test_bypass_iteration_limit_still_enforces_absolute_cap(
+    validator: SafetyValidator,
+) -> None:
+    """bypass_iteration_limit does NOT relax the absolute boost cap.
+
+    +20 dB at 80 Hz still violates the +8 dB above-threshold ceiling.
+    """
+    prev = [hpf(), FilterSpec(freq=80.0, gain_db=0.0, q=2.0, type="peaking")]
+    curr = [hpf(), FilterSpec(freq=80.0, gain_db=20.0, q=2.0, type="peaking")]
+    result = validator.validate(curr, prev, bypass_iteration_limit=True)
+    assert not result.ok
+    # Error must reference the per-band cap, not the iteration cap.
+    assert "iteration" not in result.error.lower()
+
+
+def test_bypass_iteration_limit_default_preserves_behavior(
+    validator: SafetyValidator,
+) -> None:
+    """Regression: bypass_iteration_limit=False (default) keeps the +3 dB cap.
+
+    Mirrors test_iteration_increase_exceeds_limit so we can be sure adding
+    the new param didn't accidentally weaken the default check.
+    """
+    prev = [hpf(), FilterSpec(freq=80.0, gain_db=0.0, q=2.0, type="peaking")]
+    curr = [hpf(), FilterSpec(freq=80.0, gain_db=4.0, q=2.0, type="peaking")]
+    result = validator.validate(curr, prev, bypass_iteration_limit=False)
+    assert not result.ok
+    assert "iteration" in result.error.lower() or "3" in result.error
+
+
 # ── ValidationResult ───────────────────────────────────────────────────────────
 
 def test_validation_result_passed() -> None:

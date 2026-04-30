@@ -453,6 +453,7 @@ async def _tool_apply_eq(
     output_index: int | None = None,
     target: str | None = None,
     simulation_verified: bool = False,
+    bypass_iteration_limit: bool = False,
 ) -> dict:
     """Validate and apply EQ filters to DSP output(s).
 
@@ -497,6 +498,7 @@ async def _tool_apply_eq(
             validator = SafetyValidator(rec["profile"])
             result = validator.validate(
                 specs, previous_filters=None, simulation_verified=simulation_verified,
+                bypass_iteration_limit=bypass_iteration_limit,
             )
             if not result.ok:
                 return _err(f"{result.error} [target={rec['transducer'].name!r}]")
@@ -513,6 +515,7 @@ async def _tool_apply_eq(
                     preset_for_driver, filters,
                     output_index=rec["output_index"],
                     simulation_verified=simulation_verified,
+                    bypass_iteration_limit=bypass_iteration_limit,
                 )
                 _persist_dsp_state(
                     dsp_output_key(rec["processor"], rec["output_index"], "eq"),
@@ -545,7 +548,7 @@ async def _tool_apply_eq(
         return _err(str(exc))
     processor_name = default_processor_name
     try:
-        await _dsp.apply_eq(preset, filters, output_index=output_index, simulation_verified=simulation_verified)  # type: ignore[union-attr]
+        await _dsp.apply_eq(preset, filters, output_index=output_index, simulation_verified=simulation_verified, bypass_iteration_limit=bypass_iteration_limit)  # type: ignore[union-attr]
         if output_index is not None:
             _persist_dsp_state(
                 dsp_output_key(processor_name, output_index, "eq"),
@@ -570,6 +573,7 @@ async def _tool_apply_input_eq(
     target_curve: dict | None = None,
     target: str | None = None,
     simulation_verified: bool = False,
+    bypass_iteration_limit: bool = False,
 ) -> dict:
     """Validate and apply EQ filters to the DSP input channel.
 
@@ -620,6 +624,7 @@ async def _tool_apply_input_eq(
             validator = SafetyValidator(profile)
             result = validator.validate(
                 specs, previous_filters=None, simulation_verified=simulation_verified,
+                bypass_iteration_limit=bypass_iteration_limit,
             )
             if not result.ok:
                 return _err(
@@ -635,6 +640,7 @@ async def _tool_apply_input_eq(
                 await driver.apply_input_eq(
                     preset_for_driver, filters,
                     simulation_verified=simulation_verified,
+                    bypass_iteration_limit=bypass_iteration_limit,
                 )
                 _persist_dsp_state(
                     dsp_input_key(proc_name, "eq"),
@@ -666,7 +672,7 @@ async def _tool_apply_input_eq(
         return _err(str(exc))
 
     try:
-        await _dsp.apply_input_eq(preset, filters, simulation_verified=simulation_verified)  # type: ignore[union-attr]
+        await _dsp.apply_input_eq(preset, filters, simulation_verified=simulation_verified, bypass_iteration_limit=bypass_iteration_limit)  # type: ignore[union-attr]
         processor_name = _default_dsp_name() or "dsp"
         _persist_dsp_state(
             dsp_input_key(processor_name, "eq"),
@@ -7050,6 +7056,21 @@ _TOOLS: list[Tool] = [
                         "change limit from +3 dB to +6 dB."
                     ),
                 },
+                "bypass_iteration_limit": {
+                    "type": "boolean",
+                    "description": (
+                        "Bypass the per-iteration +3 dB delta cap (cuts are always "
+                        "allowed regardless). Use only after simulating the proposed "
+                        "filter set against the current measurement and verifying the "
+                        "predicted response. Absolute boost caps "
+                        "(max_boost_per_band_db, max_boost_above_threshold_db, "
+                        "modal_cancel_max_boost_db) and the mandatory infrasonic HPF "
+                        "are STILL ENFORCED. Risk: if combined with a buggy filter "
+                        "design that applies a sustained boost, you'd produce an "
+                        "audible level jump before the next measurement, but driver "
+                        "protection (absolute boost caps + HPF) is intact."
+                    ),
+                },
             },
             "required": ["filters"],
         },
@@ -7114,6 +7135,21 @@ _TOOLS: list[Tool] = [
                         "Set to true if the filter set was verified by simulate_eq "
                         "immediately before this apply call. Relaxes the per-iteration "
                         "change limit from +3 dB to +6 dB."
+                    ),
+                },
+                "bypass_iteration_limit": {
+                    "type": "boolean",
+                    "description": (
+                        "Bypass the per-iteration +3 dB delta cap (cuts are always "
+                        "allowed regardless). Use only after simulating the proposed "
+                        "filter set against the current measurement and verifying the "
+                        "predicted response. Absolute boost caps "
+                        "(max_boost_per_band_db, max_boost_above_threshold_db, "
+                        "modal_cancel_max_boost_db) and the mandatory infrasonic HPF "
+                        "are STILL ENFORCED. Risk: if combined with a buggy filter "
+                        "design that applies a sustained boost, you'd produce an "
+                        "audible level jump before the next measurement, but driver "
+                        "protection (absolute boost caps + HPF) is intact."
                     ),
                 },
             },
@@ -9653,6 +9689,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             output_index=output_index,
             target=arguments.get("target"),
             simulation_verified=bool(arguments.get("simulation_verified", False)),
+            bypass_iteration_limit=bool(arguments.get("bypass_iteration_limit", False)),
         )
     elif name == "apply_input_eq":
         result = await _tool_apply_input_eq(
@@ -9660,6 +9697,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             target_curve=arguments.get("target_curve"),
             target=arguments.get("target"),
             simulation_verified=bool(arguments.get("simulation_verified", False)),
+            bypass_iteration_limit=bool(arguments.get("bypass_iteration_limit", False)),
         )
     elif name in ("set_volume", "avr_set_volume", "set_denon_volume"):
         result = await _tool_avr_set_volume(float(arguments["level_db"]))

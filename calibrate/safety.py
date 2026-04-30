@@ -239,6 +239,7 @@ class SafetyValidator:
         filters: list[FilterSpec],
         previous_filters: list[FilterSpec] | None = None,
         simulation_verified: bool = False,
+        bypass_iteration_limit: bool = False,
     ) -> ValidationResult:
         """Run all safety checks on *filters*.
 
@@ -253,6 +254,12 @@ class SafetyValidator:
             simulation_verified: If True, the caller has verified the filter set via
                 simulate_eq immediately before applying.  Relaxes the per-iteration
                 change limit from +3 dB to +6 dB.
+            bypass_iteration_limit: If True, skip the per-iteration change check
+                entirely.  All absolute caps (per-band boost ceiling, cumulative
+                ceiling, boost frequency floor, mandatory HPF) STILL APPLY — only
+                the delta-vs-previous check is skipped.  Use only after
+                simulating the proposed filter set against the current
+                measurement.  Cuts are unconstrained as before.
 
         Returns ValidationResult.passed() if all checks pass, or
         ValidationResult.failed(reason) on the first violation found.
@@ -269,7 +276,7 @@ class SafetyValidator:
             if not result.ok:
                 return result
 
-        if previous_filters is not None:
+        if previous_filters is not None and not bypass_iteration_limit:
             result = self._check_per_iteration_change(
                 filters, previous_filters, simulation_verified=simulation_verified
             )
