@@ -600,6 +600,203 @@ delay shifts slightly (typically ≤0.5 ms).
 
 Max 3 alignment iterations total (wideband + deep-bass + post-FIR).
 
+## Phase 1.95 — Build the calibration plan (NON-NEGOTIABLE)
+
+Before touching `design_fir` / `design_modal_fir` / `apply_eq` / `apply_input_eq`
+in Phase 2 or 3, **the LLM MUST emit a structured plan document and submit it
+for adversarial review**. This phase exists because: in real runs the LLM has
+made anchor-direction mistakes, mis-classified modal treatments, picked
+tap counts without justification, and committed boost budgets that ended up
+exceeding safety caps. A plan-then-review handoff catches these before any
+hardware writes.
+
+**The plan is not a free-form essay.** It's a structured document that
+forces every decision to have a measurable justification.
+
+### 1.95.1 Gather all available signals
+
+Before drafting the plan, collect:
+
+- Per-sub post-alignment solo FRs (from Phase 1)
+- Combined post-alignment FR
+- `analyze_phase` per band (fixability classification)
+- `analyze_decay` per sub and combined (T60 + peak per mode)
+- `compare_sub_phase` solo-A vs solo-B (per-band reinforcement classification)
+- Coherence per band (already in measurement metadata)
+- `eq_capabilities` (FIR taps, sample rate, PEQ slot counts)
+- Target curve points + `anchor_target` analysis under `cuts_only` and
+  `balanced` directions
+- Safety profile from `get_signal_graph` (boost caps, port_tune, modal_cancel cap)
+
+### 1.95.2 Emit the structured plan
+
+Output a plan in this shape (YAML-flavored, embed in a code block):
+
+```yaml
+calibration_plan:
+  target:
+    curve: harman-in-room
+    anchor:
+      freq_hz: 25
+      method: deep_bass_priority
+      reasoning: |
+        Lowest band where every adjacent has measured-relative ≥ target-relative
+        gap (i.e., implementable via cuts). At anchor=25 Hz: 31 has +0.3 gap,
+        40 has +3.9 gap, 50 has +6.7 gap. Anchor=31 also works but yields
+        smaller cuts above; anchor=25 maximizes cut headroom.
+
+  per_sub_strategy:
+    sub_front_right:
+      filter_type: design_fir   # or design_modal_fir
+      target_curve_in_fir: true
+      num_taps: 24576
+      taps_reasoning: |
+        max(T60) = 1163 ms at 47 Hz → impulse window ≥ 2× = 2326 ms.
+        24576 taps @ 48 kHz = 512 ms window. SHORT of 2× requirement.
+        Acceptable trade-off: 24576 matches 8 kHz processing rate alignment
+        and DSP CPU budget. Document residual ringing as known limit.
+      freq_focus_hz: [25, 100]
+      anchor_mode: deep_bass_priority
+      modal_treatment:           # only if using design_modal_fir
+        47Hz: linear_notch
+        70Hz: anti_pulse cancel_strength=0.6 bp_q=auto
+        94Hz: anti_pulse cancel_strength=0.5 bp_q=auto
+      modal_treatment_reasoning: |
+        47 Hz IS in priority band 25-50 → linear_notch to avoid anti-pulse
+        leakage into 25-31 (deep bass we want to PRESERVE). 70 Hz and 94 Hz
+        are above the protected band → anti_pulse OK. cancel_strength
+        will be auto-reduced if adjacent-band cap trips (commit 2d18420).
+    sub_nearfield:
+      ...
+
+  combined_strategy:
+    input_peq: hpf_only
+    reasoning: |
+      Per-sub FIRs carry both target shape AND modal correction. Combined
+      response should land within achievable accuracy of the curve.
+      Input PEQ would only stack with FIR cuts — no value-add unless a
+      residual modal peak survives both per-sub FIRs.
+
+  expected_residual:
+    rms_db: 3.0
+    threshold_chosen: 3.0
+    reasoning: |
+      Modal dilution feedback memory documents PEQ/FIR cuts deliver only
+      20-30% at the listener in this room (T60 471-1163 ms at 47-94 Hz).
+      Default 1.5 dB threshold not achievable without bass traps. 3.0 dB
+      is realistic for DSP-only path.
+
+  unfixable:
+    - description: "20 Hz null"
+      reason: "below SVS PB12-NSD port tune (22 Hz) + position-induced cancellation"
+      action: "skip — document for retrospective"
+
+  safety_budget_check:
+    max_predicted_boost_per_band_db: 4.5    # below profile cap of +6 below 25
+    max_predicted_boost_above_25_db: 7.2    # below profile cap of +8
+    modal_cancel_predicted_boost_db: 18     # below profile cap of +20
+    headroom_assessment: "all bands within budget; no expected safety rejections"
+
+  next_steps:
+    - "bass traps at 47/70/94 Hz to reduce T60 below 400ms (largest impact)"
+    - "sub repositioning: try corner placement for FR sub to break mode coupling"
+    - "re-cal after physical changes"
+```
+
+The plan MUST be specific. "Try anti-pulse maybe" is not a plan. "anti_pulse
+on 70 Hz at cancel_strength=0.6 bp_q=auto, expected adjacent-band boost
++18 dB at 50 Hz (within +20 cap)" is a plan.
+
+### 1.96 Adversarial review (NON-NEGOTIABLE)
+
+Invoke the `Agent` tool with `subagent_type: general-purpose` to red-team
+the plan. The reviewer prompt MUST include:
+
+1. The full structured plan from 1.95.2
+2. The relevant measurement session IDs (the agent can pull data via MCP
+   `get_measurement_history`, `analyze_phase`, `analyze_decay`)
+3. The `eq_capabilities` and safety profile
+4. Explicit red-team checklist (below)
+
+**Reviewer red-team checklist (all 8 must be addressed):**
+
+1. **Anchor direction**: is anchor at the deep-bass end? If not, justify.
+   For Harman-style curves in modal-rich rooms, anchoring high makes deep
+   bass a boost target. Has the LLM checked both `anchor_target
+   direction=cuts_only` and `direction=balanced`?
+
+2. **Tap count**: is `num_taps` justified by `2 × max(T60_ms)` of the
+   modes being treated? If not, what's the trade-off rationale?
+
+3. **Modal treatment classification**: did the plan correctly identify
+   modes in the priority band [25, 50] as `linear_notch` (not
+   `anti_pulse` — leakage risk) and modes outside as `anti_pulse`? Did
+   it consider mode density (47-70 are half-octave apart — Q affects
+   leakage)?
+
+4. **Boost budget**: are any predicted boosts within 1 dB of the safety
+   cap (+6 below 25 Hz, +8 above, +20 modal_cancel)? If yes, what's
+   the contingency if the FIR design overshoots predicted?
+
+5. **Convergence threshold**: is the chosen RMS threshold realistic
+   given the room's T60 and modal density? Or is it wishful thinking
+   that will drive the LLM to iterate past convergence?
+
+6. **Geometry-bound problems**: are there nulls (combined < max(solo) at
+   some band) that EQ can't fix that the plan still allocates filter
+   budget to?
+
+7. **Tool sequencing**: does the plan respect `apply_fir` REPLACING (not
+   stacking) the previous FIR? Does it leave a viable iteration path if
+   first apply doesn't converge?
+
+8. **Hidden assumptions**: does the plan rely on any room characteristic
+   that wasn't actually measured (e.g., assumed sub T60 from a different
+   session)?
+
+The reviewer agent returns:
+
+```yaml
+review:
+  overall: pass|fail
+  concerns:
+    - severity: high|medium|low
+      checklist_item: 1-8
+      issue: <specific concern>
+      suggested_revision: <concrete change>
+  recommended_action: proceed|revise_plan|escalate_to_user
+```
+
+### 1.97 Plan revision
+
+If `overall == fail` OR any concern is `severity: high`:
+
+1. Apply the suggested revisions to the plan.
+2. Re-run 1.96 adversarial review against the revised plan.
+3. Maximum 2 revision cycles. If still flagged after 2 revisions,
+   escalate to the user with both the original plan, all reviewer
+   feedback, and the revisions tried.
+
+If `overall == pass` (or only `low/medium` concerns the LLM accepts with
+documented rationale): proceed to Phase 2 executing THIS plan.
+
+### Why plan-then-review
+
+This phase looks like overhead. It catches the exact mistakes that cost
+hours in prior runs:
+
+- Anchored at 80 Hz when target needed deep-bass anchor → ran into safety
+  cap on every iteration
+- Picked num_taps=8192 without checking T60 → modal correction didn't
+  resolve the modes
+- Applied input PEQ -10 dB cuts without realizing modal dilution would
+  cap effect at -2 dB → spent iterations chasing what physics wouldn't
+  give
+- Mis-classified 47 Hz as anti_pulse → leakage into 25 Hz hit safety
+
+The reviewer agent is cheap (~30 sec). The mistakes it catches cost
+hours each. Always run.
+
 ## Phase 2 — Per-sub correction FIR
 
 For each sub, design a minimum-phase FIR that flattens that sub's solo response
