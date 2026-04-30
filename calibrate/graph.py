@@ -179,7 +179,7 @@ class TransducerProfile:
     # The validator applies this cap only when explicitly called with
     # ``intent="modal_cancel"``; generic FIRs and PEQ writes still respect
     # the stricter ``max_boost_above_threshold_db`` cap.
-    modal_cancel_max_boost_db: float = 14.0
+    modal_cancel_max_boost_db: float = 20.0
     notes: str = ""
 
 
@@ -226,7 +226,7 @@ SVS_PB12_NSD_PROFILE = TransducerProfile(
     max_change_simulated_db=6.0,
     hpf_freq_hz=18.0,
     hpf_order=4,
-    modal_cancel_max_boost_db=14.0,
+    modal_cancel_max_boost_db=20.0,
     notes="Default SVS PB12-NSD ported sub. Matches legacy safety.py constants.",
 )
 

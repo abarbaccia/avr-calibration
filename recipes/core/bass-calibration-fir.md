@@ -966,10 +966,73 @@ design_modal_fir(
 The session's third-octave SPL is the source FR; target − source − modal_fir
 becomes the magnitude correction. Anchored to the 60–100 Hz midband so
 absolute SPL drops out. Outside ``band`` the correction tapers to 0 dB.
-**Transient-aware safety** (v0.6.8.7+) lets brief Gabor anti-pulses exceed
-the +8 dB sustained cap up to +15 dB transient, distinguished by the
-bandpassed envelope's width-above-half-amplitude (>30 ms ⇒ sustained,
-<30 ms ⇒ transient).
+
+**Modal-cancellation safety cap (v0.6.8.8+).** Anti-pulse modal cancellation
+intentionally drives the driver hot at the mode frequency (the FIR's FFT
+magnitude at the mode is meant to cancel the room mode at the listener,
+so net SPL at MLP is unchanged but the driver receives the boosted level).
+``SafetyValidator.validate_fir(intent="modal_cancel")`` admits up to
+``profile.modal_cancel_max_boost_db`` (+20 dB on PB12-NSD). At typical
+calibrated levels (master gain ~-25 to -15 dB) this is well within driver
+xmax/thermal capacity. Generic FIRs and PEQ writes still respect the
+strict ``max_boost_above_threshold_db`` cap. ``apply_fir`` reads the
+cached design intent so coefficients from ``design_modal_fir`` use the
+relaxed cap automatically.
+
+### 2.2b Anti-pulse caveats — phase interference is real (2026-04-29 lessons)
+
+Anti-pulse modal cancellation is **the only mechanism in this recipe that
+shortens T60** — magnitude-only EQ (PEQ, ``design_fir``) reduces the peak
+but the mode still rings at reduced level. The trade-off is that the
+anti-pulse's time-domain phase rotation has consequences at adjacent
+frequencies you can't predict from the FIR alone.
+
+**Phase-interference is bidirectional and per-room:**
+
+- **Helpful direction:** at frequencies where the room has a *natural
+  cancellation null* (forward + reflected paths arriving 180° out of phase),
+  the anti-pulse's phase rotation can shift one path toward in-phase →
+  **null fills**. Empirically observed 2026-04-29: 80 Hz null at -10 dB
+  → +3 dB (+13 dB lift) from a single 70 Hz anti-pulse, with no FIR
+  magnitude boost at 80 Hz.
+- **Harmful direction:** at frequencies where the room has natural modal
+  reinforcement (forward + reflected paths arriving in-phase), the
+  anti-pulse's phase rotation can shift toward 180° → **constructive
+  reinforcement turns destructive**. Bug observed 2026-04-28 (since fixed):
+  the 47 Hz anti-pulse rotated phase at 25 Hz, destroying 8 dB of deep
+  bass at MLP without any visible FIR-magnitude cut at 25 Hz.
+
+**You can't predict which way it goes without measuring.** The room's
+arrival-path geometry is unknown. The recipe's right path is the
+**empirical 2-step**:
+
+1. Apply modal FIR.
+2. Measure listener result.
+3. If a null filled (lucky) — keep going.
+4. If deep bass collapsed at adjacent frequencies — back off
+   ``cancel_strength``, switch the offending mode to ``linear_notch`` or
+   ``skip``, OR layer a magnitude-correction FIR on top to compensate.
+
+**Concrete starting parameters for typical sub rooms** (validated
+2026-04-29 on a +13 dB at 47 Hz, +11 dB at 70 Hz, +7 dB at 94 Hz room):
+
+- Start with **a single anti_pulse on the most distant-from-deep-bass mode**
+  (e.g. 70 Hz first, not 47 Hz). Measure.
+- If 25-40 Hz dropped >2 dB at MLP, the phase interaction was harmful —
+  reduce ``cancel_strength`` or use ``linear_notch``.
+- If 25-40 Hz held, add a second anti_pulse (e.g. 94 Hz). Measure again.
+- Avoid ≥3 simultaneous anti-pulses — the cumulative pre-ring energy
+  saturates the IR onset detector and breaks T60 measurement (observed
+  2026-04-29 session 768: IR peak detected at 1 ms instead of 130 ms;
+  T60 numbers became unusable).
+
+**Worked example, 2026-04-29 final state:**
+
+- 1× anti-pulse on 70 Hz: ``cancel_strength=0.3, bp_q=3, envelope=gabor``
+- 47 Hz, 94 Hz: ``treatment=skip`` (47 too close to deep bass; 94 destabilizes
+  IR detection in combination)
+- Result vs baseline: T60 at 70 Hz **-22 %** (467 → 362 ms), 80 Hz null
+  **+13 dB filled** (-10 → +3), deep bass preserved (25 Hz: +0.3 → -0.1).
 
 ### 2.3 Apply the FIR
 

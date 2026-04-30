@@ -5886,6 +5886,11 @@ async def _tool_apply_fir(
             )
         coefficients = cached
         source = f"design_session_id={design_session_id}"
+        # design_modal_fir explicitly tags its cache entries with
+        # "modal_cancel" intent so the looser modal cap applies. design_fir
+        # also caches but doesn't tag — those default to "general" (strict
+        # thermal/excursion cap) which is correct for magnitude-correction
+        # FIRs that aren't doing anti-pulse cancellation.
         intent = _fir_design_intent.get(int(design_session_id), "general")
     else:
         source = "inline"
@@ -5920,7 +5925,7 @@ async def _tool_apply_fir(
         pass
 
     try:
-        await _dsp.apply_fir(output_index, coefficients)  # type: ignore[union-attr]
+        await _dsp.apply_fir(output_index, coefficients, intent=intent)  # type: ignore[union-attr]
     except DriverError as exc:
         return _err(str(exc))
     except Exception as exc:

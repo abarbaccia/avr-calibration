@@ -2,7 +2,7 @@ name: svs_pb12_nsd
 min_boost_freq_hz: 25
 max_boost_per_band_db: 6
 max_boost_above_threshold_db: 8
-modal_cancel_max_boost_db: 14
+modal_cancel_max_boost_db: 20
 freq_dependent_boost_threshold_hz: 30
 max_cumulative_boost_db: 9
 max_change_per_iter_db: 3
@@ -20,7 +20,7 @@ notes: |
   Two above-floor caps:
     - max_boost_above_threshold_db = 8 — strict thermal/excursion cap for
       generic FIR writes (e.g. arbitrary apply_fir, PEQ-equivalent boosts).
-    - modal_cancel_max_boost_db = 14 — looser cap applied when SafetyValidator
+    - modal_cancel_max_boost_db = 20 — looser cap applied when SafetyValidator
       is called with intent="modal_cancel" (FIRs produced by
       ``design_modal_fir``). Justified physically: anti-pulse modal
       cancellation drives the driver hot at the mode frequency, but the

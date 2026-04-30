@@ -1846,7 +1846,7 @@ async def test_apply_fir_success(mock_dsp) -> None:
     assert result["ok"]
     assert result["output_index"] == 1
     assert result["taps"] == 128
-    mock_dsp.apply_fir.assert_awaited_once_with(1, coeffs)
+    mock_dsp.apply_fir.assert_awaited_once_with(1, coeffs, intent="general")
 
 
 @pytest.mark.asyncio
@@ -1897,14 +1897,20 @@ async def test_apply_fir_via_design_session_id(mock_dsp) -> None:
     from calibrate import mcp_server as _mod
     coeffs = [0.1, 0.2, 0.3, 0.4, 0.5]
     _mod._fir_design_cache[42] = coeffs
+    _mod._fir_design_intent.pop(42, None)
     try:
         result = await _tool_apply_fir(output_index=1, design_session_id=42)
     finally:
         _mod._fir_design_cache.pop(42, None)
+        _mod._fir_design_intent.pop(42, None)
     assert result["ok"]
     assert result["taps"] == 5
     assert result["source"] == "design_session_id=42"
-    mock_dsp.apply_fir.assert_awaited_once_with(1, coeffs)
+    # design_session_id path defaults to "general" intent (strict thermal
+    # cap). design_modal_fir explicitly tags its cache entries as
+    # "modal_cancel" via _fir_design_intent; design_fir's cache entries
+    # are untagged and fall back to general / strict safety.
+    mock_dsp.apply_fir.assert_awaited_once_with(1, coeffs, intent="general")
 
 
 @pytest.mark.asyncio
@@ -1972,7 +1978,7 @@ async def test_apply_fir_safe_coefficients_proceed(mock_dsp) -> None:
     coeffs = [1.0] + [0.0] * 127  # impulse → flat 0 dB
     result = await _tool_apply_fir(output_index=1, coefficients=coeffs)
     assert result["ok"]
-    mock_dsp.apply_fir.assert_awaited_once_with(1, coeffs)
+    mock_dsp.apply_fir.assert_awaited_once_with(1, coeffs, intent="general")
 
 
 @pytest.mark.asyncio
