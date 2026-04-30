@@ -33,12 +33,16 @@ import struct
 import time
 from typing import Mapping
 
-# Empirically measured on Denon X3800H (2026-04-25). The AVR firmware caps
-# the actual applied per-channel delay at ~65 ms regardless of the pushed
-# distance value — pushing 30.72 m, 50 m, and 100 m all produce identical
-# ~65 ms of mains delay. The configured value persists, the *applied* delay
-# does not exceed this. May differ on other Denon/Marantz models.
-MAX_APPLIED_DELAY_MS: float = 65.0
+# Empirically measured on Denon X3800H. Two distinct ceilings depending on
+# whether the OCA-style envelope bypass is used:
+#   - Standard ``Distance``-only writes: ~38 ms applied delay variance,
+#     clamped on EXIT_AUDMD re-validation (matches UI 18 m / 60 ft cap)
+#   - Envelope writes (Distance + AudyFinFlg=NotFin → Fin commit): ~55 ms
+#     applied delay variance — confirmed via SW1 = 20-30 m sweep
+#     (2026-04-30). Beyond ~22 m configured the applied delay plateaus.
+# The configured value persists past either cap; the *applied* delay does not.
+MAX_APPLIED_DELAY_MS: float = 55.0
+MAX_APPLIED_DELAY_STANDARD_MS: float = 38.0
 
 DEFAULT_PORT: int = 1256
 HEADER_LEN: int = 9
@@ -91,6 +95,64 @@ def build_distance_payload(
         raise ValueError("n_positions must be >= 1")
     pos_dict = {ch: round(m * 100) for ch, m in channel_distances_m.items()}
     return {"Distance": [dict(pos_dict) for _ in range(n_positions)]}
+
+
+def build_envelope_distance_payload(
+    channel_distances_m: Mapping[str, float],
+    n_positions: int = 1,
+) -> dict:
+    """Build a SET_SETDAT payload that bypasses the firmware variance cap.
+
+    Verified working on Denon X3800H (2026-04-29 / 2026-04-30). The
+    ``Distance`` field alone, sent without an explicit ``AudyFinFlg``,
+    gets re-validated by the firmware on EXIT_AUDMD and snapped back to
+    the ~38 ms applied-delay variance cap (UI 18 m / 60 ft on X3800H).
+
+    Including ``AudyFinFlg: "NotFin"`` in the same packet, then sending a
+    separate ``{"AudyFinFlg":"Fin"}`` commit before EXIT_AUDMD, tells the
+    firmware "this is a complete calibration write, not a partial poke"
+    — and the larger Distance values stick. Empirically the new
+    applied-delay ceiling is ~55 ms (not unbounded — likely ~22 m
+    variance hard-cap somewhere in the firmware).
+
+    Caller responsibility: do NOT enter the AVR's Manual Setup > Distances
+    menu after pushing — that triggers re-validation and snaps values
+    back to the original 6 m variance cap.
+
+    The PRIOR ``CustomDistance`` (.ady file field) approach was a red
+    herring — the AVR's wire protocol doesn't have a CustomDistance
+    field; only the .ady JSON file format does. The actual bypass is the
+    NotFin/Fin commit dance on the standard Distance field.
+
+    Side effect to be aware of: this minimal envelope (Distance + NotFin
+    only) does NOT include AudyMultEq / AudyEqRef / AudyEqSet — the AVR
+    applies defaults for those on Fin commit, which has been observed to
+    drift mains FR by ±5-10 dB in the mid band. To keep MultEQ filter
+    state intact, push the full ordered envelope (AmpAssign, AssignBin,
+    SpConfig, Distance, ChLevel, Crossover, AudyFinFlg, AudyDynEq,
+    AudyEqRef, AudyDynVol, AudyDynSet, AudyMultEq, AudyEqSet, AudyLfc,
+    AudyLfcLev, SWSetup) — see scripts/audyssey_push_full_envelope.py.
+
+    Args:
+        channel_distances_m: e.g. {"FL": 4.05, "SW1": 20.0}. SW1=20m on
+            X3800H lands ~50 ms of applied mains delay vs the ~38 ms cap.
+        n_positions: number of stored positions. Replicated across all.
+    """
+    if not channel_distances_m:
+        raise ValueError("channel_distances_m is empty")
+    if n_positions < 1:
+        raise ValueError("n_positions must be >= 1")
+    pos_dict = {ch: round(m * 100) for ch, m in channel_distances_m.items()}
+    return {
+        "Distance": [dict(pos_dict) for _ in range(n_positions)],
+        "AudyFinFlg": "NotFin",
+    }
+
+
+# Back-compat alias — older code calls this name. The behaviour now matches
+# the proven envelope-bypass (Distance + AudyFinFlg=NotFin), not the
+# misnamed CustomDistance approach which never worked.
+build_custom_distance_payload = build_envelope_distance_payload
 
 
 def distances_from_ady(ady: dict) -> dict[str, float]:
@@ -167,17 +229,44 @@ async def push_speaker_distances(
     commit: bool = False,
     port: int = DEFAULT_PORT,
     timeout: float = 6.0,
+    use_custom: bool = False,
 ) -> None:
     """Push speaker distances to a Denon/Marantz AVR via Audyssey TCP.
 
     With ``commit=False`` the change is volatile (lost on power cycle).
     With ``commit=True`` the AVR persists to NVRAM via ``AudyFinFlg=Fin``.
 
+    With ``use_custom=False`` (default), writes the standard ``Distance``
+    field WITHOUT the AudyFinFlg envelope — the AVR re-validates on
+    EXIT_AUDMD and clamps the applied delay to the firmware variance cap
+    (~38 ms / 6 m on X3800H).
+
+    With ``use_custom=True``, uses the verified bypass: payload is
+    ``{"Distance": [...], "AudyFinFlg": "NotFin"}``, followed by an
+    explicit ``{"AudyFinFlg":"Fin"}`` commit before EXIT_AUDMD. The
+    firmware accepts the larger Distance values; applied delay extends
+    to ~55 ms (still capped, but ~17 ms more than the standard path).
+    ``commit`` is forced to True when ``use_custom=True`` — the Fin
+    commit IS the bypass mechanism; without it, no effect.
+
+    The ``use_custom`` name is historical (referred to a different,
+    non-working ``customDistance`` field idea); the implementation now
+    sends the proven envelope bypass.
+
+    Caller MUST NOT open Manual Setup > Distances on the AVR after a
+    use_custom=True write — that triggers re-validation and snaps the
+    distance values back to the standard cap.
+
     Caller is responsible for any user confirmation per the
-    "signal-path-writes need human approval" rule. This function does
-    not prompt — it just executes what it's told.
+    "signal-path-writes need human approval" rule.
     """
-    payload = build_distance_payload(channel_distances_m, n_positions=n_positions)
+    if use_custom:
+        payload = build_envelope_distance_payload(
+            channel_distances_m, n_positions=n_positions
+        )
+        commit = True  # NotFin envelope requires Fin commit to bypass the cap
+    else:
+        payload = build_distance_payload(channel_distances_m, n_positions=n_positions)
     await asyncio.get_running_loop().run_in_executor(
         None,
         _push_sync,

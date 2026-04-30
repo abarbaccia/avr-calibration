@@ -3705,7 +3705,7 @@ async def _tool_design_modal_fir(
     anti_pulse_cancel_strength: float = 0.6,
     num_taps: int = 4096,
     max_pre_ring_ms: float = 25.0,
-    samplerate: int = 8000,
+    samplerate: int = 48000,
     return_coefficients: bool = False,
 ) -> dict:
     """Design a modal-aware mixed-phase FIR with explicit per-mode treatment.
@@ -3942,6 +3942,7 @@ async def _tool_set_speaker_distances(
     distances: dict[str, float],
     n_positions: int = 1,
     commit: bool = False,
+    use_custom: bool = False,
 ) -> dict:
     """Push per-channel Audyssey distances to the AVR via direct TCP.
 
@@ -3976,6 +3977,7 @@ async def _tool_set_speaker_distances(
             distances,
             n_positions=int(n_positions),
             commit=bool(commit),
+            use_custom=bool(use_custom),
         )
     except DriverError as exc:
         return _err(f"distance push failed: {exc}")
@@ -6668,6 +6670,26 @@ _TOOLS: list[Tool] = [
                     ),
                     "default": False,
                 },
+                "use_custom": {
+                    "type": "boolean",
+                    "description": (
+                        "When true, uses the OCA-style envelope bypass: payload "
+                        "is {Distance, AudyFinFlg=NotFin}, followed by an explicit "
+                        "AudyFinFlg=Fin commit before EXIT_AUDMD. Verified to "
+                        "extend the firmware applied-delay cap from ~38 ms (UI "
+                        "limit) to ~55 ms (envelope limit) on X3800H. ``commit`` "
+                        "is forced to True when this is set — the Fin commit IS "
+                        "the bypass mechanism. CRITICAL: caller must NOT enter "
+                        "Manual Setup > Distances on the AVR after pushing — "
+                        "that re-validates and snaps back to the 6 m cap. "
+                        "Side effect: minimal envelope (Distance + NotFin only) "
+                        "doesn't carry MultEQ EQ params, so the AVR may apply "
+                        "defaults for AudyMultEq/AudyEqRef/AudyEqSet on commit, "
+                        "drifting mains FR by ±5-10 dB in mids. For full-state "
+                        "preservation see scripts/audyssey_push_full_envelope.py."
+                    ),
+                    "default": False,
+                },
             },
             "required": ["distances"],
         },
@@ -8837,6 +8859,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             distances=dict(arguments["distances"]),
             n_positions=int(arguments.get("n_positions", 1)),
             commit=bool(arguments.get("commit", False)),
+            use_custom=bool(arguments.get("use_custom", False)),
         )
     elif name in ("measure", "trigger_measurement"):
         result = await _tool_trigger_measurement(
@@ -9133,7 +9156,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             anti_pulse_cancel_strength=float(arguments.get("anti_pulse_cancel_strength", 0.6)),
             num_taps=int(arguments.get("num_taps", 4096)),
             max_pre_ring_ms=float(arguments.get("max_pre_ring_ms", 25.0)),
-            samplerate=int(arguments.get("samplerate", 8000)),
+            samplerate=int(arguments.get("samplerate", 48000)),
             return_coefficients=bool(arguments.get("return_coefficients", False)),
         )
     # ── LLM filter-design math tools ────────────────────────────────────────

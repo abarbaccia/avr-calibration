@@ -80,6 +80,7 @@ class DenonDriver(AVRDriver):
         *,
         n_positions: int = 1,
         commit: bool = False,
+        use_custom: bool = False,
     ) -> None:
         """Push per-channel Audyssey distances directly to the AVR.
 
@@ -113,6 +114,7 @@ class DenonDriver(AVRDriver):
                 channel_distances_m,
                 n_positions=n_positions,
                 commit=commit,
+                use_custom=use_custom,
             )
         except (OSError, ValueError) as exc:
             raise DriverError(f"audyssey push failed: {exc}")

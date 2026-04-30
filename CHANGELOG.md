@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.9.6] - 2026-04-30
+
+### Added / Changed
+- **Audyssey distance variance-cap bypass (OCA-style envelope), verified on X3800H:** the firmware re-validates a `Distance`-only SET_SETDAT on `EXIT_AUDMD` and clamps the applied delay variance to ~38 ms (matches UI 18 m / 60 ft cap). Including `AudyFinFlg: "NotFin"` in the same packet, then a separate `AudyFinFlg=Fin` commit before `EXIT_AUDMD`, tells the firmware "this is a complete write, not a partial poke" — and the larger Distance values stick. Empirically the envelope extends the applied-delay ceiling to ~55 ms (still capped, just higher). Confirmed end-to-end via SW1=20m sweep with sub-vs-mains phase-slope going from +10.6 ms (subs trail) to -3.93 ms (subs slightly lead) and per-band cancelling bands dropping from 2 → 0.
+
+  Implementation: `audyssey_tcp.build_envelope_distance_payload` returns `{"Distance":[...], "AudyFinFlg":"NotFin"}`; `push_speaker_distances(use_custom=True)` now sends that payload and forces `commit=True`. Old `build_custom_distance_payload` (which targeted a non-existent `customDistance` wire field) is now an alias for the working envelope builder.
+
+- **`set_speaker_distances` MCP tool docstring updated** to describe the envelope bypass behaviour, the 38 ms vs 55 ms cap distinction, and the FR-drift side effect from the minimal envelope (mids may shift ±5-10 dB because AudyMultEq/AudyEqRef/AudyEqSet aren't carried). For full-state preservation, callers should switch to `scripts/audyssey_push_full_envelope.py` once it gains AVR-state introspection.
+
+### Removed
+- `build_custom_distance_payload` no longer constructs the broken `Distance=0 + CustomDistance` payload (that field doesn't exist on the wire — it's a .ady-file-only artifact). The name remains as a back-compat alias for `build_envelope_distance_payload`.
+
 ## [0.6.9.5] - 2026-04-29
 
 ### Added
