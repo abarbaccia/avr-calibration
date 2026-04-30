@@ -1005,6 +1005,7 @@ async def _tool_anchor_target(
     null_threshold_db: float = 15.0,
     port_rolloff_hz: float = 28.0,
     exclude_geometry: bool = True,
+    direction: str = "balanced",
 ) -> dict:
     """Compute the optimal reference SPL for a target curve against a baseline measurement.
 
@@ -1131,6 +1132,58 @@ async def _tool_anchor_target(
         )
         reference_spl = min_headroom + max_boost_db
 
+        # ── cuts_only anchor: pick LOWEST-frequency anchor where every band
+        # above has positive gap (measured-relative ≥ target-relative). This
+        # yields a target that's pure cuts above the anchor — useful for
+        # deep-bass-priority sub calibration where boosts are only ~25–50%
+        # effective at the listener but cuts are unconstrained.
+        residual_boost_band_hz: float | None = None
+        anchor_freq_used: float | None = None
+        if direction == "cuts_only":
+            # Sort headroom_values by ascending frequency
+            hv_sorted = sorted(headroom_values, key=lambda r: r[0])
+            best_anchor: tuple[float, float] | None = None  # (freq, ref_spl)
+            best_shortfall_anchor: tuple[float, float, float, float] | None = None
+            # (freq, ref_spl, min_gap, shortfall_freq)
+            for a_freq, a_meas, a_off, _ in hv_sorted:
+                # Reference SPL such that target(anchor) == measured(anchor):
+                #   ref + a_off == a_meas → ref = a_meas - a_off
+                ref_spl_cand = a_meas - a_off
+                min_gap = float("inf")
+                min_gap_freq = a_freq
+                for f, m, o, _ in hv_sorted:
+                    if f <= a_freq:
+                        continue
+                    # gap = (measured - measured_anchor) - (target - target_anchor)
+                    #     = (m - a_meas) - (o - a_off)
+                    gap = (m - a_meas) - (o - a_off)
+                    if gap < min_gap:
+                        min_gap = gap
+                        min_gap_freq = f
+                if min_gap == float("inf"):
+                    # No bands above this anchor — accept it (degenerate)
+                    if best_anchor is None:
+                        best_anchor = (a_freq, ref_spl_cand)
+                    continue
+                if min_gap >= -0.5:
+                    best_anchor = (a_freq, ref_spl_cand)
+                    break
+                if (
+                    best_shortfall_anchor is None
+                    or min_gap > best_shortfall_anchor[2]
+                ):
+                    best_shortfall_anchor = (
+                        a_freq, ref_spl_cand, min_gap, min_gap_freq,
+                    )
+            if best_anchor is not None:
+                anchor_freq_used, reference_spl = best_anchor
+                limiting_freq = anchor_freq_used
+            elif best_shortfall_anchor is not None:
+                anchor_freq_used = best_shortfall_anchor[0]
+                reference_spl = best_shortfall_anchor[1]
+                limiting_freq = anchor_freq_used
+                residual_boost_band_hz = round(best_shortfall_anchor[3], 1)
+
         # Build anchored target curve. Flag anchored points that are below
         # port_rolloff_hz as unreachable — the sub physically can't produce
         # those levels, so Phase 3 filter design should ignore them.
@@ -1194,6 +1247,11 @@ async def _tool_anchor_target(
             ],
             null_zones=null_zones,
             valid_points=len(headroom_values),
+            direction=direction,
+            anchor_freq_hz=(
+                round(anchor_freq_used, 1) if anchor_freq_used is not None else None
+            ),
+            residual_boost_band_hz=residual_boost_band_hz,
         )
     except Exception as exc:
         return _err(f"anchor_target failed: {exc}")
@@ -8380,6 +8438,24 @@ _TOOLS: list[Tool] = [
                         "physically reach."
                     ),
                 },
+                "direction": {
+                    "type": "string",
+                    "enum": ["balanced", "cuts_only"],
+                    "description": (
+                        "balanced (default) preserves legacy behavior: places the "
+                        "reference at min(headroom)+max_boost so the limiting "
+                        "frequency needs exactly max_boost_db. cuts_only picks the "
+                        "LOWEST-frequency anchor where every band above has "
+                        "measured-relative ≥ target-relative — yielding a target "
+                        "that needs only cuts above the anchor. Use cuts_only for "
+                        "deep-bass-priority sub calibration where boosts are only "
+                        "~25-50% effective at the listener but cuts are unconstrained. "
+                        "If no fully-cuts anchor exists, picks the lowest-freq "
+                        "anchor with the smallest shortfall and returns "
+                        "residual_boost_band_hz."
+                    ),
+                    "default": "balanced",
+                },
             },
             "required": ["session_id", "target_offsets"],
         },
@@ -9573,6 +9649,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             null_threshold_db=float(arguments.get("null_threshold_db", 15.0)),
             port_rolloff_hz=float(arguments.get("port_rolloff_hz", 28.0)),
             exclude_geometry=bool(arguments.get("exclude_geometry", True)),
+            direction=str(arguments.get("direction", "balanced")),
         )
     elif name == "compare_sessions":
         result = await _tool_compare_sessions(
