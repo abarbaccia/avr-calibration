@@ -225,6 +225,7 @@ class ModalAwareFIRDesigner:
                 target_curve_db: list[tuple[float, float]] | None = None,
                 source_fr_db: list[tuple[float, float]] | None = None,
                 magnitude_focus_hz: tuple[float, float] | None = None,
+                anchor_freq_hz: float | None = None,
                 ) -> tuple[list[float], DesignSummary]:
         """Generate a modal-aware mixed-phase FIR.
 
@@ -343,6 +344,7 @@ class ModalAwareFIRDesigner:
                 sample_rate=self.sr,
                 n_taps=min(self.n_taps, 1024),
                 focus_hz=magnitude_focus_hz,
+                anchor_freq_hz=anchor_freq_hz,
             )
             # Convolve and truncate to n_taps
             combined = np.convolve(fir, mag_fir)[: self.n_taps].astype(np.float32)
@@ -369,6 +371,7 @@ def _design_magnitude_correction_fir(
     sample_rate: int,
     n_taps: int = 1024,
     focus_hz: tuple[float, float] | None = None,
+    anchor_freq_hz: float | None = None,
 ) -> np.ndarray:
     """Design a min-phase FIR that corrects ``source + fir`` toward ``target``.
 
@@ -397,13 +400,24 @@ def _design_magnitude_correction_fir(
     tgt_interp = np.interp(log_freqs, np.log10(tgt_freqs), tgt_db,
                             left=tgt_db[0], right=tgt_db[-1])
 
-    # Anchor target to source at a midband reference so absolute SPL drops out.
-    ref_lo, ref_hi = 60.0, 100.0
-    ref_mask = (freqs >= ref_lo) & (freqs <= ref_hi)
-    if np.any(ref_mask):
-        src_ref = float(np.mean(src_interp[ref_mask]))
-        tgt_ref = float(np.mean(tgt_interp[ref_mask]))
-        tgt_interp = tgt_interp - tgt_ref + src_ref
+    # Anchor target to source. Default: midband (60-100 Hz) mean reference so
+    # absolute SPL drops out. When `anchor_freq_hz` is set, force
+    # target(anchor) == source(anchor) — yields pure-cuts above the anchor for
+    # downward-sloping curves; useful for deep-bass-priority sub calibration.
+    if anchor_freq_hz is not None and anchor_freq_hz > 0:
+        # Sample both curves at the anchor frequency (log-interp on log_freqs grid).
+        src_at = float(np.interp(np.log10(anchor_freq_hz),
+                                 np.log10(src_freqs), src_db))
+        tgt_at = float(np.interp(np.log10(anchor_freq_hz),
+                                 np.log10(tgt_freqs), tgt_db))
+        tgt_interp = tgt_interp - tgt_at + src_at
+    else:
+        ref_lo, ref_hi = 60.0, 100.0
+        ref_mask = (freqs >= ref_lo) & (freqs <= ref_hi)
+        if np.any(ref_mask):
+            src_ref = float(np.mean(src_interp[ref_mask]))
+            tgt_ref = float(np.mean(tgt_interp[ref_mask]))
+            tgt_interp = tgt_interp - tgt_ref + src_ref
 
     # Residual: how much more boost the magnitude FIR must add.
     residual_db = tgt_interp - src_interp - fir_spec_db

@@ -3853,6 +3853,7 @@ async def _tool_design_modal_fir(
     max_pre_ring_ms: float = 25.0,
     samplerate: int = 48000,
     return_coefficients: bool = False,
+    anchor: dict | None = None,
 ) -> dict:
     """Design a modal-aware mixed-phase FIR with explicit per-mode treatment.
 
@@ -4036,6 +4037,96 @@ async def _tool_design_modal_fir(
                         for b in fr_bands
                     ]
 
+        # Resolve anchor parameter (re-anchoring of target_curve magnitude layer).
+        # Same semantics as design_fir.anchor: band_mean (legacy), freq, or
+        # deep_bass_priority. Only the magnitude correction layer is affected;
+        # the modal anti-pulse layer is independent.
+        anchor_freq_for_designer: float | None = None
+        anchor_used: dict | None = None
+        if anchor and target_curve_db and source_fr_db:
+            anchor_mode = str(anchor.get("mode", "band_mean"))
+            if anchor_mode == "band_mean":
+                anchor_used = {"mode": "band_mean", "freq_hz": None}
+            elif anchor_mode == "freq":
+                af = float(anchor.get("freq_hz") or 0.0)
+                if af <= 0:
+                    return _err("anchor.mode='freq' requires anchor.freq_hz > 0")
+                anchor_freq_for_designer = af
+                anchor_used = {"mode": "freq", "freq_hz": round(af, 2)}
+            elif anchor_mode == "deep_bass_priority":
+                # Search lowest candidate in [band_lo, band_lo+20] where every
+                # freq above is cut-implementable (gap ≥ -0.5 dB).
+                if magnitude_focus_hz:
+                    band_lo_search = float(magnitude_focus_hz[0])
+                    cmp_hi = float(magnitude_focus_hz[1])
+                else:
+                    band_lo_search = float(target_curve_db[0][0])
+                    cmp_hi = float(target_curve_db[-1][0])
+                band_hi_search = band_lo_search + 20.0
+
+                src_pts_sorted = sorted(source_fr_db, key=lambda p: p[0])
+                tgt_pts_sorted = sorted(target_curve_db, key=lambda p: p[0])
+                import math as _math
+                src_fs_ar = [p[0] for p in src_pts_sorted]
+                src_ds_ar = [p[1] for p in src_pts_sorted]
+                tgt_fs_ar = [p[0] for p in tgt_pts_sorted]
+                tgt_ds_ar = [p[1] for p in tgt_pts_sorted]
+
+                def _interp_log(f: float, fs: list[float], ds: list[float]) -> float:
+                    if f <= fs[0]:
+                        return ds[0]
+                    if f >= fs[-1]:
+                        return ds[-1]
+                    for i in range(len(fs) - 1):
+                        if fs[i] <= f <= fs[i + 1]:
+                            t = (
+                                _math.log(f / fs[i])
+                                / _math.log(fs[i + 1] / fs[i])
+                                if fs[i + 1] != fs[i]
+                                else 0.0
+                            )
+                            return ds[i] + t * (ds[i + 1] - ds[i])
+                    return ds[-1]
+
+                chosen: float | None = None
+                for cand in range(int(round(band_lo_search)), int(round(band_hi_search)) + 1):
+                    cf = float(cand)
+                    if cf <= 0 or cf > cmp_hi:
+                        continue
+                    src_a = _interp_log(cf, src_fs_ar, src_ds_ar)
+                    tgt_a = _interp_log(cf, tgt_fs_ar, tgt_ds_ar)
+                    ok = True
+                    for ff in range(int(round(cf)) + 1, int(round(cmp_hi)) + 1):
+                        fff = float(ff)
+                        gap = (
+                            (_interp_log(fff, src_fs_ar, src_ds_ar) - src_a)
+                            - (_interp_log(fff, tgt_fs_ar, tgt_ds_ar) - tgt_a)
+                        )
+                        if gap < -0.5:
+                            ok = False
+                            break
+                    if ok:
+                        chosen = cf
+                        break
+                if chosen is not None:
+                    anchor_freq_for_designer = chosen
+                    anchor_used = {
+                        "mode": "deep_bass_priority",
+                        "freq_hz": round(chosen, 2),
+                    }
+                else:
+                    anchor_freq_for_designer = band_lo_search
+                    anchor_used = {
+                        "mode": "deep_bass_priority",
+                        "freq_hz": round(band_lo_search, 2),
+                        "residual_boost": True,
+                    }
+            else:
+                return _err(
+                    f"anchor.mode must be 'band_mean', 'freq', or "
+                    f"'deep_bass_priority' (got {anchor_mode!r})"
+                )
+
         designer = ModalAwareFIRDesigner(
             sample_rate=int(samplerate),
             n_taps=int(num_taps),
@@ -4054,6 +4145,7 @@ async def _tool_design_modal_fir(
             target_curve_db=target_curve_db,
             source_fr_db=source_fr_db,
             magnitude_focus_hz=magnitude_focus_hz,
+            anchor_freq_hz=anchor_freq_for_designer,
         )
 
         _fir_design_cache[int(session_id)] = list(coeffs)
@@ -4070,6 +4162,7 @@ async def _tool_design_modal_fir(
             "notes": summary.notes,
             "latency_budget": latency_budget_breakdown(summary),
             "design_cached": True,
+            "anchor_used": anchor_used,
             "note": (
                 f"Modal-aware FIR at 8000Hz, {summary.total_taps} taps. "
                 f"Pre-ring: {summary.pre_delay_ms:.1f}ms (budget {max_pre_ring_ms:.0f}ms). "
@@ -9084,6 +9177,26 @@ _TOOLS: list[Tool] = [
                     ),
                     "default": False,
                 },
+                "anchor": {
+                    "type": "object",
+                    "description": (
+                        "Optional re-anchoring for the target_curve magnitude "
+                        "correction layer. Only the magnitude layer is affected — "
+                        "anti-pulse modal cancellation is independent. \n"
+                        "- mode='band_mean' (default): legacy 60-100 Hz mean anchor. \n"
+                        "- mode='freq': force target(freq_hz) == measured(freq_hz). \n"
+                        "- mode='deep_bass_priority': pick the lowest freq in "
+                        "[band_lo, band_lo+20] where every band above is "
+                        "cut-implementable (gap ≥ -0.5 dB)."
+                    ),
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "enum": ["band_mean", "freq", "deep_bass_priority"],
+                        },
+                        "freq_hz": {"type": "number"},
+                    },
+                },
             },
             "required": ["session_id"],
         },
@@ -9841,6 +9954,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             max_pre_ring_ms=float(arguments.get("max_pre_ring_ms", 25.0)),
             samplerate=int(arguments.get("samplerate", 48000)),
             return_coefficients=bool(arguments.get("return_coefficients", False)),
+            anchor=arguments.get("anchor"),
         )
     # ── LLM filter-design math tools ────────────────────────────────────────
     elif name == "evaluate_transfer_function":
