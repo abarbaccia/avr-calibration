@@ -926,12 +926,14 @@ def test_denon_sweep_from_config_returns_none_no_sweep_input():
     assert DenonSweepContext.from_config(cfg) is None
 
 
-def _make_sweep_receiver(volume=-28.0, sound_mode="DTS SURROUND"):
+def _make_sweep_receiver(volume=-28.0, sound_mode="DTS SURROUND", power="ON"):
     """Build a denonavr mock receiver with all async methods needed by DenonSweepContext."""
     mock_mod, mock_receiver = _make_denonavr_mock(volume=volume)
     mock_receiver.input_func = "SHIELD"
+    mock_receiver.power = power
     mock_receiver.async_set_input_func = AsyncMock()
     mock_receiver.async_set_volume = AsyncMock()
+    mock_receiver.async_power_on = AsyncMock()
     mock_receiver.soundmode = MagicMock()
     mock_receiver.soundmode.sound_mode = sound_mode
     mock_receiver.soundmode.async_set_sound_mode = AsyncMock()
