@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.9.8] - 2026-04-30
+
+### Added
+- **`calibrate/drivers/denon/audyssey_filter_upload.py`** — full Audyssey TCP upload orchestration. `query_avr_status()` runs ENTER_AUDY + GET_AVRINF + GET_AVRSTS introspection. `build_set_dat_envelope()` constructs the 16-field ordered SET_SETDAT payload from a .ady file + GET_AVRSTS response, with correct types (booleans not strings, integers not strings, capital-Q in `AudyMultEQ`). `chunk_setdat_payload()` splits envelopes under the 510-byte AVR threshold preserving canonical field order. `push_avr_filters()` runs the full upload sequence: ENTER_AUDY → chunked SET_SETDAT → SET_COEFDT streams per channel × tc × sr → FINZ_COEFS → AudyFinFlg=Fin commit → EXIT_AUDMD. INIT_COEFS is auto-detected from `DType` (only sent when fixed-point — X3800H is float, skip).
+
+- **MCP tools `design_avr_fir` + `apply_avr_fir`** — design + push AVR-format FIR coefficients via the Audyssey TCP path, fully scriptable from a recipe.
+  - `design_avr_fir(channel_id, target_curve_db, cache_key)` — takes a target FR curve (list of `{freq_hz, gain_db}` points), runs `design_correction_ir → convert_xt32`, caches the 1024 (speaker) / 704 (sub) AVR coefficients keyed by `(cache_key, channel_id)`.
+  - `apply_avr_fir(host, ady_path, cache_key, ...)` — loads cached coefficients per channel, builds the full envelope from .ady + AVR introspection, pushes via `push_avr_filters`. Supports `distances_override_m` for the variance-cap bypass and `target_curves` / `samplerates_hz` for limiting the upload to specific banks.
+
+- **`scripts/smoke_test_filter_upload.py`** — end-to-end pipeline smoke test against a live AVR with no audio sweeps. Default `--dry-run` mode introspects + builds envelopes + counts packets without writing. `--transmit` mode actually pushes (with a typed-confirmation prompt) — useful for verifying the full protocol works before the first measurement-driven calibration.
+
+- 22 new tests in `test_audyssey_filter_upload.py` covering field-order preservation, bool/int type-correctness for picky firmware fields, distance overrides, chunker behaviour, and `parse_frames` round-trip. 12 new tests in `test_mcp_avr_fir_tools.py` for the MCP tool layer (caching, validation, mocked TCP push).
+
+### Notes for callers
+- The full SET_SETDAT envelope is now sent (16 fields) — `apply_avr_fir` does not have the FR-drift side effect that `set_speaker_distances(use_custom=True)` exhibited. EQ-related fields (AudyDynEq, AudyEqRef, AudyMultEQ, etc.) are sent explicitly to the values that match A1Evo Acoustica's post-cal defaults.
+- The `AudyFinFlg=Fin` commit at the end of `apply_avr_fir` writes to the AVR's NVRAM. There is no volatile mode for filter coefficients.
+- Caller MUST NOT enter Manual Setup > Distances on the AVR after a successful push — that triggers re-validation that snaps Distance back to the variance cap.
+- Recovery from a botched push: re-upload the original `.ady` via the MultEQ Editor app's "Send to AV receiver" button.
+
+### Verified end-to-end (2026-04-30)
+- `query_avr_status` against X3800H returns AmpAssign="Normal", EQType="MultEQXT32", DType="Float", CoefWaitTime.Final=15000.
+- `build_set_dat_envelope` from a real .ady + GET_AVRSTS produces a 1619-byte payload that chunks cleanly into 5 sub-510-byte SET_SETDAT packets.
+- `all_streams_for_channel` produces 522 SET_COEFDT packets for a 9-speaker + 1-sub setup × 2 target curves × 3 sample rates.
+- The actual `--transmit` path against the AVR is gated on a typed confirmation in the smoke-test script — not exercised in this commit.
+
 ## [0.6.9.7] - 2026-04-30
 
 ### Added

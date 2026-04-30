@@ -4024,6 +4024,203 @@ async def _tool_set_speaker_distances(
     )
 
 
+# ── Audyssey FIR upload ────────────────────────────────────────────────
+# Module-level cache of AVR-format polyphase-decimated coefficient vectors.
+# Keyed by (cache_key, channel_id) → list[float] of length 1024 (speaker)
+# or 704 (sub). Populated by ``design_avr_fir``; consumed by ``apply_avr_fir``.
+_AVR_FIR_CACHE: dict[tuple[str, str], list[float]] = {}
+
+
+async def _tool_design_avr_fir(
+    channel_id: str,
+    target_curve_db: list[dict],
+    cache_key: str,
+    samplerate_hz: float = 48000.0,
+) -> dict:
+    """Design + polyphase-decimate an AVR-format FIR for one channel.
+
+    Pipeline: ``target_curve_db`` (per-frequency gain targets) →
+    16,321-tap (speaker) / 16,055-tap (sub) impulse response →
+    XT32 4-band polyphase decimation → 1024 / 704 AVR coefficients.
+
+    The result is cached server-side keyed by (cache_key, channel_id).
+    Apply via ``apply_avr_fir(cache_key=...)``.
+
+    Args:
+        channel_id: Audyssey commandId — FL, C, FR, SLA, SRA, TFL,
+            TFR, TRL, TRR, SBL, SBR, SW1, SW2, SW3, SW4, LFE.
+        target_curve_db: list of ``{freq_hz: float, gain_db: float}``
+            points defining the desired EQ curve. Outside the supplied
+            frequency range gain tapers to 0 dB. Sub channels typically
+            specify points across 20-200 Hz; speakers 20-20,000 Hz.
+        cache_key: opaque caller-chosen identifier — usually a session
+            id or "<sid>-iter-N". Pair with ``apply_avr_fir`` to commit.
+        samplerate_hz: design sample rate. Default 48 kHz (matches the
+            AVR's native processing rate for the 48 kHz coefficient bank).
+
+    Returns ``{ok, channel_id, cache_key, fir_taps, peak_amplitude,
+    is_sub}``.
+    """
+    from .audyssey_fir import (
+        convert_xt32, design_correction_ir, get_channel_byte, is_sub_channel,
+    )
+
+    if not target_curve_db:
+        return _err("target_curve_db is empty")
+    try:
+        # Validate the channel exists before doing the IR FFT.
+        get_channel_byte(channel_id, "XT32")
+    except ValueError as exc:
+        return _err(str(exc))
+
+    freqs: list[float] = []
+    gains: list[float] = []
+    for pt in target_curve_db:
+        try:
+            freqs.append(float(pt["freq_hz"]))
+            gains.append(float(pt["gain_db"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            return _err(f"bad target_curve_db entry {pt!r}: {exc}")
+    # Sort by frequency so the interpolator sees monotonic input.
+    order = sorted(range(len(freqs)), key=lambda i: freqs[i])
+    freqs = [freqs[i] for i in order]
+    gains = [gains[i] for i in order]
+
+    is_sub = is_sub_channel(channel_id)
+    try:
+        ir = design_correction_ir(
+            target_freqs_hz=freqs,
+            target_gain_db=gains,
+            is_sub=is_sub,
+            samplerate_hz=float(samplerate_hz),
+        )
+        coefs = convert_xt32(ir)
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"FIR design failed: {exc}")
+
+    _AVR_FIR_CACHE[(str(cache_key), channel_id)] = coefs
+    import numpy as np
+    arr = np.asarray(coefs)
+    return _ok(
+        channel_id=channel_id,
+        cache_key=str(cache_key),
+        fir_taps=len(coefs),
+        peak_amplitude=float(np.max(np.abs(arr))) if len(arr) else 0.0,
+        is_sub=is_sub,
+        message=(
+            f"Designed {len(coefs)}-tap AVR FIR for {channel_id} "
+            f"({'sub' if is_sub else 'speaker'} chain). "
+            f"Cached as ({cache_key!r}, {channel_id!r})."
+        ),
+    )
+
+
+async def _tool_apply_avr_fir(
+    host: str,
+    ady_path: str,
+    cache_key: str,
+    channel_ids: list[str] | None = None,
+    distances_override_m: dict[str, float] | None = None,
+    target_curves: list[str] | None = None,
+    samplerates_hz: list[int] | None = None,
+    inter_packet_delay_ms: float = 5.0,
+) -> dict:
+    """Push cached AVR-format FIR coefficients to the receiver.
+
+    HARD RULE: this tool overwrites the AVR's MultEQ filter banks. The
+    AVR's prior calibration is replaced for every channel listed in
+    ``channel_ids``. Recovery from a botched push requires re-uploading
+    the original .ady via the MultEQ Editor app or this tool with the
+    original IRs.
+
+    Caller MUST NOT enter Manual Setup > Distances on the AVR after a
+    successful push — that triggers firmware re-validation that snaps
+    Distance values back to the variance cap.
+
+    The FULL Audyssey envelope is pushed (16 ordered fields) to keep the
+    MultEQ EQ params coherent — the partial-envelope FR drift seen in
+    earlier `set_speaker_distances(use_custom=True)` runs is avoided
+    by this tool.
+
+    Args:
+        host: AVR IP / hostname.
+        ady_path: path to the .ady file with the AVR's stored
+            calibration state. Provides per-channel speaker-type,
+            crossover, level, and existing distance values.
+        cache_key: identifier used at ``design_avr_fir`` time.
+        channel_ids: subset of channels to upload. Defaults to all
+            channels in the .ady that have a cached FIR under
+            ``cache_key``.
+        distances_override_m: optional ``{channel: meters}`` map to
+            override .ady distances during the upload (e.g. SW1=20.0
+            for the variance-cap bypass).
+        target_curves: which target-curve banks to write. Default
+            writes both Flat ("00") and Reference ("01").
+        samplerates_hz: which sample rates to ship. Default XT32's
+            three (32k, 44.1k, 48k).
+        inter_packet_delay_ms: pause between SET_COEFDT packets.
+
+    Returns the per-stage ACK summary plus an ``ok`` flag.
+    """
+    import json as _json
+    from pathlib import Path
+
+    from .drivers.denon.audyssey_filter_upload import (
+        channels_in_ady, push_avr_filters,
+    )
+
+    p = Path(ady_path)
+    if not p.exists():
+        return _err(f".ady not found: {ady_path}")
+    try:
+        with p.open() as f:
+            ady = _json.load(f)
+    except (OSError, _json.JSONDecodeError) as exc:
+        return _err(f"failed to load .ady: {exc}")
+
+    available = channels_in_ady(ady)
+    selected = list(channel_ids) if channel_ids else list(available)
+    missing_in_cache: list[str] = []
+    channel_filters: dict[str, list[float]] = {}
+    for cid in selected:
+        if cid not in available:
+            return _err(f"channel {cid!r} not in .ady (available: {available})")
+        coefs = _AVR_FIR_CACHE.get((str(cache_key), cid))
+        if coefs is None:
+            missing_in_cache.append(cid)
+        else:
+            channel_filters[cid] = coefs
+    if missing_in_cache:
+        return _err(
+            f"no cached FIR for cache_key={cache_key!r} on channels "
+            f"{missing_in_cache} — call design_avr_fir for each first"
+        )
+
+    overrides = {ch: float(m) for ch, m in (distances_override_m or {}).items()}
+    tc_arg = tuple(target_curves) if target_curves else None
+    sr_arg = (
+        tuple(int(r) for r in samplerates_hz) if samplerates_hz else None
+    )
+
+    push_kwargs = {
+        "ady": ady,
+        "channel_filters": channel_filters,
+        "distances_override_m": overrides or None,
+        "inter_packet_delay_ms": float(inter_packet_delay_ms),
+    }
+    if tc_arg:
+        push_kwargs["target_curves"] = tc_arg
+    if sr_arg:
+        push_kwargs["samplerates_hz"] = sr_arg
+
+    try:
+        summary = await push_avr_filters(host, **push_kwargs)
+    except (OSError, ValueError) as exc:
+        return _err(f"AVR upload failed: {exc}")
+
+    return _ok(**summary, channels_uploaded=list(channel_filters.keys()))
+
+
 async def _tool_avr_set_volume(level_db: float) -> dict:
     """Set AVR volume to *level_db* dB.
 
@@ -6695,6 +6892,154 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="design_avr_fir",
+        description=(
+            "Design an AVR-format polyphase FIR for one Denon/Marantz "
+            "Audyssey channel from a target-curve specification. The "
+            "result is cached server-side keyed by (cache_key, channel_id) "
+            "and applied via apply_avr_fir. Pipeline: target FR → "
+            "16,321-tap (speaker) / 16,055-tap (sub) IR → XT32 4-band "
+            "polyphase decimation → 1024 / 704 AVR-format coefficients. "
+            "Use one design_avr_fir call per channel; then a single "
+            "apply_avr_fir to push them all in one TCP session."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "channel_id": {
+                    "type": "string",
+                    "description": (
+                        "Audyssey channel commandId — e.g. FL, C, FR, SLA, "
+                        "SRA, TFL, TFR, TRL, TRR, SBL, SBR, SW1, SW2, SW3, "
+                        "SW4, LFE."
+                    ),
+                },
+                "target_curve_db": {
+                    "type": "array",
+                    "description": (
+                        "List of {freq_hz, gain_db} points defining the "
+                        "desired EQ curve. Outside the supplied frequency "
+                        "range gain tapers to 0 dB. Sub channels typically "
+                        "specify points across 20-200 Hz; speakers "
+                        "20-20,000 Hz."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "freq_hz": {"type": "number"},
+                            "gain_db": {"type": "number"},
+                        },
+                        "required": ["freq_hz", "gain_db"],
+                    },
+                },
+                "cache_key": {
+                    "type": "string",
+                    "description": (
+                        "Caller-chosen identifier — usually a session id "
+                        "or a string like 'iter-3'. apply_avr_fir uses "
+                        "this to find the coefficient set."
+                    ),
+                },
+                "samplerate_hz": {
+                    "type": "number",
+                    "description": (
+                        "FIR design sample rate. Default 48000 (matches "
+                        "the AVR's native processing rate for the 48 kHz "
+                        "bank — XT32 stores three banks but uploads the "
+                        "same coefficients to all)."
+                    ),
+                    "default": 48000,
+                },
+            },
+            "required": ["channel_id", "target_curve_db", "cache_key"],
+        },
+    ),
+    Tool(
+        name="apply_avr_fir",
+        description=(
+            "Push cached AVR-format FIR coefficients to the receiver via "
+            "the Audyssey TCP/1256 protocol. Overwrites the AVR's MultEQ "
+            "filter banks with the per-channel coefficients designed by "
+            "prior design_avr_fir calls (matched by cache_key). The full "
+            "16-field SET_SETDAT envelope is sent to keep the AVR's EQ "
+            "state coherent; coefficient streams are shipped per channel × "
+            "target_curve × sample_rate; the AudyFinFlg=Fin commit at "
+            "the end persists everything to the AVR's flash. "
+            "HARD RULE: caller MUST NOT enter Manual Setup > Distances "
+            "on the AVR after a successful push — that triggers firmware "
+            "re-validation. Always backup the original .ady before calling "
+            "this tool. REQUIRES EXPLICIT USER CONFIRMATION."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "host": {
+                    "type": "string",
+                    "description": "AVR IP or hostname.",
+                },
+                "ady_path": {
+                    "type": "string",
+                    "description": (
+                        "Path to a .ady file with the AVR's stored "
+                        "calibration state. Provides per-channel "
+                        "speaker-type, crossover, level, and the "
+                        "channel list. Distances are taken from .ady "
+                        "but can be selectively overridden via "
+                        "distances_override_m."
+                    ),
+                },
+                "cache_key": {
+                    "type": "string",
+                    "description": "Cache key used at design_avr_fir time.",
+                },
+                "channel_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Subset of channels to upload. Default: all "
+                        "channels in the .ady that have a cached FIR "
+                        "under cache_key."
+                    ),
+                },
+                "distances_override_m": {
+                    "type": "object",
+                    "description": (
+                        "Optional {channel: meters} map to override .ady "
+                        "distances during the upload. Use to push past "
+                        "the variance cap (e.g. SW1=20.0)."
+                    ),
+                    "additionalProperties": {"type": "number"},
+                },
+                "target_curves": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Which target-curve banks to write. Default "
+                        "[\"00\", \"01\"] writes both Flat and Reference "
+                        "so user can toggle at runtime via AudyEqSet."
+                    ),
+                },
+                "samplerates_hz": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": (
+                        "Sample rates to ship per channel. Default "
+                        "[32000, 44100, 48000] (XT32's three banks)."
+                    ),
+                },
+                "inter_packet_delay_ms": {
+                    "type": "number",
+                    "description": (
+                        "Pause between SET_COEFDT packets in ms. "
+                        "Helps less-buffered receivers keep up. Default 5."
+                    ),
+                    "default": 5.0,
+                },
+            },
+            "required": ["host", "ady_path", "cache_key"],
+        },
+    ),
+    Tool(
         name="measure",
         description=(
             "Trigger a frequency response measurement using the UMIK microphone. "
@@ -8860,6 +9205,24 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             n_positions=int(arguments.get("n_positions", 1)),
             commit=bool(arguments.get("commit", False)),
             use_custom=bool(arguments.get("use_custom", False)),
+        )
+    elif name == "design_avr_fir":
+        result = await _tool_design_avr_fir(
+            channel_id=str(arguments["channel_id"]),
+            target_curve_db=list(arguments["target_curve_db"]),
+            cache_key=str(arguments["cache_key"]),
+            samplerate_hz=float(arguments.get("samplerate_hz", 48000.0)),
+        )
+    elif name == "apply_avr_fir":
+        result = await _tool_apply_avr_fir(
+            host=str(arguments["host"]),
+            ady_path=str(arguments["ady_path"]),
+            cache_key=str(arguments["cache_key"]),
+            channel_ids=arguments.get("channel_ids"),
+            distances_override_m=arguments.get("distances_override_m"),
+            target_curves=arguments.get("target_curves"),
+            samplerates_hz=arguments.get("samplerates_hz"),
+            inter_packet_delay_ms=float(arguments.get("inter_packet_delay_ms", 5.0)),
         )
     elif name in ("measure", "trigger_measurement"):
         result = await _tool_trigger_measurement(
