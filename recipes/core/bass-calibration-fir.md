@@ -154,44 +154,97 @@ cancellation at MLP. The fixes are physical:
 Note this in the run log if the geometry is the bottleneck. Don't waste
 filter slots trying to compensate.
 
-## Filter strategy
+## Filter strategy — REASON, DON'T PRESCRIBE
 
-Three layers, all simultaneously active in the DSP pipeline:
+The recipe deliberately does NOT prescribe a fixed pipeline of "FIR for X, PEQ
+for Y." After the alignment phase, you have rich data (per-sub solo FRs,
+modal decay, phase fixability, coherence, combined response). Use it to
+**design a filter plan tailored to this room**, considering all the tools
+available and what we are optimizing for.
 
-| Layer | Tool | Purpose | Required? |
-|-------|------|---------|-----------|
-| Per-sub FIR | `apply_fir` with `output_index` | Per-sub magnitude correction (and modal T60 cancellation via `design_modal_fir`) | Always |
-| Per-sub PEQ | `apply_eq` with `output_index` | **HPF only** (18 Hz 4th-order infrasonic protection) | Always |
-| Input PEQ | `apply_input_eq` | Target curve shape + cuts at residual modal peaks | Always (≥1 filter — the HPF) |
-
-**DSP signal chain:**
+**The DSP pipeline:**
 ```
-Input → Input PEQ (target shape + modal cuts) → Routing → Output PEQ (HPF) → Output FIR (per-sub correction) → DAC
+Input → Input PEQ → Routing → Per-output PEQ → Per-output FIR → DAC
 ```
 
-**Default architecture (Phase 2 = flat per-sub, Phase 3 = target shape via input PEQ):**
+Every layer above is available. Pick where each correction lives based on:
 
-1. Phase 1: align subs by delay/polarity at the listening position.
-2. Phase 2: per-sub FIR flattens each sub's solo response (no target curve
-   baked in). If T60 > 400 ms at any major mode, use `design_modal_fir`
-   for active anti-pulse cancellation (Phase 2.2a).
-3. Phase 3: input PEQ shapes the COMBINED response toward the target
-   curve. Anchor the curve at the band where measured ≈ local target
-   (Phase 3.2 — usually NOT 0 dB on the curve), then use cuts wherever
-   possible. Master gain compensates for the level drop.
+**Tool capabilities:**
 
-**Why this ordering:** PEQ cuts deliver ~100 % at the listener; PEQ
-boosts deliver 25-50 %. Flattening per-sub in Phase 2 (FIR cuts at
-modal peaks) means the combined response in Phase 3 is mostly bumps
-and dips that need cuts to flatten — boosts only where physically
-achievable. Target-curve swaps re-run Phase 3 only.
+| Tool | Strengths | Weaknesses |
+|------|-----------|------------|
+| Per-output FIR (`design_fir`, `apply_fir`) | High-resolution magnitude shape; cuts and boosts at exact frequencies; per-sub differentiation | Auto-anchors target_curve at band mean — aggressive shapes need explicit absolute target points |
+| Per-output modal FIR (`design_modal_fir`) | Active anti-pulse T60 cancellation | Adds pre-ring latency; transient-aware safety still bounded |
+| Per-output PEQ (`apply_eq`) | Cheap modal cuts, HPF | Limited slot count; can't shorten T60 |
+| Input PEQ (`apply_input_eq`) | Single shared shape stage; biquad shelves at low slot cost | All-output broadcast — can't shape per-sub |
+| Master gain | Restores level lost to cuts | Single number |
 
-**Fallback architecture — FIR carries target shape directly.** Pass
-`target_curve` to `design_fir` so each sub plays its share. Use only
-when the layered architecture trips SafetyValidator: aggressive target
-+ asymmetric subs where the weak sub would need a boost beyond profile
-limits to deliver the target. Target swap requires FIR redesign; less
-flexible.
+**Constants you must factor in (not optional):**
+
+1. **Cuts work; boosts don't.** PEQ cuts ≈ 100 % at the listener; PEQ boosts
+   25-50 %. FIR magnitude cuts ≈ 100 %. FIR magnitude boosts hit the same
+   thermal/excursion ceiling as PEQ (`+6 dB below port_tune+3`, `+8 dB above`,
+   code-enforced).
+2. **Modal T60 cannot be cut down by magnitude EQ.** Cutting at the source
+   reduces the energy that excites the mode but the room rings on. Only
+   anti-pulse FIR or physical bass traps shorten T60.
+3. **Anchoring drives the entire shape.** For sub calibration, anchor at the
+   DEEP-BASS end of the band (e.g. 25-40 Hz) so the work is cuts above; never
+   at the curve's nominal 0 dB at the crossover (that direction makes deep
+   bass a boost target and runs into safety limits). See Phase 3.2.
+4. **Tool auto-anchoring fights aggressive shapes.** `design_fir`'s
+   `target_curve` parameter is interpreted relative to band-mean SPL — passing
+   the raw harman offsets gives a *modest* slope. To get the FIR to actually
+   carry a steep shape, pass absolute SPL target points anchored deep-bass
+   (i.e. set the upper-bass target points well below current measured SPL so
+   the only solution is a CUT).
+5. **Per-sub differs from combined.** Per-sub FIR can flatten each sub
+   individually, then a smaller shared layer adds the target shape — OR a
+   per-sub FIR can deliver the per-sub share of the target shape directly.
+   Different subs can be allowed to do different work (e.g. only the
+   stronger-deep-bass sub carries deep bass; the other rolls off below 40 Hz).
+
+**Build a plan, then execute. Phase 2 and Phase 3 below are sequence
+guides, not filter recipes.** For your room:
+
+1. Read the post-alignment combined and per-sub FRs (`get_measurement_history`,
+   `analyze_phase`, `analyze_decay`, `compare_sub_phase`).
+2. Determine the **anchor frequency** (Phase 3.2 algorithm). The anchor
+   determines whether the work is mostly cuts (anchor low) or mostly boosts
+   (anchor high — usually wrong for sub cal).
+3. Decide where the **target-curve shape** lives:
+   - Per-sub FIR (high resolution, per-sub differentiation, but aggressive
+     shapes need explicit absolute SPL target points to override auto-anchor)
+   - Input PEQ (cheap, easy target swaps)
+   - Hybrid (FIR carries some shape + flattens per-sub; input PEQ adds
+     residual shape and modal cuts)
+4. Decide where **modal correction** lives:
+   - `design_modal_fir` per sub: anti-pulse for ringy modes outside the
+     priority deep-bass band; linear_notch for modes inside it.
+   - PEQ cuts: cheap when the budget fits, but only reduce peak — don't
+     shorten T60.
+5. **Tap-count sizing.** Read `eq_capabilities.fir_max_taps_per_output` and
+   `fir_sample_rate_hz`. Pick taps so the impulse window covers
+   `2 × max(T60_ms)` of the modes you care about (bass T60s in this room
+   are typically 400-800 ms → 800-1600 ms window → 38400-77000 taps at
+   48 kHz). Smaller windows under-resolve deep modes; larger windows cost
+   DSP CPU. State the choice and why.
+6. **Simulate before applying.** `simulate_eq` for PEQ; design_fir's
+   `predicted_effect` for FIR magnitude; cross-check against the
+   1/3-octave coverage limits (predicted_effect smooths over narrow boosts
+   the safety validator catches in finer bins).
+7. **Verify after applying.** `verify_input_eq_effect`, `verify_fir_effect`,
+   and a fresh combined measurement.
+
+State the plan in the iteration log (`save_calibration_iteration`)
+with `filters_proposed` containing your reasoning, not just the numbers.
+
+**Why no fixed default.** Past recipe versions hard-coded "Phase 2 =
+flat per-sub, Phase 3 = target via input PEQ" — this works for some
+rooms and fails for others (aggressive target curves where input PEQ
+boosts run out of budget, or modal-rich rooms where FIR's better
+resolution is needed for the shape). Reason about which split fits
+the room you actually measured.
 
 ## Configuration
 
@@ -831,18 +884,33 @@ already in the FIRs.
 
 ### 3.2 Anchor the target curve — pick the right reference
 
-**Anchor at the band where the room is naturally close to the curve's
-local target** — usually NOT 0 dB on the curve itself. Two rules:
+**For sub calibration, ALWAYS anchor at the DEEP-BASS end of the band
+(e.g. 25-40 Hz), NOT near the curve's 0 dB point at the crossover (80
+Hz).** A sub cal exists to maximize bass; anchoring near the crossover
+makes deep bass a boost target — and PEQ boosts deliver only 25-50% at
+the listener in modal-rich rooms while running into safety caps. The
+goal is for the MEASURED deep bass to BE the curve's high point. The
+mid/upper bass then comes DOWN to the curve's falloff via cuts. Cuts
+deliver ~100% at the listener and are unconstrained by safety. Master
+gain (Phase 5 cleanup) restores the absolute level the cuts removed.
 
-1. **Cuts work; boosts don't (in modal-rich rooms).** PEQ cuts deliver
+Three rules:
+
+1. **Anchor low, not high.** Deep bass is the priority and the place
+   the room can't physically be boosted. Anchor where the measured
+   response is at-or-above the curve's local value, so the rest is cuts.
+2. **Cuts work; boosts don't (in modal-rich rooms).** PEQ cuts deliver
    ~100% of their dB at the listener; boosts deliver 25-50%. Anchor
-   such that most of the work is cuts, not boosts.
-
-2. **Pick the anchor empirically from the baseline measurement.** For
-   each candidate anchor frequency f_anchor in the target band, compute
-   per-band gap = (measured[f] − measured[f_anchor]) − (target[f] −
-   target[f_anchor]). The right anchor is the one that minimizes the
-   worst per-band gap.
+   such that ALL the work is cuts when possible.
+3. **Pick the anchor empirically from the baseline measurement.** For
+   each candidate anchor frequency f_anchor in the deep-bass band
+   (typically 25-40 Hz), compute per-band gap = (measured[f] −
+   measured[f_anchor]) − (target[f] − target[f_anchor]). The right
+   anchor is the LOWEST-frequency candidate where every band above it
+   has a non-negative gap (i.e. measured ≥ target relative to the
+   anchor — implementable via cut). If no such candidate exists,
+   accept the lowest-frequency anchor with the smallest single-band
+   shortfall and accept some residual boost at that one band.
 
 Concrete worked example, validated 2026-04-29 (Harman+4 in a modal
 room with mid-bass hump):
