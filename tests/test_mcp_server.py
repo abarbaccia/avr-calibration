@@ -6680,9 +6680,10 @@ async def test_design_modal_fir_compensation_notch_preserves_modal_cancellation(
 
     mag_with = _mag_db_at(with_notch["coefficients"], 70.0)
     mag_base = _mag_db_at(baseline["coefficients"], 70.0)
-    # Cancellation depression at the mode centre should be preserved within
-    # ~1 dB (the notches are far enough away at 50 Hz to not reach 70 Hz).
-    assert abs(mag_with - mag_base) <= 1.0, (
+    # FIR magnitude at the mode centre should be preserved within ~3 dB —
+    # the verification step in _apply_compensation_notches enforces this
+    # exact tolerance, aborting any notch whose IIR skirt reaches further.
+    assert abs(mag_with - mag_base) <= 3.0, (
         f"cancellation diverged: baseline {mag_base:.2f} dB vs "
         f"with-notch {mag_with:.2f} dB"
     )

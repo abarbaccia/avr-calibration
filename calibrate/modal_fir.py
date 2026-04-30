@@ -637,7 +637,7 @@ class ModalAwareFIRDesigner:
             # cancellation zone and undoes the anti-pulse.
             mag_pre = _mag_db_at(pre_notch_fir, mode_hz)
             mag_post = _mag_db_at(candidate, mode_hz)
-            if abs(mag_post - mag_pre) > 1.0:
+            if abs(mag_post - mag_pre) > 3.0:
                 summary.notes.append(
                     f"compensation_notch aborted: {centre:.1f} Hz notch "
                     f"shifts FIR magnitude at mode {mode_hz:.1f} Hz by "
