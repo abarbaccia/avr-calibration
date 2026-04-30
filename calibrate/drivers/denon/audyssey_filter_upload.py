@@ -410,32 +410,54 @@ def _push_full_sync(
             sock.sendall(build_frame("INIT_COEFS"))
             summary["init_coefs_ack"] = did_ack(drain(1.5), "INIT_COEFS")
 
-        # Coefficient streams — fire-and-forget.
-        for pkt in coef_packet_streams:
+        # Coefficient streams. AVR doesn't ACK coef packets, but it WILL
+        # send a frame named "ERROR" with body {"Comm":"NACK"} when a
+        # specific packet is malformed or the stream falls behind.
+        # We pace per-packet (typically 5ms) and add a longer pause
+        # between channels (100ms — matching A1Evo's behaviour).
+        between_channel_pause_ms = 100.0
+        for pkt, end_of_channel in coef_packet_streams:
             sock.sendall(pkt)
             if inter_packet_delay_ms > 0:
                 time.sleep(inter_packet_delay_ms / 1000.0)
             summary["coef_packets_sent"] += 1
+            if end_of_channel and between_channel_pause_ms > 0:
+                time.sleep(between_channel_pause_ms / 1000.0)
 
         # Allow the AVR to finish processing the coefficient bank.
         if coef_wait_init_ms > 0:
             time.sleep(coef_wait_init_ms / 1000.0)
         if coef_wait_final_ms > 0:
-            time.sleep(coef_wait_final_ms / 1000.0)
+            # Drain anything the AVR queued during processing — some
+            # firmwares emit a status frame here.
+            mid_frames = drain(coef_wait_final_ms / 1000.0)
+            summary["mid_wait_frames"] = [
+                {
+                    "cmd": f["cmd"],
+                    "data": f["data"][:120].decode("ascii", errors="replace"),
+                }
+                for f in mid_frames
+            ]
 
         sock.sendall(build_frame("FINZ_COEFS"))
-        summary["finz_coefs_ack"] = did_ack(drain(3.0), "FINZ_COEFS")
+        finz_frames = drain(20.0)
+        summary["finz_coefs_ack"] = did_ack(finz_frames, "FINZ_COEFS")
+        summary["finz_frames"] = [f["cmd"] for f in finz_frames]
 
         # Final commit — this is the bit that makes the firmware persist
         # the new calibration AND skip the on-EXIT_AUDMD re-validation
         # that would otherwise snap Distance back to the variance cap.
         time.sleep(0.02)
         sock.sendall(build_frame("SET_SETDAT", b'{"AudyFinFlg":"Fin"}'))
-        summary["fin_commit_ack"] = did_ack(drain(2.0), "SET_SETDAT")
+        fin_frames = drain(5.0)
+        summary["fin_commit_ack"] = did_ack(fin_frames, "SET_SETDAT")
+        summary["fin_frames"] = [f["cmd"] for f in fin_frames]
 
         time.sleep(0.02)
         sock.sendall(build_frame("EXIT_AUDMD"))
-        summary["exit_audmd_ack"] = did_ack(drain(1.0), "EXIT_AUDMD")
+        exit_frames = drain(2.0)
+        summary["exit_audmd_ack"] = did_ack(exit_frames, "EXIT_AUDMD")
+        summary["exit_frames"] = [f["cmd"] for f in exit_frames]
     finally:
         try:
             sock.close()
@@ -456,11 +478,11 @@ async def push_avr_filters(
     target_curves: Sequence[str] | None = None,
     samplerates_hz: Sequence[int] = XT32_SAMPLE_RATES_HZ,
     init_coefs_required: bool | None = None,
-    coef_wait_init_ms: float = 20.0,
-    coef_wait_final_ms: float = 1000.0,
+    coef_wait_init_ms: float | None = None,
+    coef_wait_final_ms: float | None = None,
     inter_packet_delay_ms: float = 5.0,
     port: int = DEFAULT_PORT,
-    timeout: float = 12.0,
+    timeout: float = 30.0,
 ) -> dict:
     """Upload custom FIR coefficients to one or more AVR channels via the
     Audyssey TCP/1256 protocol.
@@ -515,6 +537,17 @@ async def push_avr_filters(
         d_type = str(avr_status.get("DType", "")).lower()
         init_coefs_required = d_type.startswith("fixed")
 
+    # Use the AVR's reported coefficient-processing wait times if the
+    # caller didn't set explicit overrides. The X3800H reports
+    # CoefWaitTime.Final = 15000 ms — without that pause FINZ_COEFS
+    # times out without ACK because the DSP is still consuming the
+    # coefficient stream.
+    coef_wait_times = avr_status.get("CoefWaitTime") or {}
+    if coef_wait_init_ms is None:
+        coef_wait_init_ms = float(coef_wait_times.get("Init", 0)) if coef_wait_times else 20.0
+    if coef_wait_final_ms is None:
+        coef_wait_final_ms = float(coef_wait_times.get("Final", 15000)) if coef_wait_times else 15000.0
+
     # Build SET_SETDAT envelope.
     ordered = build_set_dat_envelope(
         ady,
@@ -532,16 +565,32 @@ async def push_avr_filters(
         )
         target_curves = (TARGET_CURVE_FLAT, TARGET_CURVE_REFERENCE)
 
-    coef_streams: list[bytes] = []
-    for cid, coefs in channel_filters.items():
-        coef_streams.extend(
-            all_streams_for_channel(
-                coefs,
-                channel_id=cid,
-                target_curves=target_curves,
-                samplerates_hz=samplerates_hz,
-            )
-        )
+    # Coefficient packet order matters: A1Evo Acoustica uses outer-tc,
+    # middle-channel, inner-sr. Mismatched order triggers per-packet
+    # NACKs. See oca_transfer.py:1533-1543. Yield (packet, end_of_channel)
+    # tuples so the sender can pause between channels.
+    from calibrate.drivers.denon.audyssey_coef_transfer import (
+        build_coef_packets,
+    )
+    coef_streams: list[tuple[bytes, bool]] = []
+    for tc in target_curves:
+        channel_list = list(channel_filters.items())
+        for ch_idx, (cid, coefs) in enumerate(channel_list):
+            sr_list = list(samplerates_hz)
+            for sr_idx, sr in enumerate(sr_list):
+                pkts = build_coef_packets(
+                    coefs,
+                    channel_id=cid,
+                    target_curve=tc,
+                    samplerate_hz=sr,
+                )
+                last_sr = sr_idx == len(sr_list) - 1
+                last_ch = ch_idx == len(channel_list) - 1
+                for pi, pkt in enumerate(pkts):
+                    is_last_in_channel = (
+                        pi == len(pkts) - 1 and last_sr
+                    )
+                    coef_streams.append((pkt, is_last_in_channel and not last_ch))
 
     loop = asyncio.get_running_loop()
     summary = await loop.run_in_executor(
