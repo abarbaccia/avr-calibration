@@ -6504,6 +6504,140 @@ async def test_design_modal_fir_target_curve_adds_magnitude_correction() -> None
     assert delta_db > 1.0, f"expected ≥+1 dB lift at 25 Hz, got {delta_db:.2f}"
 
 
+@pytest.mark.asyncio
+async def test_design_modal_fir_iterative_reduction_fits_cap() -> None:
+    """Aggressive cancel_strength on a strong mode is iteratively reduced
+    so the resulting FIR passes SafetyValidator (modal_cancel intent)."""
+    from calibrate.safety import SafetyValidator, SafetyValidationError
+    decay_modes = [{"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0}]
+    intents = [{
+        "freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0,
+        "treatment": "anti_pulse", "cancel_strength": 0.6, "bp_q": 1.5,
+    }]
+    session = _make_modal_session(decay_modes)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_modal_fir(
+            session_id=1, intents=intents,
+            num_taps=4096, max_pre_ring_ms=25.0, samplerate=8000,
+            return_coefficients=True,
+        )
+    assert result["ok"], result
+    treatment = result["per_mode_treatments"][0]
+    assert treatment["treatment"] == "anti_pulse"
+    # Achieved strength should be below requested when iteration kicked in.
+    assert treatment["cancel_strength_requested"] == 0.6
+    assert treatment["cancel_strength_achieved"] <= 0.6
+    # safety_budget surfaced
+    assert result["safety_budget"]
+    sb = result["safety_budget"][0]
+    assert sb["mode_freq_hz"] == 70.0
+    assert "headroom_db" in sb
+    # Resulting FIR must pass SafetyValidator with intent='modal_cancel'.
+    validator = SafetyValidator()
+    try:
+        validator.validate_fir(
+            result["coefficients"], sample_rate=8000, intent="modal_cancel"
+        )
+    except SafetyValidationError as exc:
+        # If validation still fails the achieved strength must explain it.
+        raise AssertionError(
+            f"FIR rejected by validator after iteration: {exc}"
+        ) from exc
+
+
+@pytest.mark.asyncio
+async def test_design_modal_fir_demotes_to_linear_notch_when_unreachable() -> None:
+    """When two adjacent strong modes can never both fit the cap, at least
+    one is demoted to linear_notch."""
+    decay_modes = [
+        {"freq_hz": 50.0, "t60_ms": 1500, "peak_db": 18.0},
+        {"freq_hz": 63.0, "t60_ms": 1500, "peak_db": 18.0},
+    ]
+    intents = [
+        {"freq_hz": 50.0, "t60_ms": 1500, "peak_db": 18.0,
+         "treatment": "anti_pulse", "cancel_strength": 1.0, "bp_q": 1.0},
+        {"freq_hz": 63.0, "t60_ms": 1500, "peak_db": 18.0,
+         "treatment": "anti_pulse", "cancel_strength": 1.0, "bp_q": 1.0},
+    ]
+    session = _make_modal_session(decay_modes)
+    # Force an impossibly tight cap (negative) to provoke demotion.
+    # Even with both pulses at amplitude≈0, the impulse base correction's
+    # 0 dB passband exceeds a sub-zero cap → demotion path.
+    with patch("calibrate.storage.SessionStore") as MockStore, \
+         patch("calibrate.graph.SVS_PB12_NSD_PROFILE") as MockProfile:
+        MockStore.return_value.list_sessions.return_value = [session]
+        MockProfile.modal_cancel_max_boost_db = -1.0
+        result = await _tool_design_modal_fir(
+            session_id=1, intents=intents,
+            num_taps=4096, max_pre_ring_ms=25.0, samplerate=8000,
+        )
+    assert result["ok"], result
+    treatments = result["per_mode_treatments"]
+    demoted = [t for t in treatments if t.get("demoted_from") == "anti_pulse"]
+    assert demoted, f"expected at least one demoted treatment, got {treatments}"
+    assert demoted[0]["treatment"] == "linear_notch"
+    assert "adjacent-band cap unreachable" in demoted[0]["rationale"]
+
+
+@pytest.mark.asyncio
+async def test_design_modal_fir_no_anti_pulse_unchanged() -> None:
+    """When no anti_pulse intents are present, iteration is a no-op and the
+    output is byte-identical to running the same design twice."""
+    decay_modes = [{"freq_hz": 70.0, "t60_ms": 200, "peak_db": 4.0}]
+    intents = [{"freq_hz": 70.0, "t60_ms": 200, "peak_db": 4.0,
+                "treatment": "min_phase"}]
+    session = _make_modal_session(decay_modes)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        a = await _tool_design_modal_fir(
+            session_id=1, intents=intents, num_taps=1024, samplerate=8000,
+            return_coefficients=True,
+        )
+        b = await _tool_design_modal_fir(
+            session_id=1, intents=intents, num_taps=1024, samplerate=8000,
+            return_coefficients=True,
+        )
+    assert a["ok"] and b["ok"]
+    assert a["coefficients"] == b["coefficients"]
+    # No anti-pulses → empty safety_budget (only anti_pulse modes appear).
+    assert a["safety_budget"] == []
+
+
+def test_validate_fir_message_names_culprit_modes() -> None:
+    """validate_fir(intent='modal_cancel') error names nearby boost bands."""
+    import numpy as np
+    from calibrate.safety import SafetyValidator, SafetyValidationError
+    # Construct a pathological FIR with strong content at 70 Hz that leaks
+    # into the 50 Hz band. We synthesize directly: a windowed sinusoid at
+    # 70 Hz of large amplitude has its main lobe at 70 Hz but also a sizable
+    # adjacent-band peak at 50 Hz when the window is short enough.
+    sr = 8000
+    n = 1024
+    t = np.arange(n) / sr
+    # Strong narrow boost at 70 Hz; small carrier elsewhere.
+    fir = (3.0 * np.sin(2 * np.pi * 70.0 * t) * np.exp(-((t - n/2/sr) * 30)**2)
+           ).astype(np.float32)
+    fir[0] += 1.0  # impulse so we have a passband baseline
+    validator = SafetyValidator()
+    try:
+        validator.validate_fir(fir.tolist(), sample_rate=sr, intent="modal_cancel")
+        raised = False
+        msg = ""
+    except SafetyValidationError as exc:
+        raised = True
+        msg = str(exc)
+    assert raised, "expected safety rejection on synthetic pathological FIR"
+    # Message should mention the modal_cancel cap AND a culprit-mode hint.
+    assert "modal-cancellation cap" in msg
+    # Either an explicit "Likely from anti_pulse modes" hint, or the
+    # alternative "no adjacent-band signature" hint — both are valid
+    # depending on which adjacent bands also exceed 0 dB.
+    assert ("Likely from anti_pulse modes at" in msg) or (
+        "No adjacent-band anti-pulse signature" in msg
+    )
+
+
 def test_gabor_anti_pulse_has_less_adjacent_band_leakage_than_butterworth() -> None:
     """Gabor envelope must have steeper spectral skirts than Butterworth.
 

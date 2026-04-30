@@ -58,6 +58,7 @@ class DesignSummary:
     peak_amplitude: float
     mode_treatments: list[dict] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    safety_budget: list[dict] = field(default_factory=list)
 
 
 def design_anti_pulse(freq_hz: float, peak_db: float, cancel_strength: float,
@@ -226,6 +227,7 @@ class ModalAwareFIRDesigner:
                 source_fr_db: list[tuple[float, float]] | None = None,
                 magnitude_focus_hz: tuple[float, float] | None = None,
                 anchor_freq_hz: float | None = None,
+                modal_cancel_max_boost_db: float | None = None,
                 ) -> tuple[list[float], DesignSummary]:
         """Generate a modal-aware mixed-phase FIR.
 
@@ -292,8 +294,17 @@ class ModalAwareFIRDesigner:
         end_base = min(pre_samples + len(base_min), self.n_taps)
         fir[pre_samples:end_base] += base_min[:end_base - pre_samples]
 
-        # 5. Add anti-pulses for ringy modes
-        for intent in intents:
+        # 5. Add anti-pulses for ringy modes.
+        # We track per-anti-pulse signals + placement so we can run an
+        # adjacent-band-aware iterative amplitude search after summation
+        # (see step 5b below). Non-anti-pulse treatments still emit their
+        # treatment record here.
+        anti_records: list[dict] = []  # mutable per-pulse state for iteration
+        # Build a treatment-record-by-mode lookup so iteration can demote
+        # entries without disturbing ordering.
+        treatment_index: dict[int, dict] = {}
+
+        for idx, intent in enumerate(intents):
             entry = {
                 "freq_hz": intent.freq_hz,
                 "treatment": intent.treatment,
@@ -322,12 +333,44 @@ class ModalAwareFIRDesigner:
                     start = 0
                 end = min(start + len(anti), self.n_taps)
                 # Inverted polarity for cancellation
-                fir[start:end] -= anti[:end - start]
+                segment = -anti[:end - start]
+                fir[start:end] += segment
+                base_amp = float(np.max(np.abs(anti)))
                 entry["anti_pulse_pre_ms"] = round(half_cycle_samples / self.sr * 1000, 2)
-                entry["anti_pulse_amplitude"] = round(float(np.max(np.abs(anti))), 4)
+                entry["anti_pulse_amplitude"] = round(base_amp, 4)
+                entry["cancel_strength_requested"] = round(intent.cancel_strength, 4)
+                entry["cancel_strength_achieved"] = round(intent.cancel_strength, 4)
                 entry["predicted_t60_reduction_pct"] = int(intent.cancel_strength * 60)
+                anti_records.append({
+                    "intent_idx": idx,
+                    "freq_hz": float(intent.freq_hz),
+                    "segment": np.asarray(segment, dtype=np.float32),
+                    "start": int(start),
+                    "end": int(end),
+                    "scale": 1.0,
+                    "requested_strength": float(intent.cancel_strength),
+                    "base_amp": base_amp,
+                    "entry": entry,
+                })
 
             summary.mode_treatments.append(entry)
+            treatment_index[idx] = entry
+
+        # 5b. Adjacent-band-aware iterative amplitude search.
+        # Anti-pulses are time-localized but their FFT magnitude leaks into
+        # adjacent 1/3-octave bands — typically the bands one and two below
+        # the mode (e.g. a 70 Hz pulse boosts 50 and 63 Hz). When that boost
+        # exceeds the profile's modal_cancel cap, SafetyValidator will reject
+        # the FIR. We catch it here, scaling each pulse down (binary search
+        # ≤6 iterations, jointly across pulses) until all adjacent bands fit.
+        if anti_records and modal_cancel_max_boost_db is not None:
+            cap_db = float(modal_cancel_max_boost_db)
+            self._iteratively_fit_adjacent_band_cap(
+                fir=fir,
+                anti_records=anti_records,
+                cap_db=cap_db,
+                summary=summary,
+            )
 
         # 6. Optional magnitude-correction layer for target-curve tracking.
         # When target_curve_db + source_fr_db are provided, the unified design
@@ -362,6 +405,195 @@ class ModalAwareFIRDesigner:
         summary.peak_amplitude = float(np.max(np.abs(fir)))
 
         return fir.tolist(), summary
+
+    # ── Adjacent-band iterative amplitude search ────────────────────────
+    # The anti-pulse spectral skirt leaks energy into 1/3-octave bands
+    # surrounding the mode. SafetyValidator's modal_cancel cap rejects any
+    # band exceeding modal_cancel_max_boost_db. Rather than make the LLM
+    # blindly retry with smaller cancel_strength, we self-iterate here.
+
+    def _adjacent_band_centres(self, mode_freq_hz: float) -> list[float]:
+        """Return 1/3-octave centres within ±2/3-octave of ``mode_freq_hz``.
+
+        Two-thirds of an octave covers the 1-2 bands above and below the
+        mode where Gabor-anti-pulse spectral skirts typically leak. We
+        deliberately exclude the mode's own band (its boost is the
+        cancellation we want — caller's safety profile already applies the
+        modal_cancel cap there).
+        """
+        # Late import to avoid a circular dependency at module import.
+        from .safety import THIRD_OCTAVE_CENTRES_HZ
+        ratio = 2.0 ** (2.0 / 3.0)
+        lo = mode_freq_hz / ratio
+        hi = mode_freq_hz * ratio
+        # Find the centre that "owns" the mode (closest in log-space).
+        own = min(
+            THIRD_OCTAVE_CENTRES_HZ,
+            key=lambda c: abs(np.log(c) - np.log(mode_freq_hz)),
+        )
+        return [c for c in THIRD_OCTAVE_CENTRES_HZ if lo <= c <= hi and c != own]
+
+    def _per_band_peak_db(self, fir: np.ndarray) -> dict[float, float]:
+        """Bin |H(f)| into 1/3-oct centres, return peak dB per band."""
+        from .safety import THIRD_OCTAVE_CENTRES_HZ
+        n_fft = max(4096, int(2 ** np.ceil(np.log2(max(len(fir), 2)))))
+        spec = np.fft.rfft(fir, n=n_fft)
+        freqs = np.fft.rfftfreq(n_fft, d=1.0 / float(self.sr))
+        mag = np.abs(spec)
+        mag_db = 20.0 * np.log10(np.maximum(mag, 1e-9))
+        half = 2.0 ** (1.0 / 6.0)
+        out: dict[float, float] = {}
+        for centre in THIRD_OCTAVE_CENTRES_HZ:
+            lo, hi = centre / half, centre * half
+            mask = (freqs >= lo) & (freqs < hi)
+            if np.any(mask):
+                out[centre] = float(np.max(mag_db[mask]))
+        return out
+
+    def _iteratively_fit_adjacent_band_cap(
+        self,
+        fir: np.ndarray,
+        anti_records: list[dict],
+        cap_db: float,
+        summary: DesignSummary,
+    ) -> None:
+        """Scale each anti-pulse so adjacent-band boost ≤ ``cap_db``.
+
+        Each anti-pulse contributes (linearly) to the FIR's spectrum, so
+        scaling its time-domain amplitude scales its spectral contribution
+        by the same factor. We binary-search a per-pulse scale ``s`` ∈
+        [0, 1] such that, when applied to that pulse, every band in its
+        adjacency window is within cap. We re-run the full set up to 6
+        times to converge when pulses share adjacent bands.
+
+        If any pulse's amplitude must drop to ≈0 yet still exceeds cap,
+        the corresponding mode is auto-demoted to ``linear_notch`` (the
+        anti-pulse component is removed and the entry's treatment field
+        is updated).
+        """
+        max_passes = 6
+
+        def _band_peak_excluding_pulses(
+            current_fir: np.ndarray, centres: list[float]
+        ) -> dict[float, float]:
+            return {c: v for c, v in self._per_band_peak_db(current_fir).items()
+                    if c in centres}
+
+        for pass_idx in range(max_passes):
+            changed = False
+            band_peaks = self._per_band_peak_db(fir)
+            for rec in list(anti_records):
+                if rec.get("demoted"):
+                    continue
+                adj_bands = self._adjacent_band_centres(rec["freq_hz"])
+                worst = max(
+                    (band_peaks.get(c, -np.inf) for c in adj_bands),
+                    default=-np.inf,
+                )
+                if worst <= cap_db:
+                    continue
+                # Binary search a scale factor for THIS pulse that brings
+                # all adjacent bands ≤ cap, holding others fixed.
+                s_lo, s_hi = 0.0, rec["scale"]
+                # Save the current contribution and remove it from fir
+                seg = rec["segment"][: rec["end"] - rec["start"]] * rec["scale"]
+                fir[rec["start"]:rec["end"]] -= seg
+                # Now binary-search a new scale relative to the unscaled segment.
+                base_seg = rec["segment"][: rec["end"] - rec["start"]]
+                best_s = 0.0
+                # Quick check: is even s=0 (no pulse) over-cap from OTHER pulses?
+                worst_zero = max(
+                    (self._per_band_peak_db(fir).get(c, -np.inf) for c in adj_bands),
+                    default=-np.inf,
+                )
+                if worst_zero > cap_db:
+                    # Other pulses alone overflow this band — leave this pulse
+                    # at zero; the other-pulse pass will fix it.
+                    new_scale = 0.0
+                else:
+                    # Binary search for largest s such that adding s*base_seg
+                    # keeps adjacent bands ≤ cap.
+                    lo, hi = 0.0, rec["scale"]
+                    for _ in range(6):
+                        mid = 0.5 * (lo + hi)
+                        fir[rec["start"]:rec["end"]] += base_seg * mid
+                        peaks = self._per_band_peak_db(fir)
+                        worst_mid = max(
+                            (peaks.get(c, -np.inf) for c in adj_bands),
+                            default=-np.inf,
+                        )
+                        fir[rec["start"]:rec["end"]] -= base_seg * mid
+                        if worst_mid <= cap_db:
+                            best_s = mid
+                            lo = mid
+                        else:
+                            hi = mid
+                    new_scale = best_s
+                # Apply the new scale
+                fir[rec["start"]:rec["end"]] += base_seg * new_scale
+                if abs(new_scale - rec["scale"]) > 1e-4:
+                    rec["scale"] = float(new_scale)
+                    changed = True
+            if not changed:
+                break
+
+        # Demote any pulse whose final scale is effectively zero AND whose
+        # band still exceeds cap (caller can't deliver any cancellation).
+        post_peaks = self._per_band_peak_db(fir)
+        for rec in anti_records:
+            entry = rec["entry"]
+            achieved_strength = rec["scale"] * rec["requested_strength"]
+            entry["cancel_strength_achieved"] = round(achieved_strength, 4)
+            entry["anti_pulse_amplitude"] = round(rec["base_amp"] * rec["scale"], 4)
+            entry["predicted_t60_reduction_pct"] = int(achieved_strength * 60)
+            adj_bands = self._adjacent_band_centres(rec["freq_hz"])
+            worst = max(
+                (post_peaks.get(c, -np.inf) for c in adj_bands),
+                default=-np.inf,
+            )
+            entry["adjacent_band_peak_db"] = round(float(worst), 2) if np.isfinite(worst) else None
+            entry["adjacent_band_cap_db"] = round(cap_db, 2)
+            if rec["scale"] < 0.02 and worst > cap_db:
+                # Even amplitude≈0 cannot fit cap (other pulses dominate this
+                # band). Demote this mode to linear_notch — the FIR's anti-
+                # pulse contribution has already been zeroed by the search.
+                rec["demoted"] = True
+                entry["demoted_from"] = "anti_pulse"
+                entry["treatment"] = "linear_notch"
+                entry["rationale"] = (
+                    "anti_pulse demoted to linear_notch — adjacent-band cap "
+                    "unreachable (cap=+%.0f dB at adjacent band still exceeded "
+                    "even at amplitude≈0)" % cap_db
+                )
+                summary.notes.append(
+                    f"auto-demote: {rec['freq_hz']:.0f} Hz anti_pulse → "
+                    f"linear_notch (adjacent-band cap unreachable)"
+                )
+            elif rec["scale"] < 0.999:
+                summary.notes.append(
+                    f"adjacent-band fit: {rec['freq_hz']:.0f} Hz anti_pulse "
+                    f"scaled to {rec['scale']:.2f} of requested "
+                    f"(cancel_strength {rec['requested_strength']:.2f} → "
+                    f"{achieved_strength:.2f}) to keep adjacent bands ≤"
+                    f"+{cap_db:.0f} dB"
+                )
+
+        # Populate per-mode safety_budget entries for the response.
+        for rec in anti_records:
+            adj_bands = self._adjacent_band_centres(rec["freq_hz"])
+            band_peaks_now = {c: post_peaks.get(c, -np.inf) for c in adj_bands}
+            worst = max(band_peaks_now.values(), default=-np.inf)
+            summary.safety_budget.append({
+                "mode_freq_hz": round(float(rec["freq_hz"]), 2),
+                "adjacent_bands_hz": [round(c, 1) for c in adj_bands],
+                "max_boost_db": round(float(worst), 2) if np.isfinite(worst) else None,
+                "cap_db": round(float(cap_db), 2),
+                "headroom_db": (
+                    round(float(cap_db - worst), 2)
+                    if np.isfinite(worst)
+                    else None
+                ),
+            })
 
 
 def _design_magnitude_correction_fir(

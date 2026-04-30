@@ -4127,6 +4127,15 @@ async def _tool_design_modal_fir(
                     f"'deep_bass_priority' (got {anchor_mode!r})"
                 )
 
+        # Pull the active sub profile's modal-cancel cap so the designer can
+        # iteratively scale anti-pulses to fit. Fall back to the SVS default
+        # if no profile is wired (mainly tests with mocked stores).
+        try:
+            from .graph import SVS_PB12_NSD_PROFILE
+            modal_cap_db = float(SVS_PB12_NSD_PROFILE.modal_cancel_max_boost_db)
+        except Exception:
+            modal_cap_db = 14.0
+
         designer = ModalAwareFIRDesigner(
             sample_rate=int(samplerate),
             n_taps=int(num_taps),
@@ -4146,6 +4155,7 @@ async def _tool_design_modal_fir(
             source_fr_db=source_fr_db,
             magnitude_focus_hz=magnitude_focus_hz,
             anchor_freq_hz=anchor_freq_for_designer,
+            modal_cancel_max_boost_db=modal_cap_db,
         )
 
         _fir_design_cache[int(session_id)] = list(coeffs)
@@ -4159,6 +4169,7 @@ async def _tool_design_modal_fir(
             "pre_delay_samples": summary.pre_delay_samples,
             "peak_amplitude": round(summary.peak_amplitude, 4),
             "per_mode_treatments": summary.mode_treatments,
+            "safety_budget": summary.safety_budget,
             "notes": summary.notes,
             "latency_budget": latency_budget_breakdown(summary),
             "design_cached": True,
