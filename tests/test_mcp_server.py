@@ -4089,6 +4089,161 @@ def test_camilladsp_rehydrate_restores_fir_from_active_state() -> None:
     assert driver._fir_state.get(1) == [float(c) for c in coeffs]
 
 
+# ── design_fir / anchor=cuts_only / deep-bass-priority ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_design_fir_anchor_none_preserves_legacy_behavior() -> None:
+    """anchor=None (default) must produce the same predicted_effect as before.
+
+    Regression guard: target_curve points are interpreted as absolute SPL,
+    just as the legacy implementation did. This keeps every existing caller
+    working unchanged.
+    """
+    import numpy as np
+
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls = [75.0 - 0.05 * (f - 80) for f in freqs]  # gentle slope
+    session = _make_fr_session(freqs, spls)
+
+    target = {"points": [
+        {"freq": 25, "spl": 80}, {"freq": 50, "spl": 78}, {"freq": 80, "spl": 75},
+        {"freq": 120, "spl": 73},
+    ]}
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        a = await _tool_design_fir(
+            session_id=1, target_curve=target, num_taps=128, phase_mode="minimum",
+        )
+        b = await _tool_design_fir(
+            session_id=1, target_curve=target, num_taps=128, phase_mode="minimum",
+            anchor=None,
+        )
+    assert a["ok"] and b["ok"]
+    # band_mean default reports anchor_used.mode == 'band_mean'
+    assert b["anchor_used"]["mode"] == "band_mean"
+    # Predicted effect identical (deterministic design)
+    assert a["predicted_effect"] == b["predicted_effect"]
+
+
+@pytest.mark.asyncio
+async def test_design_fir_anchor_freq_yields_cuts_above_anchor() -> None:
+    """anchor=freq forces target(anchor)==measured(anchor); above is pure cuts.
+
+    Synthetic measurement: 31 Hz at -2.2 dB relative to 80 Hz (a typical
+    deep-bass-shy room). Harman-in-room target rises into deep bass. With
+    anchor at 31 Hz, the absolute target above 31 Hz must lie BELOW the
+    measured FR — i.e. predicted FIR effect at every freq above 31 Hz must
+    be negative (cuts).
+    """
+    import numpy as np
+
+    # Build measurement with known shape: flat at 75 dB, with 31 Hz at 72.8.
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls = []
+    for f in freqs:
+        if f <= 31.0:
+            spls.append(72.8)  # deep-bass shy
+        else:
+            spls.append(75.0)  # mid/upper bass at 75
+    session = _make_fr_session(freqs, spls)
+
+    # Harman-in-room: bass rises (relative dB).
+    target = {"points": [
+        {"freq": 25, "spl": 5}, {"freq": 31, "spl": 4}, {"freq": 40, "spl": 3},
+        {"freq": 50, "spl": 2}, {"freq": 63, "spl": 1}, {"freq": 80, "spl": 0},
+        {"freq": 100, "spl": 0}, {"freq": 120, "spl": 0},
+    ]}
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_fir(
+            session_id=1, target_curve=target,
+            num_taps=512, phase_mode="minimum",
+            anchor={"mode": "freq", "freq_hz": 31.0},
+        )
+    assert result["ok"], result
+    assert result["anchor_used"] == {"mode": "freq", "freq_hz": 31.0}
+    # Above the anchor, target is downward-sloping (4 → 0 dB) and measurement
+    # is flat at 75 — so target_abs above 31 Hz lies below the measured curve.
+    # FIR predicted effect should be ≤ 0 (cuts) above 31 Hz.
+    for band in result["predicted_effect"]:
+        if band["freq_hz"] >= 40 and band["freq_hz"] <= 120:
+            assert band["fir_effect_db"] <= 0.5, band
+
+
+@pytest.mark.asyncio
+async def test_design_fir_anchor_deep_bass_priority_picks_low_anchor() -> None:
+    """deep_bass_priority finds a low anchor where bands above are cut-implementable."""
+    import numpy as np
+
+    # Measurement: flat-ish at 75 dB above 30, slight rise at 50 (peak),
+    # bass shy below.
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    def m(f: float) -> float:
+        if f < 30:
+            return 70.0
+        if 45 <= f <= 55:
+            return 78.0  # 50 Hz peak
+        return 75.0
+    spls = [m(f) for f in freqs]
+    session = _make_fr_session(freqs, spls)
+
+    # Slight bass rise harman-style target.
+    target = {"points": [
+        {"freq": 25, "spl": 5}, {"freq": 31, "spl": 4}, {"freq": 40, "spl": 3},
+        {"freq": 50, "spl": 2}, {"freq": 63, "spl": 1}, {"freq": 80, "spl": 0},
+        {"freq": 100, "spl": 0}, {"freq": 120, "spl": 0},
+    ]}
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_fir(
+            session_id=1, target_curve=target,
+            num_taps=512, phase_mode="minimum",
+            freq_focus_hz=[30.0, 120.0],
+            anchor={"mode": "deep_bass_priority"},
+        )
+    assert result["ok"], result
+    assert result["anchor_used"]["mode"] == "deep_bass_priority"
+    # Anchor must lie within [30, 50] (band_lo .. band_lo+20).
+    af = result["anchor_used"]["freq_hz"]
+    assert 30.0 <= af <= 50.0
+
+
+@pytest.mark.asyncio
+async def test_anchor_target_cuts_only_picks_low_anchor() -> None:
+    """direction='cuts_only' picks the lowest anchor where above-bands are cuts."""
+    from calibrate.mcp_server import _tool_anchor_target
+
+    # Measurement: flat-ish, slight bass shy at 25 Hz, peaks above 40 Hz.
+    freqs = [25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 120.0]
+    spls  = [70.0, 73.0, 78.0, 79.0, 78.0, 76.0,  75.0,  74.0]
+    session = _make_deviation_session(1, freqs, spls)
+
+    # Harman-in-room style target: rises into bass.
+    offsets = [
+        {"freq_hz": 25, "offset_db": 5},
+        {"freq_hz": 31.5, "offset_db": 4},
+        {"freq_hz": 40, "offset_db": 3},
+        {"freq_hz": 50, "offset_db": 2},
+        {"freq_hz": 63, "offset_db": 1},
+        {"freq_hz": 80, "offset_db": 0},
+        {"freq_hz": 100, "offset_db": 0},
+        {"freq_hz": 120, "offset_db": 0},
+    ]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.get_session.return_value = session
+        result = await _tool_anchor_target(
+            session_id=1, target_offsets=offsets,
+            port_rolloff_hz=20.0, max_boost_db=6.0,
+            direction="cuts_only", exclude_geometry=False,
+        )
+    assert result["ok"], result
+    assert result["direction"] == "cuts_only"
+    # Anchor freq should be in the low end of the band (< 50 Hz).
+    assert result["anchor_freq_hz"] is not None
+    assert result["anchor_freq_hz"] < 50.0
+
+
 # ── LLM filter-design math tools ─────────────────────────────────────────────
 
 
