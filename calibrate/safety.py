@@ -408,21 +408,25 @@ class SafetyValidator:
             per_band[centre] = float(np.max(mag_db[mask]))
 
         floor = prof.min_boost_freq_hz
-        below_floor_limit = prof.max_boost_per_band_db
-        # The above-floor cap depends on intent. Generic FIRs (PEQ-equivalent
-        # arbitrary writes) get the strict thermal/excursion cap. Modal-
-        # cancellation FIRs from ``design_modal_fir`` get a looser cap: their
-        # boost at the mode is meant to cancel the room mode at the listener,
-        # so net SPL at the listening position is unchanged; only the driver
-        # sees the boosted level, well within thermal/excursion at typical
-        # calibrated listening levels.
+        # The cap depends on intent. Generic FIRs (PEQ-equivalent arbitrary
+        # writes) get the strict thermal/excursion cap. Modal-cancellation
+        # FIRs from ``design_modal_fir`` get a looser cap: their boost at the
+        # mode is meant to cancel the room mode at the listener, so net SPL
+        # at the listening position is unchanged; only the driver sees the
+        # boosted level, well within thermal/excursion at typical calibrated
+        # listening levels. For below-port-tune leakage from anti-pulses
+        # (one half-wavelength transient pulse, ~14 ms), the same logic
+        # applies: the boost is transient and below port tuning the
+        # mandatory HPF further limits driver excursion.
         if intent == "modal_cancel":
             above_floor_limit = prof.modal_cancel_max_boost_db
+            below_floor_limit = prof.modal_cancel_max_boost_db
             cap_label = (
                 f"modal-cancellation cap of +{above_floor_limit:.0f} dB"
             )
         else:
             above_floor_limit = prof.max_boost_above_threshold_db
+            below_floor_limit = prof.max_boost_per_band_db
             cap_label = f"thermal ceiling of +{above_floor_limit:.0f} dB"
 
         for centre, peak_db in per_band.items():
