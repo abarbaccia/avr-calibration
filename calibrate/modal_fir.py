@@ -33,7 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 import numpy as np
-from scipy.signal import minimum_phase, butter, sosfilt
+from scipy.signal import minimum_phase, butter, sosfilt, iirpeak, lfilter
 
 
 @dataclass
@@ -47,6 +47,39 @@ class ModeIntent:
     bp_q: float = 1.5              # bandpass Q for anti-pulse envelope
     envelope: str = "gabor"        # "gabor" (default) or "butterworth" (legacy)
     rationale: str = ""
+    # Provenance flags. When True, the value was explicitly supplied by the
+    # caller and must not be overridden by adjacent-mode-density auto-selection.
+    bp_q_user_set: bool = False
+    envelope_user_set: bool = False
+
+
+def _auto_envelope_for_mode(
+    mode_freq: float,
+    all_anti_pulse_modes: list[float],
+    default_bp_q: float = 1.5,
+) -> tuple[str, float, bool]:
+    """Pick (envelope, bp_q, warn_dense) based on adjacent-mode log-distance.
+
+    Adjacent anti-pulse modes within ~1 octave force a narrower Gabor envelope
+    so spectral skirts do not leak into the neighbour's 1/3-oct band and trip
+    the modal_cancel safety cap.
+
+      * nearest neighbour > 1 octave (or none): default Gabor at ``default_bp_q``.
+      * 0.5 .. 1.0 octave: bump bp_q to 3.0 (still Gabor).
+      * < 0.5 octave (very dense triplets like 47/70/94 Hz): bump bp_q to 5.0
+        and signal ``warn_dense=True`` so the caller can suggest a
+        compensation_notch.
+    """
+    others = [f for f in all_anti_pulse_modes if abs(f - mode_freq) > 1e-6]
+    if not others:
+        return ("gabor", float(default_bp_q), False)
+    nearest = min(others, key=lambda f: abs(np.log2(f / mode_freq)))
+    octaves = abs(np.log2(nearest / mode_freq))
+    if octaves > 1.0:
+        return ("gabor", float(default_bp_q), False)
+    if octaves >= 0.5:
+        return ("gabor", 3.0, False)
+    return ("gabor", 5.0, True)
 
 
 @dataclass
@@ -59,6 +92,7 @@ class DesignSummary:
     mode_treatments: list[dict] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     safety_budget: list[dict] = field(default_factory=list)
+    compensation_notches: list[dict] = field(default_factory=list)
 
 
 def design_anti_pulse(freq_hz: float, peak_db: float, cancel_strength: float,
@@ -228,6 +262,7 @@ class ModalAwareFIRDesigner:
                 magnitude_focus_hz: tuple[float, float] | None = None,
                 anchor_freq_hz: float | None = None,
                 modal_cancel_max_boost_db: float | None = None,
+                compensation_notch: bool = False,
                 ) -> tuple[list[float], DesignSummary]:
         """Generate a modal-aware mixed-phase FIR.
 
@@ -304,6 +339,28 @@ class ModalAwareFIRDesigner:
         # entries without disturbing ordering.
         treatment_index: dict[int, dict] = {}
 
+        # 5a. Adjacent-mode-density-aware envelope/bp_q auto-selection.
+        # When the caller did NOT explicitly supply bp_q or envelope on an
+        # anti_pulse intent, choose them from the *set* of anti_pulse mode
+        # frequencies so densely-spaced modes get a narrower Gabor (less
+        # spectral-skirt leak into neighbours' 1/3-oct bands).
+        anti_pulse_freqs = [
+            float(i.freq_hz) for i in intents if i.treatment == "anti_pulse"
+        ]
+        auto_envelope_decisions: dict[int, tuple[str, float, bool]] = {}
+        for idx, intent in enumerate(intents):
+            if intent.treatment != "anti_pulse":
+                continue
+            if intent.bp_q_user_set or intent.envelope_user_set:
+                continue
+            env, bp_q, warn_dense = _auto_envelope_for_mode(
+                float(intent.freq_hz), anti_pulse_freqs,
+            )
+            # Only mark as auto-selected when at least one of (envelope, bp_q)
+            # actually differs from the dataclass defaults.
+            if env != intent.envelope or abs(bp_q - intent.bp_q) > 1e-6:
+                auto_envelope_decisions[idx] = (env, bp_q, warn_dense)
+
         for idx, intent in enumerate(intents):
             entry = {
                 "freq_hz": intent.freq_hz,
@@ -312,13 +369,31 @@ class ModalAwareFIRDesigner:
             }
 
             if intent.treatment == "anti_pulse":
+                # Apply auto-envelope selection if the caller didn't pin
+                # bp_q/envelope on this intent.
+                eff_envelope = intent.envelope
+                eff_bp_q = intent.bp_q
+                if idx in auto_envelope_decisions:
+                    auto_env, auto_bp_q, warn_dense = auto_envelope_decisions[idx]
+                    eff_envelope = auto_env
+                    eff_bp_q = auto_bp_q
+                    entry["auto_envelope_selected"] = True
+                    entry["auto_envelope"] = auto_env
+                    entry["auto_bp_q"] = round(float(auto_bp_q), 3)
+                    if warn_dense:
+                        summary.notes.append(
+                            f"dense-mode warning: {intent.freq_hz:.0f} Hz has an "
+                            f"adjacent anti_pulse mode within 0.5 octave; bp_q "
+                            f"raised to {auto_bp_q:.0f} — consider a "
+                            f"compensation_notch on the leaked band"
+                        )
                 anti = design_anti_pulse(
                     freq_hz=intent.freq_hz,
                     peak_db=intent.peak_db,
                     cancel_strength=intent.cancel_strength,
                     sample_rate=self.sr,
-                    bp_q=intent.bp_q,
-                    envelope=intent.envelope,
+                    bp_q=eff_bp_q,
+                    envelope=eff_envelope,
                 )
                 # Anti-pulse position: pre_samples - half_cycle
                 half_cycle_samples = int(0.5 * self.sr / intent.freq_hz)
@@ -365,12 +440,24 @@ class ModalAwareFIRDesigner:
         # ≤6 iterations, jointly across pulses) until all adjacent bands fit.
         if anti_records and modal_cancel_max_boost_db is not None:
             cap_db = float(modal_cancel_max_boost_db)
-            self._iteratively_fit_adjacent_band_cap(
-                fir=fir,
-                anti_records=anti_records,
-                cap_db=cap_db,
-                summary=summary,
-            )
+            if compensation_notch:
+                # Alternative path: keep cancel_strength HIGH, then add narrow
+                # magnitude notches on adjacent over-cap bands. Verifies the
+                # mode's cancellation is preserved (notch BW > mode BW would
+                # destroy the cancellation, so we abort the notch in that case).
+                self._apply_compensation_notches(
+                    fir=fir,
+                    anti_records=anti_records,
+                    cap_db=cap_db,
+                    summary=summary,
+                )
+            else:
+                self._iteratively_fit_adjacent_band_cap(
+                    fir=fir,
+                    anti_records=anti_records,
+                    cap_db=cap_db,
+                    summary=summary,
+                )
 
         # 6. Optional magnitude-correction layer for target-curve tracking.
         # When target_curve_db + source_fr_db are provided, the unified design
@@ -449,6 +536,155 @@ class ModalAwareFIRDesigner:
             if np.any(mask):
                 out[centre] = float(np.max(mag_db[mask]))
         return out
+
+    def _apply_compensation_notches(
+        self,
+        fir: np.ndarray,
+        anti_records: list[dict],
+        cap_db: float,
+        summary: DesignSummary,
+    ) -> None:
+        """Keep anti-pulse cancel_strength HIGH; suppress over-cap leakage with
+        narrow magnitude notches.
+
+        Strategy:
+          1. Identify each adjacent 1/3-oct band whose peak exceeds ``cap_db``.
+          2. For each over-cap band, design a Q≈5 peaking-cut biquad sized to
+             pull the band down to (cap − 0.5 dB).
+          3. Verify mode preservation: the depression at ``mode_freq`` must be
+             ≥ 80% of the no-notch depression. If the notch directly overlaps
+             the mode centre (notch BW envelopes the mode), abort that notch
+             and record a warning.
+          4. Apply each surviving notch via ``scipy.signal.lfilter`` in place.
+        """
+        n_fft = max(4096, int(2 ** np.ceil(np.log2(max(len(fir), 2)))))
+
+        def _mag_db_at(arr: np.ndarray, freq: float) -> float:
+            spec = np.fft.rfft(arr, n=n_fft)
+            freqs = np.fft.rfftfreq(n_fft, d=1.0 / float(self.sr))
+            idx = int(np.argmin(np.abs(freqs - freq)))
+            return float(20.0 * np.log10(max(abs(spec[idx]), 1e-9)))
+
+        # Mark per-mode achieved strength = requested (no amplitude reduction
+        # in this path) and predicted T60 reduction accordingly.
+        for rec in anti_records:
+            entry = rec["entry"]
+            entry["cancel_strength_achieved"] = round(
+                float(rec["requested_strength"]), 4
+            )
+            entry["anti_pulse_amplitude"] = round(float(rec["base_amp"]), 4)
+            entry["predicted_t60_reduction_pct"] = int(
+                rec["requested_strength"] * 60
+            )
+
+        # Snapshot the pre-notch FIR for verifying mode-cancellation depression.
+        pre_notch_fir = fir.copy()
+
+        # Collect all over-cap adjacent bands across all anti-pulses.
+        band_peaks = self._per_band_peak_db(fir)
+        over_cap: dict[float, dict] = {}
+        for rec in anti_records:
+            for centre in self._adjacent_band_centres(rec["freq_hz"]):
+                level = band_peaks.get(centre)
+                if level is None or level <= cap_db:
+                    continue
+                if centre not in over_cap or level > over_cap[centre]["level_db"]:
+                    over_cap[centre] = {
+                        "level_db": float(level),
+                        "neighbour_mode_hz": float(rec["freq_hz"]),
+                    }
+
+        notch_q = 5.0
+        for centre, info in sorted(over_cap.items()):
+            level = info["level_db"]
+            mode_hz = info["neighbour_mode_hz"]
+            cut_db = -(level - cap_db + 0.5)
+            if cut_db >= -0.05:
+                continue
+
+            # Mode-bandwidth check. If the compensation notch's nominal BW
+            # (≈ centre/Q) envelopes the neighbouring mode centre, the notch
+            # would directly cut the cancellation energy → abort.
+            notch_bw = centre / notch_q
+            notch_lo = centre - notch_bw / 2.0
+            notch_hi = centre + notch_bw / 2.0
+            if notch_lo <= mode_hz <= notch_hi:
+                summary.notes.append(
+                    f"compensation_notch skipped: {centre:.1f} Hz notch "
+                    f"(BW={notch_bw:.1f} Hz) overlaps mode at {mode_hz:.1f} Hz"
+                )
+                continue
+
+            # Hand-rolled RBJ peaking EQ biquad (cut).
+            A = 10.0 ** (cut_db / 40.0)
+            w0 = 2.0 * np.pi * centre / float(self.sr)
+            cos_w0 = np.cos(w0)
+            alpha = np.sin(w0) / (2.0 * notch_q)
+            b0 = 1.0 + alpha * A
+            b1 = -2.0 * cos_w0
+            b2 = 1.0 - alpha * A
+            a0 = 1.0 + alpha / A
+            a1 = -2.0 * cos_w0
+            a2 = 1.0 - alpha / A
+            b = np.array([b0, b1, b2]) / a0
+            a = np.array([1.0, a1 / a0, a2 / a0])
+
+            candidate = lfilter(b, a, fir).astype(fir.dtype)
+
+            # Verify cancellation preserved at the neighbouring mode centre.
+            # The notch must not shift the FIR magnitude at ``mode_hz`` by
+            # more than 1 dB — any larger drop means the notch BW reaches the
+            # cancellation zone and undoes the anti-pulse.
+            mag_pre = _mag_db_at(pre_notch_fir, mode_hz)
+            mag_post = _mag_db_at(candidate, mode_hz)
+            if abs(mag_post - mag_pre) > 1.0:
+                summary.notes.append(
+                    f"compensation_notch aborted: {centre:.1f} Hz notch "
+                    f"shifts FIR magnitude at mode {mode_hz:.1f} Hz by "
+                    f"{mag_post - mag_pre:+.2f} dB (>1 dB) — notch BW "
+                    f"overlaps cancellation"
+                )
+                continue
+
+            # Commit the notch.
+            fir[:] = candidate
+            summary.compensation_notches.append({
+                "freq_hz": round(float(centre), 2),
+                "gain_db": round(float(cut_db), 2),
+                "q": round(float(notch_q), 2),
+                "neighbour_mode_hz": round(float(mode_hz), 2),
+                "pre_band_peak_db": round(float(level), 2),
+            })
+
+        # Populate per-mode safety_budget post-notch.
+        post_peaks = self._per_band_peak_db(fir)
+        for rec in anti_records:
+            adj_bands = self._adjacent_band_centres(rec["freq_hz"])
+            band_peaks_now = {c: post_peaks.get(c, -np.inf) for c in adj_bands}
+            worst = max(band_peaks_now.values(), default=-np.inf)
+            entry = rec["entry"]
+            entry["adjacent_band_peak_db"] = (
+                round(float(worst), 2) if np.isfinite(worst) else None
+            )
+            entry["adjacent_band_cap_db"] = round(float(cap_db), 2)
+            mode_round = round(float(rec["freq_hz"]), 2)
+            summary.safety_budget.append({
+                "mode_freq_hz": mode_round,
+                "adjacent_bands_hz": [round(c, 1) for c in adj_bands],
+                "max_boost_db": (
+                    round(float(worst), 2) if np.isfinite(worst) else None
+                ),
+                "cap_db": round(float(cap_db), 2),
+                "headroom_db": (
+                    round(float(cap_db - worst), 2)
+                    if np.isfinite(worst)
+                    else None
+                ),
+                "compensation_notch_used": any(
+                    cn["neighbour_mode_hz"] == mode_round
+                    for cn in summary.compensation_notches
+                ),
+            })
 
     def _iteratively_fit_adjacent_band_cap(
         self,

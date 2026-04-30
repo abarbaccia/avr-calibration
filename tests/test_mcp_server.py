@@ -6604,6 +6604,198 @@ async def test_design_modal_fir_no_anti_pulse_unchanged() -> None:
     assert a["safety_budget"] == []
 
 
+@pytest.mark.asyncio
+async def test_design_modal_fir_compensation_notch_keeps_cancel_strength() -> None:
+    """compensation_notch=True keeps achieved cancel_strength == requested
+    and adds narrow notches on adjacent over-cap bands."""
+    decay_modes = [{"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0}]
+    intents = [{
+        "freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0,
+        "treatment": "anti_pulse", "cancel_strength": 0.6, "bp_q": 1.5,
+    }]
+    session = _make_modal_session(decay_modes)
+    # Tight cap to force compensation notches to be needed.
+    with patch("calibrate.storage.SessionStore") as MockStore, \
+         patch("calibrate.graph.SVS_PB12_NSD_PROFILE") as MockProfile:
+        MockStore.return_value.list_sessions.return_value = [session]
+        MockProfile.modal_cancel_max_boost_db = 3.0
+        result = await _tool_design_modal_fir(
+            session_id=1, intents=intents,
+            num_taps=4096, max_pre_ring_ms=25.0, samplerate=8000,
+            compensation_notch=True, return_coefficients=True,
+        )
+    assert result["ok"], result
+    treatment = result["per_mode_treatments"][0]
+    assert treatment["treatment"] == "anti_pulse"
+    # Achieved == requested (no iterative amplitude reduction in this path).
+    assert treatment["cancel_strength_requested"] == 0.6
+    assert treatment["cancel_strength_achieved"] == 0.6
+    # compensation_notches surfaced and non-empty.
+    assert "compensation_notches" in result
+    assert len(result["compensation_notches"]) >= 1
+    cn = result["compensation_notches"][0]
+    assert "freq_hz" in cn and "gain_db" in cn and "q" in cn
+    assert cn["gain_db"] < 0.0  # cuts only
+    assert 4.0 <= cn["q"] <= 6.0
+
+
+@pytest.mark.asyncio
+async def test_design_modal_fir_compensation_notch_preserves_modal_cancellation() -> None:
+    """Adding compensation notches must not undo the cancellation at the mode
+    centre — the depression at 70 Hz with notches should be within ~1 dB of
+    the no-notch baseline."""
+    import numpy as np
+    decay_modes = [{"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0}]
+    intents = [{
+        "freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0,
+        "treatment": "anti_pulse", "cancel_strength": 0.6, "bp_q": 1.5,
+    }]
+    session = _make_modal_session(decay_modes)
+    with patch("calibrate.storage.SessionStore") as MockStore, \
+         patch("calibrate.graph.SVS_PB12_NSD_PROFILE") as MockProfile:
+        MockStore.return_value.list_sessions.return_value = [session]
+        MockProfile.modal_cancel_max_boost_db = 3.0
+        with_notch = await _tool_design_modal_fir(
+            session_id=1, intents=intents,
+            num_taps=4096, samplerate=8000,
+            compensation_notch=True, return_coefficients=True,
+        )
+        # Baseline: same FIR design but without compensation notches AND
+        # without iterative amplitude reduction (use a permissive cap).
+        MockProfile.modal_cancel_max_boost_db = 100.0
+        baseline = await _tool_design_modal_fir(
+            session_id=1, intents=intents,
+            num_taps=4096, samplerate=8000,
+            compensation_notch=False, return_coefficients=True,
+        )
+    assert with_notch["ok"] and baseline["ok"]
+
+    def _mag_db_at(coeffs, freq, sr=8000):
+        arr = np.array(coeffs, dtype=np.float32)
+        n_fft = 8192
+        spec = np.fft.rfft(arr, n=n_fft)
+        freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)
+        idx = int(np.argmin(np.abs(freqs - freq)))
+        return float(20.0 * np.log10(max(abs(spec[idx]), 1e-9)))
+
+    mag_with = _mag_db_at(with_notch["coefficients"], 70.0)
+    mag_base = _mag_db_at(baseline["coefficients"], 70.0)
+    # Cancellation depression at the mode centre should be preserved within
+    # ~1 dB (the notches are far enough away at 50 Hz to not reach 70 Hz).
+    assert abs(mag_with - mag_base) <= 1.0, (
+        f"cancellation diverged: baseline {mag_base:.2f} dB vs "
+        f"with-notch {mag_with:.2f} dB"
+    )
+
+
+@pytest.mark.asyncio
+async def test_design_modal_fir_compensation_notch_default_false() -> None:
+    """compensation_notch defaults to False — output is byte-identical to the
+    post-2d18420 iterative-amplitude behaviour (regression guard)."""
+    decay_modes = [{"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0}]
+    intents = [{"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0,
+                "treatment": "anti_pulse", "cancel_strength": 0.6, "bp_q": 1.5}]
+    session = _make_modal_session(decay_modes)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        default = await _tool_design_modal_fir(
+            session_id=1, intents=intents, num_taps=1024, samplerate=8000,
+            return_coefficients=True,
+        )
+        explicit = await _tool_design_modal_fir(
+            session_id=1, intents=intents, num_taps=1024, samplerate=8000,
+            compensation_notch=False, return_coefficients=True,
+        )
+    assert default["ok"] and explicit["ok"]
+    assert default["coefficients"] == explicit["coefficients"]
+    # No notches added in default path.
+    assert default.get("compensation_notches", []) == []
+
+
+@pytest.mark.asyncio
+async def test_design_modal_fir_auto_envelope_dense_modes() -> None:
+    """Dense triplet (47/70/94 Hz, ~half-octave each) auto-bumps bp_q for the
+    inner mode (70 Hz) so its Gabor skirt does not leak into 50/63/80 bands.
+
+    No bp_q/envelope passed by caller → designer is free to auto-select.
+    Expect bp_q ∈ {3, 5} and ``auto_envelope_selected=True`` on inner mode.
+    """
+    decay_modes = [
+        {"freq_hz": 47.0, "t60_ms": 1100, "peak_db": 8.0},
+        {"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0},
+        {"freq_hz": 94.0, "t60_ms": 1100, "peak_db": 8.0},
+    ]
+    intents = [
+        {"freq_hz": 47.0, "t60_ms": 1100, "peak_db": 8.0,
+         "treatment": "anti_pulse", "cancel_strength": 0.4},
+        {"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0,
+         "treatment": "anti_pulse", "cancel_strength": 0.4},
+        {"freq_hz": 94.0, "t60_ms": 1100, "peak_db": 8.0,
+         "treatment": "anti_pulse", "cancel_strength": 0.4},
+    ]
+    session = _make_modal_session(decay_modes)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_modal_fir(
+            session_id=1, intents=intents, num_taps=4096, samplerate=8000,
+        )
+    assert result["ok"], result
+    by_freq = {t["freq_hz"]: t for t in result["per_mode_treatments"]}
+    inner = by_freq[70.0]
+    assert inner.get("auto_envelope_selected") is True
+    assert inner.get("auto_envelope") == "gabor"
+    assert inner.get("auto_bp_q") in (3.0, 5.0)
+
+
+@pytest.mark.asyncio
+async def test_design_modal_fir_auto_envelope_sparse_modes() -> None:
+    """A single 70 Hz anti_pulse with no neighbours keeps default bp_q=1.5
+    and does NOT mark auto_envelope_selected."""
+    decay_modes = [{"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0}]
+    intents = [{"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0,
+                "treatment": "anti_pulse", "cancel_strength": 0.4}]
+    session = _make_modal_session(decay_modes)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_modal_fir(
+            session_id=1, intents=intents, num_taps=4096, samplerate=8000,
+        )
+    assert result["ok"], result
+    treatment = result["per_mode_treatments"][0]
+    assert treatment.get("auto_envelope_selected") is not True
+
+
+@pytest.mark.asyncio
+async def test_design_modal_fir_user_bp_q_not_overridden() -> None:
+    """When the user explicitly passes bp_q on an intent, the designer must
+    NOT override it via adjacent-mode auto-selection — even with dense
+    neighbours that would otherwise bump bp_q to 3 or 5."""
+    decay_modes = [
+        {"freq_hz": 47.0, "t60_ms": 1100, "peak_db": 8.0},
+        {"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0},
+        {"freq_hz": 94.0, "t60_ms": 1100, "peak_db": 8.0},
+    ]
+    intents = [
+        {"freq_hz": 47.0, "t60_ms": 1100, "peak_db": 8.0,
+         "treatment": "anti_pulse", "cancel_strength": 0.4, "bp_q": 2.0},
+        {"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0,
+         "treatment": "anti_pulse", "cancel_strength": 0.4, "bp_q": 2.0},
+        {"freq_hz": 94.0, "t60_ms": 1100, "peak_db": 8.0,
+         "treatment": "anti_pulse", "cancel_strength": 0.4, "bp_q": 2.0},
+    ]
+    session = _make_modal_session(decay_modes)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_modal_fir(
+            session_id=1, intents=intents, num_taps=4096, samplerate=8000,
+        )
+    assert result["ok"], result
+    for t in result["per_mode_treatments"]:
+        # User wins: no auto-override marker.
+        assert t.get("auto_envelope_selected") is not True
+        assert "auto_bp_q" not in t
+
+
 def test_validate_fir_message_names_culprit_modes() -> None:
     """validate_fir(intent='modal_cancel') error names nearby boost bands."""
     import numpy as np

@@ -3854,6 +3854,7 @@ async def _tool_design_modal_fir(
     samplerate: int = 48000,
     return_coefficients: bool = False,
     anchor: dict | None = None,
+    compensation_notch: bool = False,
 ) -> dict:
     """Design a modal-aware mixed-phase FIR with explicit per-mode treatment.
 
@@ -3980,6 +3981,8 @@ async def _tool_design_modal_fir(
                     bp_q=float(i.get("bp_q", 1.5)),
                     envelope=str(i.get("envelope", "gabor")),
                     rationale=str(i.get("rationale", "")),
+                    bp_q_user_set="bp_q" in i,
+                    envelope_user_set="envelope" in i,
                 )
                 for i in intents
             ]
@@ -4156,6 +4159,7 @@ async def _tool_design_modal_fir(
             magnitude_focus_hz=magnitude_focus_hz,
             anchor_freq_hz=anchor_freq_for_designer,
             modal_cancel_max_boost_db=modal_cap_db,
+            compensation_notch=bool(compensation_notch),
         )
 
         _fir_design_cache[int(session_id)] = list(coeffs)
@@ -4170,6 +4174,7 @@ async def _tool_design_modal_fir(
             "peak_amplitude": round(summary.peak_amplitude, 4),
             "per_mode_treatments": summary.mode_treatments,
             "safety_budget": summary.safety_budget,
+            "compensation_notches": summary.compensation_notches,
             "notes": summary.notes,
             "latency_budget": latency_budget_breakdown(summary),
             "design_cached": True,
@@ -9207,6 +9212,21 @@ _TOOLS: list[Tool] = [
                         },
                         "freq_hz": {"type": "number"},
                     },
+                },
+                "compensation_notch": {
+                    "type": "boolean",
+                    "description": (
+                        "When true, keep cancel_strength HIGH and instead "
+                        "add narrow Q≈5 magnitude cuts on adjacent 1/3-oct "
+                        "bands that exceed the modal_cancel cap. Verifies "
+                        "the mode's cancellation depression is preserved "
+                        "(≥80% of pre-notch); aborts the notch if it would "
+                        "destroy cancellation. Returns added notches in "
+                        "the ``compensation_notches`` field. Default false "
+                        "preserves the post-2d18420 iterative-amplitude "
+                        "behaviour."
+                    ),
+                    "default": False,
                 },
             },
             "required": ["session_id"],
