@@ -276,3 +276,177 @@ async def push_speaker_distances(
         commit,
         timeout,
     )
+
+
+# ── FIR coefficient upload — full envelope + per-channel SET_COEFDT streams ──
+
+def _push_filters_sync(
+    host: str,
+    port: int,
+    *,
+    setdat_envelope: dict,
+    coef_packets_per_channel: list[tuple[str, list[bytes]]],
+    inter_packet_ms: float = 0.0,
+    inter_channel_ms: float = 20.0,
+    coef_wait_final_ms: float = 15000.0,
+    timeout: float = 30.0,
+) -> dict:
+    """End-to-end FIR upload sequence — synchronous, called via executor.
+
+    Sequence (per A1EvoAcoustica/main.js + audyssey-rew-tuner orchestrator):
+
+      ENTER_AUDY
+      SET_SETDAT (full ordered envelope, AudyFinFlg=NotFin)
+      [INIT_COEFS only if DType startsWith "fixed" — caller decides]
+      for tc in target_curves:
+        for channel in sorted_channels:
+          for sr in sample_rates:
+            stream SET_COEFDT × N packets   # NO ACK on coef msgs
+            sleep inter_packet_ms / inter_channel_ms
+      sleep coef_wait_final_ms (default 15 s on X3800H)
+      FINZ_COEFS                            → ACK
+      SET_SETDAT {"AudyFinFlg":"Fin"}      → ACK (commit)
+      EXIT_AUDMD                            → ACK
+
+    Args:
+        setdat_envelope: full SET_SETDAT payload — caller's responsibility
+            to include all 16 ordered fields with AudyFinFlg="NotFin".
+        coef_packets_per_channel: list of ``(channel_id, [packets])`` in
+            the order the AVR expects (typically outer = target curve,
+            inner = channel, innermost = sample rate; flatten with
+            ``audyssey_coef_transfer.all_streams_for_channel``).
+        inter_packet_ms: sleep between SET_COEFDT packets within a stream.
+            X3800H tolerates 0 in practice but 1-2 is safer for slow links.
+        inter_channel_ms: sleep between channels (matches transfer.js
+            20ms inter-channel delay).
+        coef_wait_final_ms: post-stream pause before FINZ_COEFS. Default
+            15 000 ms matches X3800H GET_AVRINF.CoefWaitTime.Final.
+        timeout: socket timeout per recv (frames are tiny).
+
+    Returns dict with per-stage status. Raises OSError / RuntimeError on
+    fatal errors (no ACK on ENTER_AUDY, NACK on commit, etc.).
+    """
+    sock = socket.create_connection((host, port), timeout=timeout)
+    sock.settimeout(timeout)
+
+    rxbuf = bytearray()
+    status: dict = {
+        "enter_audy": None,
+        "set_setdat_envelope": None,
+        "coef_streams_sent": 0,
+        "coef_packets_sent": 0,
+        "finz_coefs": None,
+        "commit": None,
+        "exit_audmd": None,
+    }
+
+    def drain(seconds: float) -> list[str]:
+        """Drain inbound frames; return list of received command names."""
+        end = time.monotonic() + seconds
+        cmds: list[str] = []
+        while time.monotonic() < end:
+            try:
+                sock.settimeout(max(0.05, end - time.monotonic()))
+                c = sock.recv(65536)
+            except (socket.timeout, TimeoutError):
+                return cmds
+            if not c:
+                return cmds
+            rxbuf.extend(c)
+            # naive frame scan — we just look for command name + ACK
+            i = 0
+            while i + 19 <= len(rxbuf):
+                if rxbuf[i] not in (ord("T"), ord("R")):
+                    i += 1
+                    continue
+                tl = (rxbuf[i + 1] << 8) | rxbuf[i + 2]
+                if i + tl > len(rxbuf):
+                    break
+                cmd = bytes(rxbuf[i + 5: i + 15]).decode("ascii", errors="replace").rstrip("\x00")
+                cmds.append(cmd.strip())
+                i += tl
+            del rxbuf[:i]
+        return cmds
+
+    try:
+        # 1. ENTER_AUDY
+        sock.sendall(build_frame("ENTER_AUDY"))
+        cmds = drain(1.5)
+        status["enter_audy"] = "ENTER_AUDY" in cmds
+
+        # 2. SET_SETDAT (full envelope, AudyFinFlg=NotFin)
+        body = json.dumps(setdat_envelope, separators=(",", ":")).encode("ascii")
+        sock.sendall(build_frame("SET_SETDAT", body))
+        cmds = drain(3.0)
+        status["set_setdat_envelope"] = "SET_SETDAT" in cmds and "ERROR" not in cmds
+
+        # 3. Coefficient streams (no ACK from AVR on these — fire and forget)
+        for channel_id, packets in coef_packets_per_channel:
+            for pkt in packets:
+                sock.sendall(pkt)
+                if inter_packet_ms > 0:
+                    time.sleep(inter_packet_ms / 1000.0)
+                status["coef_packets_sent"] += 1
+            status["coef_streams_sent"] += 1
+            if inter_channel_ms > 0:
+                time.sleep(inter_channel_ms / 1000.0)
+
+        # 4. Wait for AVR to finish digesting coefficients
+        if coef_wait_final_ms > 0:
+            time.sleep(coef_wait_final_ms / 1000.0)
+
+        # 5. FINZ_COEFS
+        sock.sendall(build_frame("FINZ_COEFS"))
+        cmds = drain(5.0)  # FINZ may take longer on big uploads
+        status["finz_coefs"] = "FINZ_COEFS" in cmds
+
+        # 6. AudyFinFlg=Fin commit
+        sock.sendall(build_frame("SET_SETDAT", COMMIT_BODY))
+        cmds = drain(2.0)
+        status["commit"] = "SET_SETDAT" in cmds and "ERROR" not in cmds
+
+        # 7. EXIT_AUDMD
+        sock.sendall(build_frame("EXIT_AUDMD"))
+        cmds = drain(1.5)
+        status["exit_audmd"] = "EXIT_AUDMD" in cmds
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    return status
+
+
+async def push_filter_set(
+    host: str,
+    *,
+    setdat_envelope: dict,
+    coef_packets_per_channel: list[tuple[str, list[bytes]]],
+    inter_packet_ms: float = 0.0,
+    inter_channel_ms: float = 20.0,
+    coef_wait_final_ms: float = 15000.0,
+    port: int = DEFAULT_PORT,
+    timeout: float = 30.0,
+) -> dict:
+    """Async wrapper around :func:`_push_filters_sync`.
+
+    Run via the default thread-pool executor. See ``_push_filters_sync``
+    for argument semantics + sequence detail.
+
+    Caller MUST NOT enter Manual Setup > Distances on the AVR after this
+    write — same constraint as the distance bypass: re-validation on
+    menu open snaps Audyssey state.
+    """
+    return await asyncio.get_running_loop().run_in_executor(
+        None,
+        lambda: _push_filters_sync(
+            host,
+            port,
+            setdat_envelope=setdat_envelope,
+            coef_packets_per_channel=coef_packets_per_channel,
+            inter_packet_ms=inter_packet_ms,
+            inter_channel_ms=inter_channel_ms,
+            coef_wait_final_ms=coef_wait_final_ms,
+            timeout=timeout,
+        ),
+    )
