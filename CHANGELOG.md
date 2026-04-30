@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.9.7] - 2026-04-30
+
+### Added
+- **`calibrate/audyssey_fir.py`** — XT32 polyphase FIR designer. Generates a 16,321-tap (speaker) or 16,055-tap (sub) impulse response from a target FR curve, then polyphase-decimates 4-band to the AVR's expected 1024 / 704 coefficient vector. Math ported with attribution from `srinivas486/audyssey-rew-tuner` (MIT-licensed). Includes channel-byte mapping table for SET_COEFDT routing, sample-rate codes (32k/44.1k/48k/96k), and `design_correction_ir` / `design_passthrough_ir` helpers.
+- **`calibrate/drivers/denon/audyssey_coef_transfer.py`** — SET_COEFDT packet builder. Frames 1024/704-float vectors into the AVR's variable-length packet stream (1×127 floats first, ~7×128 mid, last partial — total 9 packets per stream for speakers, 6 for subs). Builds one stream per (target_curve × sample_rate) tuple — XT32 expects 6 streams per channel (Reference + Flat × 3 sample rates), so 54 packets for a speaker / 36 for a sub.
+- 46 new tests (`tests/test_audyssey_fir.py`, `tests/test_audyssey_coef_transfer.py`) — channel-byte table coverage, polyphase decomposition round-trip, multi-rate output-length checks for speaker/sub, packet framing + checksum + round-trip of LE float32 coefficients, all-streams-per-channel counts.
+
+These are the building blocks for direct-uploading custom FIR coefficients to the AVR — the last protocol layer needed for an LLM-driven mains calibration loop. The TCP orchestration that ties them together (full SET_SETDAT envelope → coefficient streams → FINZ_COEFS → AudyFinFlg=Fin commit) and the MCP `design_avr_fir` / `apply_avr_fir` tools are not in this version yet.
+
 ## [0.6.9.6] - 2026-04-30
 
 ### Added / Changed

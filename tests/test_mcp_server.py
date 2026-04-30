@@ -6318,11 +6318,13 @@ async def test_design_modal_fir_target_curve_adds_magnitude_correction() -> None
         MockStore.return_value.list_sessions.return_value = [session]
         with_target = await _tool_design_modal_fir(
             session_id=1, intents=intents, target_curve=target_curve,
-            num_taps=4096, max_pre_ring_ms=25.0, return_coefficients=True,
+            num_taps=4096, max_pre_ring_ms=25.0, samplerate=8000,
+            return_coefficients=True,
         )
         without_target = await _tool_design_modal_fir(
             session_id=1, intents=intents,
-            num_taps=4096, max_pre_ring_ms=25.0, return_coefficients=True,
+            num_taps=4096, max_pre_ring_ms=25.0, samplerate=8000,
+            return_coefficients=True,
         )
     assert with_target["ok"] and without_target["ok"]
     # The unified design should append a note about the magnitude layer.
@@ -6399,7 +6401,7 @@ async def test_set_speaker_distances_dispatches_to_driver() -> None:
     assert result["avr_max_delay_ms"] == 65.0
     assert result["audyssey"]["active"] is True
     avr.set_speaker_distances.assert_awaited_once_with(
-        {"FL": 4.05, "SW1": 30.72}, n_positions=3, commit=True,
+        {"FL": 4.05, "SW1": 30.72}, n_positions=3, commit=True, use_custom=False,
     )
 
 
@@ -6532,7 +6534,7 @@ async def test_set_speaker_distances_skips_audyssey_check_when_unsupported() -> 
     """AVR drivers without audyssey_status (future YamahaDriver etc.) don't crash the tool."""
     class _PlainAvr:
         MAX_SPEAKER_DELAY_MS = 65.0
-        async def set_speaker_distances(self, distances, *, n_positions=1, commit=False):
+        async def set_speaker_distances(self, distances, *, n_positions=1, commit=False, use_custom=False):
             return None
         # no audyssey_status method
     with patch("calibrate.mcp_server._avr", _PlainAvr()):
