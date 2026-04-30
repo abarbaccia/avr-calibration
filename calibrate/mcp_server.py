@@ -3392,6 +3392,7 @@ async def _tool_design_fir(
     freq_focus_hz: list[float] | None = None,
     return_coefficients: bool = True,
     preringing_ms: float = 25.0,
+    anchor: dict | None = None,
 ) -> dict:
     """Design FIR correction coefficients from a measurement.
 
@@ -3463,26 +3464,112 @@ async def _tool_design_fir(
         spl_measured = np.array(fr.spl)
 
         # Target: either provided curve or flat at average SPL
+        anchor_used: dict | None = None
         if target_curve and target_curve.get("points"):
             import math
             target_points = sorted(target_curve["points"], key=lambda p: p["freq"])
-            target_spl_at_freq = []
-            for f in freqs_measured:
-                if f < target_points[0]["freq"]:
-                    target_spl_at_freq.append(target_points[0]["spl"])
-                elif f > target_points[-1]["freq"]:
-                    target_spl_at_freq.append(target_points[-1]["spl"])
-                else:
-                    for i in range(len(target_points) - 1):
-                        f0, s0 = target_points[i]["freq"], target_points[i]["spl"]
-                        f1, s1 = target_points[i + 1]["freq"], target_points[i + 1]["spl"]
-                        if f0 <= f <= f1:
-                            t = math.log(f / f0) / math.log(f1 / f0) if f1 != f0 else 0.0
-                            target_spl_at_freq.append(s0 + t * (s1 - s0))
+            tgt_freqs_pts = [p["freq"] for p in target_points]
+            tgt_vals_pts = [p["spl"] for p in target_points]
+
+            def _interp_target_offset(f: float) -> float:
+                if f <= tgt_freqs_pts[0]:
+                    return tgt_vals_pts[0]
+                if f >= tgt_freqs_pts[-1]:
+                    return tgt_vals_pts[-1]
+                for i in range(len(tgt_freqs_pts) - 1):
+                    f0, s0 = tgt_freqs_pts[i], tgt_vals_pts[i]
+                    f1, s1 = tgt_freqs_pts[i + 1], tgt_vals_pts[i + 1]
+                    if f0 <= f <= f1:
+                        t = math.log(f / f0) / math.log(f1 / f0) if f1 != f0 else 0.0
+                        return s0 + t * (s1 - s0)
+                return tgt_vals_pts[-1]
+
+            def _interp_measured(f: float) -> float:
+                idx = int(np.argmin(np.abs(freqs_measured - f)))
+                return float(spl_measured[idx])
+
+            anchor_mode = (anchor or {}).get("mode", "band_mean")
+
+            if anchor_mode == "band_mean" or anchor is None:
+                # Legacy behavior: target points used as absolute SPL.
+                target_spl_at_freq = [
+                    _interp_target_offset(float(f)) for f in freqs_measured
+                ]
+                target_spl = np.array(target_spl_at_freq)
+                anchor_used = {"mode": "band_mean", "freq_hz": None}
+            else:
+                # Re-anchor: choose anchor freq, then compute absolute target
+                # so target_at(anchor_freq) == measured_at(anchor_freq).
+                if anchor_mode == "freq":
+                    anchor_freq = float(anchor.get("freq_hz") or 0.0)
+                    if anchor_freq <= 0:
+                        return _err("anchor.mode='freq' requires anchor.freq_hz > 0")
+                elif anchor_mode == "deep_bass_priority":
+                    # Search lowest candidate in [band_lo, band_lo + 20] where
+                    # every freq above has measured-relative ≥ target-relative.
+                    if freq_focus_hz:
+                        band_lo_search = float(freq_focus_hz[0])
+                    else:
+                        band_lo_search = float(np.min(freqs_measured))
+                    band_hi_search = band_lo_search + 20.0
+                    # Restrict comparison to freq_focus or full target range
+                    if freq_focus_hz:
+                        cmp_lo, cmp_hi = float(freq_focus_hz[0]), float(freq_focus_hz[1])
+                    else:
+                        cmp_lo, cmp_hi = tgt_freqs_pts[0], tgt_freqs_pts[-1]
+                    candidate_fs = list(
+                        range(int(round(band_lo_search)), int(round(band_hi_search)) + 1)
+                    )
+                    chosen: float | None = None
+                    for cand in candidate_fs:
+                        cf = float(cand)
+                        if cf <= 0 or cf > cmp_hi:
+                            continue
+                        m_anchor = _interp_measured(cf)
+                        t_anchor = _interp_target_offset(cf)
+                        # Sample comparison freqs above anchor at 1 Hz steps
+                        ok = True
+                        for ff in range(int(round(cf)) + 1, int(round(cmp_hi)) + 1):
+                            fff = float(ff)
+                            gap = (
+                                (_interp_measured(fff) - m_anchor)
+                                - (_interp_target_offset(fff) - t_anchor)
+                            )
+                            if gap < -0.5:
+                                ok = False
+                                break
+                        if ok:
+                            chosen = cf
                             break
-            target_spl = np.array(target_spl_at_freq)
+                    if chosen is None:
+                        # Fall back to band_lo_search; document residual
+                        anchor_freq = band_lo_search
+                        anchor_used_residual = True
+                    else:
+                        anchor_freq = chosen
+                        anchor_used_residual = False
+                else:
+                    return _err(
+                        f"anchor.mode must be 'band_mean', 'freq', or "
+                        f"'deep_bass_priority' (got {anchor_mode!r})"
+                    )
+
+                m_at = _interp_measured(anchor_freq)
+                t_at = _interp_target_offset(anchor_freq)
+                ref_spl = m_at - t_at
+                target_spl_at_freq = [
+                    ref_spl + _interp_target_offset(float(f)) for f in freqs_measured
+                ]
+                target_spl = np.array(target_spl_at_freq)
+                anchor_used = {
+                    "mode": anchor_mode,
+                    "freq_hz": round(float(anchor_freq), 2),
+                }
+                if anchor_mode == "deep_bass_priority" and anchor_used_residual:
+                    anchor_used["residual_boost"] = True
         else:
             target_spl = np.full_like(spl_measured, np.mean(spl_measured))
+            anchor_used = {"mode": "band_mean", "freq_hz": None}
 
         # Compute correction curve (dB): what the FIR needs to add
         correction_db = target_spl - spl_measured
@@ -3708,6 +3795,7 @@ async def _tool_design_fir(
             "avr_compensable": avr_compensable,
             "avr_headroom_ms": avr_headroom_ms,
             "design_cached": True,
+            "anchor_used": anchor_used,
         }
 
         budget_msg = ""
@@ -8796,6 +8884,27 @@ _TOOLS: list[Tool] = [
                     ),
                     "default": 25.0,
                 },
+                "anchor": {
+                    "type": "object",
+                    "description": (
+                        "Optional re-anchoring of target_curve. Default (omitted) "
+                        "preserves legacy behavior: target_curve points are used "
+                        "as absolute SPL. \n"
+                        "- mode='band_mean': legacy (default). \n"
+                        "- mode='freq': force target(freq_hz) == measured(freq_hz); "
+                        "downward-sloping curves above the anchor become pure cuts. \n"
+                        "- mode='deep_bass_priority': pick the lowest freq in "
+                        "[band_lo, band_lo+20] where every band above is "
+                        "cut-implementable (gap ≥ -0.5 dB)."
+                    ),
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "enum": ["band_mean", "freq", "deep_bass_priority"],
+                        },
+                        "freq_hz": {"type": "number"},
+                    },
+                },
             },
             "required": ["session_id"],
         },
@@ -9715,6 +9824,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             freq_focus_hz=arguments.get("freq_focus_hz"),
             return_coefficients=bool(arguments.get("return_coefficients", True)),
             preringing_ms=float(arguments.get("preringing_ms", 25.0)),
+            anchor=arguments.get("anchor"),
         )
     elif name == "design_modal_fir":
         result = await _tool_design_modal_fir(
