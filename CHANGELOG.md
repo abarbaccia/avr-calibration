@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.9.9] - 2026-04-30
+
+### Fixed
+- **Preflight `check_denon` now fails loudly when AVR is in standby.** The Denon HTTP service responds in standby — `state["connected"] == True` does not mean "ready to play audio." If `power != "ON"`, Telnet replies vanish silently and sweep measurements come back at SNR = 0. Surfaces a clear "AVR is in standby" failure instead of passing the check. Caught after wasting 30 minutes assuming the AVR was on.
+- **`DenonDriver.get_state` now reports `power`** (was missing). Callers can guard before sending Telnet/sweep commands.
+
+### Added
+- **`DenonSweepContext` auto-powers-on the AVR.** If the AVR is in standby when a sweep context is entered, the context now calls `async_power_on()` and waits up to 10 s for `power == "ON"` before yielding. Sweeps that previously came back silent now either succeed or fail with a clear "AVR did not report power=ON within 10 s" error.
+- **`DenonDriver.async_power_on()`** — public helper to power on the AVR + wait for ON.
+- **`DenonDriver.telnet_query()`** — loud-fail wrapper for Telnet command sequences. Verifies `power == "ON"` first (configurable), sends commands, raises `DriverError` with a diagnostic message if all replies are empty (which happens silently in standby or with an exhausted Telnet pool). Replaces the silent-empty-string pattern that hid the standby bug.
+
 ## [0.6.9.8] - 2026-04-30
 
 ### Added

@@ -292,10 +292,33 @@ class PreflightChecker:
             state = await driver.get_state()
             model = state.get("model", "Denon AVR")
             suffix = " (auto-discovered)" if auto_discovered else ""
+
+            # Power-state guard. The AVR's HTTP service (and therefore the
+            # denonavr library) responds in standby — connected=True does
+            # not mean "ready to play audio." If power != "ON", Telnet
+            # replies disappear and sweep measurements come back at SNR=0.
+            # Surface this loudly so callers don't waste time chasing
+            # protocol bugs that are actually a power switch.
+            power = state.get("power")
+            if power != "ON":
+                return CheckResult(
+                    name="Denon AVR",
+                    passed=False,
+                    detail=(
+                        f"{model} reachable at {host}{suffix} but power={power!r} — "
+                        "audio path is silent and Telnet replies will not arrive."
+                    ),
+                    error=(
+                        "Denon AVR is in standby. Turn it on at the unit / remote, "
+                        "or call set_volume / measure (DenonSweepContext now "
+                        "auto-powers-on at sweep entry)."
+                    ),
+                )
+
             return CheckResult(
                 name="Denon AVR",
                 passed=True,
-                detail=f"{model} online at {host}{suffix}",
+                detail=f"{model} online at {host}{suffix}, power=ON",
             )
         except DriverError as exc:
             return CheckResult(

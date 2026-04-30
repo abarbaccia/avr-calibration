@@ -64,15 +64,43 @@ class DenonDriver(AVRDriver):
         if not self._host:
             return {"connected": False, "error": "no host configured"}
         receiver = await _connect_receiver(self._host)
+        # NOTE: AVR HTTP responds in standby — Telnet replies + sweep audio
+        # do NOT work when power != "ON". Surface power so callers can guard
+        # before sending Telnet/sweep commands.
         return {
             "connected": True,
             "host": self._host,
             "model": receiver.model_name or "Denon AVR",
+            "power": receiver.power,
             "volume": receiver.volume,
             "input": receiver.input_func,
             "mute": receiver.muted,
             "max_speaker_delay_ms": self.MAX_SPEAKER_DELAY_MS,
         }
+
+    async def async_power_on(self) -> str:
+        """Power the AVR on and wait for it to report ON.
+
+        Returns the final power state. Raises DriverError on timeout.
+        """
+        if not self._host:
+            raise DriverError("no host configured")
+        receiver = await _connect_receiver(self._host)
+        if receiver.power == "ON":
+            return "ON"
+        try:
+            await receiver.async_power_on()
+        except Exception as exc:
+            raise DriverError(f"power_on failed: {exc}") from exc
+        # Poll up to 10 s for the AVR to report ON. HDMI handshake usually
+        # needs another ~3 s on top, but ON status is enough for callers
+        # to know Telnet/sweeps will respond.
+        for _ in range(20):
+            await asyncio.sleep(0.5)
+            await receiver.async_update()
+            if receiver.power == "ON":
+                return "ON"
+        raise DriverError("AVR did not report power=ON within 10 s")
 
     async def set_speaker_distances(
         self,
@@ -118,6 +146,108 @@ class DenonDriver(AVRDriver):
             )
         except (OSError, ValueError) as exc:
             raise DriverError(f"audyssey push failed: {exc}")
+
+    async def telnet_query(
+        self,
+        commands: list[str],
+        *,
+        port: int = 23,
+        connect_timeout: float = 5.0,
+        reply_timeout: float = 2.0,
+        require_power_on: bool = True,
+    ) -> dict[str, str]:
+        """Run one or more Denon Telnet commands and return their replies.
+
+        Loud-fail wrapper around the raw Telnet protocol. If the AVR is in
+        standby, replies vanish silently — this helper detects that state
+        and raises DriverError with a clear message instead of returning
+        empty strings.
+
+        Args:
+            commands: e.g. ``["MV?", "CV?", "SI?"]``. The trailing CR is
+                added automatically.
+            port: Telnet port, default 23.
+            connect_timeout: socket-connect timeout in seconds.
+            reply_timeout: per-command read timeout in seconds.
+            require_power_on: if True (default), check ``avr.power`` first
+                and raise if not ON. Disable only when intentionally
+                probing standby state.
+
+        Returns:
+            dict mapping each input command (verbatim, without CR) to the
+            decoded reply string with CRs stripped.
+
+        Raises:
+            DriverError: power is off, connection fails, or no replies
+                returned for any of the commands.
+        """
+        if not self._host:
+            raise DriverError("no host configured")
+
+        if require_power_on:
+            receiver = await _connect_receiver(self._host)
+            if receiver.power != "ON":
+                raise DriverError(
+                    f"AVR power is {receiver.power!r} — Telnet replies will not "
+                    "arrive in standby. Power on the AVR (or call "
+                    "DenonDriver.async_power_on()) before sending Telnet commands."
+                )
+
+        import socket
+        import time
+
+        loop = asyncio.get_running_loop()
+
+        def _do_telnet() -> dict[str, str]:
+            sock = socket.create_connection((self._host, port), timeout=connect_timeout)
+            sock.settimeout(reply_timeout)
+            # Drain any queued banner / prior session state.
+            time.sleep(0.5)
+            try:
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+            except (socket.timeout, TimeoutError):
+                pass
+
+            replies: dict[str, str] = {}
+            try:
+                for cmd in commands:
+                    sock.sendall((cmd + "\r").encode("ascii"))
+                    time.sleep(0.4)
+                    buf = b""
+                    try:
+                        while True:
+                            chunk = sock.recv(4096)
+                            if not chunk:
+                                break
+                            buf += chunk
+                    except (socket.timeout, TimeoutError):
+                        pass
+                    replies[cmd] = buf.decode("ascii", errors="replace").strip()
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            return replies
+
+        try:
+            replies = await loop.run_in_executor(None, _do_telnet)
+        except OSError as exc:
+            raise DriverError(f"Telnet connection failed: {exc}") from exc
+
+        empty = [cmd for cmd, reply in replies.items() if not reply]
+        if empty and len(empty) == len(commands):
+            raise DriverError(
+                f"Denon Telnet returned no replies for any of {commands}. "
+                "Likely causes (in order of probability): "
+                "(1) AVR is in standby (verify power=ON via get_state); "
+                "(2) Telnet connection pool exhausted — wait 30 s and retry; "
+                "(3) AVR firmware in a stuck state, power-cycle the unit."
+            )
+        return replies
 
     async def set_volume(self, level_db: float) -> float:
         """Set volume to *level_db* dB. Returns confirmed level from hardware."""
@@ -270,6 +400,30 @@ class DenonSweepContext:
 
     async def __aenter__(self) -> "DenonSweepContext":
         self._receiver = await _connect_receiver(self._host)
+
+        # Power-state guard. The AVR's HTTP / denonavr library reports
+        # connected=True in standby — but Telnet replies vanish and sweeps
+        # produce silence. Auto-power-on so callers don't have to track it.
+        if self._receiver.power != "ON":
+            log.info("Denon sweep: AVR is in %s — powering on", self._receiver.power)
+            try:
+                await self._receiver.async_power_on()
+            except Exception as exc:
+                raise RuntimeError(
+                    "AVR is not powered on and async_power_on failed: "
+                    f"{exc}. Turn the AVR on manually before measuring."
+                ) from exc
+            for _ in range(20):
+                await asyncio.sleep(0.5)
+                await self._receiver.async_update()
+                if self._receiver.power == "ON":
+                    log.info("Denon sweep: AVR is now ON")
+                    break
+            else:
+                raise RuntimeError(
+                    "AVR did not report power=ON within 10 s — sweeps will be silent. "
+                    "Turn the AVR on manually and retry."
+                )
 
         self._saved_input = self._receiver.input_func
         self._saved_volume = self._receiver.volume
