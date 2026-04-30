@@ -20,7 +20,7 @@ notes: |
   Two above-floor caps:
     - max_boost_above_threshold_db = 8 — strict thermal/excursion cap for
       generic FIR writes (e.g. arbitrary apply_fir, PEQ-equivalent boosts).
-    - modal_cancel_max_boost_db = 14 — looser cap applied when SafetyValidator
+    - modal_cancel_max_boost_db = 20 — looser cap applied when SafetyValidator
       is called with intent="modal_cancel" (FIRs produced by
       ``design_modal_fir``). Justified physically: anti-pulse modal
       cancellation drives the driver hot at the mode frequency, but the

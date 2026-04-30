@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
-from calibrate.drivers import audyssey_tcp
+from calibrate.drivers.denon import audyssey_tcp
 from calibrate.drivers.base import DriverError
 from calibrate.drivers.denon import DenonDriver
 
@@ -245,3 +245,111 @@ async def test_audyssey_status_no_host_raises() -> None:
     driver = DenonDriver(host=None)
     with pytest.raises(DriverError, match="no host"):
         await driver.audyssey_status()
+
+
+# ── Full-upload orchestration ──────────────────────────────────────────────
+
+import socket
+from unittest.mock import patch, MagicMock
+
+from calibrate.drivers.denon.audyssey_tcp import _push_filters_sync
+
+
+def _make_mock_sock(rx_frames: list[bytes]) -> MagicMock:
+    """Build a mock socket whose recv returns the given frames once,
+    then empty bytes (mimicking a closed connection)."""
+    sock = MagicMock()
+    sock.settimeout = MagicMock()
+    sock.sendall = MagicMock()
+    sock.close = MagicMock()
+    queue = list(rx_frames) + [b""] * 100
+    sock.recv.side_effect = lambda n: queue.pop(0) if queue else b""
+    return sock
+
+
+def _ack_frame(cmd: str) -> bytes:
+    """Build a minimal R-frame ACK for given command name."""
+    from calibrate.drivers.denon.audyssey_tcp import build_frame as bf
+    body = b'{"Comm":"ACK"}'
+    raw = bf(cmd, body)
+    # build_frame always emits T-marker; for receive flip to R
+    return b"R" + raw[1:]
+
+
+def test_push_filters_sync_runs_full_sequence() -> None:
+    """End-to-end: ENTER_AUDY → SET_SETDAT(envelope) → coef streams →
+    FINZ_COEFS → SET_SETDAT(Fin) → EXIT_AUDMD."""
+    rx = [
+        _ack_frame("ENTER_AUDY"),
+        _ack_frame("SET_SETDAT"),    # envelope ack
+        _ack_frame("FINZ_COEFS"),
+        _ack_frame("SET_SETDAT"),    # commit ack
+        _ack_frame("EXIT_AUDMD"),
+    ]
+    mock_sock = _make_mock_sock(rx)
+    fake_packet = b"\x54\x00\x10\x00\x00SET_COEFDT\x00\x00\x00\x00"  # not real, just bytes
+    coef_per_channel = [
+        ("FL", [fake_packet, fake_packet]),
+        ("C", [fake_packet]),
+    ]
+    envelope = {"Distance": [{"FL": 400, "SW1": 1800}], "AudyFinFlg": "NotFin"}
+
+    with patch.object(socket, "create_connection", return_value=mock_sock):
+        status = _push_filters_sync(
+            "192.168.1.209",
+            1256,
+            setdat_envelope=envelope,
+            coef_packets_per_channel=coef_per_channel,
+            inter_packet_ms=0.0,
+            inter_channel_ms=0.0,
+            coef_wait_final_ms=0.0,  # skip the 15s wait in tests
+        )
+
+    # Counts always reliable regardless of rx-mock timing
+    assert status["coef_streams_sent"] == 2
+    assert status["coef_packets_sent"] == 3   # 2 + 1
+    # ACK booleans depend on rx-frame draining; the send-order test
+    # below exercises the wire-level correctness independently.
+
+
+def test_push_filters_sync_sends_in_correct_order() -> None:
+    """Verify the wire-level sendall order: ENTER_AUDY first, EXIT_AUDMD last,
+    with SET_SETDAT-envelope before coef packets and FINZ_COEFS after."""
+    rx = [
+        _ack_frame("ENTER_AUDY"),
+        _ack_frame("SET_SETDAT"),
+        _ack_frame("FINZ_COEFS"),
+        _ack_frame("SET_SETDAT"),
+        _ack_frame("EXIT_AUDMD"),
+    ]
+    mock_sock = _make_mock_sock(rx)
+    coef_per_channel = [("FL", [b"\x54coef1"]), ("C", [b"\x54coef2"])]
+    envelope = {"Distance": [{}], "AudyFinFlg": "NotFin"}
+
+    with patch.object(socket, "create_connection", return_value=mock_sock):
+        _push_filters_sync(
+            "192.168.1.209",
+            1256,
+            setdat_envelope=envelope,
+            coef_packets_per_channel=coef_per_channel,
+            inter_packet_ms=0.0,
+            inter_channel_ms=0.0,
+            coef_wait_final_ms=0.0,
+        )
+
+    sends = [args[0] for args, _ in mock_sock.sendall.call_args_list]
+    # First send must be ENTER_AUDY frame
+    assert b"ENTER_AUDY" in sends[0]
+    # Second is SET_SETDAT (envelope) — the JSON body should appear in the frame
+    assert b"AudyFinFlg" in sends[1]
+    assert b"SET_SETDAT" in sends[1]
+    # Then the coef packets (raw bytes we provided)
+    assert sends[2] == b"\x54coef1"
+    assert sends[3] == b"\x54coef2"
+    # Then FINZ_COEFS
+    assert b"FINZ_COEFS" in sends[4]
+    # Then SET_SETDAT(commit)
+    assert b"AudyFinFlg" in sends[5]
+    assert b"Fin" in sends[5]
+    # Last is EXIT_AUDMD
+    assert b"EXIT_AUDMD" in sends[6]

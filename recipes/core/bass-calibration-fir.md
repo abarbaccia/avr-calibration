@@ -1,56 +1,34 @@
 # Recipe: Bass Calibration (FIR-Native)
-version: 1.1
+version: 1.2
 
-## Compliance — READ FIRST (NON-NEGOTIABLE)
+## Compliance — READ FIRST
 
-**You MUST execute every step in this recipe in order. You MUST NOT skip
-checkpoints, even when a later phase looks ready.** The recipe encodes
-learnings from prior runs; skipping a step has caused measurable audible
-regressions (e.g. run 14 skipped Phase 2.5 and left a major mode at 1900 ms
-T60 instead of the ~700 ms mixed-phase would have delivered).
+**Execute every step in order. Do not skip checkpoints.** Past LLM runs
+that skipped steps left audible regressions (e.g. run 14 skipped Phase 2.5
+and left a 46.9 Hz mode at 2037 ms T60).
 
-Rules:
-1. **Do not skip a numbered step**, even if you believe it's a no-op. If a
-   step is genuinely N/A (single-sub skip in Phase 1), say so explicitly in
-   your run log. "I assumed it wasn't needed" is not acceptable.
-2. **Do not proceed past a decision point without executing it.** Every
-   "Decision point:" heading is a required branch — evaluate the condition,
-   log the evaluation, then take the branch the data dictates.
-3. **When you take a shortcut, stop and ask the user first.** Do not rewrite
-   the recipe under fatigue, pressure to finish, or "this looks close enough".
-4. **Every `analyze_decay` / `analyze_phase` call that flags a mode over
-   threshold REQUIRES a follow-up action** — either a filter redesign, a
-   documented "unfixable — geometry" classification, or an explicit user
-   override. Seeing the flag and moving on is a recipe violation.
-5. **Record compliance in each `save_calibration_iteration` call.** The
-   `filters_proposed` field must include which recipe step produced the
-   decision, so post-hoc audits can detect skips.
-6. **Run-instrumentation is mandatory — never skip the bookkeeping.** This
-   is the same class of bug as `feedback_calibration_cleanup.md`: the work
-   completes, but a closing-state step is silently skipped, leaving no
-   audit trail. Concrete enforcement:
-   - **At START:** `run_id` MUST already be in scope. The `/avr:calibrate`
-     skill calls `save_calibration_run` before invoking this recipe — if
-     `run_id` is not set, abort and surface the missing handshake.
-   - **After EVERY iteration** (Phase 0 reset, Phase 1 alignment, Phase 2
-     per-sub FIR, Phase 2.5a mixed-phase decision, Phase 3 target shaping
-     — every loop pass, including no-op passes that confirm convergence):
-     MUST call
-     `save_calibration_iteration(run_id, iteration=N, rms_before=..., rms_after=..., filters_proposed=..., filters_applied=..., safety_ok=...)`.
-     `filters_proposed` MUST include the recipe step (rule 5).
-   - **On EARLY EXIT for ANY reason** (convergence, max iterations,
-     SafetyValidator halt, hardware error, user abort, "looks good
-     enough", recipe deviation): MUST call
-     `update_calibration_run(run_id, converged=<bool>, final_rms=<float>, iterations_run=<N>, error=<str-or-null>)`
-     **BEFORE** running Phase 5 cleanup or telling the user "done."
-   - Runs 17 and 18 from 2026-04-24 completed 57 measurement sessions and
-     applied 65k-tap mixed-phase FIRs but recorded `iterations_run=0` and
-     no `calibration_iterations` rows. That happened because this rule
-     wasn't explicit. Do not repeat it.
+1. **No silent skips.** If a step is N/A (single-sub: Phase 1 alignment),
+   log it explicitly. "I assumed it wasn't needed" is not acceptable.
+2. **Execute every decision point.** Every "Decision point:" heading is
+   a required branch — evaluate, log, take the branch the data dictates.
+3. **Ask before shortcutting.** Don't rewrite the recipe under fatigue
+   or pressure to finish.
+4. **Every `analyze_decay`/`analyze_phase` flag requires follow-up** —
+   either filter redesign, documented "unfixable" classification, or
+   user override. Don't see the flag and move on.
+5. **Bookkeeping is mandatory:**
+   - At start, `run_id` must be in scope (set by `/avr:calibrate`).
+   - After EVERY iteration (every phase, every loop pass), call
+     `save_calibration_iteration(run_id, iteration=N, rms_before=...,
+     rms_after=..., filters_proposed=..., filters_applied=...,
+     safety_ok=...)`. `filters_proposed` MUST include the recipe step.
+   - On early exit FOR ANY REASON, call
+     `update_calibration_run(run_id, converged=..., final_rms=...,
+     iterations_run=N, error=...)` BEFORE Phase 5 cleanup or telling
+     the user "done."
 
-If at any point the recipe feels wrong for the hardware in front of you,
-surface the disagreement to the user and amend the recipe — do not silently
-deviate mid-run.
+If the recipe feels wrong for your hardware, surface the disagreement
+to the user and amend — don't silently deviate.
 
 ## Goal
 
@@ -176,35 +154,97 @@ cancellation at MLP. The fixes are physical:
 Note this in the run log if the geometry is the bottleneck. Don't waste
 filter slots trying to compensate.
 
-## Filter strategy
+## Filter strategy — REASON, DON'T PRESCRIBE
 
-Three layers, all of them simultaneously active in the DSP pipeline:
+The recipe deliberately does NOT prescribe a fixed pipeline of "FIR for X, PEQ
+for Y." After the alignment phase, you have rich data (per-sub solo FRs,
+modal decay, phase fixability, coherence, combined response). Use it to
+**design a filter plan tailored to this room**, considering all the tools
+available and what we are optimizing for.
 
-| Layer | Tool | Purpose | Required? |
-|-------|------|---------|-----------|
-| Per-sub FIR | `apply_fir` with `output_index` | Per-sub correction (magnitude + decay reduction) AND target-curve shape (default: Architecture B) | Always |
-| Per-sub PEQ | `apply_eq` with `output_index` | **HPF only** (18 Hz 4th-order infrasonic protection) | Always |
-| Input PEQ | `apply_input_eq` | Narrow modal cuts only (Architecture B) — no broad shaping | Optional |
-
-**DSP signal chain:**
+**The DSP pipeline:**
 ```
-Input → Input PEQ (modal cuts only) → Routing → Output PEQ (HPF) → Output FIR (per-sub correction + target shape) → DAC
+Input → Input PEQ → Routing → Per-output PEQ → Per-output FIR → DAC
 ```
 
-**Default architecture: B (FIR carries target shape; input PEQ for narrow
-modal cuts only).** Use Architecture A (FIR=flat + input PEQ shelf for shape)
-only when the per-sub solo response makes B trip SafetyValidator and tightening
-`freq_focus_hz` doesn't recover.
+Every layer above is available. Pick where each correction lives based on:
 
-**Recipe ordering** (Architecture B):
+**Tool capabilities:**
 
-```
-1. Per-sub HPF only (Phase 0 reset)
-2. Alignment via delay + polarity (Phase 1)
-3. Per-sub FIR with target_curve baked in (Phase 2)
-4. (Optional) Narrow input PEQ modal cuts (Phase 3) — only for residual peaks
-   the FIR couldn't tame within safety bounds
-```
+| Tool | Strengths | Weaknesses |
+|------|-----------|------------|
+| Per-output FIR (`design_fir`, `apply_fir`) | High-resolution magnitude shape; cuts and boosts at exact frequencies; per-sub differentiation | Auto-anchors target_curve at band mean — aggressive shapes need explicit absolute target points |
+| Per-output modal FIR (`design_modal_fir`) | Active anti-pulse T60 cancellation | Adds pre-ring latency; transient-aware safety still bounded |
+| Per-output PEQ (`apply_eq`) | Cheap modal cuts, HPF | Limited slot count; can't shorten T60 |
+| Input PEQ (`apply_input_eq`) | Single shared shape stage; biquad shelves at low slot cost | All-output broadcast — can't shape per-sub |
+| Master gain | Restores level lost to cuts | Single number |
+
+**Constants you must factor in (not optional):**
+
+1. **Cuts work; boosts don't.** PEQ cuts ≈ 100 % at the listener; PEQ boosts
+   25-50 %. FIR magnitude cuts ≈ 100 %. FIR magnitude boosts hit the same
+   thermal/excursion ceiling as PEQ (`+6 dB below port_tune+3`, `+8 dB above`,
+   code-enforced).
+2. **Modal T60 cannot be cut down by magnitude EQ.** Cutting at the source
+   reduces the energy that excites the mode but the room rings on. Only
+   anti-pulse FIR or physical bass traps shorten T60.
+3. **Anchoring drives the entire shape.** For sub calibration, anchor at the
+   DEEP-BASS end of the band (e.g. 25-40 Hz) so the work is cuts above; never
+   at the curve's nominal 0 dB at the crossover (that direction makes deep
+   bass a boost target and runs into safety limits). See Phase 3.2.
+4. **Tool auto-anchoring fights aggressive shapes.** `design_fir`'s
+   `target_curve` parameter is interpreted relative to band-mean SPL — passing
+   the raw harman offsets gives a *modest* slope. To get the FIR to actually
+   carry a steep shape, pass absolute SPL target points anchored deep-bass
+   (i.e. set the upper-bass target points well below current measured SPL so
+   the only solution is a CUT).
+5. **Per-sub differs from combined.** Per-sub FIR can flatten each sub
+   individually, then a smaller shared layer adds the target shape — OR a
+   per-sub FIR can deliver the per-sub share of the target shape directly.
+   Different subs can be allowed to do different work (e.g. only the
+   stronger-deep-bass sub carries deep bass; the other rolls off below 40 Hz).
+
+**Build a plan, then execute. Phase 2 and Phase 3 below are sequence
+guides, not filter recipes.** For your room:
+
+1. Read the post-alignment combined and per-sub FRs (`get_measurement_history`,
+   `analyze_phase`, `analyze_decay`, `compare_sub_phase`).
+2. Determine the **anchor frequency** (Phase 3.2 algorithm). The anchor
+   determines whether the work is mostly cuts (anchor low) or mostly boosts
+   (anchor high — usually wrong for sub cal).
+3. Decide where the **target-curve shape** lives:
+   - Per-sub FIR (high resolution, per-sub differentiation, but aggressive
+     shapes need explicit absolute SPL target points to override auto-anchor)
+   - Input PEQ (cheap, easy target swaps)
+   - Hybrid (FIR carries some shape + flattens per-sub; input PEQ adds
+     residual shape and modal cuts)
+4. Decide where **modal correction** lives:
+   - `design_modal_fir` per sub: anti-pulse for ringy modes outside the
+     priority deep-bass band; linear_notch for modes inside it.
+   - PEQ cuts: cheap when the budget fits, but only reduce peak — don't
+     shorten T60.
+5. **Tap-count sizing.** Read `eq_capabilities.fir_max_taps_per_output` and
+   `fir_sample_rate_hz`. Pick taps so the impulse window covers
+   `2 × max(T60_ms)` of the modes you care about (bass T60s in this room
+   are typically 400-800 ms → 800-1600 ms window → 38400-77000 taps at
+   48 kHz). Smaller windows under-resolve deep modes; larger windows cost
+   DSP CPU. State the choice and why.
+6. **Simulate before applying.** `simulate_eq` for PEQ; design_fir's
+   `predicted_effect` for FIR magnitude; cross-check against the
+   1/3-octave coverage limits (predicted_effect smooths over narrow boosts
+   the safety validator catches in finer bins).
+7. **Verify after applying.** `verify_input_eq_effect`, `verify_fir_effect`,
+   and a fresh combined measurement.
+
+State the plan in the iteration log (`save_calibration_iteration`)
+with `filters_proposed` containing your reasoning, not just the numbers.
+
+**Why no fixed default.** Past recipe versions hard-coded "Phase 2 =
+flat per-sub, Phase 3 = target via input PEQ" — this works for some
+rooms and fails for others (aggressive target curves where input PEQ
+boosts run out of budget, or modal-rich rooms where FIR's better
+resolution is needed for the shape). Reason about which split fits
+the room you actually measured.
 
 ## Configuration
 
@@ -523,31 +563,239 @@ If combined < max(solo) in any band:
   only the front sub carries the deep bass. Loses spatial averaging
   in that band, but eliminates the cancellation.
 
-Max 3 alignment iterations.
+**Required deep-bass re-pass for 2+ subs.** Default `optimize_sub_alignment`
+minimizes flatness across the full target band — that can leave a narrow
+cancellation null in the boost zone (e.g. 30-40 Hz) because flatness
+elsewhere offsets it on RMS. Single-call workflow:
 
-### 1.6 Deep-bass-priority re-alignment + delay sweep (REQUIRED for 2+ subs)
+```
+optimize_sub_alignment(session_ids=[...], priority_band=[20, 50])
+```
 
-The default `optimize_sub_alignment` minimizes flatness across the full target
-band. That can leave a **narrow cancellation null in the boost zone** (e.g.
-30-40 Hz) because flatness elsewhere offsets it on RMS. The null is the
-audible problem ("subs not digging deep") even when RMS reads fine.
+The `priority_band` argument weights that range 3× in the objective so
+the optimizer attacks deep-bass nulls in one call. Inspect the
+`per_band_polarity` field in the response — bands listed there indicate
+per-band cancellations that would benefit from a polarity flip on a
+specific sub.
 
-1. Re-run `optimize_sub_alignment(session_ids=[...], min_hz=20, max_hz=50)`
-   to weight the optimizer toward deep bass. Compare to the wideband
-   recommendation. If relative timing flips or moves > 2 ms, the wideband
-   answer was a false-flat global minimum that hid a narrow null.
+**Then refine inter-sub delay with the automated sweep:**
 
-2. Apply the deep-bass-priority recommendation. Measure combined.
+```
+sweep_inter_sub_delay(
+    session_ids=[<sub_a>, <sub_b>],
+    base_delays_ms=[<current>, <current>],
+    priority_band=[28, 50],
+    sweep_range_ms=2.0,
+    step_ms=0.25,
+)
+```
 
-3. **Manual delay sweep on the trailing sub** ±2 ms in 0.5-1 ms steps.
-   Pick the step where the deepest null in 28-50 Hz is shallowest. Mid-bass
-   evenness barely shifts under ±2 ms moves; only deep-bass null position
-   changes meaningfully. The right answer is "no narrow catastrophic null
-   anywhere in 28-50 Hz" — accept slight RMS cost for shallower max-error.
+The tool predicts deepest-null depth for each delay step and reports the
+delay that shallowest the deepest 1/3-octave null in the priority band.
+Apply via `set_delay(output_index=<trailing_sub>, delay_ms=<recommended>)`.
 
-4. After Phase 2 designs FIRs against the new-alignment solos, **redo the
-   delay sweep at ±0.5 ms granularity once more** — the new FIRs have
-   different phase response and the optimal inter-sub delay shifts slightly.
+**After Phase 2** designs FIRs, re-run `sweep_inter_sub_delay` with
+`step_ms=0.1` — the FIRs change phase response, so the optimal inter-sub
+delay shifts slightly (typically ≤0.5 ms).
+
+Max 3 alignment iterations total (wideband + deep-bass + post-FIR).
+
+## Phase 1.95 — Build the calibration plan (NON-NEGOTIABLE)
+
+Before touching `design_fir` / `design_modal_fir` / `apply_eq` / `apply_input_eq`
+in Phase 2 or 3, **the LLM MUST emit a structured plan document and submit it
+for adversarial review**. This phase exists because: in real runs the LLM has
+made anchor-direction mistakes, mis-classified modal treatments, picked
+tap counts without justification, and committed boost budgets that ended up
+exceeding safety caps. A plan-then-review handoff catches these before any
+hardware writes.
+
+**The plan is not a free-form essay.** It's a structured document that
+forces every decision to have a measurable justification.
+
+### 1.95.1 Gather all available signals
+
+Before drafting the plan, collect:
+
+- Per-sub post-alignment solo FRs (from Phase 1)
+- Combined post-alignment FR
+- `analyze_phase` per band (fixability classification)
+- `analyze_decay` per sub and combined (T60 + peak per mode)
+- `compare_sub_phase` solo-A vs solo-B (per-band reinforcement classification)
+- Coherence per band (already in measurement metadata)
+- `eq_capabilities` (FIR taps, sample rate, PEQ slot counts)
+- Target curve points + `anchor_target` analysis under `cuts_only` and
+  `balanced` directions
+- Safety profile from `get_signal_graph` (boost caps, port_tune, modal_cancel cap)
+
+### 1.95.2 Emit the structured plan
+
+Output a plan in this shape (YAML-flavored, embed in a code block):
+
+```yaml
+calibration_plan:
+  target:
+    curve: harman-in-room
+    anchor:
+      freq_hz: 25
+      method: deep_bass_priority
+      reasoning: |
+        Lowest band where every adjacent has measured-relative ≥ target-relative
+        gap (i.e., implementable via cuts). At anchor=25 Hz: 31 has +0.3 gap,
+        40 has +3.9 gap, 50 has +6.7 gap. Anchor=31 also works but yields
+        smaller cuts above; anchor=25 maximizes cut headroom.
+
+  per_sub_strategy:
+    sub_front_right:
+      filter_type: design_fir   # or design_modal_fir
+      target_curve_in_fir: true
+      num_taps: 24576
+      taps_reasoning: |
+        max(T60) = 1163 ms at 47 Hz → impulse window ≥ 2× = 2326 ms.
+        24576 taps @ 48 kHz = 512 ms window. SHORT of 2× requirement.
+        Acceptable trade-off: 24576 matches 8 kHz processing rate alignment
+        and DSP CPU budget. Document residual ringing as known limit.
+      freq_focus_hz: [25, 100]
+      anchor_mode: deep_bass_priority
+      modal_treatment:           # only if using design_modal_fir
+        47Hz: linear_notch
+        70Hz: anti_pulse cancel_strength=0.6 bp_q=auto
+        94Hz: anti_pulse cancel_strength=0.5 bp_q=auto
+      modal_treatment_reasoning: |
+        47 Hz IS in priority band 25-50 → linear_notch to avoid anti-pulse
+        leakage into 25-31 (deep bass we want to PRESERVE). 70 Hz and 94 Hz
+        are above the protected band → anti_pulse OK. cancel_strength
+        will be auto-reduced if adjacent-band cap trips (commit 2d18420).
+    sub_nearfield:
+      ...
+
+  combined_strategy:
+    input_peq: hpf_only
+    reasoning: |
+      Per-sub FIRs carry both target shape AND modal correction. Combined
+      response should land within achievable accuracy of the curve.
+      Input PEQ would only stack with FIR cuts — no value-add unless a
+      residual modal peak survives both per-sub FIRs.
+
+  expected_residual:
+    rms_db: 3.0
+    threshold_chosen: 3.0
+    reasoning: |
+      Modal dilution feedback memory documents PEQ/FIR cuts deliver only
+      20-30% at the listener in this room (T60 471-1163 ms at 47-94 Hz).
+      Default 1.5 dB threshold not achievable without bass traps. 3.0 dB
+      is realistic for DSP-only path.
+
+  unfixable:
+    - description: "20 Hz null"
+      reason: "below SVS PB12-NSD port tune (22 Hz) + position-induced cancellation"
+      action: "skip — document for retrospective"
+
+  safety_budget_check:
+    max_predicted_boost_per_band_db: 4.5    # below profile cap of +6 below 25
+    max_predicted_boost_above_25_db: 7.2    # below profile cap of +8
+    modal_cancel_predicted_boost_db: 18     # below profile cap of +20
+    headroom_assessment: "all bands within budget; no expected safety rejections"
+
+  next_steps:
+    - "bass traps at 47/70/94 Hz to reduce T60 below 400ms (largest impact)"
+    - "sub repositioning: try corner placement for FR sub to break mode coupling"
+    - "re-cal after physical changes"
+```
+
+The plan MUST be specific. "Try anti-pulse maybe" is not a plan. "anti_pulse
+on 70 Hz at cancel_strength=0.6 bp_q=auto, expected adjacent-band boost
++18 dB at 50 Hz (within +20 cap)" is a plan.
+
+### 1.96 Adversarial review (NON-NEGOTIABLE)
+
+Invoke the `Agent` tool with `subagent_type: general-purpose` to red-team
+the plan. The reviewer prompt MUST include:
+
+1. The full structured plan from 1.95.2
+2. The relevant measurement session IDs (the agent can pull data via MCP
+   `get_measurement_history`, `analyze_phase`, `analyze_decay`)
+3. The `eq_capabilities` and safety profile
+4. Explicit red-team checklist (below)
+
+**Reviewer red-team checklist (all 8 must be addressed):**
+
+1. **Anchor direction**: is anchor at the deep-bass end? If not, justify.
+   For Harman-style curves in modal-rich rooms, anchoring high makes deep
+   bass a boost target. Has the LLM checked both `anchor_target
+   direction=cuts_only` and `direction=balanced`?
+
+2. **Tap count**: is `num_taps` justified by `2 × max(T60_ms)` of the
+   modes being treated? If not, what's the trade-off rationale?
+
+3. **Modal treatment classification**: did the plan correctly identify
+   modes in the priority band [25, 50] as `linear_notch` (not
+   `anti_pulse` — leakage risk) and modes outside as `anti_pulse`? Did
+   it consider mode density (47-70 are half-octave apart — Q affects
+   leakage)?
+
+4. **Boost budget**: are any predicted boosts within 1 dB of the safety
+   cap (+6 below 25 Hz, +8 above, +20 modal_cancel)? If yes, what's
+   the contingency if the FIR design overshoots predicted?
+
+5. **Convergence threshold**: is the chosen RMS threshold realistic
+   given the room's T60 and modal density? Or is it wishful thinking
+   that will drive the LLM to iterate past convergence?
+
+6. **Geometry-bound problems**: are there nulls (combined < max(solo) at
+   some band) that EQ can't fix that the plan still allocates filter
+   budget to?
+
+7. **Tool sequencing**: does the plan respect `apply_fir` REPLACING (not
+   stacking) the previous FIR? Does it leave a viable iteration path if
+   first apply doesn't converge?
+
+8. **Hidden assumptions**: does the plan rely on any room characteristic
+   that wasn't actually measured (e.g., assumed sub T60 from a different
+   session)?
+
+The reviewer agent returns:
+
+```yaml
+review:
+  overall: pass|fail
+  concerns:
+    - severity: high|medium|low
+      checklist_item: 1-8
+      issue: <specific concern>
+      suggested_revision: <concrete change>
+  recommended_action: proceed|revise_plan|escalate_to_user
+```
+
+### 1.97 Plan revision
+
+If `overall == fail` OR any concern is `severity: high`:
+
+1. Apply the suggested revisions to the plan.
+2. Re-run 1.96 adversarial review against the revised plan.
+3. Maximum 2 revision cycles. If still flagged after 2 revisions,
+   escalate to the user with both the original plan, all reviewer
+   feedback, and the revisions tried.
+
+If `overall == pass` (or only `low/medium` concerns the LLM accepts with
+documented rationale): proceed to Phase 2 executing THIS plan.
+
+### Why plan-then-review
+
+This phase looks like overhead. It catches the exact mistakes that cost
+hours in prior runs:
+
+- Anchored at 80 Hz when target needed deep-bass anchor → ran into safety
+  cap on every iteration
+- Picked num_taps=8192 without checking T60 → modal correction didn't
+  resolve the modes
+- Applied input PEQ -10 dB cuts without realizing modal dilution would
+  cap effect at -2 dB → spent iterations chasing what physics wouldn't
+  give
+- Mis-classified 47 Hz as anti_pulse → leakage into 25 Hz hit safety
+
+The reviewer agent is cheap (~30 sec). The mistakes it catches cost
+hours each. Always run.
 
 ## Phase 2 — Per-sub correction FIR
 
@@ -565,75 +813,50 @@ For each sub:
 4. `analyze_decay(session_id)` — T60 per mode
 5. Unmute
 
-### 2.2 Design the FIR
+### 2.2 Design the FIR — flat per-sub + target shape via input PEQ (default)
 
-There are two valid architectures for combining per-sub correction with
-the target curve. Pick based on the target shape and the room:
+Default architecture: per-sub FIRs flatten each sub's solo response
+across the target band; input PEQ (Phase 3) shapes the combined
+response to the chosen target. Pros: easy target-curve swaps (re-run
+Phase 3 only), clean separation of "what the room does to each sub"
+(FIR) from "what shape I want" (PEQ). The risk — per-sub FIR cuts at
+modal peaks fighting input-PEQ shape boosts at adjacent frequencies
+— is mitigated by Phase 3.3's "cuts first, boosts last" rule.
 
-**Architecture A — FIR=flat + Input PEQ=shape** (layered, fallback)
+**Call `design_fir` for each sub:**
 
-Per-sub FIRs flatten each sub's solo response to flat across the target
-band. Input PEQ in Phase 3 then shapes the combined response to the
-chosen target. Pros: easy target-curve swaps (re-run Phase 3 only),
-clean separation of per-sub and target concerns. Cons: per-sub FIR cuts
-at modal peaks compete with input PEQ shape boosts in nearby bands —
-the FIR cut at, say, 70 Hz reduces the response that input PEQ then
-tries to lift for a Harman bass shape.
-
-**Architecture B — FIR=target_shape + Input PEQ=narrow modal cuts only**
-
-Per-sub FIRs are designed against the same target curve (each sub
-plays its share of the target). Input PEQ is HPF + narrow-Q (Q4-5)
-cuts at any modes that still ring after the FIR. Pros: target shape
-baked in, no shape conflict between layers, no per-sub flat-cut
-fighting per-sub target boost. Cons: asymmetric subs (one delivers
-deep bass much better than another) may trip the safety validator
-when an aggressive target asks the weaker sub to boost more than it
-physically can. Target swap requires FIR redesign.
-
-**When to use each**:
-
-| Situation | Use |
-|---|---|
-| Flat target curve | A (always — there's nothing to swap) |
-| Gentle target (Harman, House+3), symmetric subs | A |
-| Aggressive target (Harman+4, Cinema-Bass) | B |
-| Strongly asymmetric subs (one weak in deep bass) | A — let the layered approach take what each sub can deliver |
-| Modal-heavy room with long T60s | A with mixed-phase FIR (modal cuts via PEQ) |
-| Well-treated room | B (FIR can target shape directly without fighting modes) |
-
-**For each sub, call `design_fir` with**:
 - `session_id` = the sub's solo measurement from 2.1
-- `phase_mode="mixed"` with `preringing_ms=38` (default — shortens modal T60
-  and fits within the AVR's distance-budget headroom; switch to `"minimum"`
-  only if AVR-side delay compensation isn't available)
-- `num_taps=8192` (default; bump to 16384 if T60 > 600 ms on a major mode)
-- `freq_focus_hz=[port_tune+18, crossover+5]` — e.g. `[40, 85]`. Lower bound
-  starts above the deepest-bass null because Architecture B asks the FIR to
-  LIFT toward the target curve in this band; the steepest target lift sits
-  just above port tune, and the bigger the lift, the more likely the FIR's
-  narrow-band peak trips SafetyValidator. Tighten the lower bound by 2 Hz
-  each retry until the max boost lands within profile limits.
-- **For Architecture B (default)**: pass `target_curve` matching the
-  chosen target shape.
-- **For Architecture A (fallback)**: omit `target_curve` (defaults to flat).
+- `phase_mode="minimum"` (default for this architecture — flattens
+  magnitude only, zero pre-ring). Use Phase 2.5a to upgrade to
+  modal-aware (`design_modal_fir`) if T60 > 400 ms after this pass.
+- `num_taps=8192` (bump to 16384 if T60 > 600 ms on a major mode)
+- `freq_focus_hz=[port_tune+18, crossover+5]` — e.g. `[40, 85]`.
+  Lower bound starts above the deepest-bass null because the FIR
+  has limited boost headroom there; tighten +2 Hz on retry until
+  max boost lands within safety profile.
+- **No `target_curve`** — defaults to flat per-sub.
 
-**Inspect the returned predicted magnitude response**:
-- Max boost below `port_tune+3` must be ≤ +6 dB. If exceeded, raise the
-  lower bound of `freq_focus_hz` by 1 Hz and retry.
-- Max boost in target band must be ≤ +8 dB. If exceeded:
-  - Architecture A: reduce `num_taps` or accept softer correction
-  - Architecture B: the target is too aggressive for this sub at
-    these frequencies. Either soften the target curve, narrow the
-    `freq_focus_hz`, OR fall back to Architecture A (which lets each
-    sub deliver what it physically can without forcing target shape).
-- Check pre-ringing estimate (returned by `design_fir`). For
-  minimum-phase it should be effectively zero.
+**Inspect the predicted magnitude response:**
 
-**For bands marked `fixable=False` by `analyze_phase`** (cancellation
-nulls): the FIR will try and fail to correct them. This is unavoidable
-in one pass, but the recipe must note these bands in the retrospective
-as unfixable.
+- Max boost below `port_tune + 3 Hz` must be ≤ +6 dB. If exceeded,
+  raise lower bound of `freq_focus_hz` by 1 Hz and retry.
+- Max boost in target band must be ≤ +8 dB. If exceeded, reduce
+  `num_taps` or accept softer correction.
+- Pre-ring estimate should be near zero for `phase_mode="minimum"`.
+
+**Bands marked `fixable=False` by `analyze_phase`** (cancellation
+nulls): the FIR can't correct them. Note in the retrospective as
+unfixable; do not waste FIR taps on them.
+
+**Fallback architecture — FIR=target_shape + Input PEQ=narrow modal cuts.**
+For asymmetric setups where per-sub flat correction conflicts with
+target shape (rare), pass `target_curve` to `design_fir` so each sub
+plays its share of the target shape directly. Input PEQ then becomes
+HPF + narrow Q4-5 cuts at residual modes only. Used when subs differ
+strongly in deep-bass capability and the target curve calls for an
+aggressive bass shelf — the layered approach (FIR=flat + PEQ=shape)
+asks the weak sub to boost beyond its safety limit. Most rooms don't
+need this fallback; default to flat per-sub.
 
 ### 2.2a Modal-aware FIR (`design_modal_fir`) — when ringing dominates magnitude
 
@@ -845,59 +1068,30 @@ If a sub's post-FIR response has residual peaks > 2 dB:
 4. Max 3 iterations per sub. After 3, document residual peaks in the
    retrospective.
 
-### 2.5a Mixed-phase decision point — REQUIRED, do not skip
+### 2.5a Decay-vs-magnitude decision
 
-For **each sub**, after applying its min-phase FIR (Phase 2.3) and taking its
-post-FIR solo measurement (Phase 2.4):
+After Phase 2.4's post-FIR solo measurement, call
+`recommend_fir_phase(session_id=<sub_solo_postfir>)`. It returns
+`recommendation: "minimum" | "mixed"` based on T60 and peak prominence.
 
-1. **MANDATORY tool call:** `recommend_fir_phase(session_id=<sub_solo_postfir>)`.
-   Evaluates T60 and peak prominence against the recipe's thresholds and
-   returns `recommendation: "minimum" | "mixed"`, `offending_modes`, and
-   `suggested_num_taps`. Do not eyeball `analyze_decay` and decide yourself;
-   call the tool. If the tool is unavailable (older container), abort and
-   surface the version mismatch to the user.
-2. **If `recommendation == "mixed"`:** DO NOT proceed to Phase 2.6 or Phase 3.
-   - Re-run `design_fir(session_id=<pre_FIR_solo>, phase_mode="mixed",
-     num_taps=<suggested_num_taps>,
-     preringing_ms=<suggested_preringing_ms>,
-     return_coefficients=false)` for this sub. The tool's
-     `suggested_preringing_ms` (default 25 ms) bounds the filter's added
-     audio latency AND the psychoacoustic pre-ringing window — below
-     ~100 Hz the ear integrates over 20–30 ms so the pre-ringing is
-     inaudible. The `fits_in_budget` flag tells you whether the pre-ringing
-     stays within the AVR's per-channel speaker-distance compensation
-     range (default 53 ms ≈ 60 ft, the Denon X-series UI cap).
-   - Apply via `apply_fir(output_index=N, design_session_id=<pre_FIR_solo>)`.
-   - **Compensate the FIR latency on the MAINS, not via lip-sync.** The
-     CamillaDSP pipeline only processes the LFE/sub chain — mains pass
-     through the AVR's amps directly. Sub is now late by `latency_ms`
-     relative to mains. Increase the per-channel **speaker DISTANCE**
-     setting for mains/centre/surrounds by `latency_ms × 1.13 ft/ms`
-     (or `× 0.343 m/ms`) so the AVR delays them to wait for the FIR-
-     delayed sub. Do NOT use the global "Audio Delay / lip-sync" slider
-     (Menu → Audio → Audio Delay) — that delays *all* audio uniformly
-     relative to video, which preserves the sub-vs-mains misalignment.
-   - **If the required mains distance exceeds 60 ft** (the Denon X-series
-     UI cap), use MultEQ-X / ratbuddyssey on TCP port 1256 to write
-     larger distance values directly via the OCA protocol. The firmware
-     accepts values past the UI clamp; only the on-device UI clamps them.
-   - Re-measure that sub solo.
-   - Re-run `recommend_fir_phase` on the new post-mixed-FIR measurement. If
-     it still returns "mixed" on the second pass, document the residual,
-     recommend bass-trap placement for the offending frequency, and proceed.
-     Two mixed-phase attempts is the max per sub.
-3. **If `recommendation == "minimum"`:** log the tool's `note` field in your
-   iteration record and proceed to Phase 2.6.
-4. Every `save_calibration_iteration` call for Phase 2 MUST include the
-   tool's `recommendation` and `offending_modes` in the `filters_proposed`
-   payload, so post-hoc audits can verify the check was executed.
+- **`"minimum"`**: proceed to Phase 2.6.
+- **`"mixed"`**: the sub still has ringy modes the magnitude-only FIR can't
+  fix. Switch to **`design_modal_fir`** (Phase 2.2a) instead of `design_fir`
+  with `phase_mode="mixed"`. The modal-aware tool's anti-pulse cancellation
+  is the right path; the mixed-phase magnitude FIR is the legacy approach
+  that this recipe used pre-v0.6.8.5 and is left in for hardware that
+  doesn't support modal_fir's Gabor pulses.
 
-**Why this is a tool, not prose:** min-phase FIR flattens magnitude but does
-not cancel decay; mixed-phase FIR actively cancels decay in exchange for a
-small amount of pre-ringing, inaudible below ~100 Hz. In run 14 the driving
-LLM skipped this step, left a 46.9 Hz mode at 2037 ms T60, and moved to
-Phase 3. Turning the decision into a single structured tool result is
-harder to silently omit than a free-form paragraph.
+When the sub-chain FIR adds pre-ring latency, compensate by increasing the
+**mains' per-channel SPEAKER DISTANCE** in the AVR (NOT the global Audio
+Delay / lip-sync slider). For Denon X-series, the UI clamps distance at
+~60 ft; if you need more, write directly via the Audyssey TCP protocol
+(MultEQ-X / ratbuddyssey on port 1256 — the firmware accepts values past
+the UI clamp).
+
+Two passes max — if `recommend_fir_phase` keeps returning `"mixed"` after
+two iterations, document the unfixable mode and recommend bass-trap
+placement at that frequency.
 
 ### 2.6 Combined verification
 
@@ -908,36 +1102,39 @@ After all subs have FIR applied:
 3. Compare to the pre-alignment combined (Phase 1.5) — combined RMS should
    be flatter across the target band.
 
+### 2.7 Diagnose room limits before Phase 3
+
+Before designing target-curve EQ, identify which features in the combined
+FR are EQ-fixable vs physical-only. Three categories of feature, and what
+the LLM should do with each:
+
+| Feature | EQ-fixable? | Action |
+|---------|-------------|--------|
+| **Modal peak with T60 < 300 ms** | Yes via PEQ cut | Cut at the mode in Phase 3 with high Q (4-6) |
+| **Modal peak with T60 > 400 ms** | Partially via anti-pulse FIR | Re-run `design_modal_fir` (Phase 2.2a) with stronger `cancel_strength`. PEQ cuts at the source only kill new energy; the room rings on regardless and the 1/3-octave RMS captures the tail. |
+| **Cancellation null (>5 dB dip vs adjacent bands)** | NOT fixable with PEQ | Skip it. PEQ boost at a phase null delivers <30 % of asked dB at the listener. Recommend sub repositioning instead. Document in retrospective. |
+| **Below-port rolloff (< port_tune + 3 Hz)** | NOT fixable | Hard physical limit. Don't fight. |
+| **Modal ringing dominating a 1/3-octave band** | Only modal FIR or bass traps | PEQ cuts at the source reduce input energy, but the room mode keeps ringing for T60 ms. Band-RMS measurement integrates the tail; cuts deliver only 1-2 dB at the listener even when the source-side cut is 6-8 dB. |
+
+**Rule of thumb for modal-rich rooms:** if combined T60 across the modal
+band averages > 400 ms, PEQ alone won't get you flat. Either push
+modal-FIR cancellation harder (Phase 2.2a, stronger `cancel_strength`),
+add physical bass traps, or pick a target curve that accepts the room's
+character (Phase 3 curve selection).
+
 ## Phase 3 — Target curve (Input PEQ)
 
-Phase 3 behavior depends on which architecture was chosen in Phase 2.2:
+In the default architecture, Phase 2 left each sub flat per-solo. Phase
+3 shapes the COMBINED response to the target curve via input PEQ —
+biquads handle smooth low-order shapes (Harman, flat, house) with 3-5
+filters; FIR would use thousands of taps for the same result.
 
-**If Architecture A (FIR=flat + Input PEQ=shape) was used in Phase 2.2**:
-do this whole Phase 3 — biquad shaping of the combined response to the
-target curve. Why PEQ instead of FIR here: target curves (Harman, flat,
-house) are smooth low-order shapes. Biquad PEQ handles them with 3-5
-filters. FIR would use thousands of taps for the same result.
-
-**If Architecture B (FIR=target_shape + Input PEQ=narrow modal cuts)
-was used**: the target shape is already in the FIRs. Phase 3 is
-truncated — DO NOT design biquad shaping in input PEQ. Instead:
-
-1. Clear input PEQ to HPF only: `apply_input_eq([{type: "hpf", freq:
-   18, gain_db: 0, q: 0.707}])`.
-2. Measure combined.
-3. Identify any modes still ringing visibly (T60 > 500 ms or peak >
-   target by 3+ dB).
-4. Add **only narrow Q4-5 peaking cuts** at those mode frequencies
-   (typically -2 to -4 dB). These are surgical cuts, not shape work.
-5. Skip Phase 3.2-3.4 (anchor / design / iterate). The target shape
-   is already in the FIRs.
-
-**Architecture-A rationale**: PEQ is cheaper to redesign than FIR for
-target-curve swaps, and lets you separate "what the room does to each
-sub" (FIR) from "what shape I want" (PEQ). The risk is that FIR cuts
-at modal peaks fight PEQ boosts at adjacent frequencies — the recipe
-mitigates this by keeping per-sub FIR cuts narrow (which `freq_focus`
-already does) and by testing the layered result before iterating.
+**Skip Phase 3.2-3.4 if you used the fallback architecture** (FIR
+carries target shape via `target_curve` in `design_fir`). In that case
+Phase 3 is truncated to: clear input PEQ to HPF only, measure combined,
+add narrow Q4-5 peaking cuts (typically -2 to -4 dB) at any modes still
+visibly ringing, skip anchor/design/iterate. The target shape is
+already in the FIRs.
 
 ### 3.1 Baseline: HPF-only input
 
@@ -945,46 +1142,100 @@ already does) and by testing the layered result before iterating.
 2. `measure(label="combined-baseline-hpfonly", position="MLP")` — note `session_id`
 3. **This is the session all Phase 3 simulations target.**
 
-### 3.2 Anchor the target curve
+### 3.2 Anchor the target curve — pick the right reference
 
-Compute the optimal reference SPL for the target curve against the baseline.
+**For sub calibration, ALWAYS anchor at the DEEP-BASS end of the band
+(e.g. 25-40 Hz), NOT near the curve's 0 dB point at the crossover (80
+Hz).** A sub cal exists to maximize bass; anchoring near the crossover
+makes deep bass a boost target — and PEQ boosts deliver only 25-50% at
+the listener in modal-rich rooms while running into safety caps. The
+goal is for the MEASURED deep bass to BE the curve's high point. The
+mid/upper bass then comes DOWN to the curve's falloff via cuts. Cuts
+deliver ~100% at the listener and are unconstrained by safety. Master
+gain (Phase 5 cleanup) restores the absolute level the cuts removed.
 
-Algorithm:
-1. Pull full-res FR: `get_measurement_history(format="compact", min_hz=20, max_hz=120)` for the baseline session
-2. For each frequency in the target range:
-   - Interpolate the target offset at this frequency
-   - `required_boost(f) = offset(f) + ref - measured_spl(f)`
-3. Constraint: `max(required_boost) <= 6 dB` (SafetyValidator max boost)
-4. So: `ref = min(measured_spl(f) - offset(f)) + 6` across all f in the range
-5. Exclude from this calculation:
-   - Frequencies where measured SPL > 15 dB below band average (nulls — unfixable)
-   - Frequencies below `port_tune + 3` Hz (rolloff — unfixable)
+Three rules:
 
-Report the chosen reference level and the resulting max boost needed.
+1. **Anchor low, not high.** Deep bass is the priority and the place
+   the room can't physically be boosted. Anchor where the measured
+   response is at-or-above the curve's local value, so the rest is cuts.
+2. **Cuts work; boosts don't (in modal-rich rooms).** PEQ cuts deliver
+   ~100% of their dB at the listener; boosts deliver 25-50%. Anchor
+   such that ALL the work is cuts when possible.
+3. **Pick the anchor empirically from the baseline measurement.** For
+   each candidate anchor frequency f_anchor in the deep-bass band
+   (typically 25-40 Hz), compute per-band gap = (measured[f] −
+   measured[f_anchor]) − (target[f] − target[f_anchor]). The right
+   anchor is the LOWEST-frequency candidate where every band above it
+   has a non-negative gap (i.e. measured ≥ target relative to the
+   anchor — implementable via cut). If no such candidate exists,
+   accept the lowest-frequency anchor with the smallest single-band
+   shortfall and accept some residual boost at that one band.
 
-### 3.3 Design input PEQ
+Concrete worked example, validated 2026-04-29 (Harman+4 in a modal
+room with mid-bass hump):
 
-Input PEQ slots from `eq_capabilities.input_peq.available_slots` — typically 8.
-Always reserve slot 1 for the HPF. Target curves usually need 3-5 filters for
-the curve shape + 0-2 for residual room-mode cleanup.
+| Anchor freq | Worst gap | Avg \|gap\| |
+|-------------|-----------|-------------|
+| 25 Hz (curve's max value) | +7.6 dB | 3.2 dB |
+| **31 Hz (slightly off the max)** | **+4.1 dB** | **2.4 dB** |
+| 80 Hz (curve's 0 dB / canonical) | similar to 25 Hz | ~3 dB |
 
-Design the filter set:
+The 25 Hz anchor was wrong because measured 25 Hz was 8 dB BELOW where
+the curve says it should be (deep-bass rolloff + null at adjacent
+bands). 31 Hz was naturally close to its target value, so anchoring
+there gave most other bands smaller errors.
+
+**Algorithm:**
+
+1. Pull baseline FR (HPF-only state).
+2. For each f_anchor in {25, 31, 40, 50, 63, 80}:
+   - Compute the relative target shape: `target[f] − target[f_anchor]`
+   - Compute the relative measured shape: `measured[f] − measured[f_anchor]`
+   - For each band f, gap = relative_meas[f] − relative_target[f]
+   - Score = max(|gap|) across the target band
+3. Pick the f_anchor with the lowest score.
+4. The reference SPL for the target_curve = measured[f_anchor] − target[f_anchor].
+
+This makes cuts dominate the correction, side-stepping the boost-
+inefficiency problem. Master gain (Phase 5 cleanup) compensates for
+the level drop the cuts create — so the absolute SPL anchor is
+decoupled from the curve fit.
+
+### 3.3 Design input PEQ — cuts first, boosts last
+
+Input PEQ slots from `eq_capabilities.input_peq.available_slots` —
+typically 8. Always reserve slot 1 for the HPF. Most target curves
+need 3-5 filters for shape + 1-2 for residual cleanup.
+
+**Filter ordering by effectiveness in modal-rich rooms:**
+
+| Type | Effectiveness at MLP | Use for |
+|------|---------------------|---------|
+| Peaking cut at modal peak (high Q 4-6) | Near 100% of dB cut | Trimming +X dB modal hot spots |
+| Low/high shelf in non-modal range | 80-100% | Broad tilt toward curve shape |
+| Peaking cut, broad Q (1-2) | Limited by modal ringing in band | Avoid — cut SOURCE energy but room rings on |
+| **Peaking BOOST at any band** | **25-50%** | **Avoid wherever possible** |
+| Boost at a phase null | <30% | Never (waste of headroom) |
+
+**Design steps:**
 
 1. Always include 18 Hz 4th-order HPF.
-2. Compute the error curve: `error(f) = (ref + offset(f)) - measured(f)` at
-   full resolution across the target band.
-3. Decompose the error into a small set of biquad shapes:
-   - **Low shelf** around the target's bass-rise knee (e.g. Harman's shelf
-     peaks near 40–50 Hz)
-   - **Peaking filters** for any residual room modes still protruding through
-     the per-sub FIR (these should be small — FIR already handled most)
-   - For each filter, call `optimize_q(session, freq_hz, target_gain_db)` to
-     find the Q that minimizes residual error in the filter's band
-4. **Simulate before applying:** `simulate_eq(baseline_session, filters)`.
-   Inspect predicted response. Iterate design in simulation until satisfied.
+2. Compute residual = target_anchored − measured. Sort by sign:
+   negative deltas → CUTS (cheap), positive deltas → BOOSTS (expensive).
+3. Place high-Q (4-6) peaking cuts AT the modal peaks where measured is
+   hot. Cut depth = the residual error there. These deliver near-100%.
+4. Place broad shelves only when the curve genuinely calls for tilt
+   (don't shelf-boost just to lift a band the room can't deliver).
+5. **For boost candidates, ask: is this a phase null?** Check FR for
+   a sharp dip vs surrounding bands. A null > 5 dB below average is
+   NOT fillable with PEQ; skip it and accept the dip.
+6. Simulate via `simulate_eq` before applying — its prediction will
+   over-estimate boost effects. Cross-check with `verify_input_eq_effect`
+   after applying.
 
-Use `compute_deviation(baseline_session, target_curve)` to see RMS error
-before vs after simulation.
+Use `compute_deviation(baseline_session, target_curve)` for RMS error
+delta in simulation.
 
 ### 3.4 Apply and iterate
 

@@ -1237,6 +1237,50 @@ class CamillaDSPDriver(DSPDriver):
 
     # ── FIR ───────────────────────────────────────────────────────────────────
 
+    def get_fir_pre_delay_ms(self) -> float:
+        """Estimate the maximum FIR pre-ring window across all outputs.
+
+        Returns the longest duration (in ms) of significant non-causal
+        content among loaded FIRs — anti-pulse modal cancellation places
+        energy before the main impulse, and the IR onset detector needs
+        to know how much leading window to skip.
+
+        Heuristic: locate the main-impulse sample (max |coeff|), measure
+        how many samples of significant content precede it (envelope above
+        -20 dB of peak), convert to ms at the FIR sample rate. Returns 0
+        if no FIRs are loaded.
+        """
+        try:
+            import numpy as _np
+        except Exception:
+            return 0.0
+        sr = float(self.capabilities.fir_sample_rate_hz or 8000)
+        if sr <= 0:
+            return 0.0
+        worst_ms = 0.0
+        for coeffs in self._fir_state.values():
+            if not coeffs:
+                continue
+            arr = _np.asarray(coeffs, dtype=float)
+            if arr.size == 0:
+                continue
+            abs_arr = _np.abs(arr)
+            peak = float(abs_arr.max())
+            if peak <= 0:
+                continue
+            main_idx = int(_np.argmax(abs_arr))
+            threshold = peak * 0.10  # -20 dB
+            # Find earliest sample BEFORE the main impulse that exceeds threshold.
+            pre = abs_arr[:main_idx]
+            above = _np.where(pre >= threshold)[0]
+            if len(above) == 0:
+                continue
+            pre_samples = main_idx - int(above[0])
+            ms = 1000.0 * pre_samples / sr
+            if ms > worst_ms:
+                worst_ms = ms
+        return worst_ms
+
     async def apply_fir(
         self,
         output_index: int,
@@ -1249,6 +1293,12 @@ class CamillaDSPDriver(DSPDriver):
         *sample_rate* is accepted for parity with MinidspDriver.apply_fir but
         must match the processing rate — CamillaDSP applies Conv filters at the
         pipeline rate, with no per-filter resampling.
+
+        *intent* selects the FIR safety profile: ``"general"`` (default,
+        strict thermal/excursion cap) or ``"modal_cancel"`` (looser cap for
+        anti-pulse modal-cancellation FIRs from ``design_modal_fir`` whose
+        magnitude is intentionally hot at the mode but cancels at the
+        listener — see SafetyValidator.validate_fir docstring).
         """
         caps = self.capabilities
         if not coefficients:

@@ -2,6 +2,91 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.10.0] - 2026-04-30
+
+### Added
+- **Per-speaker `sweep_range_hz` in config.yaml** drives sweep band selection. Each entry under `speakers:` and `sub:` can now declare `sweep_range_hz: [lo, hi]`. The `measure` MCP tool resolves the right band when given a `target` parameter (e.g. `target="mains"` → 60-20000 Hz, `target="subs"` → 15-150 Hz, `target="FL"` → looks up the main speaker's range). Avoids the recipe author having to remember which range to use per speaker class.
+- **`measure` tool gained `target`, `freq_min`, `freq_max` parameters.** Resolution order: explicit `freq_min`/`freq_max` (any one of them, partial overrides supported) → `target` → speaker config → global `measurement.freq_min`/`freq_max` defaults. The default behaviour (no params) is unchanged: 20-200 Hz sub-only sweep.
+- **`MeasurementEngine.measure()` accepts `freq_min`/`freq_max` overrides.** Engine falls back to config defaults when None is passed.
+- **New helper `_resolve_sweep_range()`** with 16 unit tests covering explicit overrides, partial overrides (only `freq_min`), target-based lookups (subs / mains / atmos / position codes / aliases), fallback when no target / no speaker has the range configured, and the diagnostic `source` string returned alongside.
+
+### Why
+Mains play 48 Hz - 32 kHz. The default 20-200 Hz sweep was sub-only and produced essentially no useful data above the crossover. Mains calibration via the AVR's MultEQ filter banks (the SET_COEFDT path landed in v0.6.9.7-8) needs full-range FR data to design filters across the audible band. With this change a recipe can do `measure(target="FL")` and Just Get Right.
+
+### Notes for callers
+- The 1/3-octave summary returned by `get_fr_summary` is currently still pinned to 20-200 Hz bins. Wider sweeps capture full data into the session store; the summary will be extended to 20-20000 Hz in a follow-up.
+
+## [0.6.9.9] - 2026-04-30
+
+### Fixed
+- **Preflight `check_denon` now fails loudly when AVR is in standby.** The Denon HTTP service responds in standby — `state["connected"] == True` does not mean "ready to play audio." If `power != "ON"`, Telnet replies vanish silently and sweep measurements come back at SNR = 0. Surfaces a clear "AVR is in standby" failure instead of passing the check. Caught after wasting 30 minutes assuming the AVR was on.
+- **`DenonDriver.get_state` now reports `power`** (was missing). Callers can guard before sending Telnet/sweep commands.
+
+### Added
+- **`DenonSweepContext` auto-powers-on the AVR.** If the AVR is in standby when a sweep context is entered, the context now calls `async_power_on()` and waits up to 10 s for `power == "ON"` before yielding. Sweeps that previously came back silent now either succeed or fail with a clear "AVR did not report power=ON within 10 s" error.
+- **`DenonDriver.async_power_on()`** — public helper to power on the AVR + wait for ON.
+- **`DenonDriver.telnet_query()`** — loud-fail wrapper for Telnet command sequences. Verifies `power == "ON"` first (configurable), sends commands, raises `DriverError` with a diagnostic message if all replies are empty (which happens silently in standby or with an exhausted Telnet pool). Replaces the silent-empty-string pattern that hid the standby bug.
+
+## [0.6.9.8] - 2026-04-30
+
+### Added
+- **`calibrate/drivers/denon/audyssey_filter_upload.py`** — full Audyssey TCP upload orchestration. `query_avr_status()` runs ENTER_AUDY + GET_AVRINF + GET_AVRSTS introspection. `build_set_dat_envelope()` constructs the 16-field ordered SET_SETDAT payload from a .ady file + GET_AVRSTS response, with correct types (booleans not strings, integers not strings, capital-Q in `AudyMultEQ`). `chunk_setdat_payload()` splits envelopes under the 510-byte AVR threshold preserving canonical field order. `push_avr_filters()` runs the full upload sequence: ENTER_AUDY → chunked SET_SETDAT → SET_COEFDT streams per channel × tc × sr → FINZ_COEFS → AudyFinFlg=Fin commit → EXIT_AUDMD. INIT_COEFS is auto-detected from `DType` (only sent when fixed-point — X3800H is float, skip).
+
+- **MCP tools `design_avr_fir` + `apply_avr_fir`** — design + push AVR-format FIR coefficients via the Audyssey TCP path, fully scriptable from a recipe.
+  - `design_avr_fir(channel_id, target_curve_db, cache_key)` — takes a target FR curve (list of `{freq_hz, gain_db}` points), runs `design_correction_ir → convert_xt32`, caches the 1024 (speaker) / 704 (sub) AVR coefficients keyed by `(cache_key, channel_id)`.
+  - `apply_avr_fir(host, ady_path, cache_key, ...)` — loads cached coefficients per channel, builds the full envelope from .ady + AVR introspection, pushes via `push_avr_filters`. Supports `distances_override_m` for the variance-cap bypass and `target_curves` / `samplerates_hz` for limiting the upload to specific banks.
+
+- **`scripts/smoke_test_filter_upload.py`** — end-to-end pipeline smoke test against a live AVR with no audio sweeps. Default `--dry-run` mode introspects + builds envelopes + counts packets without writing. `--transmit` mode actually pushes (with a typed-confirmation prompt) — useful for verifying the full protocol works before the first measurement-driven calibration.
+
+- 22 new tests in `test_audyssey_filter_upload.py` covering field-order preservation, bool/int type-correctness for picky firmware fields, distance overrides, chunker behaviour, and `parse_frames` round-trip. 12 new tests in `test_mcp_avr_fir_tools.py` for the MCP tool layer (caching, validation, mocked TCP push).
+
+### Notes for callers
+- The full SET_SETDAT envelope is now sent (16 fields) — `apply_avr_fir` does not have the FR-drift side effect that `set_speaker_distances(use_custom=True)` exhibited. EQ-related fields (AudyDynEq, AudyEqRef, AudyMultEQ, etc.) are sent explicitly to the values that match A1Evo Acoustica's post-cal defaults.
+- The `AudyFinFlg=Fin` commit at the end of `apply_avr_fir` writes to the AVR's NVRAM. There is no volatile mode for filter coefficients.
+- Caller MUST NOT enter Manual Setup > Distances on the AVR after a successful push — that triggers re-validation that snaps Distance back to the variance cap.
+- Recovery from a botched push: re-upload the original `.ady` via the MultEQ Editor app's "Send to AV receiver" button.
+
+### Verified end-to-end (2026-04-30)
+- `query_avr_status` against X3800H returns AmpAssign="Normal", EQType="MultEQXT32", DType="Float", CoefWaitTime.Final=15000.
+- `build_set_dat_envelope` from a real .ady + GET_AVRSTS produces a 1619-byte payload that chunks cleanly into 5 sub-510-byte SET_SETDAT packets.
+- `all_streams_for_channel` produces 522 SET_COEFDT packets for a 9-speaker + 1-sub setup × 2 target curves × 3 sample rates.
+- The actual `--transmit` path against the AVR is gated on a typed confirmation in the smoke-test script — not exercised in this commit.
+
+## [0.6.9.7] - 2026-04-30
+
+### Added
+- **`calibrate/audyssey_fir.py`** — XT32 polyphase FIR designer. Generates a 16,321-tap (speaker) or 16,055-tap (sub) impulse response from a target FR curve, then polyphase-decimates 4-band to the AVR's expected 1024 / 704 coefficient vector. Math ported with attribution from `srinivas486/audyssey-rew-tuner` (MIT-licensed). Includes channel-byte mapping table for SET_COEFDT routing, sample-rate codes (32k/44.1k/48k/96k), and `design_correction_ir` / `design_passthrough_ir` helpers.
+- **`calibrate/drivers/denon/audyssey_coef_transfer.py`** — SET_COEFDT packet builder. Frames 1024/704-float vectors into the AVR's variable-length packet stream (1×127 floats first, ~7×128 mid, last partial — total 9 packets per stream for speakers, 6 for subs). Builds one stream per (target_curve × sample_rate) tuple — XT32 expects 6 streams per channel (Reference + Flat × 3 sample rates), so 54 packets for a speaker / 36 for a sub.
+- **`audyssey_tcp.push_filter_set`** — full upload orchestrator. Sequences ENTER_AUDY → SET_SETDAT(envelope, AudyFinFlg=NotFin) → coefficient streams (no ACK) → FINZ_COEFS → SET_SETDAT(AudyFinFlg=Fin) → EXIT_AUDMD. Sync core (`_push_filters_sync`) + async wrapper. Configurable inter-packet / inter-channel pacing and final-coef wait (default 15 s for X3800H). Returns per-stage status. **Wire-tested via mocked socket only — not yet hardware-validated.** No MCP tool exposes it yet.
+- 50 tests across `tests/test_audyssey_fir.py`, `tests/test_audyssey_coef_transfer.py`, `tests/test_audyssey_tcp.py` — polyphase decomposition round-trip, multi-rate output-length checks, packet framing + checksum + LE float32 round-trip, all-streams-per-channel counts, full-upload sequence ordering with mock socket.
+
+These are the building blocks for direct-uploading custom FIR coefficients to the AVR — the protocol layers needed for an LLM-driven mains calibration loop. **Still not in this version:** MCP tools (`design_avr_fir` / `apply_avr_fir`) that wire these into Claude's calibration loop, plus the AVR-state introspection (GET_AVRINF + GET_AVRSTS) that builds the full 16-field SET_SETDAT envelope. Hardware validation of the upload path is also pending.
+
+## [0.6.9.6] - 2026-04-30
+
+### Added / Changed
+- **Audyssey distance variance-cap bypass (OCA-style envelope), verified on X3800H:** the firmware re-validates a `Distance`-only SET_SETDAT on `EXIT_AUDMD` and clamps the applied delay variance to ~38 ms (matches UI 18 m / 60 ft cap). Including `AudyFinFlg: "NotFin"` in the same packet, then a separate `AudyFinFlg=Fin` commit before `EXIT_AUDMD`, tells the firmware "this is a complete write, not a partial poke" — and the larger Distance values stick. Empirically the envelope extends the applied-delay ceiling to ~55 ms (still capped, just higher). Confirmed end-to-end via SW1=20m sweep with sub-vs-mains phase-slope going from +10.6 ms (subs trail) to -3.93 ms (subs slightly lead) and per-band cancelling bands dropping from 2 → 0.
+
+  Implementation: `audyssey_tcp.build_envelope_distance_payload` returns `{"Distance":[...], "AudyFinFlg":"NotFin"}`; `push_speaker_distances(use_custom=True)` now sends that payload and forces `commit=True`. Old `build_custom_distance_payload` (which targeted a non-existent `customDistance` wire field) is now an alias for the working envelope builder.
+
+- **`set_speaker_distances` MCP tool docstring updated** to describe the envelope bypass behaviour, the 38 ms vs 55 ms cap distinction, and the FR-drift side effect from the minimal envelope (mids may shift ±5-10 dB because AudyMultEq/AudyEqRef/AudyEqSet aren't carried). For full-state preservation, callers should switch to `scripts/audyssey_push_full_envelope.py` once it gains AVR-state introspection.
+
+### Removed
+- `build_custom_distance_payload` no longer constructs the broken `Distance=0 + CustomDistance` payload (that field doesn't exist on the wire — it's a .ady-file-only artifact). The name remains as a back-compat alias for `build_envelope_distance_payload`.
+
+## [0.6.9.5] - 2026-04-29
+
+### Added
+- **`samplerate` param on `design_modal_fir`:** previously the tool hardcoded `sample_rate=8000` regardless of the CamillaDSP processing rate. When the daemon runs at 48 kHz native (no internal resampler), the 8 kHz coefficients applied 1:6 — modal frequencies shifted 6× higher, anti-pulse positions garbled. The new `samplerate` param (default 8000 to preserve backward behavior) plumbs through to `ModalAwareFIRDesigner(sample_rate=...)`. Use `samplerate=48000, num_taps=24576` to match the `8000 + 4096` 512 ms filter window at 48 kHz native. Function signature, tool inputSchema, and dispatcher all updated.
+
+## [0.6.9.4] - 2026-04-29
+
+### Changed
+- **`analyze_ir` description + docstring tightened to flag cross-path misuse:** the tool's `peak_time_s` only equals acoustic travel time when the compared measurements share an identical processing chain. With a long FIR (e.g. 4096-tap modal-FIR @ 48 kHz ≈ 85 ms window) on the sub chain, the detected peak sits inside the FIR's non-causal region — its absolute value reflects FIR shape and buffer latency, not arrival time. Every cross-path use (sub-vs-mains, FIR-chain vs no-FIR-chain, cal-mode vs HDMI) was returning misleading numbers without warning. Docstring + tool description now name the valid (solo-sub) and invalid (cross-path) use cases explicitly and route cross-path callers to `compare_sub_phase` or the loopback alignment rig.
+
+### Added
+- **`cross_path_warning` field in `analyze_ir` response:** when `peak_time_ms` exceeds 80 ms (well beyond any realistic solo-sub acoustic range), the response includes a string warning that the value reflects FIR/buffer latency rather than acoustic arrival, and that cross-path comparisons against this number are invalid. Solo-sub callers (peak in normal 0–30 ms range) see `cross_path_warning: null` and behave unchanged.
+
 ## [0.6.8.4] - 2026-04-28
 
 ### Fixed

@@ -408,21 +408,25 @@ class SafetyValidator:
             per_band[centre] = float(np.max(mag_db[mask]))
 
         floor = prof.min_boost_freq_hz
-        below_floor_limit = prof.max_boost_per_band_db
-        # The above-floor cap depends on intent. Generic FIRs (PEQ-equivalent
-        # arbitrary writes) get the strict thermal/excursion cap. Modal-
-        # cancellation FIRs from ``design_modal_fir`` get a looser cap: their
-        # boost at the mode is meant to cancel the room mode at the listener,
-        # so net SPL at the listening position is unchanged; only the driver
-        # sees the boosted level, well within thermal/excursion at typical
-        # calibrated listening levels.
+        # The cap depends on intent. Generic FIRs (PEQ-equivalent arbitrary
+        # writes) get the strict thermal/excursion cap. Modal-cancellation
+        # FIRs from ``design_modal_fir`` get a looser cap: their boost at the
+        # mode is meant to cancel the room mode at the listener, so net SPL
+        # at the listening position is unchanged; only the driver sees the
+        # boosted level, well within thermal/excursion at typical calibrated
+        # listening levels. For below-port-tune leakage from anti-pulses
+        # (one half-wavelength transient pulse, ~14 ms), the same logic
+        # applies: the boost is transient and below port tuning the
+        # mandatory HPF further limits driver excursion.
         if intent == "modal_cancel":
             above_floor_limit = prof.modal_cancel_max_boost_db
+            below_floor_limit = prof.modal_cancel_max_boost_db
             cap_label = (
                 f"modal-cancellation cap of +{above_floor_limit:.0f} dB"
             )
         else:
             above_floor_limit = prof.max_boost_above_threshold_db
+            below_floor_limit = prof.max_boost_per_band_db
             cap_label = f"thermal ceiling of +{above_floor_limit:.0f} dB"
 
         for centre, peak_db in per_band.items():
@@ -441,6 +445,44 @@ class SafetyValidator:
                     )
             else:
                 if peak_db > above_floor_limit:
+                    if intent == "modal_cancel":
+                        # Identify likely culprit modes: any per-band peak
+                        # within 2/3-oct of this boost band that is itself
+                        # boosted (i.e. an anti-pulse there is the most
+                        # plausible source of leakage into ``centre``).
+                        ratio = 2.0 ** (2.0 / 3.0)
+                        nearby = []
+                        for other_centre, other_peak in per_band.items():
+                            if other_centre == centre:
+                                continue
+                            if other_peak <= 1.0:
+                                continue
+                            r = max(other_centre / centre, centre / other_centre)
+                            if r <= ratio:
+                                nearby.append(other_centre)
+                        if nearby:
+                            culprits = ", ".join(
+                                f"{c:.0f} Hz" for c in sorted(nearby)
+                            )
+                            hint = (
+                                f" Likely from anti_pulse modes at {culprits} "
+                                f"(within 2/3-oct of boost band). Try reducing "
+                                f"cancel_strength on those modes, or use "
+                                f"design_modal_fir which auto-iterates to fit cap."
+                            )
+                        else:
+                            hint = (
+                                " No adjacent-band anti-pulse signature "
+                                "detected — boost may come from the magnitude "
+                                "correction layer; reduce target-curve "
+                                "demand at this frequency."
+                            )
+                        raise SafetyValidationError(
+                            f"SafetyValidator: FIR boost of +{peak_db:.1f} dB "
+                            f"at {centre:.0f} Hz 1/3-octave band exceeds "
+                            f"{cap_label} (profile {prof.name!r}, intent "
+                            f"{intent!r}).{hint}"
+                        )
                     raise SafetyValidationError(
                         f"SafetyValidator: FIR boost of +{peak_db:.1f} dB "
                         f"at {centre:.0f} Hz 1/3-octave band exceeds "

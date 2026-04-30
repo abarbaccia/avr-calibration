@@ -25,7 +25,7 @@ Tools:
   set_output_gain        — set gain for a single DSP output (dB)
   apply_fir              — write FIR coefficients to a DSP output (via CLI, WAV temp file)
   clear_fir              — clear FIR and reset to passthrough
-  analyze_ir             — IR peak time, polarity, SPL from stored session (sub alignment)
+  analyze_ir             — IR onset time, polarity, SPL (solo-sub alignment ONLY — invalid cross-path)
   analyze_decay          — T60 decay analysis on stored IR; returns ringing modes with priority
   configure_matrix       — configure miniDSP routing matrix (active input → all outputs)
   check_system           — pre-flight hardware checks
@@ -950,6 +950,20 @@ async def _tool_compute_deviation(
                 "excluded_band_diagnostics will be empty", exc,
             )
 
+        # Geometry-dominated flag: when more than half the in-band points
+        # are excluded as geometry nulls, the RMS / mean / max stats are
+        # computed from < 50% of the band and are not representative.
+        # Surface a single boolean so callers can branch (e.g. recommend
+        # sub repositioning instead of further EQ iteration) without
+        # comparing counts to thresholds themselves.
+        total_points = (
+            len(included_errors) + len(excluded_null)
+            + len(excluded_rolloff) + len(excluded_geometry)
+        )
+        geometry_dominated = (
+            total_points > 0
+            and len(excluded_geometry) > total_points * 0.5
+        )
         return _ok(
             session_id=session_id,
             rms_db=round(rms, 2),
@@ -970,6 +984,7 @@ async def _tool_compute_deviation(
             excluded_null_points=len(excluded_null),
             excluded_rolloff_points=len(excluded_rolloff),
             excluded_geometry_points=len(excluded_geometry),
+            geometry_dominated=geometry_dominated,
             geometry_bands=[
                 {"lo_hz": round(lo, 1), "hi_hz": round(hi, 1)}
                 for lo, hi in geometry_ranges
@@ -990,6 +1005,7 @@ async def _tool_anchor_target(
     null_threshold_db: float = 15.0,
     port_rolloff_hz: float = 28.0,
     exclude_geometry: bool = True,
+    direction: str = "balanced",
 ) -> dict:
     """Compute the optimal reference SPL for a target curve against a baseline measurement.
 
@@ -1116,6 +1132,58 @@ async def _tool_anchor_target(
         )
         reference_spl = min_headroom + max_boost_db
 
+        # ── cuts_only anchor: pick LOWEST-frequency anchor where every band
+        # above has positive gap (measured-relative ≥ target-relative). This
+        # yields a target that's pure cuts above the anchor — useful for
+        # deep-bass-priority sub calibration where boosts are only ~25–50%
+        # effective at the listener but cuts are unconstrained.
+        residual_boost_band_hz: float | None = None
+        anchor_freq_used: float | None = None
+        if direction == "cuts_only":
+            # Sort headroom_values by ascending frequency
+            hv_sorted = sorted(headroom_values, key=lambda r: r[0])
+            best_anchor: tuple[float, float] | None = None  # (freq, ref_spl)
+            best_shortfall_anchor: tuple[float, float, float, float] | None = None
+            # (freq, ref_spl, min_gap, shortfall_freq)
+            for a_freq, a_meas, a_off, _ in hv_sorted:
+                # Reference SPL such that target(anchor) == measured(anchor):
+                #   ref + a_off == a_meas → ref = a_meas - a_off
+                ref_spl_cand = a_meas - a_off
+                min_gap = float("inf")
+                min_gap_freq = a_freq
+                for f, m, o, _ in hv_sorted:
+                    if f <= a_freq:
+                        continue
+                    # gap = (measured - measured_anchor) - (target - target_anchor)
+                    #     = (m - a_meas) - (o - a_off)
+                    gap = (m - a_meas) - (o - a_off)
+                    if gap < min_gap:
+                        min_gap = gap
+                        min_gap_freq = f
+                if min_gap == float("inf"):
+                    # No bands above this anchor — accept it (degenerate)
+                    if best_anchor is None:
+                        best_anchor = (a_freq, ref_spl_cand)
+                    continue
+                if min_gap >= -0.5:
+                    best_anchor = (a_freq, ref_spl_cand)
+                    break
+                if (
+                    best_shortfall_anchor is None
+                    or min_gap > best_shortfall_anchor[2]
+                ):
+                    best_shortfall_anchor = (
+                        a_freq, ref_spl_cand, min_gap, min_gap_freq,
+                    )
+            if best_anchor is not None:
+                anchor_freq_used, reference_spl = best_anchor
+                limiting_freq = anchor_freq_used
+            elif best_shortfall_anchor is not None:
+                anchor_freq_used = best_shortfall_anchor[0]
+                reference_spl = best_shortfall_anchor[1]
+                limiting_freq = anchor_freq_used
+                residual_boost_band_hz = round(best_shortfall_anchor[3], 1)
+
         # Build anchored target curve. Flag anchored points that are below
         # port_rolloff_hz as unreachable — the sub physically can't produce
         # those levels, so Phase 3 filter design should ignore them.
@@ -1179,6 +1247,11 @@ async def _tool_anchor_target(
             ],
             null_zones=null_zones,
             valid_points=len(headroom_values),
+            direction=direction,
+            anchor_freq_hz=(
+                round(anchor_freq_used, 1) if anchor_freq_used is not None else None
+            ),
+            residual_boost_band_hz=residual_boost_band_hz,
         )
     except Exception as exc:
         return _err(f"anchor_target failed: {exc}")
@@ -2788,6 +2861,7 @@ async def _tool_optimize_sub_alignment(
     max_delay_ms: float = 30.0,
     search_polarity: bool = True,
     gain_search_db: float = 3.0,
+    priority_band: list[float] | None = None,
     seed: int = 42,
 ) -> dict:
     """MSO-style numerical sub alignment.
@@ -2800,6 +2874,13 @@ async def _tool_optimize_sub_alignment(
     band (flatness objective). Pass a target_curve = {"points":[{"freq","spl"},…]}
     to optimize against e.g. Harman or cinema-bass.
 
+    ``priority_band``: optional [lo_hz, hi_hz]. When supplied, the objective
+    weights points inside this band 3× higher than baseline, so the optimizer
+    preferentially drives the deepest-null elimination in that range. Use to
+    collapse the deep-bass-priority + wideband 2-call workflow (recipe
+    Phase 1.5) into one call: pass ``priority_band=[20, 50]`` and the
+    optimizer attacks deep-bass nulls without a separate narrow re-pass.
+
     Bounds:
       delay_ms  ∈ [0, max_delay_ms]  (lower-bound 0: optimizer delays leading
                                        subs rather than negatively delaying
@@ -2807,7 +2888,11 @@ async def _tool_optimize_sub_alignment(
       gain_db   ∈ [-gain_search_db, +gain_search_db]  (level match)
       polarity  ∈ {0, 1}             (continuous in DE, snapped on return)
 
-    Returns per-sub recommendations + predicted combined FR + improvement_db.
+    Returns per-sub recommendations + predicted combined FR + improvement_db
+    + per_band_polarity diagnostic (for each 1/3-octave band, indicates
+    whether flipping each sub's polarity individually would IMPROVE the
+    band's SPL — surfaces the polarity insight that the global optimizer
+    can miss when its objective averages across the full band).
     """
     try:
         from .storage import SessionStore
@@ -2902,6 +2987,19 @@ async def _tool_optimize_sub_alignment(
             1.0 - (in_band_freqs - min_hz) / max(max_hz - min_hz, 1e-9) * 0.9,
             0.1, 1.0,
         )
+
+        # Priority-band boost: when caller specifies ``priority_band``,
+        # multiply weights inside that band by 3.0 so the optimizer
+        # prefers fixing nulls there over flatness elsewhere. Collapses
+        # the wideband + narrowband 2-call workflow into one call
+        # (recipe Phase 1.5).
+        if priority_band is not None:
+            try:
+                pb_lo, pb_hi = float(priority_band[0]), float(priority_band[1])
+                pb_mask = (in_band_freqs >= pb_lo) & (in_band_freqs <= pb_hi)
+                freq_weights = np.where(pb_mask, freq_weights * 3.0, freq_weights)
+            except (IndexError, TypeError, ValueError):
+                pass  # invalid priority_band — silently ignore
 
         # Coherence weights: bins with low coherence (<0.7) carry substantial
         # measurement noise and should influence the optimizer proportionally
@@ -3023,9 +3121,52 @@ async def _tool_optimize_sub_alignment(
         in_band_freqs = freqs[in_band].tolist()
         in_band_pred = [float(x) for x in combined_fr_db(best)[in_band]]
 
+        # Per-band polarity diagnostic. For each 1/3-octave centre,
+        # compute the combined SPL with the optimizer's recommendation
+        # vs the same recommendation with each non-anchored sub flipped
+        # individually. If a flip improves SPL by >2 dB in a band, the
+        # global optimizer's polarity choice is suboptimal at that band
+        # — usually because the wideband objective averaged across bands
+        # masked a per-band cancellation. Surfacing this lets the LLM
+        # decide per-band rather than only seeing the global answer.
+        third_octave = [25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0]
+        half_step = 2 ** (1 / 6)
+        per_band_polarity: list[dict] = []
+        try:
+            current_fr = combined_fr_db(best)
+            for centre in third_octave:
+                if centre < min_hz or centre > max_hz:
+                    continue
+                lo, hi = centre / half_step, centre * half_step
+                mask = (freqs >= lo) & (freqs < hi)
+                if not np.any(mask):
+                    continue
+                current_band_spl = float(np.mean(current_fr[mask]))
+                flips = []
+                for i in range(1, N_subs):  # sub_0 is anchored
+                    flipped = best.copy()
+                    flipped[3 * i + 2] = 1.0 - best[3 * i + 2]
+                    flipped_fr = combined_fr_db(flipped)
+                    flipped_band_spl = float(np.mean(flipped_fr[mask]))
+                    delta = flipped_band_spl - current_band_spl
+                    if delta > 2.0:
+                        flips.append({
+                            "session_id": subs[i].id,
+                            "spl_gain_if_flipped_db": round(delta, 1),
+                        })
+                if flips:
+                    per_band_polarity.append({
+                        "freq_hz": centre,
+                        "current_spl_db": round(current_band_spl, 1),
+                        "flips_that_help": flips,
+                    })
+        except Exception:
+            per_band_polarity = []
+
         return _ok(
             per_sub=per_sub,
             band_hz=[min_hz, max_hz],
+            priority_band=priority_band if priority_band else None,
             baseline_error_db=round(baseline_err, 3),
             optimized_error_db=round(optimized_err, 3),
             improvement_db=improvement_db,
@@ -3034,23 +3175,213 @@ async def _tool_optimize_sub_alignment(
                 "frequencies": in_band_freqs,
                 "spl_db": in_band_pred,
             },
+            per_band_polarity=per_band_polarity,
             converged=bool(result.success),
             n_evaluations=int(result.nfev),
             note=(
                 "Per-sub recommendations minimize predicted combined-FR error in-band. "
                 "Apply delay via set_delay, gain via set_output_gain, polarity via "
-                "set_polarity per session_id. Then measure combined to verify "
-                "improvement_db shows up. Delays are returned in MINIMUM-LATENCY "
-                "form: the trailing sub is anchored at 0 ms; leading subs receive "
-                "only the inter-sub delta needed to align. This avoids burning "
-                "10-25 ms of pure latency on the sub chain (which would push the "
-                "sub-vs-mains offset out of alignment and consume Audyssey "
-                "distance-push budget). The combined FR is invariant to absolute "
-                "time offset — only the inter-sub delta matters."
+                "set_polarity per session_id. Delays are in MINIMUM-LATENCY form: "
+                "the trailing sub is anchored at 0 ms; leading subs get only the "
+                "inter-sub delta. ``per_band_polarity`` lists bands where flipping "
+                "an individual sub would gain >2 dB SPL vs the global recommendation "
+                "— useful for catching cancellations the wideband objective averaged "
+                "out. ``priority_band`` (if set) weighted that range 3× in the "
+                "objective for deep-bass-priority alignment."
             ),
         )
     except Exception as exc:
         return _err(f"optimize_sub_alignment failed: {exc}")
+
+
+async def _tool_sweep_inter_sub_delay(
+    session_ids: list[int],
+    sub_polarity: list[bool] | None = None,
+    sub_gain_db: list[float] | None = None,
+    base_delays_ms: list[float] | None = None,
+    priority_band: list[float] = [28.0, 50.0],
+    sweep_range_ms: float = 2.0,
+    step_ms: float = 0.25,
+) -> dict:
+    """Automated inter-sub delay sweep — predicts deepest-null depth in
+    the priority band for each delay step on the trailing sub.
+
+    Replaces the manual ±2 ms human-driven sweep in recipe Phase 1.5.
+    Takes post-alignment solo session_ids (one per sub), the polarity /
+    gain / base-delay state already applied to each sub, and sweeps the
+    *non-leading* sub's delay across ``[base − sweep_range, base + sweep_range]``
+    in ``step_ms`` increments. For each step, predicts the combined FR
+    by shift-and-summing the IRs and computes the deepest 1/3-octave-band
+    null depth in ``priority_band`` (default 28-50 Hz). Returns the step
+    that minimizes the deepest null.
+
+    Args:
+        session_ids: solo measurement session IDs (2 subs assumed; for
+            3+ subs, pass the two whose inter-delay you want to sweep).
+        sub_polarity: list of bools, one per sub. Defaults to all False.
+        sub_gain_db: list of floats, one per sub. Defaults to all 0.
+        base_delays_ms: list of floats, one per sub — the current delay
+            already applied. The trailing sub's delay is swept around
+            its base value; the leading sub's stays put. Defaults to
+            all 0.
+        priority_band: ``[lo_hz, hi_hz]`` for null detection. Default
+            [28, 50] = the deep-bass priority band.
+        sweep_range_ms: ± range around the trailing sub's base delay.
+        step_ms: sweep granularity. Default 0.25 ms = 9 measurements
+            for ±2 ms range.
+
+    Returns each step's predicted deepest-null depth and the optimal
+    delta. Apply the recommended delta via ``set_delay`` on the
+    trailing sub.
+    """
+    try:
+        from .storage import SessionStore
+        import numpy as np
+
+        if not session_ids or len(session_ids) < 2:
+            return _err("sweep_inter_sub_delay: need at least 2 session_ids")
+
+        store = SessionStore()
+        sessions = store.list_sessions()
+        by_id = {s.id: s for s in sessions}
+        subs = []
+        for sid in session_ids:
+            s = by_id.get(sid)
+            if s is None:
+                return _err(f"session {sid} not found")
+            if not s.impulse_response:
+                return _err(f"session {sid} has no impulse_response")
+            if not s.start_fr or not s.start_fr.sample_rate:
+                return _err(f"session {sid} has no sample_rate")
+            subs.append(s)
+
+        N = len(subs)
+        sr = int(subs[0].start_fr.sample_rate)
+        for s in subs:
+            if int(s.start_fr.sample_rate) != sr:
+                return _err(
+                    f"session {s.id}: sample_rate mismatch "
+                    f"({s.start_fr.sample_rate} vs {sr})"
+                )
+
+        polarity = list(sub_polarity) if sub_polarity else [False] * N
+        gain_db = list(sub_gain_db) if sub_gain_db else [0.0] * N
+        base_delays = list(base_delays_ms) if base_delays_ms else [0.0] * N
+        if len(polarity) != N or len(gain_db) != N or len(base_delays) != N:
+            return _err(
+                f"polarity/gain/base_delays must each have {N} elements"
+            )
+
+        # Identify the trailing sub (the one whose base delay is highest —
+        # min-latency form puts trailing sub at 0, but if both are at 0
+        # we pick sub_1 by convention).
+        trailing_idx = int(max(range(N), key=lambda i: base_delays[i]))
+        if all(d == base_delays[0] for d in base_delays):
+            trailing_idx = 1  # default to sub_1 when no leader is identifiable
+
+        # Pad IRs to the longest length.
+        irs = [np.asarray(s.impulse_response, dtype=np.float64) for s in subs]
+        n = max(len(ir) for ir in irs) + int(
+            (max(base_delays) + sweep_range_ms + 5.0) * sr / 1000.0
+        )
+        irs_padded = np.stack([
+            np.pad(ir, (0, n - len(ir))) for ir in irs
+        ])
+
+        freqs = np.fft.rfftfreq(n, d=1.0 / sr)
+        pb_lo, pb_hi = float(priority_band[0]), float(priority_band[1])
+
+        # Build 1/3-octave centres in the priority band.
+        third_octave_all = [25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0]
+        centres = [c for c in third_octave_all if pb_lo <= c <= pb_hi]
+        half_step = 2 ** (1 / 6)
+
+        def predict_null(trailing_delay_ms: float) -> dict:
+            combined = np.zeros(n, dtype=np.float64)
+            for i in range(N):
+                d_ms = (
+                    trailing_delay_ms if i == trailing_idx else base_delays[i]
+                )
+                d_samples = int(round(d_ms * sr / 1000.0))
+                if d_samples >= n:
+                    d_samples = n - 1
+                shifted = np.zeros(n, dtype=np.float64)
+                if d_samples == 0:
+                    shifted = irs_padded[i].copy()
+                else:
+                    shifted[d_samples:] = irs_padded[i][:n - d_samples]
+                sign = -1.0 if polarity[i] else 1.0
+                g_lin = 10.0 ** (gain_db[i] / 20.0)
+                combined += sign * g_lin * shifted
+            H = np.abs(np.fft.rfft(combined)) + 1e-12
+            spl_db = 20.0 * np.log10(H)
+            band_mean = float(np.mean(spl_db[(freqs >= pb_lo) & (freqs <= pb_hi)]))
+            band_minima = []
+            for centre in centres:
+                lo, hi = centre / half_step, centre * half_step
+                mask = (freqs >= lo) & (freqs < hi)
+                if not np.any(mask):
+                    continue
+                band_minima.append(float(np.min(spl_db[mask])))
+            if not band_minima:
+                return {"deepest_null_db": 0.0, "band_mean_db": band_mean}
+            return {
+                "deepest_null_db": min(band_minima),
+                "band_mean_db": band_mean,
+                "depth_below_mean_db": min(band_minima) - band_mean,
+            }
+
+        # Sweep around the trailing sub's base delay.
+        steps = []
+        center = base_delays[trailing_idx]
+        n_steps = int(round(sweep_range_ms / step_ms))
+        for k in range(-n_steps, n_steps + 1):
+            d = max(0.0, center + k * step_ms)
+            pred = predict_null(d)
+            steps.append({
+                "trailing_delay_ms": round(d, 3),
+                "delta_from_base_ms": round(d - center, 3),
+                **{k: round(v, 2) for k, v in pred.items()},
+            })
+
+        # Pick the step with the SHALLOWEST deepest null (highest min SPL).
+        # Tie-break by smallest |delta_from_base| to prefer minimal change.
+        steps_sorted = sorted(
+            steps,
+            key=lambda x: (
+                -x["deepest_null_db"],
+                abs(x["delta_from_base_ms"]),
+            ),
+        )
+        best = steps_sorted[0]
+
+        return _ok(
+            session_ids=session_ids,
+            trailing_sub_session_id=subs[trailing_idx].id,
+            trailing_sub_label=subs[trailing_idx].label,
+            priority_band_hz=[pb_lo, pb_hi],
+            base_delay_ms=center,
+            recommended_delay_ms=best["trailing_delay_ms"],
+            recommended_delta_ms=best["delta_from_base_ms"],
+            recommended_deepest_null_db=best["deepest_null_db"],
+            baseline_deepest_null_db=next(
+                (s["deepest_null_db"] for s in steps
+                 if s["delta_from_base_ms"] == 0.0),
+                None,
+            ),
+            steps=steps,
+            note=(
+                f"Swept {len(steps)} delay steps in "
+                f"±{sweep_range_ms} ms / {step_ms} ms-step. Recommended "
+                f"delay {best['trailing_delay_ms']:.3f} ms shallowest the "
+                f"deepest null in {pb_lo:.0f}-{pb_hi:.0f} Hz to "
+                f"{best['deepest_null_db']:.1f} dB. Apply via "
+                f"set_delay(output_index=<trailing_sub>, delay_ms="
+                f"{best['trailing_delay_ms']:.3f})."
+            ),
+        )
+    except Exception as exc:
+        return _err(f"sweep_inter_sub_delay failed: {exc}")
 
 
 async def _tool_design_fir(
@@ -3061,6 +3392,7 @@ async def _tool_design_fir(
     freq_focus_hz: list[float] | None = None,
     return_coefficients: bool = True,
     preringing_ms: float = 25.0,
+    anchor: dict | None = None,
 ) -> dict:
     """Design FIR correction coefficients from a measurement.
 
@@ -3132,26 +3464,112 @@ async def _tool_design_fir(
         spl_measured = np.array(fr.spl)
 
         # Target: either provided curve or flat at average SPL
+        anchor_used: dict | None = None
         if target_curve and target_curve.get("points"):
             import math
             target_points = sorted(target_curve["points"], key=lambda p: p["freq"])
-            target_spl_at_freq = []
-            for f in freqs_measured:
-                if f < target_points[0]["freq"]:
-                    target_spl_at_freq.append(target_points[0]["spl"])
-                elif f > target_points[-1]["freq"]:
-                    target_spl_at_freq.append(target_points[-1]["spl"])
-                else:
-                    for i in range(len(target_points) - 1):
-                        f0, s0 = target_points[i]["freq"], target_points[i]["spl"]
-                        f1, s1 = target_points[i + 1]["freq"], target_points[i + 1]["spl"]
-                        if f0 <= f <= f1:
-                            t = math.log(f / f0) / math.log(f1 / f0) if f1 != f0 else 0.0
-                            target_spl_at_freq.append(s0 + t * (s1 - s0))
+            tgt_freqs_pts = [p["freq"] for p in target_points]
+            tgt_vals_pts = [p["spl"] for p in target_points]
+
+            def _interp_target_offset(f: float) -> float:
+                if f <= tgt_freqs_pts[0]:
+                    return tgt_vals_pts[0]
+                if f >= tgt_freqs_pts[-1]:
+                    return tgt_vals_pts[-1]
+                for i in range(len(tgt_freqs_pts) - 1):
+                    f0, s0 = tgt_freqs_pts[i], tgt_vals_pts[i]
+                    f1, s1 = tgt_freqs_pts[i + 1], tgt_vals_pts[i + 1]
+                    if f0 <= f <= f1:
+                        t = math.log(f / f0) / math.log(f1 / f0) if f1 != f0 else 0.0
+                        return s0 + t * (s1 - s0)
+                return tgt_vals_pts[-1]
+
+            def _interp_measured(f: float) -> float:
+                idx = int(np.argmin(np.abs(freqs_measured - f)))
+                return float(spl_measured[idx])
+
+            anchor_mode = (anchor or {}).get("mode", "band_mean")
+
+            if anchor_mode == "band_mean" or anchor is None:
+                # Legacy behavior: target points used as absolute SPL.
+                target_spl_at_freq = [
+                    _interp_target_offset(float(f)) for f in freqs_measured
+                ]
+                target_spl = np.array(target_spl_at_freq)
+                anchor_used = {"mode": "band_mean", "freq_hz": None}
+            else:
+                # Re-anchor: choose anchor freq, then compute absolute target
+                # so target_at(anchor_freq) == measured_at(anchor_freq).
+                if anchor_mode == "freq":
+                    anchor_freq = float(anchor.get("freq_hz") or 0.0)
+                    if anchor_freq <= 0:
+                        return _err("anchor.mode='freq' requires anchor.freq_hz > 0")
+                elif anchor_mode == "deep_bass_priority":
+                    # Search lowest candidate in [band_lo, band_lo + 20] where
+                    # every freq above has measured-relative ≥ target-relative.
+                    if freq_focus_hz:
+                        band_lo_search = float(freq_focus_hz[0])
+                    else:
+                        band_lo_search = float(np.min(freqs_measured))
+                    band_hi_search = band_lo_search + 20.0
+                    # Restrict comparison to freq_focus or full target range
+                    if freq_focus_hz:
+                        cmp_lo, cmp_hi = float(freq_focus_hz[0]), float(freq_focus_hz[1])
+                    else:
+                        cmp_lo, cmp_hi = tgt_freqs_pts[0], tgt_freqs_pts[-1]
+                    candidate_fs = list(
+                        range(int(round(band_lo_search)), int(round(band_hi_search)) + 1)
+                    )
+                    chosen: float | None = None
+                    for cand in candidate_fs:
+                        cf = float(cand)
+                        if cf <= 0 or cf > cmp_hi:
+                            continue
+                        m_anchor = _interp_measured(cf)
+                        t_anchor = _interp_target_offset(cf)
+                        # Sample comparison freqs above anchor at 1 Hz steps
+                        ok = True
+                        for ff in range(int(round(cf)) + 1, int(round(cmp_hi)) + 1):
+                            fff = float(ff)
+                            gap = (
+                                (_interp_measured(fff) - m_anchor)
+                                - (_interp_target_offset(fff) - t_anchor)
+                            )
+                            if gap < -0.5:
+                                ok = False
+                                break
+                        if ok:
+                            chosen = cf
                             break
-            target_spl = np.array(target_spl_at_freq)
+                    if chosen is None:
+                        # Fall back to band_lo_search; document residual
+                        anchor_freq = band_lo_search
+                        anchor_used_residual = True
+                    else:
+                        anchor_freq = chosen
+                        anchor_used_residual = False
+                else:
+                    return _err(
+                        f"anchor.mode must be 'band_mean', 'freq', or "
+                        f"'deep_bass_priority' (got {anchor_mode!r})"
+                    )
+
+                m_at = _interp_measured(anchor_freq)
+                t_at = _interp_target_offset(anchor_freq)
+                ref_spl = m_at - t_at
+                target_spl_at_freq = [
+                    ref_spl + _interp_target_offset(float(f)) for f in freqs_measured
+                ]
+                target_spl = np.array(target_spl_at_freq)
+                anchor_used = {
+                    "mode": anchor_mode,
+                    "freq_hz": round(float(anchor_freq), 2),
+                }
+                if anchor_mode == "deep_bass_priority" and anchor_used_residual:
+                    anchor_used["residual_boost"] = True
         else:
             target_spl = np.full_like(spl_measured, np.mean(spl_measured))
+            anchor_used = {"mode": "band_mean", "freq_hz": None}
 
         # Compute correction curve (dB): what the FIR needs to add
         correction_db = target_spl - spl_measured
@@ -3377,6 +3795,7 @@ async def _tool_design_fir(
             "avr_compensable": avr_compensable,
             "avr_headroom_ms": avr_headroom_ms,
             "design_cached": True,
+            "anchor_used": anchor_used,
         }
 
         budget_msg = ""
@@ -3432,7 +3851,10 @@ async def _tool_design_modal_fir(
     anti_pulse_cancel_strength: float = 0.6,
     num_taps: int = 4096,
     max_pre_ring_ms: float = 25.0,
+    samplerate: int = 48000,
     return_coefficients: bool = False,
+    anchor: dict | None = None,
+    compensation_notch: bool = False,
 ) -> dict:
     """Design a modal-aware mixed-phase FIR with explicit per-mode treatment.
 
@@ -3559,6 +3981,8 @@ async def _tool_design_modal_fir(
                     bp_q=float(i.get("bp_q", 1.5)),
                     envelope=str(i.get("envelope", "gabor")),
                     rationale=str(i.get("rationale", "")),
+                    bp_q_user_set="bp_q" in i,
+                    envelope_user_set="envelope" in i,
                 )
                 for i in intents
             ]
@@ -3616,8 +4040,107 @@ async def _tool_design_modal_fir(
                         for b in fr_bands
                     ]
 
+        # Resolve anchor parameter (re-anchoring of target_curve magnitude layer).
+        # Same semantics as design_fir.anchor: band_mean (legacy), freq, or
+        # deep_bass_priority. Only the magnitude correction layer is affected;
+        # the modal anti-pulse layer is independent.
+        anchor_freq_for_designer: float | None = None
+        anchor_used: dict | None = None
+        if anchor and target_curve_db and source_fr_db:
+            anchor_mode = str(anchor.get("mode", "band_mean"))
+            if anchor_mode == "band_mean":
+                anchor_used = {"mode": "band_mean", "freq_hz": None}
+            elif anchor_mode == "freq":
+                af = float(anchor.get("freq_hz") or 0.0)
+                if af <= 0:
+                    return _err("anchor.mode='freq' requires anchor.freq_hz > 0")
+                anchor_freq_for_designer = af
+                anchor_used = {"mode": "freq", "freq_hz": round(af, 2)}
+            elif anchor_mode == "deep_bass_priority":
+                # Search lowest candidate in [band_lo, band_lo+20] where every
+                # freq above is cut-implementable (gap ≥ -0.5 dB).
+                if magnitude_focus_hz:
+                    band_lo_search = float(magnitude_focus_hz[0])
+                    cmp_hi = float(magnitude_focus_hz[1])
+                else:
+                    band_lo_search = float(target_curve_db[0][0])
+                    cmp_hi = float(target_curve_db[-1][0])
+                band_hi_search = band_lo_search + 20.0
+
+                src_pts_sorted = sorted(source_fr_db, key=lambda p: p[0])
+                tgt_pts_sorted = sorted(target_curve_db, key=lambda p: p[0])
+                import math as _math
+                src_fs_ar = [p[0] for p in src_pts_sorted]
+                src_ds_ar = [p[1] for p in src_pts_sorted]
+                tgt_fs_ar = [p[0] for p in tgt_pts_sorted]
+                tgt_ds_ar = [p[1] for p in tgt_pts_sorted]
+
+                def _interp_log(f: float, fs: list[float], ds: list[float]) -> float:
+                    if f <= fs[0]:
+                        return ds[0]
+                    if f >= fs[-1]:
+                        return ds[-1]
+                    for i in range(len(fs) - 1):
+                        if fs[i] <= f <= fs[i + 1]:
+                            t = (
+                                _math.log(f / fs[i])
+                                / _math.log(fs[i + 1] / fs[i])
+                                if fs[i + 1] != fs[i]
+                                else 0.0
+                            )
+                            return ds[i] + t * (ds[i + 1] - ds[i])
+                    return ds[-1]
+
+                chosen: float | None = None
+                for cand in range(int(round(band_lo_search)), int(round(band_hi_search)) + 1):
+                    cf = float(cand)
+                    if cf <= 0 or cf > cmp_hi:
+                        continue
+                    src_a = _interp_log(cf, src_fs_ar, src_ds_ar)
+                    tgt_a = _interp_log(cf, tgt_fs_ar, tgt_ds_ar)
+                    ok = True
+                    for ff in range(int(round(cf)) + 1, int(round(cmp_hi)) + 1):
+                        fff = float(ff)
+                        gap = (
+                            (_interp_log(fff, src_fs_ar, src_ds_ar) - src_a)
+                            - (_interp_log(fff, tgt_fs_ar, tgt_ds_ar) - tgt_a)
+                        )
+                        if gap < -0.5:
+                            ok = False
+                            break
+                    if ok:
+                        chosen = cf
+                        break
+                if chosen is not None:
+                    anchor_freq_for_designer = chosen
+                    anchor_used = {
+                        "mode": "deep_bass_priority",
+                        "freq_hz": round(chosen, 2),
+                    }
+                else:
+                    anchor_freq_for_designer = band_lo_search
+                    anchor_used = {
+                        "mode": "deep_bass_priority",
+                        "freq_hz": round(band_lo_search, 2),
+                        "residual_boost": True,
+                    }
+            else:
+                return _err(
+                    f"anchor.mode must be 'band_mean', 'freq', or "
+                    f"'deep_bass_priority' (got {anchor_mode!r})"
+                )
+
+        # Pull the active sub profile's modal-cancel cap so the designer can
+        # iteratively scale anti-pulses to fit. Fall back to the SVS default
+        # if no profile is wired (mainly tests with mocked stores).
+        try:
+            from .graph import SVS_PB12_NSD_PROFILE
+            modal_cap_db = float(SVS_PB12_NSD_PROFILE.modal_cancel_max_boost_db)
+        except Exception:
+            modal_cap_db = 14.0
+
         designer = ModalAwareFIRDesigner(
-            sample_rate=8000,
+            sample_rate=int(samplerate),
             n_taps=int(num_taps),
             max_pre_ring_ms=float(max_pre_ring_ms),
         )
@@ -3634,6 +4157,9 @@ async def _tool_design_modal_fir(
             target_curve_db=target_curve_db,
             source_fr_db=source_fr_db,
             magnitude_focus_hz=magnitude_focus_hz,
+            anchor_freq_hz=anchor_freq_for_designer,
+            modal_cancel_max_boost_db=modal_cap_db,
+            compensation_notch=bool(compensation_notch),
         )
 
         _fir_design_cache[int(session_id)] = list(coeffs)
@@ -3647,9 +4173,12 @@ async def _tool_design_modal_fir(
             "pre_delay_samples": summary.pre_delay_samples,
             "peak_amplitude": round(summary.peak_amplitude, 4),
             "per_mode_treatments": summary.mode_treatments,
+            "safety_budget": summary.safety_budget,
+            "compensation_notches": summary.compensation_notches,
             "notes": summary.notes,
             "latency_budget": latency_budget_breakdown(summary),
             "design_cached": True,
+            "anchor_used": anchor_used,
             "note": (
                 f"Modal-aware FIR at 8000Hz, {summary.total_taps} taps. "
                 f"Pre-ring: {summary.pre_delay_ms:.1f}ms (budget {max_pre_ring_ms:.0f}ms). "
@@ -3668,6 +4197,7 @@ async def _tool_set_speaker_distances(
     distances: dict[str, float],
     n_positions: int = 1,
     commit: bool = False,
+    use_custom: bool = False,
 ) -> dict:
     """Push per-channel Audyssey distances to the AVR via direct TCP.
 
@@ -3702,6 +4232,7 @@ async def _tool_set_speaker_distances(
             distances,
             n_positions=int(n_positions),
             commit=bool(commit),
+            use_custom=bool(use_custom),
         )
     except DriverError as exc:
         return _err(f"distance push failed: {exc}")
@@ -3748,6 +4279,203 @@ async def _tool_set_speaker_distances(
     )
 
 
+# ── Audyssey FIR upload ────────────────────────────────────────────────
+# Module-level cache of AVR-format polyphase-decimated coefficient vectors.
+# Keyed by (cache_key, channel_id) → list[float] of length 1024 (speaker)
+# or 704 (sub). Populated by ``design_avr_fir``; consumed by ``apply_avr_fir``.
+_AVR_FIR_CACHE: dict[tuple[str, str], list[float]] = {}
+
+
+async def _tool_design_avr_fir(
+    channel_id: str,
+    target_curve_db: list[dict],
+    cache_key: str,
+    samplerate_hz: float = 48000.0,
+) -> dict:
+    """Design + polyphase-decimate an AVR-format FIR for one channel.
+
+    Pipeline: ``target_curve_db`` (per-frequency gain targets) →
+    16,321-tap (speaker) / 16,055-tap (sub) impulse response →
+    XT32 4-band polyphase decimation → 1024 / 704 AVR coefficients.
+
+    The result is cached server-side keyed by (cache_key, channel_id).
+    Apply via ``apply_avr_fir(cache_key=...)``.
+
+    Args:
+        channel_id: Audyssey commandId — FL, C, FR, SLA, SRA, TFL,
+            TFR, TRL, TRR, SBL, SBR, SW1, SW2, SW3, SW4, LFE.
+        target_curve_db: list of ``{freq_hz: float, gain_db: float}``
+            points defining the desired EQ curve. Outside the supplied
+            frequency range gain tapers to 0 dB. Sub channels typically
+            specify points across 20-200 Hz; speakers 20-20,000 Hz.
+        cache_key: opaque caller-chosen identifier — usually a session
+            id or "<sid>-iter-N". Pair with ``apply_avr_fir`` to commit.
+        samplerate_hz: design sample rate. Default 48 kHz (matches the
+            AVR's native processing rate for the 48 kHz coefficient bank).
+
+    Returns ``{ok, channel_id, cache_key, fir_taps, peak_amplitude,
+    is_sub}``.
+    """
+    from .audyssey_fir import (
+        convert_xt32, design_correction_ir, get_channel_byte, is_sub_channel,
+    )
+
+    if not target_curve_db:
+        return _err("target_curve_db is empty")
+    try:
+        # Validate the channel exists before doing the IR FFT.
+        get_channel_byte(channel_id, "XT32")
+    except ValueError as exc:
+        return _err(str(exc))
+
+    freqs: list[float] = []
+    gains: list[float] = []
+    for pt in target_curve_db:
+        try:
+            freqs.append(float(pt["freq_hz"]))
+            gains.append(float(pt["gain_db"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            return _err(f"bad target_curve_db entry {pt!r}: {exc}")
+    # Sort by frequency so the interpolator sees monotonic input.
+    order = sorted(range(len(freqs)), key=lambda i: freqs[i])
+    freqs = [freqs[i] for i in order]
+    gains = [gains[i] for i in order]
+
+    is_sub = is_sub_channel(channel_id)
+    try:
+        ir = design_correction_ir(
+            target_freqs_hz=freqs,
+            target_gain_db=gains,
+            is_sub=is_sub,
+            samplerate_hz=float(samplerate_hz),
+        )
+        coefs = convert_xt32(ir)
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"FIR design failed: {exc}")
+
+    _AVR_FIR_CACHE[(str(cache_key), channel_id)] = coefs
+    import numpy as np
+    arr = np.asarray(coefs)
+    return _ok(
+        channel_id=channel_id,
+        cache_key=str(cache_key),
+        fir_taps=len(coefs),
+        peak_amplitude=float(np.max(np.abs(arr))) if len(arr) else 0.0,
+        is_sub=is_sub,
+        message=(
+            f"Designed {len(coefs)}-tap AVR FIR for {channel_id} "
+            f"({'sub' if is_sub else 'speaker'} chain). "
+            f"Cached as ({cache_key!r}, {channel_id!r})."
+        ),
+    )
+
+
+async def _tool_apply_avr_fir(
+    host: str,
+    ady_path: str,
+    cache_key: str,
+    channel_ids: list[str] | None = None,
+    distances_override_m: dict[str, float] | None = None,
+    target_curves: list[str] | None = None,
+    samplerates_hz: list[int] | None = None,
+    inter_packet_delay_ms: float = 5.0,
+) -> dict:
+    """Push cached AVR-format FIR coefficients to the receiver.
+
+    HARD RULE: this tool overwrites the AVR's MultEQ filter banks. The
+    AVR's prior calibration is replaced for every channel listed in
+    ``channel_ids``. Recovery from a botched push requires re-uploading
+    the original .ady via the MultEQ Editor app or this tool with the
+    original IRs.
+
+    Caller MUST NOT enter Manual Setup > Distances on the AVR after a
+    successful push — that triggers firmware re-validation that snaps
+    Distance values back to the variance cap.
+
+    The FULL Audyssey envelope is pushed (16 ordered fields) to keep the
+    MultEQ EQ params coherent — the partial-envelope FR drift seen in
+    earlier `set_speaker_distances(use_custom=True)` runs is avoided
+    by this tool.
+
+    Args:
+        host: AVR IP / hostname.
+        ady_path: path to the .ady file with the AVR's stored
+            calibration state. Provides per-channel speaker-type,
+            crossover, level, and existing distance values.
+        cache_key: identifier used at ``design_avr_fir`` time.
+        channel_ids: subset of channels to upload. Defaults to all
+            channels in the .ady that have a cached FIR under
+            ``cache_key``.
+        distances_override_m: optional ``{channel: meters}`` map to
+            override .ady distances during the upload (e.g. SW1=20.0
+            for the variance-cap bypass).
+        target_curves: which target-curve banks to write. Default
+            writes both Flat ("00") and Reference ("01").
+        samplerates_hz: which sample rates to ship. Default XT32's
+            three (32k, 44.1k, 48k).
+        inter_packet_delay_ms: pause between SET_COEFDT packets.
+
+    Returns the per-stage ACK summary plus an ``ok`` flag.
+    """
+    import json as _json
+    from pathlib import Path
+
+    from .drivers.denon.audyssey_filter_upload import (
+        channels_in_ady, push_avr_filters,
+    )
+
+    p = Path(ady_path)
+    if not p.exists():
+        return _err(f".ady not found: {ady_path}")
+    try:
+        with p.open() as f:
+            ady = _json.load(f)
+    except (OSError, _json.JSONDecodeError) as exc:
+        return _err(f"failed to load .ady: {exc}")
+
+    available = channels_in_ady(ady)
+    selected = list(channel_ids) if channel_ids else list(available)
+    missing_in_cache: list[str] = []
+    channel_filters: dict[str, list[float]] = {}
+    for cid in selected:
+        if cid not in available:
+            return _err(f"channel {cid!r} not in .ady (available: {available})")
+        coefs = _AVR_FIR_CACHE.get((str(cache_key), cid))
+        if coefs is None:
+            missing_in_cache.append(cid)
+        else:
+            channel_filters[cid] = coefs
+    if missing_in_cache:
+        return _err(
+            f"no cached FIR for cache_key={cache_key!r} on channels "
+            f"{missing_in_cache} — call design_avr_fir for each first"
+        )
+
+    overrides = {ch: float(m) for ch, m in (distances_override_m or {}).items()}
+    tc_arg = tuple(target_curves) if target_curves else None
+    sr_arg = (
+        tuple(int(r) for r in samplerates_hz) if samplerates_hz else None
+    )
+
+    push_kwargs = {
+        "ady": ady,
+        "channel_filters": channel_filters,
+        "distances_override_m": overrides or None,
+        "inter_packet_delay_ms": float(inter_packet_delay_ms),
+    }
+    if tc_arg:
+        push_kwargs["target_curves"] = tc_arg
+    if sr_arg:
+        push_kwargs["samplerates_hz"] = sr_arg
+
+    try:
+        summary = await push_avr_filters(host, **push_kwargs)
+    except (OSError, ValueError) as exc:
+        return _err(f"AVR upload failed: {exc}")
+
+    return _ok(**summary, channels_uploaded=list(channel_filters.keys()))
+
+
 async def _tool_avr_set_volume(level_db: float) -> dict:
     """Set AVR volume to *level_db* dB.
 
@@ -3767,10 +4495,80 @@ async def _tool_avr_set_volume(level_db: float) -> dict:
         return _err(f"avr unreachable: {exc}")
 
 
+def _resolve_sweep_range(
+    cfg: object,
+    target: str | None,
+    freq_min: int | None,
+    freq_max: int | None,
+) -> tuple[int | None, int | None, str]:
+    """Pick the right sweep range for a measurement.
+
+    Resolution order:
+      1. Explicit ``freq_min``/``freq_max`` from the caller (any one of them
+         can be set independently — partial overrides supported)
+      2. ``target`` parameter — looks up the named speaker / sub group in
+         config.yaml and uses its ``sweep_range_hz`` if present
+      3. Falls back to None (caller / measurement engine uses
+         ``measurement.freq_min`` / ``measurement.freq_max`` defaults —
+         currently 20–200 Hz, the right value for sub-only sweeps).
+
+    Returns (lo, hi, source_description) where ``source_description``
+    explains where the values came from for the response metadata.
+    """
+    source_parts: list[str] = []
+    resolved_min = freq_min
+    resolved_max = freq_max
+    if freq_min is not None or freq_max is not None:
+        source_parts.append("explicit")
+
+    if (resolved_min is None or resolved_max is None) and target:
+        # Resolve target → speaker config (or sub config) → sweep_range_hz
+        target_norm = str(target).strip().upper()
+        speakers = getattr(cfg, "speakers", [])
+        sub_cfg = getattr(cfg, "sub", {}) or {}
+
+        sweep_range = None
+        # Match against speaker ``positions`` (e.g. "FL", "C") or ``model`` /
+        # group keywords like "main"/"mains"/"atmos"/"sub"/"subs".
+        keyword_map = {
+            "MAIN": "main", "MAINS": "main", "FRONT": "main",
+            "ATMOS": "atmos", "HEIGHT": "atmos", "HEIGHTS": "atmos",
+            "SURROUND": "surround", "SURROUNDS": "surround",
+            "SUB": "sub", "SUBS": "sub", "LFE": "sub",
+        }
+        wanted_type = keyword_map.get(target_norm)
+
+        if wanted_type == "sub":
+            sweep_range = sub_cfg.get("sweep_range_hz")
+        else:
+            for sp in speakers:
+                positions = [p.upper() for p in sp.get("positions", [])]
+                sp_type = (sp.get("type") or "").lower()
+                matches_position = target_norm in positions
+                matches_type = wanted_type and sp_type == wanted_type
+                if matches_position or matches_type:
+                    sweep_range = sp.get("sweep_range_hz")
+                    if sweep_range:
+                        break
+        if sweep_range and len(sweep_range) >= 2:
+            if resolved_min is None:
+                resolved_min = int(sweep_range[0])
+            if resolved_max is None:
+                resolved_max = int(sweep_range[1])
+            source_parts.append(f"speaker_config[{target!r}]")
+
+    if not source_parts:
+        source_parts.append("measurement.freq_min/freq_max defaults")
+    return resolved_min, resolved_max, " + ".join(source_parts)
+
+
 async def _tool_trigger_measurement(
     label: str | None = None,
     position: str | None = None,
     target_curve: dict | None = None,
+    target: str | None = None,
+    freq_min: int | None = None,
+    freq_max: int | None = None,
 ) -> dict:
     """Trigger a measurement via UMIK-1 + PyTTa.
 
@@ -3781,6 +4579,18 @@ async def _tool_trigger_measurement(
     loop — include the reference_spl and band used to compute the filters for
     this iteration. Leave None for raw/diagnostic captures; those sessions will
     not show a delta on the dashboard.
+
+    Sweep range:
+      - ``freq_min`` / ``freq_max`` are explicit per-call overrides.
+      - ``target`` (e.g. "FL", "mains", "subs", "atmos") resolves to the
+        speaker / sub group's ``sweep_range_hz`` from config.yaml.
+      - With neither, falls back to the global
+        ``measurement.freq_min``/``freq_max`` defaults (currently 20–200 Hz —
+        ideal for sub work, blind for mains).
+
+    For mains calibration always pass either an explicit range or
+    ``target="mains"`` — mains play 60 Hz–20 kHz; the default 200 Hz cap
+    can't characterise them.
     """
     try:
         import sounddevice as sd
@@ -3806,6 +4616,11 @@ async def _tool_trigger_measurement(
         engine = MeasurementEngine(cfg)
         route = cfg.measurement.get("playback_route", "usb")
 
+        # Resolve sweep range from explicit args / target / config defaults.
+        resolved_min, resolved_max, sweep_range_source = _resolve_sweep_range(
+            cfg, target, freq_min, freq_max,
+        )
+
         # When the DSP driver is in cal mode, route the sweep into its loopback
         # capture device so the sweep enters CamillaDSP via snd-aloop. Bypasses
         # the AVR — Audyssey/MultEQ filters cannot color the cal stimulus.
@@ -3821,7 +4636,11 @@ async def _tool_trigger_measurement(
 
         if route == "hdmi" and _drivers is not None:
             async with graph.sweep_context_for_route(route, targets, cfg, _drivers):
-                fr = await engine.measure(playback_device_override=cal_playback)
+                fr = await engine.measure(
+                    playback_device_override=cal_playback,
+                    freq_min=resolved_min,
+                    freq_max=resolved_max,
+                )
         elif route == "hdmi":
             # Legacy path used when the driver registry isn't populated (older
             # test setups that patch `_dsp` directly without the lifespan).
@@ -3829,9 +4648,17 @@ async def _tool_trigger_measurement(
             denon_ctx = DenonSweepContext.from_config(cfg)
             if denon_ctx:
                 async with denon_ctx:
-                    fr = await engine.measure(playback_device_override=cal_playback)
+                    fr = await engine.measure(
+                    playback_device_override=cal_playback,
+                    freq_min=resolved_min,
+                    freq_max=resolved_max,
+                )
             else:
-                fr = await engine.measure(playback_device_override=cal_playback)
+                fr = await engine.measure(
+                    playback_device_override=cal_playback,
+                    freq_min=resolved_min,
+                    freq_max=resolved_max,
+                )
         else:
             # USB mode keeps the persistent-session pattern so repeat
             # measurements don't thrash the DSP source switch. The persistent
@@ -3840,8 +4667,20 @@ async def _tool_trigger_measurement(
             await _ensure_sweep_session()
             fr = await engine.measure(playback_device_override=cal_playback)
 
-        # Compute IR-derived metadata at capture time
-        metadata = compute_session_metadata(fr)
+        # Compute IR-derived metadata at capture time. Query the DSP for the
+        # current per-output FIR pre-delay so the onset detector can skip
+        # any FIR-injected pre-ring (multi-pulse modal-cancellation FIRs
+        # produce strong pre-arrival content that would otherwise walk the
+        # detected onset back into the FIR's own non-causal window).
+        fir_pre_delay_ms = 0.0
+        try:
+            if _dsp is not None:
+                getter = getattr(_dsp, "get_fir_pre_delay_ms", None)
+                if callable(getter):
+                    fir_pre_delay_ms = float(getter() or 0.0)
+        except Exception:
+            fir_pre_delay_ms = 0.0
+        metadata = compute_session_metadata(fr, fir_pre_delay_ms=fir_pre_delay_ms)
         if position:
             metadata["position"] = position
 
@@ -4950,10 +5789,19 @@ async def _tool_analyze_ir(
     session_id: int | None = None,
     search_window_ms: float = 50.0,
 ) -> dict:
-    """Extract IR peak time, polarity sign, and SPL from a stored session.
+    """Extract IR onset time, polarity sign, and SPL from a stored session.
 
-    Used for sub alignment: measure each sub solo, call this on each session,
-    compute delay offsets from peak_time_s differences, apply via set_delay.
+    Valid use: solo-sub time alignment — measure each sub solo with identical
+    DSP processing on each, then subtract the earliest peak_time_s from the
+    latest to get the delay offset. Both measurements share the same FIR and
+    buffer latency, so those terms cancel.
+
+    INVALID use: cross-path comparisons (sub-vs-mains, FIR-chain vs no-FIR-chain,
+    cal-mode vs HDMI). The detected peak sits inside the sub chain's FIR
+    non-causal window (~42 ms for a 4096-tap linear-phase filter @ 48 kHz);
+    its absolute value reflects FIR shape + buffer latency, not acoustic
+    arrival. Use ``compare_sub_phase`` (phase-slope fit) or the loopback
+    alignment rig for sub-vs-mains timing instead.
     """
     from .storage import SessionStore
 
@@ -4985,9 +5833,24 @@ async def _tool_analyze_ir(
         ir_arr = np.array(ir, dtype=np.float64)
         onset = detect_ir_onset(ir_arr, sample_rate, search_window_ms, xcorr_peak_ms=xcorr_ms)
 
+        # Solo subs at room-realistic distances peak in the 0–30 ms range
+        # (mic ≤10 m). A peak past ~80 ms means the chain has a long FIR or
+        # buffer in the path — analyze_ir's absolute number is then a property
+        # of that processing, not acoustic arrival, and is invalid for
+        # cross-path comparison (sub vs mains, FIR-chain vs no-FIR).
+        cross_path_warning: str | None = None
+        if onset["peak_time_ms"] > 80.0:
+            cross_path_warning = (
+                f"peak_time_ms={onset['peak_time_ms']:.1f} exceeds typical solo-sub "
+                "acoustic range — likely reflects FIR/buffer latency on the chain. "
+                "Do NOT use this value to compare against measurements with different "
+                "processing (e.g. mains via HDMI). Use compare_sub_phase for cross-path timing."
+            )
+
         return _ok(
             session_id=session.id,
             peak_time_s=round(onset["peak_time_ms"] / 1000.0, 6),
+            cross_path_warning=cross_path_warning,
             **onset,
         )
     except Exception as exc:
@@ -5023,11 +5886,12 @@ async def _tool_apply_fir(
             )
         coefficients = cached
         source = f"design_session_id={design_session_id}"
-        # Default to modal_cancel for cached designs (only design_modal_fir
-        # populates the cache with intent today; design_fir doesn't use
-        # the design_session_id path). The explicit lookup keeps room for
-        # future per-design intents.
-        intent = _fir_design_intent.get(int(design_session_id), "modal_cancel")
+        # design_modal_fir explicitly tags its cache entries with
+        # "modal_cancel" intent so the looser modal cap applies. design_fir
+        # also caches but doesn't tag — those default to "general" (strict
+        # thermal/excursion cap) which is correct for magnitude-correction
+        # FIRs that aren't doing anti-pulse cancellation.
+        intent = _fir_design_intent.get(int(design_session_id), "general")
     else:
         source = "inline"
 
@@ -5076,6 +5940,143 @@ async def _tool_apply_fir(
         {"coefficients": list(coefficients), "num_taps": len(coefficients)},
     )
     return _ok(output_index=output_index, taps=len(coefficients), source=source)
+
+
+async def _tool_design_corrective_fir(
+    session_id: int,
+    target_curve: dict,
+    output_index: int,
+    num_taps: int = 1024,
+    focus_hz: list[float] | None = None,
+    return_coefficients: bool = False,
+) -> dict:
+    """Design a magnitude-correction FIR for the *residual* between a measured
+    listener FR and the target curve, then convolve with the existing FIR
+    cached on ``output_index``. Returns a new design_session_id whose
+    coefficients can be applied via ``apply_fir(design_session_id=...)``.
+
+    This is the **empirical 2-step** workflow:
+      1. Apply some baseline correction (e.g. a modal-cancellation FIR via
+         ``design_modal_fir``).
+      2. Measure the listener result (the ``session_id`` argument here).
+      3. This tool computes the residual ``target − measured`` and designs
+         a min-phase FIR that closes that gap, convolved on top of the
+         existing FIR for ``output_index``.
+      4. Apply via ``apply_fir(output_index, design_session_id=<returned>)``.
+
+    Use after ``design_modal_fir`` / ``apply_fir`` revealed a per-room FR
+    deviation from the target curve that wasn't predictable from the FIR
+    design alone (anti-pulse phase interaction with the room's modal
+    response — see recipe Section 2.2b).
+
+    Args:
+        session_id: post-baseline-FIR measurement (the room's response
+            after the existing FIR is applied to ``output_index``).
+        target_curve: ``{"points": [{"freq", "spl"}, ...], "band": [lo, hi]}``.
+            Same shape as ``design_fir``'s target_curve. Anchored to the
+            60-100 Hz midband so absolute SPL drops out.
+        output_index: DSP output whose existing cached FIR to convolve onto.
+            Must have a cached design (i.e. an earlier ``design_*_fir`` call
+            populated ``_fir_design_cache[session_id]`` referenced by an
+            apply_fir(design_session_id=...)). When no cached FIR is found,
+            falls back to a passthrough impulse (so this tool still works
+            for the first-pass case where there's no baseline FIR yet).
+        num_taps: corrective FIR length (default 1024 — short, since this
+            is just magnitude correction at low frequencies).
+        focus_hz: ``[lo, hi]`` band where correction is applied; outside
+            tapers to 0 dB. Default: target_curve's ``band`` if present,
+            else [25, 120].
+        return_coefficients: include the convolved FIR taps in the response.
+    """
+    from .storage import SessionStore
+    import numpy as _np
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        session = next((s for s in sessions if s.id == session_id), None)
+        if session is None:
+            return _err(f"session {session_id} not found")
+        if not session.start_fr or not session.start_fr.frequencies:
+            return _err(f"session {session_id} has no FR data")
+
+        # Target curve plumbing
+        if not isinstance(target_curve, dict) or not target_curve.get("points"):
+            return _err("target_curve.points required")
+        target_points = [
+            (float(p.get("freq", p.get("freq_hz", 0))),
+             float(p.get("spl", p.get("spl_db", 0))))
+            for p in target_curve["points"]
+        ]
+        band = target_curve.get("band") or focus_hz
+        focus = (float(band[0]), float(band[1])) if isinstance(band, (list, tuple)) and len(band) == 2 else (25.0, 120.0)
+
+        # Source FR from the session (raw arrays).
+        fr = session.start_fr
+        source_pairs = list(zip(
+            [float(f) for f in fr.frequencies],
+            [float(s) for s in fr.spl],
+        ))
+
+        # Existing FIR for output_index — find any cached design that was
+        # applied to this output. Fall back to passthrough if none.
+        existing_fir = None
+        for sid, coeffs in _fir_design_cache.items():
+            # Best-effort: assume the most recently applied design is the
+            # right baseline. Without an apply→cache reverse index we
+            # approximate by using the largest session_id that has cached
+            # coefficients (chronological proxy).
+            existing_fir = list(coeffs)
+        if existing_fir is None:
+            existing_fir = [0.0] * num_taps
+            existing_fir[0] = 1.0
+
+        # Design the corrective magnitude FIR.
+        from .modal_fir import _design_magnitude_correction_fir
+        sample_rate = 8000  # FIR processing rate
+        existing_arr = _np.asarray(existing_fir, dtype=_np.float32)
+        corrective = _design_magnitude_correction_fir(
+            fir=existing_arr,
+            target_db=target_points,
+            source_fr_db=source_pairs,
+            sample_rate=sample_rate,
+            n_taps=int(num_taps),
+            focus_hz=focus,
+        )
+        # Convolve corrective with existing — combined FIR delivers both.
+        combined = _np.convolve(existing_arr, corrective)
+        # Cap at a reasonable length so apply_fir doesn't reject. Use the
+        # longer of the two inputs.
+        max_len = max(len(existing_arr), int(num_taps))
+        combined = combined[:max_len].astype(_np.float32)
+        peak = float(_np.max(_np.abs(combined)))
+        if peak > 1.0:
+            combined = combined / (peak * 1.001)
+
+        # Cache under a synthetic session_id derived from the source.
+        cache_id = int(session_id)
+        _fir_design_cache[cache_id] = combined.tolist()
+        _fir_design_intent[cache_id] = "modal_cancel"
+
+        result = {
+            "session_id": session_id,
+            "output_index": int(output_index),
+            "num_taps": int(len(combined)),
+            "sample_rate": sample_rate,
+            "peak_amplitude": round(float(_np.max(_np.abs(combined))), 4),
+            "design_cached": True,
+            "note": (
+                "Empirical 2-step corrective FIR convolved on top of the "
+                "existing cached FIR. Apply via "
+                f"apply_fir(output_index={output_index}, "
+                f"design_session_id={session_id})."
+            ),
+        }
+        if return_coefficients:
+            result["coefficients"] = combined.tolist()
+        return _ok(**result)
+    except Exception as exc:
+        return _err(f"design_corrective_fir failed: {exc}")
 
 
 async def _tool_clear_fir(output_index: int) -> dict:
@@ -5751,6 +6752,136 @@ async def _tool_verify_fir_effect(
         return _err(f"verify_fir_effect failed: {exc}")
 
 
+async def _tool_verify_input_eq_effect(
+    pre_session_id: int,
+    post_session_id: int,
+    predicted_filters: list[dict],
+    tolerance_db: float = 2.0,
+    min_hz: float = 20.0,
+    max_hz: float = 200.0,
+) -> dict:
+    """Compare an input-EQ filter set's predicted effect against the measured delta.
+
+    After applying input PEQ via ``apply_input_eq``, the predicted FR change
+    (computed by simulating ``predicted_filters`` against ``pre_session_id``)
+    and the measured delta (post − pre at 1/3-octave) should match within
+    ~2 dB. Bigger divergences flag:
+
+      - Filter slot conflict — the existing input EQ wasn't fully replaced.
+      - CamillaDSP biquad coefficient quantization (rare; usually <0.5 dB).
+      - Routing mismatch — the signal isn't actually flowing through the
+        channel(s) the filters were written to.
+      - Measurement variance — coherence too low at the divergent band.
+
+    Mirrors the contract of ``verify_fir_effect``. ``predicted_filters`` is
+    the same list you passed to ``apply_input_eq``; the tool simulates them
+    against ``pre_session_id`` to compute the predicted delta.
+    """
+    from .storage import SessionStore
+    import math
+
+    try:
+        store = SessionStore()
+        sessions = store.list_sessions()
+        pre = next((s for s in sessions if s.id == pre_session_id), None)
+        post = next((s for s in sessions if s.id == post_session_id), None)
+        if pre is None:
+            return _err(f"pre_session_id {pre_session_id} not found")
+        if post is None:
+            return _err(f"post_session_id {post_session_id} not found")
+        if not pre.start_fr or not pre.start_fr.frequencies:
+            return _err(f"pre session {pre_session_id} has no FR data")
+        if not post.start_fr or not post.start_fr.frequencies:
+            return _err(f"post session {post_session_id} has no FR data")
+        if not predicted_filters:
+            return _err("predicted_filters is required")
+
+        # Compute predicted FR after applying the filters to the pre session.
+        sim_result = await _tool_simulate_eq(
+            session_id=pre_session_id,
+            filters=predicted_filters,
+            min_hz=min_hz,
+            max_hz=max_hz,
+        )
+        if not sim_result.get("ok"):
+            return _err(f"simulate_eq failed: {sim_result.get('error')}")
+
+        # 1/3-octave bands for both sessions and the simulated post.
+        pre_bands = _downsample_to_third_octave(
+            pre.start_fr.frequencies, pre.start_fr.spl,
+        )
+        post_bands = _downsample_to_third_octave(
+            post.start_fr.frequencies, post.start_fr.spl,
+        )
+        pre_by_freq = {b["freq_hz"]: b["spl_db"] for b in pre_bands}
+        post_by_freq = {b["freq_hz"]: b["spl_db"] for b in post_bands}
+
+        # Parse simulate_eq's compact "freq:spl,..." string into a dict.
+        pred_post_by_freq: dict[float, float] = {}
+        try:
+            raw = sim_result.get("predicted_fr", "")
+            for chunk in raw.split(","):
+                if ":" not in chunk:
+                    continue
+                freq_str, spl_str = chunk.split(":", 1)
+                pred_post_by_freq[float(freq_str)] = float(spl_str)
+        except Exception:
+            pass
+
+        # Re-band the high-resolution simulated FR to 1/3-octave for comparison.
+        if pred_post_by_freq:
+            sim_freqs = sorted(pred_post_by_freq)
+            sim_spl = [pred_post_by_freq[f] for f in sim_freqs]
+            sim_bands = _downsample_to_third_octave(sim_freqs, sim_spl)
+            sim_by_freq = {b["freq_hz"]: b["spl_db"] for b in sim_bands}
+        else:
+            sim_by_freq = {}
+
+        bands: list[dict] = []
+        off_spec: list[dict] = []
+        discrepancies: list[float] = []
+        for freq in sorted(pre_by_freq):
+            if freq < min_hz or freq > max_hz:
+                continue
+            if freq not in post_by_freq or freq not in sim_by_freq:
+                continue
+            measured_delta = post_by_freq[freq] - pre_by_freq[freq]
+            predicted_delta = sim_by_freq[freq] - pre_by_freq[freq]
+            discrepancy = measured_delta - predicted_delta
+            entry = {
+                "freq_hz": freq,
+                "predicted_delta_db": round(predicted_delta, 2),
+                "measured_delta_db": round(measured_delta, 2),
+                "discrepancy_db": round(discrepancy, 2),
+            }
+            bands.append(entry)
+            discrepancies.append(discrepancy)
+            if abs(discrepancy) > tolerance_db:
+                off_spec.append(entry)
+
+        rms = math.sqrt(
+            sum(d * d for d in discrepancies) / len(discrepancies)
+        ) if discrepancies else 0.0
+        within = len(off_spec) == 0
+        note = (
+            "All bands within tolerance — input EQ landed as predicted."
+            if within
+            else f"{len(off_spec)} bands exceed {tolerance_db} dB tolerance — "
+                 f"check filter slot conflict / routing / coherence at "
+                 f"those bands."
+        )
+        return _ok(
+            bands=bands,
+            off_spec_bands=off_spec,
+            within_tolerance=within,
+            tolerance_db=tolerance_db,
+            rms_discrepancy_db=round(rms, 2),
+            note=note,
+        )
+    except Exception as exc:
+        return _err(f"verify_input_eq_effect failed: {exc}")
+
+
 async def _tool_check_system() -> dict:
     """Run all pre-flight hardware checks and return results."""
     from .preflight import PreflightChecker
@@ -6095,8 +7226,176 @@ _TOOLS: list[Tool] = [
                     ),
                     "default": False,
                 },
+                "use_custom": {
+                    "type": "boolean",
+                    "description": (
+                        "When true, uses the OCA-style envelope bypass: payload "
+                        "is {Distance, AudyFinFlg=NotFin}, followed by an explicit "
+                        "AudyFinFlg=Fin commit before EXIT_AUDMD. Verified to "
+                        "extend the firmware applied-delay cap from ~38 ms (UI "
+                        "limit) to ~55 ms (envelope limit) on X3800H. ``commit`` "
+                        "is forced to True when this is set — the Fin commit IS "
+                        "the bypass mechanism. CRITICAL: caller must NOT enter "
+                        "Manual Setup > Distances on the AVR after pushing — "
+                        "that re-validates and snaps back to the 6 m cap. "
+                        "Side effect: minimal envelope (Distance + NotFin only) "
+                        "doesn't carry MultEQ EQ params, so the AVR may apply "
+                        "defaults for AudyMultEq/AudyEqRef/AudyEqSet on commit, "
+                        "drifting mains FR by ±5-10 dB in mids. For full-state "
+                        "preservation see scripts/audyssey_push_full_envelope.py."
+                    ),
+                    "default": False,
+                },
             },
             "required": ["distances"],
+        },
+    ),
+    Tool(
+        name="design_avr_fir",
+        description=(
+            "Design an AVR-format polyphase FIR for one Denon/Marantz "
+            "Audyssey channel from a target-curve specification. The "
+            "result is cached server-side keyed by (cache_key, channel_id) "
+            "and applied via apply_avr_fir. Pipeline: target FR → "
+            "16,321-tap (speaker) / 16,055-tap (sub) IR → XT32 4-band "
+            "polyphase decimation → 1024 / 704 AVR-format coefficients. "
+            "Use one design_avr_fir call per channel; then a single "
+            "apply_avr_fir to push them all in one TCP session."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "channel_id": {
+                    "type": "string",
+                    "description": (
+                        "Audyssey channel commandId — e.g. FL, C, FR, SLA, "
+                        "SRA, TFL, TFR, TRL, TRR, SBL, SBR, SW1, SW2, SW3, "
+                        "SW4, LFE."
+                    ),
+                },
+                "target_curve_db": {
+                    "type": "array",
+                    "description": (
+                        "List of {freq_hz, gain_db} points defining the "
+                        "desired EQ curve. Outside the supplied frequency "
+                        "range gain tapers to 0 dB. Sub channels typically "
+                        "specify points across 20-200 Hz; speakers "
+                        "20-20,000 Hz."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "freq_hz": {"type": "number"},
+                            "gain_db": {"type": "number"},
+                        },
+                        "required": ["freq_hz", "gain_db"],
+                    },
+                },
+                "cache_key": {
+                    "type": "string",
+                    "description": (
+                        "Caller-chosen identifier — usually a session id "
+                        "or a string like 'iter-3'. apply_avr_fir uses "
+                        "this to find the coefficient set."
+                    ),
+                },
+                "samplerate_hz": {
+                    "type": "number",
+                    "description": (
+                        "FIR design sample rate. Default 48000 (matches "
+                        "the AVR's native processing rate for the 48 kHz "
+                        "bank — XT32 stores three banks but uploads the "
+                        "same coefficients to all)."
+                    ),
+                    "default": 48000,
+                },
+            },
+            "required": ["channel_id", "target_curve_db", "cache_key"],
+        },
+    ),
+    Tool(
+        name="apply_avr_fir",
+        description=(
+            "Push cached AVR-format FIR coefficients to the receiver via "
+            "the Audyssey TCP/1256 protocol. Overwrites the AVR's MultEQ "
+            "filter banks with the per-channel coefficients designed by "
+            "prior design_avr_fir calls (matched by cache_key). The full "
+            "16-field SET_SETDAT envelope is sent to keep the AVR's EQ "
+            "state coherent; coefficient streams are shipped per channel × "
+            "target_curve × sample_rate; the AudyFinFlg=Fin commit at "
+            "the end persists everything to the AVR's flash. "
+            "HARD RULE: caller MUST NOT enter Manual Setup > Distances "
+            "on the AVR after a successful push — that triggers firmware "
+            "re-validation. Always backup the original .ady before calling "
+            "this tool. REQUIRES EXPLICIT USER CONFIRMATION."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "host": {
+                    "type": "string",
+                    "description": "AVR IP or hostname.",
+                },
+                "ady_path": {
+                    "type": "string",
+                    "description": (
+                        "Path to a .ady file with the AVR's stored "
+                        "calibration state. Provides per-channel "
+                        "speaker-type, crossover, level, and the "
+                        "channel list. Distances are taken from .ady "
+                        "but can be selectively overridden via "
+                        "distances_override_m."
+                    ),
+                },
+                "cache_key": {
+                    "type": "string",
+                    "description": "Cache key used at design_avr_fir time.",
+                },
+                "channel_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Subset of channels to upload. Default: all "
+                        "channels in the .ady that have a cached FIR "
+                        "under cache_key."
+                    ),
+                },
+                "distances_override_m": {
+                    "type": "object",
+                    "description": (
+                        "Optional {channel: meters} map to override .ady "
+                        "distances during the upload. Use to push past "
+                        "the variance cap (e.g. SW1=20.0)."
+                    ),
+                    "additionalProperties": {"type": "number"},
+                },
+                "target_curves": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Which target-curve banks to write. Default "
+                        "[\"00\", \"01\"] writes both Flat and Reference "
+                        "so user can toggle at runtime via AudyEqSet."
+                    ),
+                },
+                "samplerates_hz": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": (
+                        "Sample rates to ship per channel. Default "
+                        "[32000, 44100, 48000] (XT32's three banks)."
+                    ),
+                },
+                "inter_packet_delay_ms": {
+                    "type": "number",
+                    "description": (
+                        "Pause between SET_COEFDT packets in ms. "
+                        "Helps less-buffered receivers keep up. Default 5."
+                    ),
+                    "default": 5.0,
+                },
+            },
+            "required": ["host", "ady_path", "cache_key"],
         },
     ),
     Tool(
@@ -6137,6 +7436,37 @@ _TOOLS: list[Tool] = [
                         "will not show a dB delta on the dashboard. "
                         "Shape: {type: 'harman'|'flat', reference_spl: float, band: [min_hz, max_hz], "
                         "points: [{freq, spl}, ...]}"
+                    ),
+                },
+                "target": {
+                    "type": "string",
+                    "description": (
+                        "Speaker / group identifier for sweep-range resolution. "
+                        "Looks up config.yaml's `speakers[].sweep_range_hz` (or "
+                        "`sub.sweep_range_hz`) to pick the right frequency band. "
+                        "Accepts position codes ('FL', 'C', 'TFL'), speaker types "
+                        "('main'/'mains', 'atmos', 'sub'/'subs', 'surround'), or "
+                        "'LFE'. Examples: target='subs' → 15-150 Hz, "
+                        "target='mains' → 60-20000 Hz, target='FL' → looks up the "
+                        "main speaker config. Ignored if explicit "
+                        "freq_min/freq_max are also passed."
+                    ),
+                },
+                "freq_min": {
+                    "type": "integer",
+                    "description": (
+                        "Lower frequency bound for the sweep in Hz. Overrides "
+                        "any value resolved from `target`. Default behavior: "
+                        "use the global measurement.freq_min config (currently "
+                        "20 Hz — sub-only)."
+                    ),
+                },
+                "freq_max": {
+                    "type": "integer",
+                    "description": (
+                        "Upper frequency bound for the sweep in Hz. Overrides "
+                        "any value resolved from `target`. For mains "
+                        "calibration use 20000; for sub use 200 or less."
                     ),
                 },
             },
@@ -6607,12 +7937,14 @@ _TOOLS: list[Tool] = [
     Tool(
         name="analyze_ir",
         description=(
-            "Extract IR peak time, polarity sign, and SPL from a stored measurement session. "
-            "Use this after measuring each sub solo to get the data needed for alignment: "
-            "peak_time_s is the travel-time from sub to mic; "
-            "subtract the earliest arrival from the latest to get the delay offset to apply; "
-            "peak_sign tells you polarity (if it differs from the reference sub, flip it); "
+            "Extract IR onset time, polarity sign, and SPL from a stored measurement session. "
+            "VALID for solo-sub alignment ONLY (each measurement must share the same DSP chain). "
+            "Subtract the earliest peak_time_s from the latest to get the delay offset between subs; "
+            "peak_sign tells you polarity (flip if it differs from the reference sub); "
             "spl_db is the relative level for gain matching. "
+            "INVALID for cross-path comparisons (sub-vs-mains, FIR-chain vs no-FIR, "
+            "cal-mode vs HDMI) — peak_time_s reflects FIR shape and buffer latency, not "
+            "acoustic arrival. Use compare_sub_phase or the loopback rig for cross-path timing. "
             "Workflow: mute_output → measure → analyze_ir → unmute_output → repeat per sub → "
             "compute offsets → set_delay / set_polarity / set_output_gain."
         ),
@@ -6694,6 +8026,77 @@ _TOOLS: list[Tool] = [
                 },
             },
             "required": ["output_index"],
+        },
+    ),
+    Tool(
+        name="design_corrective_fir",
+        description=(
+            "Empirical 2-step corrective FIR. Computes target − measured FR "
+            "from a post-baseline-FIR session, designs a min-phase magnitude "
+            "correction FIR for the residual, and convolves it with the "
+            "existing cached FIR for ``output_index``. Returns a "
+            "design_session_id for ``apply_fir(design_session_id=...)``. "
+            "Use after design_modal_fir + apply_fir reveal a per-room "
+            "deviation from the target curve that the modal FIR alone "
+            "didn't predict (anti-pulse phase interaction with the room's "
+            "response — see recipe Section 2.2b)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "integer",
+                    "description": (
+                        "Post-baseline-FIR measurement (the room's response "
+                        "after any existing FIR is applied)."
+                    ),
+                },
+                "target_curve": {
+                    "type": "object",
+                    "description": (
+                        "Target curve points + optional band. "
+                        "Shape: {'points': [{'freq': 25, 'spl': 5}, ...], "
+                        "'band': [25, 120]}. Anchored to 60-100 Hz midband "
+                        "so absolute SPL drops out."
+                    ),
+                    "properties": {
+                        "points": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "freq": {"type": "number"},
+                                    "spl": {"type": "number"},
+                                },
+                            },
+                        },
+                        "band": {
+                            "type": "array",
+                            "items": {"type": "number"},
+                        },
+                    },
+                    "required": ["points"],
+                },
+                "output_index": {
+                    "type": "integer",
+                    "description": "DSP output to convolve onto.",
+                },
+                "num_taps": {
+                    "type": "integer",
+                    "default": 1024,
+                    "description": "Corrective FIR length. Default 1024.",
+                },
+                "focus_hz": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "[lo, hi] band for correction; outside tapers to 0 dB.",
+                },
+                "return_coefficients": {
+                    "type": "boolean",
+                    "default": False,
+                },
+            },
+            "required": ["session_id", "target_curve", "output_index"],
         },
     ),
     Tool(
@@ -7003,6 +8406,39 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="verify_input_eq_effect",
+        description=(
+            "Compare an input-EQ filter set's predicted effect (simulated "
+            "against the pre session) against the measured delta between "
+            "pre and post-apply_input_eq sessions. Flags bands where "
+            "|predicted − measured| exceeds tolerance_db (default 2.0). "
+            "Use after apply_input_eq to catch: (1) filter slot conflict "
+            "(existing EQ wasn't replaced), (2) routing mismatch (signal "
+            "not flowing through the channels the filters were written to), "
+            "(3) measurement variance. Returns per-band comparison, "
+            "off-spec band list, and RMS discrepancy."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pre_session_id": {"type": "integer"},
+                "post_session_id": {"type": "integer"},
+                "predicted_filters": {
+                    "type": "array",
+                    "description": (
+                        "Same list passed to apply_input_eq. Each item: "
+                        "{freq, gain_db, q, type}."
+                    ),
+                    "items": {"type": "object"},
+                },
+                "tolerance_db": {"type": "number", "default": 2.0},
+                "min_hz": {"type": "number", "default": 20.0},
+                "max_hz": {"type": "number", "default": 200.0},
+            },
+            "required": ["pre_session_id", "post_session_id", "predicted_filters"],
+        },
+    ),
+    Tool(
         name="check_system",
         description=(
             "Run pre-flight hardware checks: config, miniDSP (USB + daemon), "
@@ -7204,6 +8640,24 @@ _TOOLS: list[Tool] = [
                         "physically reach."
                     ),
                 },
+                "direction": {
+                    "type": "string",
+                    "enum": ["balanced", "cuts_only"],
+                    "description": (
+                        "balanced (default) preserves legacy behavior: places the "
+                        "reference at min(headroom)+max_boost so the limiting "
+                        "frequency needs exactly max_boost_db. cuts_only picks the "
+                        "LOWEST-frequency anchor where every band above has "
+                        "measured-relative ≥ target-relative — yielding a target "
+                        "that needs only cuts above the anchor. Use cuts_only for "
+                        "deep-bass-priority sub calibration where boosts are only "
+                        "~25-50% effective at the listener but cuts are unconstrained. "
+                        "If no fully-cuts anchor exists, picks the lowest-freq "
+                        "anchor with the smallest shortfall and returns "
+                        "residual_boost_band_hz."
+                    ),
+                    "default": "balanced",
+                },
             },
             "required": ["session_id", "target_offsets"],
         },
@@ -7401,6 +8855,69 @@ _TOOLS: list[Tool] = [
                     "type": "number",
                     "description": "±range for per-sub gain trim search (default: 3 dB)",
                 },
+                "priority_band": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": (
+                        "Optional [lo_hz, hi_hz]. Weights this band 3× in the "
+                        "objective so the optimizer preferentially eliminates "
+                        "deep-bass nulls. Use to collapse the wideband + "
+                        "narrowband 2-call workflow into one call (recipe Phase 1.5)."
+                    ),
+                },
+            },
+            "required": ["session_ids"],
+        },
+    ),
+    Tool(
+        name="sweep_inter_sub_delay",
+        description=(
+            "Automated inter-sub delay sweep. Replaces the manual ±2 ms "
+            "human-driven sweep in recipe Phase 1.5. Takes post-alignment "
+            "solo session IDs, the polarity / gain / base-delay state already "
+            "applied, and sweeps the trailing sub's delay in fine steps to "
+            "find the value that shallowest the deepest 1/3-octave null in "
+            "the priority band (default 28-50 Hz)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Solo session IDs (2 subs).",
+                },
+                "sub_polarity": {
+                    "type": "array",
+                    "items": {"type": "boolean"},
+                    "description": "Polarity per sub (default all false).",
+                },
+                "sub_gain_db": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "Gain dB per sub (default all 0).",
+                },
+                "base_delays_ms": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": (
+                        "Currently-applied delay per sub. Trailing sub is the "
+                        "one with the largest base delay; its delay is swept."
+                    ),
+                },
+                "priority_band": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "[lo_hz, hi_hz] for null detection (default [28, 50]).",
+                },
+                "sweep_range_ms": {
+                    "type": "number",
+                    "description": "± range around base delay (default 2.0).",
+                },
+                "step_ms": {
+                    "type": "number",
+                    "description": "Step granularity (default 0.25).",
+                },
             },
             "required": ["session_ids"],
         },
@@ -7480,6 +8997,27 @@ _TOOLS: list[Tool] = [
                         "degenerate to minimum-phase. Ignored by minimum/linear modes."
                     ),
                     "default": 25.0,
+                },
+                "anchor": {
+                    "type": "object",
+                    "description": (
+                        "Optional re-anchoring of target_curve. Default (omitted) "
+                        "preserves legacy behavior: target_curve points are used "
+                        "as absolute SPL. \n"
+                        "- mode='band_mean': legacy (default). \n"
+                        "- mode='freq': force target(freq_hz) == measured(freq_hz); "
+                        "downward-sloping curves above the anchor become pure cuts. \n"
+                        "- mode='deep_bass_priority': pick the lowest freq in "
+                        "[band_lo, band_lo+20] where every band above is "
+                        "cut-implementable (gap ≥ -0.5 dB)."
+                    ),
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "enum": ["band_mean", "freq", "deep_bass_priority"],
+                        },
+                        "freq_hz": {"type": "number"},
+                    },
                 },
             },
             "required": ["session_id"],
@@ -7641,12 +9179,57 @@ _TOOLS: list[Tool] = [
                     ),
                     "default": 25.0,
                 },
+                "samplerate": {
+                    "type": "integer",
+                    "description": (
+                        "FIR design sample rate. Must match CamillaDSP processing "
+                        "rate for coefficients to apply 1:1. Default 8000 (matches "
+                        "current 8 kHz processing). Set to 48000 when running "
+                        "48 kHz native (requires num_taps=24576 for same 512 ms window)."
+                    ),
+                    "default": 8000,
+                },
                 "return_coefficients": {
                     "type": "boolean",
                     "description": (
                         "When false (default), coefficients are cached server-side "
                         "and applied via apply_fir(design_session_id=...). When true, "
                         "the array is returned in the response."
+                    ),
+                    "default": False,
+                },
+                "anchor": {
+                    "type": "object",
+                    "description": (
+                        "Optional re-anchoring for the target_curve magnitude "
+                        "correction layer. Only the magnitude layer is affected — "
+                        "anti-pulse modal cancellation is independent. \n"
+                        "- mode='band_mean' (default): legacy 60-100 Hz mean anchor. \n"
+                        "- mode='freq': force target(freq_hz) == measured(freq_hz). \n"
+                        "- mode='deep_bass_priority': pick the lowest freq in "
+                        "[band_lo, band_lo+20] where every band above is "
+                        "cut-implementable (gap ≥ -0.5 dB)."
+                    ),
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "enum": ["band_mean", "freq", "deep_bass_priority"],
+                        },
+                        "freq_hz": {"type": "number"},
+                    },
+                },
+                "compensation_notch": {
+                    "type": "boolean",
+                    "description": (
+                        "When true, keep cancel_strength HIGH and instead "
+                        "add narrow Q≈5 magnitude cuts on adjacent 1/3-oct "
+                        "bands that exceed the modal_cancel cap. Verifies "
+                        "the mode's cancellation depression is preserved "
+                        "(≥80% of pre-notch); aborts the notch if it would "
+                        "destroy cancellation. Returns added notches in "
+                        "the ``compensation_notches`` field. Default false "
+                        "preserves the post-2d18420 iterative-amplitude "
+                        "behaviour."
                     ),
                     "default": False,
                 },
@@ -8085,12 +9668,34 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             distances=dict(arguments["distances"]),
             n_positions=int(arguments.get("n_positions", 1)),
             commit=bool(arguments.get("commit", False)),
+            use_custom=bool(arguments.get("use_custom", False)),
+        )
+    elif name == "design_avr_fir":
+        result = await _tool_design_avr_fir(
+            channel_id=str(arguments["channel_id"]),
+            target_curve_db=list(arguments["target_curve_db"]),
+            cache_key=str(arguments["cache_key"]),
+            samplerate_hz=float(arguments.get("samplerate_hz", 48000.0)),
+        )
+    elif name == "apply_avr_fir":
+        result = await _tool_apply_avr_fir(
+            host=str(arguments["host"]),
+            ady_path=str(arguments["ady_path"]),
+            cache_key=str(arguments["cache_key"]),
+            channel_ids=arguments.get("channel_ids"),
+            distances_override_m=arguments.get("distances_override_m"),
+            target_curves=arguments.get("target_curves"),
+            samplerates_hz=arguments.get("samplerates_hz"),
+            inter_packet_delay_ms=float(arguments.get("inter_packet_delay_ms", 5.0)),
         )
     elif name in ("measure", "trigger_measurement"):
         result = await _tool_trigger_measurement(
             label=arguments.get("label"),
             position=arguments.get("position"),
             target_curve=arguments.get("target_curve"),
+            target=arguments.get("target"),
+            freq_min=(int(arguments["freq_min"]) if arguments.get("freq_min") is not None else None),
+            freq_max=(int(arguments["freq_max"]) if arguments.get("freq_max") is not None else None),
         )
     elif name == "calibrate_level":
         result = await _tool_calibrate_level(
@@ -8204,6 +9809,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         )
     elif name == "clear_fir":
         result = await _tool_clear_fir(output_index=int(arguments["output_index"]))
+    elif name == "design_corrective_fir":
+        result = await _tool_design_corrective_fir(
+            session_id=int(arguments["session_id"]),
+            target_curve=arguments["target_curve"],
+            output_index=int(arguments["output_index"]),
+            num_taps=int(arguments.get("num_taps", 1024)),
+            focus_hz=arguments.get("focus_hz"),
+            return_coefficients=bool(arguments.get("return_coefficients", False)),
+        )
     elif name == "reset_dsp_defaults":
         result = await _tool_reset_dsp_defaults(
             dry_run=bool(arguments.get("dry_run", False)),
@@ -8245,6 +9859,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )),
             preringing_ms=float(arguments.get("preringing_ms", 25.0)),
         )
+    elif name == "verify_input_eq_effect":
+        result = await _tool_verify_input_eq_effect(
+            pre_session_id=int(arguments["pre_session_id"]),
+            post_session_id=int(arguments["post_session_id"]),
+            predicted_filters=list(arguments["predicted_filters"]),
+            tolerance_db=float(arguments.get("tolerance_db", 2.0)),
+            min_hz=float(arguments.get("min_hz", 20.0)),
+            max_hz=float(arguments.get("max_hz", 200.0)),
+        )
     elif name == "verify_fir_effect":
         result = await _tool_verify_fir_effect(
             pre_session_id=int(arguments["pre_session_id"]),
@@ -8284,6 +9907,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             null_threshold_db=float(arguments.get("null_threshold_db", 15.0)),
             port_rolloff_hz=float(arguments.get("port_rolloff_hz", 28.0)),
             exclude_geometry=bool(arguments.get("exclude_geometry", True)),
+            direction=str(arguments.get("direction", "balanced")),
         )
     elif name == "compare_sessions":
         result = await _tool_compare_sessions(
@@ -8328,6 +9952,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             max_delay_ms=float(arguments.get("max_delay_ms", 30.0)),
             search_polarity=bool(arguments.get("search_polarity", True)),
             gain_search_db=float(arguments.get("gain_search_db", 3.0)),
+            priority_band=arguments.get("priority_band"),
+        )
+    elif name == "sweep_inter_sub_delay":
+        result = await _tool_sweep_inter_sub_delay(
+            session_ids=[int(x) for x in arguments["session_ids"]],
+            sub_polarity=arguments.get("sub_polarity"),
+            sub_gain_db=arguments.get("sub_gain_db"),
+            base_delays_ms=arguments.get("base_delays_ms"),
+            priority_band=arguments.get("priority_band", [28.0, 50.0]),
+            sweep_range_ms=float(arguments.get("sweep_range_ms", 2.0)),
+            step_ms=float(arguments.get("step_ms", 0.25)),
         )
     elif name == "design_fir":
         result = await _tool_design_fir(
@@ -8338,6 +9973,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             freq_focus_hz=arguments.get("freq_focus_hz"),
             return_coefficients=bool(arguments.get("return_coefficients", True)),
             preringing_ms=float(arguments.get("preringing_ms", 25.0)),
+            anchor=arguments.get("anchor"),
         )
     elif name == "design_modal_fir":
         result = await _tool_design_modal_fir(
@@ -8352,7 +9988,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             anti_pulse_cancel_strength=float(arguments.get("anti_pulse_cancel_strength", 0.6)),
             num_taps=int(arguments.get("num_taps", 4096)),
             max_pre_ring_ms=float(arguments.get("max_pre_ring_ms", 25.0)),
+            samplerate=int(arguments.get("samplerate", 48000)),
             return_coefficients=bool(arguments.get("return_coefficients", False)),
+            anchor=arguments.get("anchor"),
         )
     # ── LLM filter-design math tools ────────────────────────────────────────
     elif name == "evaluate_transfer_function":

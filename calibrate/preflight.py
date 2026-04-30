@@ -292,10 +292,73 @@ class PreflightChecker:
             state = await driver.get_state()
             model = state.get("model", "Denon AVR")
             suffix = " (auto-discovered)" if auto_discovered else ""
+
+            # Power-state guard. The AVR's HTTP service (and therefore the
+            # denonavr library) responds in standby — connected=True does
+            # not mean "ready to play audio." If power != "ON", Telnet
+            # replies disappear and sweep measurements come back at SNR=0.
+            # Surface this loudly so callers don't waste time chasing
+            # protocol bugs that are actually a power switch.
+            power = state.get("power")
+            if power != "ON":
+                return CheckResult(
+                    name="Denon AVR",
+                    passed=False,
+                    detail=(
+                        f"{model} reachable at {host}{suffix} but power={power!r} — "
+                        "audio path is silent and Telnet replies will not arrive."
+                    ),
+                    error=(
+                        "Denon AVR is in standby. Turn it on at the unit / remote, "
+                        "or call set_volume / measure (DenonSweepContext now "
+                        "auto-powers-on at sweep entry)."
+                    ),
+                )
+
+            # Audyssey TCP/1256 service health probe. The Audyssey daemon
+            # occasionally wedges after soft power-on from standby — HTTP
+            # keeps responding (which is what get_state hit above), but
+            # port 1256 (where envelope/filter writes go) stops replying.
+            # Detect that here so callers don't push 5 chunks of SET_SETDAT
+            # into the void.
+            from .drivers.denon import audyssey_tcp
+            try:
+                avrinf = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: audyssey_tcp.probe_audyssey_service(host, timeout=3.0),
+                )
+            except Exception as exc:
+                avrinf = None
+                probe_error = str(exc)
+            else:
+                probe_error = None
+
+            if avrinf is None:
+                return CheckResult(
+                    name="Denon AVR",
+                    passed=False,
+                    detail=(
+                        f"{model} online at {host}{suffix} (HTTP responding, "
+                        "power=ON), but Audyssey TCP service on port 1256 is "
+                        "unresponsive."
+                    ),
+                    error=(
+                        "AVR's Audyssey TCP daemon is wedged. SET_SETDAT and "
+                        "SET_COEFDT writes will silently no-op. Recovery: pull "
+                        "the AVR's power cord, wait 30 s, plug back in. Soft "
+                        "power-cycle via async_power_on() does NOT fix this. "
+                        + (f"Probe error: {probe_error}" if probe_error else "")
+                    ),
+                )
+
+            eq_type = avrinf.get("EQType", "?")
             return CheckResult(
                 name="Denon AVR",
                 passed=True,
-                detail=f"{model} online at {host}{suffix}",
+                detail=(
+                    f"{model} online at {host}{suffix}, power=ON, "
+                    f"Audyssey TCP service responsive (EQType={eq_type})"
+                ),
             )
         except DriverError as exc:
             return CheckResult(

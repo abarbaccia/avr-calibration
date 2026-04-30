@@ -190,8 +190,12 @@ class TestMinidspCheck:
 
 class TestDenonCheck:
     async def test_avr_online(self, config):
-        state = {"connected": True, "host": "192.168.1.100", "model": "Denon AVR-X3800H"}
-        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver:
+        state = {"connected": True, "host": "192.168.1.100", "model": "Denon AVR-X3800H", "power": "ON"}
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver, \
+             patch(
+                 "calibrate.drivers.denon.audyssey_tcp.probe_audyssey_service",
+                 return_value={"EQType": "MultEQXT32"},
+             ):
             MockDriver.return_value.get_state = AsyncMock(return_value=state)
             result = await PreflightChecker(config).check_denon()
         assert result.passed
@@ -199,12 +203,42 @@ class TestDenonCheck:
         assert "192.168.1.100" in result.detail
 
     async def test_avr_model_name_none_falls_back(self, config):
-        state = {"connected": True, "host": "192.168.1.100", "model": "Denon AVR"}
-        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver:
+        state = {"connected": True, "host": "192.168.1.100", "model": "Denon AVR", "power": "ON"}
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver, \
+             patch(
+                 "calibrate.drivers.denon.audyssey_tcp.probe_audyssey_service",
+                 return_value={"EQType": "MultEQXT32"},
+             ):
             MockDriver.return_value.get_state = AsyncMock(return_value=state)
             result = await PreflightChecker(config).check_denon()
         assert result.passed
         assert "Denon AVR" in result.detail
+
+    async def test_avr_in_standby_fails_loudly(self, config):
+        """Power=STANDBY should fail with a clear message, not pass silently."""
+        state = {"connected": True, "host": "192.168.1.100", "model": "Denon AVR-X3800H", "power": "STANDBY"}
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver, \
+             patch(
+                 "calibrate.drivers.denon.audyssey_tcp.probe_audyssey_service",
+                 return_value={"EQType": "MultEQXT32"},
+             ):
+            MockDriver.return_value.get_state = AsyncMock(return_value=state)
+            result = await PreflightChecker(config).check_denon()
+        assert not result.passed
+        assert "standby" in result.error.lower()
+        assert "STANDBY" in result.detail or "standby" in result.detail.lower()
+
+    async def test_avr_power_none_fails(self, config):
+        """power=None (denonavr's default before update) should also fail."""
+        state = {"connected": True, "host": "192.168.1.100", "model": "Denon AVR-X3800H", "power": None}
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver, \
+             patch(
+                 "calibrate.drivers.denon.audyssey_tcp.probe_audyssey_service",
+                 return_value={"EQType": "MultEQXT32"},
+             ):
+            MockDriver.return_value.get_state = AsyncMock(return_value=state)
+            result = await PreflightChecker(config).check_denon()
+        assert not result.passed
 
     async def test_host_not_configured_discovery_finds_nothing(self, config):
         config._data["denon"]["host"] = None
@@ -217,14 +251,32 @@ class TestDenonCheck:
 
     async def test_host_auto_discovered_via_ssdp(self, config):
         config._data["denon"]["host"] = None
-        state = {"connected": True, "host": "192.168.1.42", "model": "Denon AVR-X3800H"}
-        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver:
+        state = {"connected": True, "host": "192.168.1.42", "model": "Denon AVR-X3800H", "power": "ON"}
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver, \
+             patch(
+                 "calibrate.drivers.denon.audyssey_tcp.probe_audyssey_service",
+                 return_value={"EQType": "MultEQXT32"},
+             ):
             MockDriver.return_value.discover = AsyncMock(return_value=["192.168.1.42"])
             MockDriver.return_value.get_state = AsyncMock(return_value=state)
             result = await PreflightChecker(config).check_denon()
         assert result.passed
         assert "192.168.1.42" in result.detail
         assert "auto-discovered" in result.detail
+
+    async def test_avr_audyssey_tcp_wedged_fails_loudly(self, config):
+        """AVR HTTP responding but Audyssey TCP unresponsive → fail with hard-cycle hint."""
+        state = {"connected": True, "host": "192.168.1.100", "model": "Denon AVR-X3800H", "power": "ON"}
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver, \
+             patch(
+                 "calibrate.drivers.denon.audyssey_tcp.probe_audyssey_service",
+                 return_value=None,
+             ):
+            MockDriver.return_value.get_state = AsyncMock(return_value=state)
+            result = await PreflightChecker(config).check_denon()
+        assert not result.passed
+        assert "wedged" in result.error.lower() or "unresponsive" in result.detail.lower()
+        assert "power cord" in result.error.lower() or "hard" in result.error.lower()
 
     async def test_ssdp_discovery_empty(self, config):
         """SSDP discovery returning nothing → fail."""
@@ -365,8 +417,12 @@ class TestPlaybackRouteCheck:
     async def test_hdmi_route_denon_reachable(self, config):
         config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
         config._data["denon"]["host"] = "192.168.1.100"
-        state = {"connected": True, "host": "192.168.1.100", "model": "Denon AVR-X3800H"}
-        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver:
+        state = {"connected": True, "host": "192.168.1.100", "model": "Denon AVR-X3800H", "power": "ON"}
+        with patch("calibrate.drivers.denon.DenonDriver") as MockDriver, \
+             patch(
+                 "calibrate.drivers.denon.audyssey_tcp.probe_audyssey_service",
+                 return_value={"EQType": "MultEQXT32"},
+             ):
             MockDriver.return_value.get_state = AsyncMock(return_value=state)
             result = await PreflightChecker(config).check_playback_route()
         assert result.passed
