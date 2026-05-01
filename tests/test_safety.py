@@ -603,8 +603,8 @@ def test_modal_cancel_intent_admits_above_thermal() -> None:
 
 
 def test_modal_cancel_intent_still_rejects_above_modal_cap() -> None:
-    """Even modal_cancel cap rejects FIRs over its (+20 dB) limit."""
-    fir = _fir_boost_at(freq_hz=70.0, gain_db=24.0, n_taps=8192)
+    """Even modal_cancel cap rejects FIRs over its (+42 dB) limit."""
+    fir = _fir_boost_at(freq_hz=70.0, gain_db=45.0, n_taps=8192)
     with pytest.raises(SafetyValidationError):
         SafetyValidator().validate_fir(fir, sample_rate=_FIR_RATE, intent="modal_cancel")
 

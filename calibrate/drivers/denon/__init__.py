@@ -351,12 +351,19 @@ class DenonSweepContext:
     MAX_SWEEP_VOLUME_DB: float = 0.0  # reference level — configurable ceiling
 
     @classmethod
-    def from_config(cls, config, manage_volume: bool = True) -> "DenonSweepContext | None":
+    def from_config(
+        cls,
+        config,
+        manage_volume: bool = True,
+        sweep_volume_override: float | None = None,
+    ) -> "DenonSweepContext | None":
         """Build from a Config object, or return None if HDMI sweep not configured.
 
         Args:
             manage_volume: If False, skip setting/restoring volume on enter/exit.
                 Useful when the caller manages volume itself (e.g. calibrate_level).
+            sweep_volume_override: If set, use this volume instead of the config value.
+                Useful for mains measurements which need a higher level than subs.
         """
         route = config.measurement.get("playback_route", "usb")
         if route != "hdmi":
@@ -365,10 +372,15 @@ class DenonSweepContext:
         sweep_input = config.measurement.get("denon_sweep_input")
         if not host or not sweep_input:
             return None
+        volume = (
+            sweep_volume_override
+            if sweep_volume_override is not None
+            else float(config.measurement.get("denon_sweep_volume", -10.0))
+        )
         return cls(
             host=host,
             sweep_input=sweep_input,
-            sweep_volume=float(config.measurement.get("denon_sweep_volume", -10.0)),
+            sweep_volume=volume,
             settle_ms=config.measurement.get("denon_settle_ms", 5000),
             manage_volume=manage_volume,
             pure_direct=bool(config.measurement.get("denon_pure_direct", True)),

@@ -3855,7 +3855,7 @@ async def _tool_design_modal_fir(
     short_loud_peak_db: float = 12.0,
     long_ringy_t60_factor: float = 2.0,
     anti_pulse_cancel_strength: float = 0.6,
-    num_taps: int = 4096,
+    num_taps: int = 24576,
     max_pre_ring_ms: float = 25.0,
     samplerate: int = 48000,
     return_coefficients: bool = False,
@@ -3923,7 +3923,8 @@ async def _tool_design_modal_fir(
             2× target) get anti-pulse treatment. Used only for
             auto-classification when ``intents`` is None. See the
             "T60 references" table above the args.
-        num_taps: FIR length (default 4096 at 8 kHz internal = 512 ms span).
+        num_taps: FIR length (default 24576 at 48 kHz = 512 ms span; matches
+            the old 4096-tap / 8 kHz design in resolution and window length).
         max_pre_ring_ms: maximum pre-ringing budget across all anti-pulses
             (default 25 ms). Larger budget = more aggressive modal
             cancellation but more sub-chain latency.
@@ -4186,7 +4187,7 @@ async def _tool_design_modal_fir(
             "design_cached": True,
             "anchor_used": anchor_used,
             "note": (
-                f"Modal-aware FIR at 8000Hz, {summary.total_taps} taps. "
+                f"Modal-aware FIR at {samplerate}Hz, {summary.total_taps} taps. "
                 f"Pre-ring: {summary.pre_delay_ms:.1f}ms (budget {max_pre_ring_ms:.0f}ms). "
                 f"{len([t for t in summary.mode_treatments if t['treatment']=='anti_pulse'])} anti-pulses. "
                 f"Apply via apply_fir(output_index, design_session_id={session_id})."
@@ -4568,6 +4569,21 @@ def _resolve_sweep_range(
     return resolved_min, resolved_max, " + ".join(source_parts)
 
 
+# HDMI multi-channel PCM channel layout as interpreted by the Denon X3800H.
+# Verified empirically: ch3=LFE (sweep to muted subs → no signal at mic),
+# ch4=C. Order: FL, FR, LFE, C, RL, RR, SBL, SBR.
+_HDMI_CHANNEL_MAP: dict[str, int] = {
+    "FL": 1, "L": 1, "front_left": 1,
+    "FR": 2, "R": 2, "front_right": 2,
+    "LFE": 3, "sub": 3, "subs": 3,
+    "C": 4, "center": 4, "centre": 4,
+    "SL": 5, "surround_left": 5, "LS": 5, "RL": 5,
+    "SR": 6, "surround_right": 6, "RS": 6, "RR": 6,
+    "SBL": 7, "surround_back_left": 7,
+    "SBR": 8, "surround_back_right": 8,
+}
+
+
 async def _tool_trigger_measurement(
     label: str | None = None,
     position: str | None = None,
@@ -4575,6 +4591,8 @@ async def _tool_trigger_measurement(
     target: str | None = None,
     freq_min: int | None = None,
     freq_max: int | None = None,
+    sweep_channel: str | None = None,
+    sweep_volume_db: float | None = None,
 ) -> dict:
     """Trigger a measurement via UMIK-1 + PyTTa.
 
@@ -4597,6 +4615,16 @@ async def _tool_trigger_measurement(
     For mains calibration always pass either an explicit range or
     ``target="mains"`` — mains play 60 Hz–20 kHz; the default 200 Hz cap
     can't characterise them.
+
+    Per-speaker mains measurement:
+      - ``sweep_channel``: HDMI output channel for the sweep. Accepts speaker
+        codes: "FL"/"L", "FR"/"R", "C"/"center", "SL"/"LS", "SR"/"RS", "LFE".
+        Maps to HDMI channels 1–6. Defaults to the config ``output_channel``
+        (channel 1 / FL). Required when measuring C, FR, SL, or SR.
+      - ``sweep_volume_db``: override the Denon sweep volume for this
+        measurement only. Mains typically need -10 to -15 dB; the default
+        sub calibration volume (-31.1 dB) is too quiet for mains at MLP.
+        Does not persist to config.
     """
     try:
         import sounddevice as sd
@@ -4627,6 +4655,16 @@ async def _tool_trigger_measurement(
             cfg, target, freq_min, freq_max,
         )
 
+        # Resolve HDMI output channel (1=FL,2=FR,3=C,4=LFE,5=SL,6=SR).
+        resolved_out_channel: int | None = None
+        if sweep_channel is not None:
+            resolved_out_channel = _HDMI_CHANNEL_MAP.get(sweep_channel.upper()) or _HDMI_CHANNEL_MAP.get(sweep_channel)
+            if resolved_out_channel is None:
+                return _err(
+                    f"Unknown sweep_channel {sweep_channel!r}. "
+                    f"Valid values: {list(_HDMI_CHANNEL_MAP.keys())}"
+                )
+
         # When the DSP driver is in cal mode, route the sweep into its loopback
         # capture device so the sweep enters CamillaDSP via snd-aloop. Bypasses
         # the AVR — Audyssey/MultEQ filters cannot color the cal stimulus.
@@ -4640,7 +4678,10 @@ async def _tool_trigger_measurement(
         graph = cfg.signal_graph
         targets = tuple(graph.transducers_by_role("sub")) or graph.transducers
 
-        if route == "hdmi" and _drivers is not None:
+        if route == "hdmi" and _drivers is not None and resolved_out_channel is None and sweep_volume_db is None:
+            # Standard sub/combined sweep: let the graph compose all processor
+            # contexts (Denon + CamillaDSP). Mains sweeps bypass this path
+            # because CamillaDSP's sweep context is not part of the mains chain.
             async with graph.sweep_context_for_route(route, targets, cfg, _drivers):
                 fr = await engine.measure(
                     playback_device_override=cal_playback,
@@ -4651,19 +4692,21 @@ async def _tool_trigger_measurement(
             # Legacy path used when the driver registry isn't populated (older
             # test setups that patch `_dsp` directly without the lifespan).
             # Behaves exactly as before the graph refactor.
-            denon_ctx = DenonSweepContext.from_config(cfg)
+            denon_ctx = DenonSweepContext.from_config(cfg, sweep_volume_override=sweep_volume_db)
             if denon_ctx:
                 async with denon_ctx:
                     fr = await engine.measure(
-                    playback_device_override=cal_playback,
-                    freq_min=resolved_min,
-                    freq_max=resolved_max,
-                )
+                        playback_device_override=cal_playback,
+                        freq_min=resolved_min,
+                        freq_max=resolved_max,
+                        out_channel_override=resolved_out_channel,
+                    )
             else:
                 fr = await engine.measure(
                     playback_device_override=cal_playback,
                     freq_min=resolved_min,
                     freq_max=resolved_max,
+                    out_channel_override=resolved_out_channel,
                 )
         else:
             # USB mode keeps the persistent-session pattern so repeat
@@ -7505,6 +7548,27 @@ _TOOLS: list[Tool] = [
                         "calibration use 20000; for sub use 200 or less."
                     ),
                 },
+                "sweep_channel": {
+                    "type": "string",
+                    "description": (
+                        "HDMI output channel to play the sweep through. Required "
+                        "for per-speaker mains measurements. Accepts: "
+                        "'FL'/'L' (front left, ch 1), 'FR'/'R' (front right, ch 2), "
+                        "'C'/'center' (center, ch 3), 'LFE' (sub, ch 4), "
+                        "'SL'/'LS' (surround left, ch 5), 'SR'/'RS' (surround right, ch 6). "
+                        "Defaults to config output_channel (ch 1 / FL)."
+                    ),
+                },
+                "sweep_volume_db": {
+                    "type": "number",
+                    "description": (
+                        "Override the Denon sweep volume for this measurement only "
+                        "(does not persist to config). Mains measurements need a "
+                        "higher level than subs — use -10 to -15 dB for mains at MLP. "
+                        "Default: config denon_sweep_volume (currently -31.1 dB, "
+                        "calibrated for subs)."
+                    ),
+                },
             },
         },
     ),
@@ -9734,6 +9798,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             target=arguments.get("target"),
             freq_min=(int(arguments["freq_min"]) if arguments.get("freq_min") is not None else None),
             freq_max=(int(arguments["freq_max"]) if arguments.get("freq_max") is not None else None),
+            sweep_channel=arguments.get("sweep_channel"),
+            sweep_volume_db=(float(arguments["sweep_volume_db"]) if arguments.get("sweep_volume_db") is not None else None),
         )
     elif name == "calibrate_level":
         result = await _tool_calibrate_level(

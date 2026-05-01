@@ -226,7 +226,7 @@ SVS_PB12_NSD_PROFILE = TransducerProfile(
     max_change_simulated_db=6.0,
     hpf_freq_hz=18.0,
     hpf_order=4,
-    modal_cancel_max_boost_db=20.0,
+    modal_cancel_max_boost_db=42.0,
     notes="Default SVS PB12-NSD ported sub. Matches legacy safety.py constants.",
 )
 

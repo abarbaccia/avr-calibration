@@ -185,7 +185,7 @@ class HDMIPlayback:
 
         # Build multi-channel buffer with sweep on the target channel.
         # HDMI requires standard channel counts (2, 6, or 8).
-        # 5.1 layout: 1=FL, 2=FR, 3=LFE, 4=C, 5=RL, 6=RR (varies by sink).
+        # Denon X3800H layout: 1=FL, 2=FR, 3=LFE, 4=C, 5=SL, 6=SR.
         standard_counts = [2, 6, 8]
         n_channels = next(c for c in standard_counts if c >= out_channel)
         hdmi_buf = np.zeros((n_samples, n_channels), dtype=np.int16)
@@ -208,21 +208,27 @@ class HDMIPlayback:
             device=in_dev, samplerate=sample_rate,
             channels=1, dtype="float32", callback=_rec_callback,
         )
-        out_stream = sd.OutputStream(
-            device=out_dev, samplerate=sample_rate,
-            channels=n_channels, dtype="int16",
-        )
+        try:
+            out_stream = sd.OutputStream(
+                device=out_dev, samplerate=sample_rate,
+                channels=n_channels, dtype="int16",
+            )
+        except Exception:
+            in_stream.close()
+            raise
 
-        in_stream.start()
-        out_stream.start()
-        out_stream.write(hdmi_buf)
-        out_stream.stop()
-        # Drain remaining mic samples after playback ends
-        import time
-        time.sleep(0.5)
-        in_stream.stop()
-        in_stream.close()
-        out_stream.close()
+        try:
+            in_stream.start()
+            out_stream.start()
+            out_stream.write(hdmi_buf)
+            out_stream.stop()
+            # Drain remaining mic samples after playback ends
+            import time
+            time.sleep(0.5)
+            in_stream.stop()
+        finally:
+            in_stream.close()
+            out_stream.close()
 
         sweep_1d = sweep.timeSignal[:, 0]
         rec_1d = rec_data[:rec_pos[0], 0].astype(np.float64)

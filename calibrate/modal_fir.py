@@ -139,10 +139,14 @@ def design_anti_pulse(freq_hz: float, peak_db: float, cancel_strength: float,
         sos = butter(4, [lo, hi], btype="band", fs=sample_rate, output="sos")
         bp = sosfilt(sos, impulse)
     bp = bp / (float(np.max(np.abs(bp))) + 1e-12)
-    # Linear amplitude proportional to mode strength × cancel_strength
-    # Use partial cancellation: don't try to fully invert (over-correction risk)
-    linear_strength = (10.0 ** (peak_db / 20.0) - 1.0) * cancel_strength * 0.10
-    linear_strength = float(np.clip(linear_strength, 0.005, 0.4))
+    # Anti-pulse amplitude = cancel_strength at the mode frequency.
+    # The FIR places this pulse T/2 before the main tap so it arrives 180°
+    # out of phase at the mode, reducing the mode excitation by cancel_strength.
+    # The iterative adjacent-band cap fitting scales this down if needed.
+    # Peak_db scaling keeps weak modes from getting disproportionately large
+    # anti-pulses; the clamp prevents over-correction for very strong modes.
+    mode_factor = min(1.0, (10.0 ** (peak_db / 20.0) - 1.0))
+    linear_strength = float(np.clip(cancel_strength * mode_factor, 0.005, 0.95))
     return bp * linear_strength
 
 
@@ -306,19 +310,34 @@ class ModalAwareFIRDesigner:
         base = np.array(base_correction, dtype=np.float32)
         base_min = minimum_phase(base, method="homomorphic", n_fft=4 * len(base))
 
-        # 3. Compute pre-ring budget needed for active anti-pulses
+        # 3. Compute pre-ring budget for active anti-pulses.
+        # The anti-pulse center is placed at (pre_samples - T/2). The Gabor
+        # envelope extends ±half_length around that center, where
+        # half_length = n_cycles * sample_rate / (2 * freq_hz). If the leading
+        # edge of the envelope falls before sample 0 it gets clipped, and the
+        # truncated Gabor's phase contribution at the mode flips from -π
+        # (destructive — what we want) to ~0 (constructive — AMPLIFIES the
+        # mode by tens of dB). So the floor must include the full Gabor
+        # half-length, not just T/2 + tail/2.
         active_anti = [i for i in intents if i.treatment == "anti_pulse"]
         if active_anti:
-            # Each anti-pulse needs half a wavelength of pre-position
-            max_half_cycle_ms = max(1000.0 / (2 * i.freq_hz) for i in active_anti)
-            # Plus 1 cycle of bandpass tail
-            tail_ms = max(1000.0 / i.freq_hz for i in active_anti)
-            needed_pre_ring_ms = max_half_cycle_ms + tail_ms / 2
+            # Mirrors design_anti_pulse default; if that default changes,
+            # update here in lockstep.
+            gabor_n_cycles = 3
+            # Per-mode pre-need = T/2 (placement) + n_cycles*T/2 (envelope).
+            # For n_cycles=3 this collapses to 2T. Take the max across modes
+            # since lower-frequency modes need more pre-ring.
+            min_needed_ms = max(
+                (0.5 + 0.5 * gabor_n_cycles) * 1000.0 / i.freq_hz
+                for i in active_anti
+            )
+            # User budget can only INCREASE pre-ring — never less than the
+            # minimum needed for clean cancellation. Going past the minimum
+            # only adds latency without improving cancellation.
+            budget_ms = max(self.max_pre_ring_ms, min_needed_ms)
         else:
-            needed_pre_ring_ms = 0.0
-
-        budget_ms = min(self.max_pre_ring_ms, max(needed_pre_ring_ms, 0.0))
-        pre_samples = int(budget_ms * self.sr / 1000)
+            budget_ms = 0.0
+        pre_samples = min(int(budget_ms * self.sr / 1000), self.n_taps - 1)
         summary.pre_delay_ms = pre_samples / self.sr * 1000
         summary.pre_delay_samples = pre_samples
 
@@ -398,17 +417,33 @@ class ModalAwareFIRDesigner:
                 # Anti-pulse position: pre_samples - half_cycle
                 half_cycle_samples = int(0.5 * self.sr / intent.freq_hz)
                 anti_center = pre_samples - half_cycle_samples
-                start = anti_center - len(anti) // 2
-                if start < 0:
+                start_unclamped = anti_center - len(anti) // 2
+                # When the full pulse doesn't fit before position 0, skip the
+                # leading tail so the Gaussian *center* still lands at
+                # anti_center — not at position 0 which would place the peak
+                # after the main impulse.
+                anti_offset = max(0, -start_unclamped)
+                start = max(0, start_unclamped)
+                if anti_offset > 0:
+                    budget_needed_ms = round(
+                        (len(anti) // 2 + half_cycle_samples) / self.sr * 1000, 1
+                    )
                     summary.notes.append(
                         f"WARN: anti-pulse for {intent.freq_hz:.0f}Hz needs "
-                        f"{half_cycle_samples} pre-samples; only {pre_samples} budget "
-                        f"available — clipping"
+                        f"{budget_needed_ms}ms pre-ring budget; only "
+                        f"{pre_samples / self.sr * 1000:.1f}ms available — "
+                        f"truncating {anti_offset} leading samples (center preserved)"
                     )
-                    start = 0
-                end = min(start + len(anti), self.n_taps)
-                # Inverted polarity for cancellation
-                segment = -anti[:end - start]
+                # Hard-clip at pre_samples so the anti-pulse never extends past
+                # the main impulse — an overlapping tail at 70+ Hz would act as
+                # a resonator after the impulse, worsening the mode it's meant
+                # to cancel.
+                end = min(start + len(anti) - anti_offset, pre_samples)
+                # Same polarity as main tap for cancellation:
+                # anti-pulse (γ ≈ +1) arrives half-cycle early; its modal
+                # ringing rotates π by the time the main tap arrives, landing
+                # 180° out of phase with the main-tap ringing and canceling it.
+                segment = anti[anti_offset:anti_offset + (end - start)]
                 fir[start:end] += segment
                 base_amp = float(np.max(np.abs(anti)))
                 entry["anti_pulse_pre_ms"] = round(half_cycle_samples / self.sr * 1000, 2)
@@ -475,6 +510,9 @@ class ModalAwareFIRDesigner:
                 n_taps=min(self.n_taps, 1024),
                 focus_hz=magnitude_focus_hz,
                 anchor_freq_hz=anchor_freq_hz,
+                anti_pulse_mode_freqs=[
+                    r["freq_hz"] for r in anti_records
+                ],
             )
             # Convolve and truncate to n_taps
             combined = np.convolve(fir, mag_fir)[: self.n_taps].astype(np.float32)
@@ -715,6 +753,20 @@ class ModalAwareFIRDesigner:
             return {c: v for c, v in self._per_band_peak_db(current_fir).items()
                     if c in centres}
 
+        def _isolated_peak(rec: dict, scale: float, adj_bands: list) -> float:
+            """Return the worst adjacent-band peak of THIS pulse alone at ``scale``.
+
+            We measure the pulse in isolation (zero-padded to n_taps) so that
+            other anti-pulses' spectral skirts cannot cascade-zero an unrelated
+            pulse.  This is the correct domain for the cap: each pulse is
+            allowed its own budget, independent of its neighbours.
+            """
+            base_seg = rec["segment"][: rec["end"] - rec["start"]]
+            isolated = np.zeros(len(fir), dtype=np.float32)
+            isolated[rec["start"]:rec["end"]] = base_seg * scale
+            peaks = self._per_band_peak_db(isolated)
+            return max((peaks.get(c, -np.inf) for c in adj_bands), default=-np.inf)
+
         def _binary_search_max_scale(
             fir: np.ndarray,
             rec: dict,
@@ -723,27 +775,15 @@ class ModalAwareFIRDesigner:
             scale_ceiling: float,
         ) -> float:
             """Binary-search the largest scale in [0, scale_ceiling] that keeps
-            adjacent bands ≤ cap_db, assuming rec's current contribution has
-            already been removed from fir."""
-            base_seg = rec["segment"][: rec["end"] - rec["start"]]
-            worst_zero = max(
-                (self._per_band_peak_db(fir).get(c, -np.inf) for c in adj_bands),
-                default=-np.inf,
-            )
-            if worst_zero > cap_db:
-                return 0.0
+            this pulse's OWN adjacent-band leakage ≤ cap_db.
+
+            Uses isolated-pulse FFT so demotion of one pulse cannot cascade to
+            unrelated modes sharing an adjacent 1/3-oct band."""
             best_s = 0.0
             lo, hi = 0.0, scale_ceiling
             for _ in range(8):
                 mid = 0.5 * (lo + hi)
-                fir[rec["start"]:rec["end"]] += base_seg * mid
-                peaks = self._per_band_peak_db(fir)
-                worst_mid = max(
-                    (peaks.get(c, -np.inf) for c in adj_bands),
-                    default=-np.inf,
-                )
-                fir[rec["start"]:rec["end"]] -= base_seg * mid
-                if worst_mid <= cap_db:
+                if _isolated_peak(rec, mid, adj_bands) <= cap_db:
                     best_s = mid
                     lo = mid
                 else:
@@ -751,21 +791,19 @@ class ModalAwareFIRDesigner:
             return best_s
 
         # Phase 1: downscaling passes — reduce over-budget pulses.
+        # Skip condition uses isolated-pulse FFT so one pulse's spectral skirt
+        # cannot falsely flag an unrelated pulse as over-budget.
         for pass_idx in range(max_passes):
             changed = False
-            band_peaks = self._per_band_peak_db(fir)
             for rec in list(anti_records):
                 if rec.get("demoted"):
                     continue
                 adj_bands = self._adjacent_band_centres(rec["freq_hz"])
-                worst = max(
-                    (band_peaks.get(c, -np.inf) for c in adj_bands),
-                    default=-np.inf,
-                )
+                worst = _isolated_peak(rec, rec["scale"], adj_bands)
                 if worst <= cap_db:
                     continue
-                # Remove this pulse's current contribution and find the max
-                # feasible scale given what the other pulses are doing.
+                # Remove this pulse's current contribution, then binary-search
+                # the max feasible scale using isolated measurement.
                 seg = rec["segment"][: rec["end"] - rec["start"]] * rec["scale"]
                 fir[rec["start"]:rec["end"]] -= seg
                 new_scale = _binary_search_max_scale(
@@ -803,8 +841,61 @@ class ModalAwareFIRDesigner:
             if not changed:
                 break
 
+        # Phase 3: combined-FIR correction — after isolation-based Phase 1+2,
+        # each pulse's spectral skirt adds a small residual to its neighbours'
+        # adjacent bands.  This pass uses the REAL combined FFT to trim any
+        # pulse whose combined-peak still exceeds the cap, without the
+        # cascade-zeroing risk (Phase 1+2 already did the heavy lifting).
+        for _ in range(max_passes):
+            combined_peaks = self._per_band_peak_db(fir)
+            changed = False
+            for rec in list(anti_records):
+                if rec.get("demoted"):
+                    continue
+                adj_bands = self._adjacent_band_centres(rec["freq_hz"])
+                combined_worst = max(
+                    (combined_peaks.get(c, -np.inf) for c in adj_bands),
+                    default=-np.inf,
+                )
+                if combined_worst <= cap_db:
+                    continue
+                base_seg = rec["segment"][: rec["end"] - rec["start"]]
+                # Remove this pulse, check if background alone already exceeds cap.
+                fir[rec["start"]:rec["end"]] -= base_seg * rec["scale"]
+                bg_worst = max(
+                    (self._per_band_peak_db(fir).get(c, -np.inf) for c in adj_bands),
+                    default=-np.inf,
+                )
+                if bg_worst > cap_db:
+                    # Background already over cap — this pulse isn't the cause;
+                    # leave it unchanged rather than zeroing it.
+                    fir[rec["start"]:rec["end"]] += base_seg * rec["scale"]
+                    continue
+                # Binary-search on combined FIR (background + this pulse at scale s).
+                best_s = 0.0
+                lo, hi = 0.0, rec["scale"]
+                for _ in range(8):
+                    mid = 0.5 * (lo + hi)
+                    fir[rec["start"]:rec["end"]] += base_seg * mid
+                    test_worst = max(
+                        (self._per_band_peak_db(fir).get(c, -np.inf) for c in adj_bands),
+                        default=-np.inf,
+                    )
+                    fir[rec["start"]:rec["end"]] -= base_seg * mid
+                    if test_worst <= cap_db:
+                        best_s = mid
+                        lo = mid
+                    else:
+                        hi = mid
+                fir[rec["start"]:rec["end"]] += base_seg * best_s
+                if abs(best_s - rec["scale"]) > 1e-4:
+                    rec["scale"] = float(best_s)
+                    changed = True
+            if not changed:
+                break
+
         # Demote any pulse whose final scale is effectively zero AND whose
-        # band still exceeds cap (caller can't deliver any cancellation).
+        # OWN isolated leakage still exceeds cap (physically impossible to fit).
         post_peaks = self._per_band_peak_db(fir)
         for rec in anti_records:
             entry = rec["entry"]
@@ -813,23 +904,26 @@ class ModalAwareFIRDesigner:
             entry["anti_pulse_amplitude"] = round(rec["base_amp"] * rec["scale"], 4)
             entry["predicted_t60_reduction_pct"] = int(achieved_strength * 60)
             adj_bands = self._adjacent_band_centres(rec["freq_hz"])
-            worst = max(
+            # Report combined adjacent-band peak (what SafetyValidator sees).
+            worst_combined = max(
                 (post_peaks.get(c, -np.inf) for c in adj_bands),
                 default=-np.inf,
             )
-            entry["adjacent_band_peak_db"] = round(float(worst), 2) if np.isfinite(worst) else None
+            entry["adjacent_band_peak_db"] = round(float(worst_combined), 2) if np.isfinite(worst_combined) else None
             entry["adjacent_band_cap_db"] = round(cap_db, 2)
-            if rec["scale"] < 0.02 and worst > cap_db:
-                # Even amplitude≈0 cannot fit cap (other pulses dominate this
-                # band). Demote this mode to linear_notch — the FIR's anti-
-                # pulse contribution has already been zeroed by the search.
+            # Demote when the achieved time-domain amplitude is negligible — below
+            # 0.5% of the main tap, the anti-pulse contributes <0.5% mode reduction,
+            # which is inaudible. Use absolute amplitude (base_amp × scale) rather
+            # than relative scale so the threshold is independent of the initial
+            # amplitude formula.
+            if rec["base_amp"] * rec["scale"] < 0.005:
                 rec["demoted"] = True
                 entry["demoted_from"] = "anti_pulse"
                 entry["treatment"] = "linear_notch"
                 entry["rationale"] = (
                     "anti_pulse demoted to linear_notch — adjacent-band cap "
-                    "unreachable (cap=+%.0f dB at adjacent band still exceeded "
-                    "even at amplitude≈0)" % cap_db
+                    "unreachable (cap=+%.0f dB; pulse must be scaled to ≈0 "
+                    "to fit its own adjacent-band budget)" % cap_db
                 )
                 summary.notes.append(
                     f"auto-demote: {rec['freq_hz']:.0f} Hz anti_pulse → "
@@ -870,6 +964,7 @@ def _design_magnitude_correction_fir(
     n_taps: int = 1024,
     focus_hz: tuple[float, float] | None = None,
     anchor_freq_hz: float | None = None,
+    anti_pulse_mode_freqs: list[float] | None = None,
 ) -> np.ndarray:
     """Design a min-phase FIR that corrects ``source + fir`` toward ``target``.
 
@@ -880,10 +975,23 @@ def _design_magnitude_correction_fir(
     Outside ``focus_hz`` (default: full sub band) the correction tapers to
     0 dB to avoid lifting noise floors or boosting frequencies the sub
     can't reproduce.
+
+    ``anti_pulse_mode_freqs``: frequencies (Hz) of anti-pulse modes. The FIR's
+    spectral contribution at these bands is excluded from the residual so the
+    magnitude-correction layer does not try to undo the anti-pulse's Gabor
+    spectral peak (which is a time-domain artifact, not a real magnitude boost).
     """
     n_fft = max(2048, int(2 ** np.ceil(np.log2(max(n_taps, len(fir))))))
     fir_spec_db = 20.0 * np.log10(np.maximum(np.abs(np.fft.rfft(fir, n_fft)), 1e-9))
     freqs = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
+    # Anti-pulse modes: mask out the Gabor resonance peak at mode frequencies so
+    # the correction layer treats those bands as if the FIR were flat there.
+    if anti_pulse_mode_freqs:
+        for mf in anti_pulse_mode_freqs:
+            lo_m = mf / (2 ** (1.0 / 3))  # 1/3 oct below
+            hi_m = mf * (2 ** (1.0 / 3))  # 1/3 oct above
+            mask = (freqs >= lo_m) & (freqs <= hi_m)
+            fir_spec_db[mask] = 0.0
 
     # Interpolate source FR and target onto the FFT grid (log-frequency).
     src_pts = sorted(source_fr_db, key=lambda p: p[0])
