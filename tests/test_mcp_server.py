@@ -6372,7 +6372,12 @@ async def test_design_modal_fir_uses_supplied_intents_verbatim() -> None:
 
 @pytest.mark.asyncio
 async def test_design_modal_fir_anti_pulse_uses_pre_ring_budget() -> None:
-    """An anti_pulse mode at 70 Hz consumes ~7 ms pre-ring (half-wavelength)."""
+    """Anti_pulse mode at 70 Hz uses the FULL max_pre_ring_ms budget.
+
+    The pre_delay equals max_pre_ring_ms (not just the minimum half-wavelength)
+    so the Gabor envelope has more room before the pre_samples hard-clip,
+    increasing the usable portion and thus cancellation efficiency.
+    """
     decay_modes = [{"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0}]
     intents = [{"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0,
                 "treatment": "anti_pulse", "cancel_strength": 0.6}]
@@ -6383,8 +6388,8 @@ async def test_design_modal_fir_anti_pulse_uses_pre_ring_budget() -> None:
             session_id=1, intents=intents, num_taps=4096, max_pre_ring_ms=25.0,
         )
     assert result["ok"]
-    # Half-wavelength of 70 Hz = 7.14 ms; tool uses half + tail/2
-    assert 5.0 < result["pre_delay_ms"] < 15.0
+    # pre_delay should use the full 25ms budget, not just ~7ms minimum
+    assert abs(result["pre_delay_ms"] - 25.0) < 1.0
     treatment = result["per_mode_treatments"][0]
     assert treatment["treatment"] == "anti_pulse"
     assert "anti_pulse_pre_ms" in treatment
@@ -6657,11 +6662,14 @@ async def test_design_modal_fir_compensation_notch_keeps_cancel_strength() -> No
         "treatment": "anti_pulse", "cancel_strength": 0.6, "bp_q": 1.5,
     }]
     session = _make_modal_session(decay_modes)
-    # Tight cap to force compensation notches to be needed.
+    # Tight cap to force compensation notches to be needed. With new amplitude
+    # formula (cancel_strength=0.6 → ~30dB adjacent peaks), cap=3 would require
+    # a ~27dB notch that bleeds into the mode and gets aborted. cap=10 forces
+    # notches while keeping the cut small enough that the mode is preserved.
     with patch("calibrate.storage.SessionStore") as MockStore, \
          patch("calibrate.graph.SVS_PB12_NSD_PROFILE") as MockProfile:
         MockStore.return_value.list_sessions.return_value = [session]
-        MockProfile.modal_cancel_max_boost_db = 3.0
+        MockProfile.modal_cancel_max_boost_db = 10.0
         result = await _tool_design_modal_fir(
             session_id=1, intents=intents,
             num_taps=4096, max_pre_ring_ms=25.0, samplerate=8000,

@@ -139,10 +139,14 @@ def design_anti_pulse(freq_hz: float, peak_db: float, cancel_strength: float,
         sos = butter(4, [lo, hi], btype="band", fs=sample_rate, output="sos")
         bp = sosfilt(sos, impulse)
     bp = bp / (float(np.max(np.abs(bp))) + 1e-12)
-    # Linear amplitude proportional to mode strength × cancel_strength
-    # Use partial cancellation: don't try to fully invert (over-correction risk)
-    linear_strength = (10.0 ** (peak_db / 20.0) - 1.0) * cancel_strength * 0.10
-    linear_strength = float(np.clip(linear_strength, 0.005, 0.4))
+    # Anti-pulse amplitude = cancel_strength at the mode frequency.
+    # The FIR places this pulse T/2 before the main tap so it arrives 180°
+    # out of phase at the mode, reducing the mode excitation by cancel_strength.
+    # The iterative adjacent-band cap fitting scales this down if needed.
+    # Peak_db scaling keeps weak modes from getting disproportionately large
+    # anti-pulses; the clamp prevents over-correction for very strong modes.
+    mode_factor = min(1.0, (10.0 ** (peak_db / 20.0) - 1.0))
+    linear_strength = float(np.clip(cancel_strength * mode_factor, 0.005, 0.95))
     return bp * linear_strength
 
 
@@ -306,19 +310,22 @@ class ModalAwareFIRDesigner:
         base = np.array(base_correction, dtype=np.float32)
         base_min = minimum_phase(base, method="homomorphic", n_fft=4 * len(base))
 
-        # 3. Compute pre-ring budget needed for active anti-pulses
+        # 3. Compute pre-ring budget for active anti-pulses.
+        # Use the full max_pre_ring_ms budget when anti-pulses are present —
+        # more pre-ring = more of the Gabor envelope preserved before the hard-
+        # clip at pre_samples, which directly increases cancellation efficiency.
+        # The minimum needed (half_cycle + tail/2) is only the floor required
+        # to place the center correctly; using the full budget improves quality.
         active_anti = [i for i in intents if i.treatment == "anti_pulse"]
         if active_anti:
-            # Each anti-pulse needs half a wavelength of pre-position
             max_half_cycle_ms = max(1000.0 / (2 * i.freq_hz) for i in active_anti)
-            # Plus 1 cycle of bandpass tail
             tail_ms = max(1000.0 / i.freq_hz for i in active_anti)
-            needed_pre_ring_ms = max_half_cycle_ms + tail_ms / 2
+            min_needed_ms = max_half_cycle_ms + tail_ms / 2
+            # Always use the full budget; fall back to minimum if budget is too tight.
+            budget_ms = max(self.max_pre_ring_ms, min_needed_ms)
         else:
-            needed_pre_ring_ms = 0.0
-
-        budget_ms = min(self.max_pre_ring_ms, max(needed_pre_ring_ms, 0.0))
-        pre_samples = int(budget_ms * self.sr / 1000)
+            budget_ms = 0.0
+        pre_samples = min(int(budget_ms * self.sr / 1000), self.n_taps - 1)
         summary.pre_delay_ms = pre_samples / self.sr * 1000
         summary.pre_delay_samples = pre_samples
 
@@ -420,8 +427,11 @@ class ModalAwareFIRDesigner:
                 # a resonator after the impulse, worsening the mode it's meant
                 # to cancel.
                 end = min(start + len(anti) - anti_offset, pre_samples)
-                # Inverted polarity for cancellation
-                segment = -anti[anti_offset:anti_offset + (end - start)]
+                # Same polarity as main tap for cancellation:
+                # anti-pulse (γ ≈ +1) arrives half-cycle early; its modal
+                # ringing rotates π by the time the main tap arrives, landing
+                # 180° out of phase with the main-tap ringing and canceling it.
+                segment = anti[anti_offset:anti_offset + (end - start)]
                 fir[start:end] += segment
                 base_amp = float(np.max(np.abs(anti)))
                 entry["anti_pulse_pre_ms"] = round(half_cycle_samples / self.sr * 1000, 2)
@@ -488,6 +498,9 @@ class ModalAwareFIRDesigner:
                 n_taps=min(self.n_taps, 1024),
                 focus_hz=magnitude_focus_hz,
                 anchor_freq_hz=anchor_freq_hz,
+                anti_pulse_mode_freqs=[
+                    r["freq_hz"] for r in anti_records
+                ],
             )
             # Convolve and truncate to n_taps
             combined = np.convolve(fir, mag_fir)[: self.n_taps].astype(np.float32)
@@ -886,10 +899,12 @@ class ModalAwareFIRDesigner:
             )
             entry["adjacent_band_peak_db"] = round(float(worst_combined), 2) if np.isfinite(worst_combined) else None
             entry["adjacent_band_cap_db"] = round(cap_db, 2)
-            # Demote when the pulse had to be scaled to near-zero to fit the
-            # cap — at <2% of requested strength, the cancellation benefit is
-            # negligible and treating it as linear_notch is more honest.
-            if rec["scale"] < 0.02:
+            # Demote when the achieved time-domain amplitude is negligible — below
+            # 0.5% of the main tap, the anti-pulse contributes <0.5% mode reduction,
+            # which is inaudible. Use absolute amplitude (base_amp × scale) rather
+            # than relative scale so the threshold is independent of the initial
+            # amplitude formula.
+            if rec["base_amp"] * rec["scale"] < 0.005:
                 rec["demoted"] = True
                 entry["demoted_from"] = "anti_pulse"
                 entry["treatment"] = "linear_notch"
@@ -937,6 +952,7 @@ def _design_magnitude_correction_fir(
     n_taps: int = 1024,
     focus_hz: tuple[float, float] | None = None,
     anchor_freq_hz: float | None = None,
+    anti_pulse_mode_freqs: list[float] | None = None,
 ) -> np.ndarray:
     """Design a min-phase FIR that corrects ``source + fir`` toward ``target``.
 
@@ -947,10 +963,23 @@ def _design_magnitude_correction_fir(
     Outside ``focus_hz`` (default: full sub band) the correction tapers to
     0 dB to avoid lifting noise floors or boosting frequencies the sub
     can't reproduce.
+
+    ``anti_pulse_mode_freqs``: frequencies (Hz) of anti-pulse modes. The FIR's
+    spectral contribution at these bands is excluded from the residual so the
+    magnitude-correction layer does not try to undo the anti-pulse's Gabor
+    spectral peak (which is a time-domain artifact, not a real magnitude boost).
     """
     n_fft = max(2048, int(2 ** np.ceil(np.log2(max(n_taps, len(fir))))))
     fir_spec_db = 20.0 * np.log10(np.maximum(np.abs(np.fft.rfft(fir, n_fft)), 1e-9))
     freqs = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
+    # Anti-pulse modes: mask out the Gabor resonance peak at mode frequencies so
+    # the correction layer treats those bands as if the FIR were flat there.
+    if anti_pulse_mode_freqs:
+        for mf in anti_pulse_mode_freqs:
+            lo_m = mf / (2 ** (1.0 / 3))  # 1/3 oct below
+            hi_m = mf * (2 ** (1.0 / 3))  # 1/3 oct above
+            mask = (freqs >= lo_m) & (freqs <= hi_m)
+            fir_spec_db[mask] = 0.0
 
     # Interpolate source FR and target onto the FFT grid (log-frequency).
     src_pts = sorted(source_fr_db, key=lambda p: p[0])
