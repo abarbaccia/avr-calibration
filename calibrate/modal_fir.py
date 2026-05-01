@@ -715,6 +715,42 @@ class ModalAwareFIRDesigner:
             return {c: v for c, v in self._per_band_peak_db(current_fir).items()
                     if c in centres}
 
+        def _binary_search_max_scale(
+            fir: np.ndarray,
+            rec: dict,
+            adj_bands: list,
+            cap_db: float,
+            scale_ceiling: float,
+        ) -> float:
+            """Binary-search the largest scale in [0, scale_ceiling] that keeps
+            adjacent bands ≤ cap_db, assuming rec's current contribution has
+            already been removed from fir."""
+            base_seg = rec["segment"][: rec["end"] - rec["start"]]
+            worst_zero = max(
+                (self._per_band_peak_db(fir).get(c, -np.inf) for c in adj_bands),
+                default=-np.inf,
+            )
+            if worst_zero > cap_db:
+                return 0.0
+            best_s = 0.0
+            lo, hi = 0.0, scale_ceiling
+            for _ in range(8):
+                mid = 0.5 * (lo + hi)
+                fir[rec["start"]:rec["end"]] += base_seg * mid
+                peaks = self._per_band_peak_db(fir)
+                worst_mid = max(
+                    (peaks.get(c, -np.inf) for c in adj_bands),
+                    default=-np.inf,
+                )
+                fir[rec["start"]:rec["end"]] -= base_seg * mid
+                if worst_mid <= cap_db:
+                    best_s = mid
+                    lo = mid
+                else:
+                    hi = mid
+            return best_s
+
+        # Phase 1: downscaling passes — reduce over-budget pulses.
         for pass_idx in range(max_passes):
             changed = False
             band_peaks = self._per_band_peak_db(fir)
@@ -728,45 +764,39 @@ class ModalAwareFIRDesigner:
                 )
                 if worst <= cap_db:
                     continue
-                # Binary search a scale factor for THIS pulse that brings
-                # all adjacent bands ≤ cap, holding others fixed.
-                s_lo, s_hi = 0.0, rec["scale"]
-                # Save the current contribution and remove it from fir
+                # Remove this pulse's current contribution and find the max
+                # feasible scale given what the other pulses are doing.
                 seg = rec["segment"][: rec["end"] - rec["start"]] * rec["scale"]
                 fir[rec["start"]:rec["end"]] -= seg
-                # Now binary-search a new scale relative to the unscaled segment.
-                base_seg = rec["segment"][: rec["end"] - rec["start"]]
-                best_s = 0.0
-                # Quick check: is even s=0 (no pulse) over-cap from OTHER pulses?
-                worst_zero = max(
-                    (self._per_band_peak_db(fir).get(c, -np.inf) for c in adj_bands),
-                    default=-np.inf,
+                new_scale = _binary_search_max_scale(
+                    fir, rec, adj_bands, cap_db, rec["scale"]
                 )
-                if worst_zero > cap_db:
-                    # Other pulses alone overflow this band — leave this pulse
-                    # at zero; the other-pulse pass will fix it.
-                    new_scale = 0.0
-                else:
-                    # Binary search for largest s such that adding s*base_seg
-                    # keeps adjacent bands ≤ cap.
-                    lo, hi = 0.0, rec["scale"]
-                    for _ in range(6):
-                        mid = 0.5 * (lo + hi)
-                        fir[rec["start"]:rec["end"]] += base_seg * mid
-                        peaks = self._per_band_peak_db(fir)
-                        worst_mid = max(
-                            (peaks.get(c, -np.inf) for c in adj_bands),
-                            default=-np.inf,
-                        )
-                        fir[rec["start"]:rec["end"]] -= base_seg * mid
-                        if worst_mid <= cap_db:
-                            best_s = mid
-                            lo = mid
-                        else:
-                            hi = mid
-                    new_scale = best_s
-                # Apply the new scale
-                fir[rec["start"]:rec["end"]] += base_seg * new_scale
+                fir[rec["start"]:rec["end"]] += (
+                    rec["segment"][: rec["end"] - rec["start"]] * new_scale
+                )
+                if abs(new_scale - rec["scale"]) > 1e-4:
+                    rec["scale"] = float(new_scale)
+                    changed = True
+            if not changed:
+                break
+
+        # Phase 2: recovery pass — pulses zeroed in phase 1 may now have budget
+        # freed by other pulses being reduced.  Try to push each back up.
+        for _ in range(max_passes):
+            changed = False
+            for rec in list(anti_records):
+                if rec.get("demoted"):
+                    continue
+                adj_bands = self._adjacent_band_centres(rec["freq_hz"])
+                # Remove current contribution and re-search for max feasible scale.
+                seg = rec["segment"][: rec["end"] - rec["start"]] * rec["scale"]
+                fir[rec["start"]:rec["end"]] -= seg
+                new_scale = _binary_search_max_scale(
+                    fir, rec, adj_bands, cap_db, 1.0
+                )
+                fir[rec["start"]:rec["end"]] += (
+                    rec["segment"][: rec["end"] - rec["start"]] * new_scale
+                )
                 if abs(new_scale - rec["scale"]) > 1e-4:
                     rec["scale"] = float(new_scale)
                     changed = True
