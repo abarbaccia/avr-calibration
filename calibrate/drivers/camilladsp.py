@@ -974,6 +974,7 @@ class CamillaDSPDriver(DSPDriver):
         filters: list[dict],
         output_index: int | None = None,
         simulation_verified: bool = False,
+        bypass_iteration_limit: bool = False,
     ) -> None:
         """Validate and apply output EQ, then push the pipeline.
 
@@ -1003,6 +1004,7 @@ class CamillaDSPDriver(DSPDriver):
             result = validator.validate(
                 filter_specs, prev_specs,
                 simulation_verified=simulation_verified,
+                bypass_iteration_limit=bypass_iteration_limit,
             )
             if not result.ok:
                 raise DriverError(f"SafetyValidator: {result.error}")
@@ -1031,6 +1033,7 @@ class CamillaDSPDriver(DSPDriver):
         filters: list[dict],
         input_index: int | None = None,
         simulation_verified: bool = False,
+        bypass_iteration_limit: bool = False,
     ) -> None:
         """Validate and apply input EQ, then push the pipeline.
 
@@ -1062,6 +1065,7 @@ class CamillaDSPDriver(DSPDriver):
             result = validator.validate(
                 filter_specs, prev_specs,
                 simulation_verified=simulation_verified,
+                bypass_iteration_limit=bypass_iteration_limit,
             )
             if not result.ok:
                 raise DriverError(f"SafetyValidator: {result.error}")

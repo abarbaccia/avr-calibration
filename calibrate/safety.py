@@ -145,6 +145,66 @@ def _is_boost(f: FilterSpec) -> bool:
     return f.gain_db > 0.0
 
 
+# Sample rate used to evaluate biquad magnitudes for the per-iteration check.
+# The per-iteration check only cares about magnitude at sub-bass frequencies
+# (≤ 200 Hz), where the choice of DSP processing rate (48 / 96 / 192 kHz) has
+# negligible effect on RBJ shelf/peaking magnitudes — well below Nyquist for
+# all supported rates.  96 kHz matches the miniDSP 2x4 HD default.
+_PER_BAND_SAMPLE_RATE_HZ: int = 96_000
+
+
+def _filter_magnitude_db(f: FilterSpec, freq_hz: float) -> float:
+    """Magnitude (dB) of a single ``FilterSpec`` at *freq_hz*.
+
+    Uses the same RBJ biquad coefficients that ``dsp.freq_gain_q_to_biquad``
+    sends to the DSP, so the validator's view of the filter matches what
+    the hardware actually executes.
+
+    HPFs and LPFs are treated as 0 dB in the passband for the per-iteration
+    delta check — they don't contribute boost in the 20–200 Hz region the
+    check inspects (the mandatory infrasonic HPF lives at 18 Hz with a
+    Butterworth roll-off; well below 20 Hz it's ≤ -3 dB, which only matters
+    for cuts and cuts are unconstrained).
+    """
+    # Late import to avoid pulling scipy into module-load path for callers
+    # that only use FilterSpec / ValidationResult.
+    import numpy as np
+    from scipy import signal as _signal
+
+    from .dsp import freq_gain_q_to_biquad
+
+    if f.type in ("hpf", "lpf", "notch"):
+        return 0.0
+
+    coeffs = freq_gain_q_to_biquad(
+        freq=f.freq, gain_db=f.gain_db, q=f.q,
+        filter_type=f.type, sample_rate=_PER_BAND_SAMPLE_RATE_HZ,
+    )
+    b = np.array([coeffs["b0"], coeffs["b1"], coeffs["b2"]], dtype=np.float64)
+    a = np.array([1.0, coeffs["a1"], coeffs["a2"]], dtype=np.float64)
+    _, h = _signal.freqz(b, a, worN=[freq_hz], fs=_PER_BAND_SAMPLE_RATE_HZ)
+    mag = float(np.abs(h[0]))
+    if mag <= 0.0:
+        return -200.0
+    return 20.0 * math.log10(mag)
+
+
+def _per_band_magnitudes(filters: list[FilterSpec]) -> dict[float, float]:
+    """Composite magnitude (dB) of *filters* at each 1/3-octave centre.
+
+    Sums per-filter dB contributions at each centre.  Cascaded biquads
+    multiply in linear magnitude → add in dB, so this matches the actual
+    hardware response.
+    """
+    out: dict[float, float] = {}
+    for centre in THIRD_OCTAVE_CENTRES_HZ:
+        total_db = 0.0
+        for f in filters:
+            total_db += _filter_magnitude_db(f, centre)
+        out[centre] = total_db
+    return out
+
+
 # ── Validator ──────────────────────────────────────────────────────────────────
 
 class SafetyValidator:
@@ -179,6 +239,7 @@ class SafetyValidator:
         filters: list[FilterSpec],
         previous_filters: list[FilterSpec] | None = None,
         simulation_verified: bool = False,
+        bypass_iteration_limit: bool = False,
     ) -> ValidationResult:
         """Run all safety checks on *filters*.
 
@@ -193,6 +254,12 @@ class SafetyValidator:
             simulation_verified: If True, the caller has verified the filter set via
                 simulate_eq immediately before applying.  Relaxes the per-iteration
                 change limit from +3 dB to +6 dB.
+            bypass_iteration_limit: If True, skip the per-iteration change check
+                entirely.  All absolute caps (per-band boost ceiling, cumulative
+                ceiling, boost frequency floor, mandatory HPF) STILL APPLY — only
+                the delta-vs-previous check is skipped.  Use only after
+                simulating the proposed filter set against the current
+                measurement.  Cuts are unconstrained as before.
 
         Returns ValidationResult.passed() if all checks pass, or
         ValidationResult.failed(reason) on the first violation found.
@@ -209,7 +276,7 @@ class SafetyValidator:
             if not result.ok:
                 return result
 
-        if previous_filters is not None:
+        if previous_filters is not None and not bypass_iteration_limit:
             result = self._check_per_iteration_change(
                 filters, previous_filters, simulation_verified=simulation_verified
             )
@@ -296,9 +363,15 @@ class SafetyValidator:
         ``simulate_eq`` and confirmed the predicted response), the limit relaxes to
         +6 dB — halving measurement cycles after structural DSP changes like FIR.
 
-        Matches filters by nearest 1/3-octave band (not exact frequency) to
-        prevent drift-based bypasses where a correction algorithm shifts a
-        filter from 50.0 Hz to 49.9 Hz to dodge the delta check.
+        Magnitudes per 1/3-octave band are computed by evaluating the composite
+        biquad transfer function of the filter set at each 1/3-octave centre,
+        not by attributing each filter's declared ``gain_db`` to its centre
+        band.  The naive per-filter attribution gets shelves wrong: a
+        ``high_shelf`` at 35 Hz with -10 dB gain attenuates *above* 35 Hz, so
+        its contribution at 31.5 Hz (1/3-octave below the corner) is ~0 dB,
+        not -10 dB.  Mis-binning the shelf produced spurious "+10 dB
+        per-iteration" rejections when callers removed or replaced such a
+        filter.
         """
         limit = (
             self._profile.max_change_simulated_db
@@ -306,26 +379,24 @@ class SafetyValidator:
             else self._profile.max_change_per_iter_db
         )
 
-        # Build a lookup: previous gain by 1/3-octave centre
-        prev_by_band: dict[float, float] = {}
-        for f in previous_filters:
-            if f.type == "hpf":
-                continue
-            centre = _third_octave_for_freq(f.freq)
-            # If multiple filters in the same band, use the max gain
-            prev_by_band[centre] = max(prev_by_band.get(centre, f.gain_db), f.gain_db)
+        prev_by_band = _per_band_magnitudes(previous_filters)
+        curr_by_band = _per_band_magnitudes(filters)
 
-        for f in filters:
-            if f.type == "hpf":
-                continue
-            centre = _third_octave_for_freq(f.freq)
+        # Tolerance to absorb floating-point rounding from RBJ biquad
+        # evaluation — a "+3 dB peaking" filter computes to e.g. +3.0001 dB
+        # at its centre due to RBJ's slight asymmetry around the centre.
+        # Without this slack, a +3 dB request lands at "+3.0 dB exceeds
+        # +3 dB" and gets rejected.
+        eps = 0.05
+        for centre in THIRD_OCTAVE_CENTRES_HZ:
             prev_gain = prev_by_band.get(centre, 0.0)
-            delta = f.gain_db - prev_gain
-            if delta > limit:
+            curr_gain = curr_by_band.get(centre, 0.0)
+            delta = curr_gain - prev_gain
+            if delta > limit + eps:
                 return ValidationResult.failed(
-                    f"band at {f.freq:.1f} Hz (1/3-octave: {centre:.0f} Hz) "
+                    f"1/3-octave band {centre:.0f} Hz "
                     f"increases by +{delta:.1f} dB "
-                    f"(previous: {prev_gain:+.1f} dB → proposed: {f.gain_db:+.1f} dB; "
+                    f"(previous: {prev_gain:+.1f} dB → proposed: {curr_gain:+.1f} dB; "
                     f"max change per iteration is +{limit:.0f} dB"
                     f"{' [simulation-verified]' if simulation_verified else ''})"
                 )
