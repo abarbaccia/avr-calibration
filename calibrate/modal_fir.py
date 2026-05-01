@@ -311,17 +311,29 @@ class ModalAwareFIRDesigner:
         base_min = minimum_phase(base, method="homomorphic", n_fft=4 * len(base))
 
         # 3. Compute pre-ring budget for active anti-pulses.
-        # Use the full max_pre_ring_ms budget when anti-pulses are present —
-        # more pre-ring = more of the Gabor envelope preserved before the hard-
-        # clip at pre_samples, which directly increases cancellation efficiency.
-        # The minimum needed (half_cycle + tail/2) is only the floor required
-        # to place the center correctly; using the full budget improves quality.
+        # The anti-pulse center is placed at (pre_samples - T/2). The Gabor
+        # envelope extends ±half_length around that center, where
+        # half_length = n_cycles * sample_rate / (2 * freq_hz). If the leading
+        # edge of the envelope falls before sample 0 it gets clipped, and the
+        # truncated Gabor's phase contribution at the mode flips from -π
+        # (destructive — what we want) to ~0 (constructive — AMPLIFIES the
+        # mode by tens of dB). So the floor must include the full Gabor
+        # half-length, not just T/2 + tail/2.
         active_anti = [i for i in intents if i.treatment == "anti_pulse"]
         if active_anti:
-            max_half_cycle_ms = max(1000.0 / (2 * i.freq_hz) for i in active_anti)
-            tail_ms = max(1000.0 / i.freq_hz for i in active_anti)
-            min_needed_ms = max_half_cycle_ms + tail_ms / 2
-            # Always use the full budget; fall back to minimum if budget is too tight.
+            # Mirrors design_anti_pulse default; if that default changes,
+            # update here in lockstep.
+            gabor_n_cycles = 3
+            # Per-mode pre-need = T/2 (placement) + n_cycles*T/2 (envelope).
+            # For n_cycles=3 this collapses to 2T. Take the max across modes
+            # since lower-frequency modes need more pre-ring.
+            min_needed_ms = max(
+                (0.5 + 0.5 * gabor_n_cycles) * 1000.0 / i.freq_hz
+                for i in active_anti
+            )
+            # User budget can only INCREASE pre-ring — never less than the
+            # minimum needed for clean cancellation. Going past the minimum
+            # only adds latency without improving cancellation.
             budget_ms = max(self.max_pre_ring_ms, min_needed_ms)
         else:
             budget_ms = 0.0
