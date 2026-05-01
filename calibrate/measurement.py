@@ -442,6 +442,7 @@ class MeasurementEngine:
         playback_device_override: str | None = None,
         freq_min: int | None = None,
         freq_max: int | None = None,
+        out_channel_override: int | None = None,
     ) -> FrequencyResponse:
         """Run a full sweep measurement. Hardware-agnostic.
 
@@ -498,7 +499,7 @@ class MeasurementEngine:
         duration: float = cfg.get("sweep_duration", 3.0)
         sample_rate: int = cfg.get("sample_rate", 48000)
         in_channel: int = cfg.get("input_channel", 1)
-        out_channel: int = cfg.get("output_channel", 1)
+        out_channel: int = out_channel_override if out_channel_override is not None else cfg.get("output_channel", 1)
         route = cfg.get("playback_route", "usb")
 
         # Generate sweep before acquiring the lock — pure computation, no global state.

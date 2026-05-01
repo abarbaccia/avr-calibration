@@ -6554,8 +6554,8 @@ async def test_design_modal_fir_iterative_reduction_fits_cap() -> None:
 
 @pytest.mark.asyncio
 async def test_design_modal_fir_demotes_to_linear_notch_when_unreachable() -> None:
-    """When two adjacent strong modes can never both fit the cap, at least
-    one is demoted to linear_notch."""
+    """When an anti-pulse is scaled to near-zero to meet the adjacent-band cap,
+    it is demoted to linear_notch (cancel_strength_achieved < 0.02)."""
     decay_modes = [
         {"freq_hz": 50.0, "t60_ms": 1500, "peak_db": 18.0},
         {"freq_hz": 63.0, "t60_ms": 1500, "peak_db": 18.0},
@@ -6567,9 +6567,45 @@ async def test_design_modal_fir_demotes_to_linear_notch_when_unreachable() -> No
          "treatment": "anti_pulse", "cancel_strength": 1.0, "bp_q": 1.0},
     ]
     session = _make_modal_session(decay_modes)
-    # Force an impossibly tight cap (negative) to provoke demotion.
-    # Even with both pulses at amplitude≈0, the impulse base correction's
-    # 0 dB passband exceeds a sub-zero cap → demotion path.
+    # Use an extremely tight cap so the binary search converges to scale < 0.02,
+    # triggering demotion.  At cap=-30 dB, even a tiny Gabor pulse at scale≈0.02
+    # will exceed the cap in isolation → the search settles near 0.
+    with patch("calibrate.storage.SessionStore") as MockStore, \
+         patch("calibrate.graph.SVS_PB12_NSD_PROFILE") as MockProfile:
+        MockStore.return_value.list_sessions.return_value = [session]
+        MockProfile.modal_cancel_max_boost_db = -30.0
+        result = await _tool_design_modal_fir(
+            session_id=1, intents=intents,
+            num_taps=4096, max_pre_ring_ms=25.0, samplerate=8000,
+        )
+    assert result["ok"], result
+    treatments = result["per_mode_treatments"]
+    demoted = [t for t in treatments if t.get("demoted_from") == "anti_pulse"]
+    assert demoted, f"expected at least one demoted treatment, got {treatments}"
+    assert demoted[0]["treatment"] == "linear_notch"
+    assert "adjacent-band cap unreachable" in demoted[0]["rationale"]
+
+
+@pytest.mark.asyncio
+async def test_design_modal_fir_scales_not_demotes_with_tight_cap() -> None:
+    """With a tight but reachable cap, pulses are scaled down (not demoted).
+
+    The adjacent-band cap check uses isolated per-pulse FFT — so neighbouring
+    pulses' spectral skirts don't cascade-zero an unrelated pulse.  Both modes
+    should survive with reduced cancel_strength, not be demoted."""
+    decay_modes = [
+        {"freq_hz": 50.0, "t60_ms": 1500, "peak_db": 18.0},
+        {"freq_hz": 63.0, "t60_ms": 1500, "peak_db": 18.0},
+    ]
+    intents = [
+        {"freq_hz": 50.0, "t60_ms": 1500, "peak_db": 18.0,
+         "treatment": "anti_pulse", "cancel_strength": 1.0, "bp_q": 1.0},
+        {"freq_hz": 63.0, "t60_ms": 1500, "peak_db": 18.0,
+         "treatment": "anti_pulse", "cancel_strength": 1.0, "bp_q": 1.0},
+    ]
+    session = _make_modal_session(decay_modes)
+    # cap=-1 dB forces heavy scaling but should NOT demote either pulse
+    # (isolated peak at ~3-5% scale fits under -1 dB).
     with patch("calibrate.storage.SessionStore") as MockStore, \
          patch("calibrate.graph.SVS_PB12_NSD_PROFILE") as MockProfile:
         MockStore.return_value.list_sessions.return_value = [session]
@@ -6581,9 +6617,10 @@ async def test_design_modal_fir_demotes_to_linear_notch_when_unreachable() -> No
     assert result["ok"], result
     treatments = result["per_mode_treatments"]
     demoted = [t for t in treatments if t.get("demoted_from") == "anti_pulse"]
-    assert demoted, f"expected at least one demoted treatment, got {treatments}"
-    assert demoted[0]["treatment"] == "linear_notch"
-    assert "adjacent-band cap unreachable" in demoted[0]["rationale"]
+    assert not demoted, f"no demotion expected with isolated cap, got {treatments}"
+    # Both pulses should be present but scaled way down
+    achieved = [t["cancel_strength_achieved"] for t in treatments]
+    assert all(0 < s < 0.15 for s in achieved), f"expected heavy scaling: {achieved}"
 
 
 @pytest.mark.asyncio
