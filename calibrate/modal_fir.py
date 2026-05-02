@@ -267,6 +267,7 @@ class ModalAwareFIRDesigner:
                 anchor_freq_hz: float | None = None,
                 modal_cancel_max_boost_db: float | None = None,
                 compensation_notch: bool = False,
+                gabor_n_cycles: int = 3,
                 ) -> tuple[list[float], DesignSummary]:
         """Generate a modal-aware mixed-phase FIR.
 
@@ -321,12 +322,12 @@ class ModalAwareFIRDesigner:
         # half-length, not just T/2 + tail/2.
         active_anti = [i for i in intents if i.treatment == "anti_pulse"]
         if active_anti:
-            # Mirrors design_anti_pulse default; if that default changes,
-            # update here in lockstep.
-            gabor_n_cycles = 3
             # Per-mode pre-need = T/2 (placement) + n_cycles*T/2 (envelope).
-            # For n_cycles=3 this collapses to 2T. Take the max across modes
-            # since lower-frequency modes need more pre-ring.
+            # For n_cycles=3 this collapses to 2T. For n_cycles=2 it's 1.5*T.
+            # Take the max across modes since lower-frequency modes need more
+            # pre-ring. Reducing n_cycles trades sub-vs-mains latency budget
+            # against Gabor spectral skirt width (less pre-ring → wider skirt
+            # → more leakage to adjacent 1/3-oct bands → tighter cap headroom).
             min_needed_ms = max(
                 (0.5 + 0.5 * gabor_n_cycles) * 1000.0 / i.freq_hz
                 for i in active_anti
@@ -413,6 +414,7 @@ class ModalAwareFIRDesigner:
                     sample_rate=self.sr,
                     bp_q=eff_bp_q,
                     envelope=eff_envelope,
+                    n_cycles=gabor_n_cycles,
                 )
                 # Anti-pulse position: pre_samples - half_cycle
                 half_cycle_samples = int(0.5 * self.sr / intent.freq_hz)
