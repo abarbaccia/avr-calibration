@@ -36,6 +36,86 @@ _DSP_START_HINTS: dict[str, str] = {
 }
 
 
+_DRM_ROOT: str = "/sys/class/drm"
+"""DRM sysfs root used to detect which HDMI port is physically connected.
+
+Each connector exposes a ``status`` file containing ``connected`` /
+``disconnected``. We use the connector name (e.g. ``card0-HDMI-A-1``) to map
+back to the matching ALSA device in ``/proc/asound/cards``.
+"""
+
+
+def _detect_connected_hdmi_alsa_device() -> Optional[str]:
+    """Return an explicit ALSA HDMI device name for the first connected HDMI port.
+
+    Walks ``/sys/class/drm/cardN-HDMI-A-N/status``. For each entry whose
+    contents are ``connected``, find the matching ALSA card whose id starts
+    with ``vc4hdmi`` (Pi 5) or ``HDMI`` and return
+    ``hdmi:CARD=<id>,DEV=0``. Returns ``None`` if nothing connected is found
+    or if sysfs is unreadable (CI sandboxes, containers without /sys mounted).
+
+    Pi-5 specifics: vc4hdmi0 corresponds to HDMI-A-1 on card0, vc4hdmi1 to
+    HDMI-A-2 on card1. The DRM connector name -> ALSA card id mapping is by
+    enumeration order, so we walk both spaces and emit the first match.
+    """
+    try:
+        drm_entries = os.listdir(_DRM_ROOT)
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+
+    connected_indices: list[int] = []
+    for entry in sorted(drm_entries):
+        # Format: cardN-HDMI-A-M
+        if "-HDMI-A-" not in entry:
+            continue
+        status_path = os.path.join(_DRM_ROOT, entry, "status")
+        try:
+            with open(status_path) as f:
+                status = f.read().strip()
+        except OSError:
+            continue
+        if status != "connected":
+            continue
+        # Extract HDMI port index (1-based after "HDMI-A-").
+        try:
+            idx = int(entry.rsplit("-HDMI-A-", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        connected_indices.append(idx)
+
+    if not connected_indices:
+        return None
+
+    # Map HDMI-A-N → ALSA card id. On Pi 5 this is vc4hdmi{N-1}.
+    try:
+        with open("/proc/asound/cards") as f:
+            cards_text = f.read()
+    except OSError:
+        # Fall back to vc4hdmi{N-1} which covers Pi 5; if the user is on
+        # something else, the warning still flags the bare alias as suspect.
+        first = connected_indices[0]
+        return f"hdmi:CARD=vc4hdmi{first - 1},DEV=0"
+
+    # Parse lines like " 2 [vc4hdmi0       ]: vc4-hdmi - vc4-hdmi-0".
+    hdmi_card_ids: list[str] = []
+    for line in cards_text.splitlines():
+        stripped = line.strip()
+        if "[" in stripped and "]" in stripped:
+            cid = stripped.split("[", 1)[1].split("]", 1)[0].strip()
+            if cid.lower().startswith(("vc4hdmi", "hdmi")):
+                hdmi_card_ids.append(cid)
+
+    if not hdmi_card_ids:
+        first = connected_indices[0]
+        return f"hdmi:CARD=vc4hdmi{first - 1},DEV=0"
+
+    # Pick the card id that matches the first connected HDMI index. Card ids
+    # like vc4hdmi0 / vc4hdmi1 line up by enumeration; HDMI-A-1 → vc4hdmi0.
+    target_idx = connected_indices[0] - 1
+    chosen = hdmi_card_ids[target_idx] if 0 <= target_idx < len(hdmi_card_ids) else hdmi_card_ids[0]
+    return f"hdmi:CARD={chosen},DEV=0"
+
+
 @dataclass
 class CheckResult:
     name: str
@@ -75,6 +155,8 @@ class PreflightChecker:
             ("Microphone", self.check_mic()),
             (dsp_label, self.check_minidsp_combined()),
             ("Denon AVR", self.check_denon_and_playback()),
+            ("Denon sweep input", self.check_denon_sweep_input_visible()),
+            ("HDMI playback device", self.check_hdmi_playback_device()),
             ("Signal Path", self.check_signal_path_sync()),
             ("Output routing", self.check_output_routing_safety()),
             ("Audio stack", self.check_audio_stack_clean()),
@@ -877,6 +959,176 @@ class PreflightChecker:
             name="Capture path",
             passed=True,
             detail=f"direct capture={device}, bridge service inactive",
+        )
+
+    async def check_denon_sweep_input_visible(self) -> CheckResult:
+        """Verify the configured Denon sweep input is visible in the AVR's source list.
+
+        Symptom that motivated this check: the Pi's HDMI input on the AVR (e.g.
+        AUX1) was hidden via Setup → Inputs → Hide Sources. The denonavr library
+        couldn't enumerate it, so ``async_set_input_func("AUX1")`` failed every
+        time. ``check_system`` reported the AVR as online and Audyssey responsive,
+        which gave no hint that the configured ``denon_sweep_input`` would fail.
+
+        Skipped (passes) when no ``measurement.denon_sweep_input`` is configured
+        (USB-only setups don't need a Denon source).
+
+        Uses ``_connect_receiver`` so the avr-x-2016 input-enumeration workaround
+        applies — without it, ``input_func_list`` is empty on X3800H-class units
+        regardless of whether the input is actually visible.
+        """
+        sweep_input = self.config.measurement.get("denon_sweep_input")
+        if not sweep_input:
+            return CheckResult(
+                name="Denon sweep input",
+                passed=True,
+                detail="measurement.denon_sweep_input not configured (skipped)",
+            )
+
+        host = self.config.denon.get("host")
+        if not host:
+            return CheckResult(
+                name="Denon sweep input",
+                passed=True,
+                detail="denon.host not configured (skipped)",
+            )
+
+        from .drivers.denon import _connect_receiver
+        from .drivers.base import DriverError
+
+        try:
+            receiver = await _connect_receiver(host)
+        except DriverError as exc:
+            return CheckResult(
+                name="Denon sweep input",
+                passed=False,
+                detail=f"Cannot connect to Denon AVR at {host}",
+                error=str(exc),
+            )
+        except Exception as exc:
+            return CheckResult(
+                name="Denon sweep input",
+                passed=False,
+                detail="",
+                error=f"Unexpected error connecting to Denon AVR: {exc}",
+            )
+
+        input_list = list(getattr(receiver, "input_func_list", None) or [])
+        if not input_list:
+            return CheckResult(
+                name="Denon sweep input",
+                passed=False,
+                detail=(
+                    f"Denon AVR at {host} returned an empty input_func_list — "
+                    "cannot verify sweep input visibility."
+                ),
+                error=(
+                    "denonavr enumerated no inputs. On avr-x-2016-class units "
+                    "(X3800H) this can mean async_setup() aborted before "
+                    "_async_update_inputfuncs_avr_x ran. Try power-cycling the "
+                    "AVR or check network connectivity."
+                ),
+            )
+
+        # Substring match (case-insensitive) tolerates "AUX1" vs "Aux 1" style
+        # spelling variants. Also accept exact matches (denonavr usually returns
+        # canonical names like "AUX1" / "CBL/SAT").
+        target_lc = sweep_input.lower()
+        matches = [name for name in input_list if name.lower() == target_lc]
+        if not matches:
+            matches = [name for name in input_list if target_lc in name.lower()]
+
+        if matches:
+            return CheckResult(
+                name="Denon sweep input",
+                passed=True,
+                detail=f"{sweep_input!r} visible in AVR source list (matched {matches[0]!r})",
+            )
+
+        # Failure: list a sample of available inputs so the user can pick a
+        # different sweep input or know what to un-hide.
+        shown = ", ".join(input_list[:8])
+        ellipsis = "…" if len(input_list) > 8 else ""
+        return CheckResult(
+            name="Denon sweep input",
+            passed=False,
+            detail=(
+                f"configured measurement.denon_sweep_input={sweep_input!r} is not in the "
+                f"AVR's source list. Visible inputs: {shown}{ellipsis}"
+            ),
+            error=(
+                f"Configured Denon input {sweep_input!r} is hidden in the AVR's "
+                "source list — un-hide via Setup → Inputs → Hide Sources, or "
+                "rename the input first. Without this, async_set_input_func() "
+                "will fail every sweep and measurements will be silent."
+            ),
+        )
+
+    async def check_hdmi_playback_device(self) -> CheckResult:
+        """Warn when the configured HDMI playback device is a bare ALSA alias.
+
+        Symptom that motivated this check: config has
+        ``hdmi_playback_device: "hdmi"`` (the bare ALSA alias). On Pi 5,
+        ``aplay -L`` shows specific devices like
+        ``hdmi:CARD=vc4hdmi0,DEV=0`` and ``hdmi:CARD=vc4hdmi1,DEV=0``. The
+        bare ``"hdmi"`` resolves wrong (or fails entirely on some setups).
+        The explicit ``"hdmi:CARD=vc4hdmi0,DEV=0"`` form works.
+
+        This is informational (a warning, not a hard fail) — some configs
+        intentionally use bare aliases. We surface the auto-detected explicit
+        name when we can find a connected HDMI port via
+        ``/sys/class/drm/cardN/cardN-HDMI-A-N/status``.
+
+        Skipped when ``measurement.playback_route != "hdmi"`` or when no
+        ``hdmi_playback_device`` is configured.
+        """
+        route = self.config.measurement.get("playback_route", "usb")
+        if route != "hdmi":
+            return CheckResult(
+                name="HDMI playback device",
+                passed=True,
+                detail=f"playback_route={route!r} (not HDMI; skipped)",
+            )
+
+        device = self.config.measurement.get("hdmi_playback_device")
+        if not device:
+            return CheckResult(
+                name="HDMI playback device",
+                passed=True,
+                detail="measurement.hdmi_playback_device not configured (skipped)",
+            )
+
+        # Bare alias = no ':' separator. Specific ALSA names look like
+        # ``hdmi:CARD=vc4hdmi0,DEV=0``. Anything containing ':' is treated as
+        # explicit and passes this check.
+        if ":" in device:
+            return CheckResult(
+                name="HDMI playback device",
+                passed=True,
+                detail=f"{device!r} is an explicit ALSA device name",
+            )
+
+        # Bare alias path. Probe /sys/class/drm for a connected HDMI port.
+        suggestion = await asyncio.to_thread(_detect_connected_hdmi_alsa_device)
+        if suggestion:
+            return CheckResult(
+                name="HDMI playback device",
+                passed=True,  # warning, not hard fail
+                detail=(
+                    f"WARNING: measurement.hdmi_playback_device={device!r} is a bare ALSA "
+                    f"alias and may resolve to the wrong card. Auto-detected explicit "
+                    f"name: {suggestion!r}. Update config.yaml to silence this warning."
+                ),
+            )
+        return CheckResult(
+            name="HDMI playback device",
+            passed=True,  # warning, not hard fail
+            detail=(
+                f"WARNING: measurement.hdmi_playback_device={device!r} is a bare ALSA "
+                "alias and may resolve to the wrong card. Could not auto-detect a "
+                "connected HDMI port; run `aplay -L | grep -A2 ^hdmi:` on the host "
+                "and pin the explicit device name in config.yaml."
+            ),
         )
 
     async def _systemctl_is_enabled(self, service: str) -> bool:

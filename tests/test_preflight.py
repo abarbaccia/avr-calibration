@@ -320,7 +320,7 @@ class TestRunAll:
         ):
             results = await checker.run_all()
         assert all(r.passed for r in results)
-        assert len(results) == 9
+        assert len(results) == 11
 
     async def test_unhandled_exception_becomes_failed_result(self, config):
         checker = PreflightChecker(config)
@@ -354,8 +354,10 @@ class TestRunAll:
         # DSP label now comes from the configured driver — "miniDSP 2x4 HD" for
         # dsp_driver: minidsp (the test fixture default).
         assert [r.name for r in results] == [
-            "Config", "Microphone", "miniDSP 2x4 HD", "Denon AVR", "Signal Path",
-            "Output routing", "Audio stack", "DSP persisted state", "Capture path",
+            "Config", "Microphone", "miniDSP 2x4 HD", "Denon AVR",
+            "Denon sweep input", "HDMI playback device",
+            "Signal Path", "Output routing", "Audio stack",
+            "DSP persisted state", "Capture path",
         ]
 
     async def test_result_names_camilladsp_label(self, config):
@@ -1104,3 +1106,221 @@ class TestCapturePathConsistency:
             result = await checker.check_capture_path_consistency()
         assert result.passed
         assert "direct" in result.detail.lower()
+
+
+# ── Denon sweep-input visibility check ────────────────────────────────────────
+
+class TestDenonSweepInputVisible:
+    """Verify the configured Denon sweep input is enumerated by the AVR."""
+
+    async def test_skipped_when_not_configured(self, config):
+        result = await PreflightChecker(config).check_denon_sweep_input_visible()
+        assert result.passed
+        assert "skipped" in result.detail.lower()
+
+    async def test_skipped_when_no_denon_host(self, config):
+        config._data.setdefault("measurement", {})["denon_sweep_input"] = "AUX1"
+        config._data["denon"]["host"] = None
+        result = await PreflightChecker(config).check_denon_sweep_input_visible()
+        assert result.passed
+        assert "skipped" in result.detail.lower()
+
+    async def test_visible_input_passes(self, config):
+        config._data.setdefault("measurement", {})["denon_sweep_input"] = "AUX1"
+        fake_receiver = MagicMock()
+        fake_receiver.input_func_list = ["TV Audio", "AUX1", "CBL/SAT", "Game"]
+        with patch(
+            "calibrate.drivers.denon._connect_receiver",
+            new_callable=AsyncMock, return_value=fake_receiver,
+        ):
+            result = await PreflightChecker(config).check_denon_sweep_input_visible()
+        assert result.passed
+        assert "AUX1" in result.detail
+
+    async def test_case_insensitive_match(self, config):
+        config._data.setdefault("measurement", {})["denon_sweep_input"] = "aux1"
+        fake_receiver = MagicMock()
+        fake_receiver.input_func_list = ["AUX1", "CBL/SAT"]
+        with patch(
+            "calibrate.drivers.denon._connect_receiver",
+            new_callable=AsyncMock, return_value=fake_receiver,
+        ):
+            result = await PreflightChecker(config).check_denon_sweep_input_visible()
+        assert result.passed
+
+    async def test_hidden_input_fails_with_remediation(self, config):
+        """The exact bug we hit: configured input is hidden in the AVR's source list."""
+        config._data.setdefault("measurement", {})["denon_sweep_input"] = "AUX1"
+        fake_receiver = MagicMock()
+        # AUX1 is missing — user has hidden it via Setup → Inputs → Hide Sources.
+        fake_receiver.input_func_list = ["TV Audio", "CBL/SAT", "Game", "Media Player"]
+        with patch(
+            "calibrate.drivers.denon._connect_receiver",
+            new_callable=AsyncMock, return_value=fake_receiver,
+        ):
+            result = await PreflightChecker(config).check_denon_sweep_input_visible()
+        assert not result.passed
+        assert "AUX1" in result.detail
+        assert "TV Audio" in result.detail  # available inputs surfaced
+        assert "hidden" in result.error.lower()
+        assert "hide sources" in result.error.lower()
+
+    async def test_empty_input_list_fails_loudly(self, config):
+        """Empty input_func_list means denonavr enumeration broke — surface it."""
+        config._data.setdefault("measurement", {})["denon_sweep_input"] = "AUX1"
+        fake_receiver = MagicMock()
+        fake_receiver.input_func_list = []
+        with patch(
+            "calibrate.drivers.denon._connect_receiver",
+            new_callable=AsyncMock, return_value=fake_receiver,
+        ):
+            result = await PreflightChecker(config).check_denon_sweep_input_visible()
+        assert not result.passed
+        assert "empty" in result.detail.lower()
+
+    async def test_connect_failure_returns_failed_result(self, config):
+        from calibrate.drivers.base import DriverError
+        config._data.setdefault("measurement", {})["denon_sweep_input"] = "AUX1"
+        with patch(
+            "calibrate.drivers.denon._connect_receiver",
+            new_callable=AsyncMock, side_effect=DriverError("refused"),
+        ):
+            result = await PreflightChecker(config).check_denon_sweep_input_visible()
+        assert not result.passed
+        assert "192.168.1.100" in result.detail
+        assert "refused" in result.error
+
+    async def test_unexpected_exception_returns_failed_result(self, config):
+        config._data.setdefault("measurement", {})["denon_sweep_input"] = "AUX1"
+        with patch(
+            "calibrate.drivers.denon._connect_receiver",
+            new_callable=AsyncMock, side_effect=RuntimeError("kaboom"),
+        ):
+            result = await PreflightChecker(config).check_denon_sweep_input_visible()
+        assert not result.passed
+        assert "kaboom" in result.error
+
+
+# ── HDMI playback device alias check ──────────────────────────────────────────
+
+class TestHdmiPlaybackDevice:
+    """Bare ALSA HDMI aliases ("hdmi") may resolve to the wrong card on Pi 5."""
+
+    async def test_skipped_when_route_is_usb(self, config):
+        config._data.setdefault("measurement", {})["playback_route"] = "usb"
+        config._data["measurement"]["hdmi_playback_device"] = "hdmi"
+        result = await PreflightChecker(config).check_hdmi_playback_device()
+        assert result.passed
+        assert "not HDMI" in result.detail or "skipped" in result.detail.lower()
+
+    async def test_skipped_when_no_device_configured(self, config):
+        config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
+        config._data["measurement"]["hdmi_playback_device"] = None
+        result = await PreflightChecker(config).check_hdmi_playback_device()
+        assert result.passed
+        assert "skipped" in result.detail.lower()
+
+    async def test_explicit_device_name_passes_silently(self, config):
+        config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
+        config._data["measurement"]["hdmi_playback_device"] = "hdmi:CARD=vc4hdmi0,DEV=0"
+        result = await PreflightChecker(config).check_hdmi_playback_device()
+        assert result.passed
+        assert "explicit" in result.detail.lower()
+        assert "WARNING" not in result.detail
+
+    async def test_bare_alias_warns_with_autodetected_suggestion(self, config):
+        """The exact bug we hit: bare 'hdmi' alias should warn + suggest explicit name."""
+        config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
+        config._data["measurement"]["hdmi_playback_device"] = "hdmi"
+        with patch(
+            "calibrate.preflight._detect_connected_hdmi_alsa_device",
+            return_value="hdmi:CARD=vc4hdmi0,DEV=0",
+        ):
+            result = await PreflightChecker(config).check_hdmi_playback_device()
+        # Warning, not hard fail.
+        assert result.passed
+        assert "WARNING" in result.detail
+        assert "hdmi:CARD=vc4hdmi0,DEV=0" in result.detail
+
+    async def test_bare_alias_warns_without_suggestion_when_detection_fails(self, config):
+        config._data.setdefault("measurement", {})["playback_route"] = "hdmi"
+        config._data["measurement"]["hdmi_playback_device"] = "hdmi"
+        with patch(
+            "calibrate.preflight._detect_connected_hdmi_alsa_device",
+            return_value=None,
+        ):
+            result = await PreflightChecker(config).check_hdmi_playback_device()
+        assert result.passed
+        assert "WARNING" in result.detail
+        assert "aplay -L" in result.detail  # remediation hint
+
+
+class TestDetectConnectedHdmiAlsaDevice:
+    """Cover the sysfs-walking helper that maps DRM connector → ALSA card id."""
+
+    async def test_returns_none_when_drm_root_missing(self, monkeypatch):
+        from calibrate import preflight
+        monkeypatch.setattr(preflight, "_DRM_ROOT", "/nonexistent/drm/path")
+        assert preflight._detect_connected_hdmi_alsa_device() is None
+
+    async def test_returns_card_for_connected_hdmi_a_1(self, tmp_path, monkeypatch):
+        from calibrate import preflight
+        # Build a fake /sys/class/drm with one connected HDMI-A-1 connector.
+        drm = tmp_path / "drm"
+        drm.mkdir()
+        connector = drm / "card0-HDMI-A-1"
+        connector.mkdir()
+        (connector / "status").write_text("connected\n")
+        # And a disconnected HDMI-A-2 to make sure we ignore it.
+        connector2 = drm / "card1-HDMI-A-2"
+        connector2.mkdir()
+        (connector2 / "status").write_text("disconnected\n")
+        monkeypatch.setattr(preflight, "_DRM_ROOT", str(drm))
+
+        # /proc/asound/cards stub with vc4hdmi0 first, vc4hdmi1 second.
+        cards_text = (
+            " 0 [vc4hdmi0       ]: vc4-hdmi - vc4-hdmi-0\n"
+            " 1 [vc4hdmi1       ]: vc4-hdmi - vc4-hdmi-1\n"
+        )
+        from io import StringIO
+        real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if str(path) == "/proc/asound/cards":
+                return StringIO(cards_text)
+            return real_open(path, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=fake_open):
+            result = preflight._detect_connected_hdmi_alsa_device()
+        assert result == "hdmi:CARD=vc4hdmi0,DEV=0"
+
+    async def test_returns_none_when_no_connectors_connected(self, tmp_path, monkeypatch):
+        from calibrate import preflight
+        drm = tmp_path / "drm"
+        drm.mkdir()
+        connector = drm / "card0-HDMI-A-1"
+        connector.mkdir()
+        (connector / "status").write_text("disconnected\n")
+        monkeypatch.setattr(preflight, "_DRM_ROOT", str(drm))
+        assert preflight._detect_connected_hdmi_alsa_device() is None
+
+    async def test_falls_back_to_vc4hdmi_pattern_when_proc_unreadable(self, tmp_path, monkeypatch):
+        from calibrate import preflight
+        drm = tmp_path / "drm"
+        drm.mkdir()
+        connector = drm / "card0-HDMI-A-2"
+        connector.mkdir()
+        (connector / "status").write_text("connected\n")
+        monkeypatch.setattr(preflight, "_DRM_ROOT", str(drm))
+
+        real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if str(path) == "/proc/asound/cards":
+                raise OSError("nope")
+            return real_open(path, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=fake_open):
+            result = preflight._detect_connected_hdmi_alsa_device()
+        # HDMI-A-2 → fallback vc4hdmi1.
+        assert result == "hdmi:CARD=vc4hdmi1,DEV=0"
