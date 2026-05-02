@@ -252,6 +252,285 @@ def n_positions_from_ady(ady: dict) -> int:
     return 1
 
 
+# ── Full-envelope path (preserves all detected channels) ──────────────────────
+#
+# What the X3800H actually accepts on TCP port 1256, verified 2026-05-02:
+#
+# 1. Per-channel arrays (`SpConfig`, `Distance`, `ChLevel`, `Crossover`)
+#    are LIST-OF-SINGLE-KEY-DICTS, ONE PER CHANNEL — not per-position
+#    multi-key dicts. Format mirrors A1EvoAcoustica/main.js:
+#       "SpConfig": [{"FL":"S"}, {"C":"S"}, {"FR":"S"}, ..., {"SW1":"E"}]
+#    Sub channels use type "E" (Effectively subwoofer) with crossover "F",
+#    speakers use "S"/"L" with numeric Hz crossover.
+# 2. Each `SET_SETDAT` packet must be ≤ 510 bytes (frame size including
+#    the 19-byte header/checksum) per A1Evo's BINARY_PACKET_THRESHOLD.
+#    Larger payloads MUST be split into multiple sequential SET_SETDAT
+#    sends; the AVR processes them in order before the Fin commit.
+# 3. ChLevel values are dB × 10 (integer) per A1Evo convention.
+# 4. The Fin commit MUST NOT be sent if any preceding SET_SETDAT NACK'd
+#    — committing on a partially-applied state corrupts the speaker
+#    layout (heights/centers/surrounds drop to defaults). The original
+#    audyssey_push_full_envelope.py script had this bug and twice wiped
+#    the live AVR layout in May 2026 before this was understood.
+# 5. The .ady file's `ampAssignInfo` is the canonical AssignBin to push
+#    when re-establishing the full layout. Using the AVR's *current*
+#    AssignBin (from GET_AVRSTS) only captures the live state, which
+#    may already be degraded if some prior write dropped channels.
+
+# Per-packet size threshold per A1EvoAcoustica/main.js BINARY_PACKET_THRESHOLD.
+# Frames over this are silently NACK'd by the X3800H's TCP handler.
+SET_SETDAT_PACKET_THRESHOLD: int = 510
+
+# Canonical SET_SETDAT param order from A1Evo. Order matters when splitting:
+# the AVR processes packets sequentially and an early-arriving param can be
+# pre-validated before later params arrive.
+DF_SETTING_DATA_PARAMETERS: tuple[str, ...] = (
+    "AmpAssign", "AssignBin", "SpConfig", "Distance", "ChLevel", "Crossover",
+    "AudyFinFlg", "AudyDynEq", "AudyEqRef", "AudyDynVol", "AudyDynSet",
+    "AudyMultEq", "AudyEqSet", "AudyLfc", "AudyLfcLev", "SWSetup",
+)
+
+
+def _parse_response_frames(stream: bytearray) -> list[dict]:
+    """Pull complete frames out of a streaming RX buffer."""
+    out: list[dict] = []
+    while len(stream) >= 19:
+        if stream[0] not in (ord("T"), ord("R")):
+            del stream[0]
+            continue
+        total_len = struct.unpack(">H", bytes(stream[1:3]))[0]
+        if len(stream) < total_len:
+            break
+        frame = bytes(stream[:total_len])
+        if frame[-1] != _checksum(frame[:-1]):
+            del stream[0]
+            continue
+        cmd = frame[5:15].decode("ascii", errors="replace").rstrip("\x00")
+        data_len = struct.unpack(">H", frame[16:18])[0]
+        out.append({"cmd": cmd, "data": frame[18:18 + data_len]})
+        del stream[:total_len]
+    return out
+
+
+def build_full_envelope_payload(
+    ady: dict,
+    distance_overrides_m: Mapping[str, float] | None = None,
+) -> dict:
+    """Build the full-envelope SET_SETDAT payload from a parsed .ady file.
+
+    Re-establishes the complete speaker layout (all detected channels with
+    matching SpConfig / Distance / ChLevel / Crossover) — NOT just a Distance
+    delta. Use this when the AVR's live state has dropped channels that the
+    .ady has, or whenever you want a complete write that won't reset
+    unmentioned fields on Fin commit.
+
+    `distance_overrides_m` lets a caller bump specific channels' distance
+    values (typical use: SW1 distance push to compensate for FIR latency).
+    Other channels keep their .ady values.
+
+    Per A1Evo convention: the four per-channel arrays are lists of single-key
+    dicts (one per channel), not per-position multi-key dicts. The X3800H
+    rejects the per-position shape with a NACK.
+    """
+    overrides = dict(distance_overrides_m or {})
+    enmp_to_ampassign = {0: "Normal", 1: "BiAmp", 2: "SBack", 3: "Front", 4: "Surr"}
+
+    distance: list[dict] = []
+    spconfig: list[dict] = []
+    chlevel: list[dict] = []
+    crossover: list[dict] = []
+    for ch in ady.get("detectedChannels", []):
+        cid = ch.get("commandId")
+        if not cid:
+            continue
+        # Speaker type: .ady's customSpeakerType, defaulting "E" for sub channels
+        # ("commandId" starting with SW), "S" otherwise.
+        sp = ch.get("customSpeakerType") or ""
+        if not sp or sp == "?":
+            sp = "E" if cid.startswith("SW") else "S"
+        # Distance: override if requested, else .ady's customDistance.
+        m = overrides.get(cid, float(ch.get("customDistance", 0) or 0))
+        # ChLevel: dB × 10 per A1Evo convention.
+        trim = float(ch.get("trimAdjustment", 0) or 0)
+        # Crossover: "F" for sub/Large, numeric Hz (40-250) for Small.
+        if sp in ("E", "L"):
+            xover: int | str = "F"
+        else:
+            xv = int(ch.get("customCrossover", 80) or 80)
+            xover = xv if 40 <= xv <= 250 else 80
+        spconfig.append({cid: sp})
+        distance.append({cid: round(m * 100)})
+        chlevel.append({cid: round(trim * 10)})
+        crossover.append({cid: xover})
+
+    return {
+        "AmpAssign": enmp_to_ampassign.get(int(ady.get("enAmpAssignType", 0)), "Normal"),
+        "AssignBin": ady.get("ampAssignInfo", ""),
+        "SpConfig": spconfig,
+        "Distance": distance,
+        "ChLevel": chlevel,
+        "Crossover": crossover,
+        "AudyFinFlg": "NotFin",
+        "AudyDynEq": False,
+        "AudyEqRef": 0,
+        "AudyDynVol": False,
+        "AudyDynSet": "L",
+        "AudyMultEq": True,
+        "AudyEqSet": "Flat",
+        "AudyLfc": False,
+        "AudyLfcLev": 3,
+        "SWSetup": {"SWNum": 1, "SWMode": "N/A", "SWLayout": "N/A"},
+    }
+
+
+def split_setdat_packets(
+    payload: dict,
+    threshold: int = SET_SETDAT_PACKET_THRESHOLD,
+) -> list[dict]:
+    """Split a full SET_SETDAT payload into one or more sub-payload dicts,
+    each whose serialised frame is ≤ ``threshold`` bytes.
+
+    Walks ``DF_SETTING_DATA_PARAMETERS`` in order, accumulating params into
+    the current packet and starting a new packet whenever adding the next
+    param would push the frame over the threshold. Mirrors A1Evo's
+    sendSetDatCommand splitting algorithm.
+    """
+    packets: list[dict] = []
+    current: dict = {}
+    for key in DF_SETTING_DATA_PARAMETERS:
+        if key not in payload:
+            continue
+        value = payload[key]
+        test_payload = {**current, key: value}
+        test_body = json.dumps(test_payload, separators=(",", ":")).encode("ascii")
+        test_frame = build_frame("SET_SETDAT", test_body)
+        if len(test_frame) > threshold:
+            if current:
+                packets.append(current)
+            current = {key: value}
+            single_body = json.dumps(current, separators=(",", ":")).encode("ascii")
+            single_frame = build_frame("SET_SETDAT", single_body)
+            if len(single_frame) > threshold:
+                raise ValueError(
+                    f"param {key!r} alone exceeds {threshold}-byte threshold "
+                    f"({len(single_frame)} bytes)"
+                )
+        else:
+            current[key] = value
+    if current:
+        packets.append(current)
+    return packets
+
+
+def _push_full_envelope_sync(
+    host: str,
+    port: int,
+    payload: dict,
+    commit: bool,
+    timeout: float,
+) -> bool:
+    """Send a multi-packet SET_SETDAT envelope. Returns True on success.
+
+    Sequence: ENTER_AUDY → SET_SETDAT × N (split-by-510B) → optional Fin → EXIT.
+    Refuses to send Fin if any preceding SET_SETDAT NACK'd — committing on
+    a partial state would corrupt the speaker layout.
+    """
+    packets = split_setdat_packets(payload)
+    sock = socket.create_connection((host, port), timeout=timeout)
+    sock.settimeout(timeout)
+    rxbuf = bytearray()
+
+    def drain(seconds: float) -> None:
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            try:
+                sock.settimeout(max(0.05, end - time.monotonic()))
+                chunk = sock.recv(65536)
+                if not chunk:
+                    return
+                rxbuf.extend(chunk)
+            except (socket.timeout, TimeoutError):
+                return
+
+    def saw_ack(clear: bool = True) -> bool:
+        ack = False
+        for f in _parse_response_frames(rxbuf):
+            snip = f["data"][:50].decode("ascii", errors="replace")
+            if "NACK" in snip:
+                if clear:
+                    rxbuf.clear()
+                return False
+            if "ACK" in snip:
+                ack = True
+        if clear:
+            rxbuf.clear()
+        return ack
+
+    all_ok = True
+    try:
+        sock.sendall(build_frame("ENTER_AUDY"))
+        drain(1.0)
+        rxbuf.clear()
+        for pkt in packets:
+            body = json.dumps(pkt, separators=(",", ":")).encode("ascii")
+            sock.sendall(build_frame("SET_SETDAT", body))
+            drain(2.5)
+            if not saw_ack():
+                all_ok = False
+                break
+            time.sleep(0.3)
+        if commit and all_ok:
+            sock.sendall(build_frame("SET_SETDAT", COMMIT_BODY))
+            drain(2.0)
+            # Fin response is informational — failure to ACK doesn't roll back.
+            saw_ack()
+        sock.sendall(build_frame("EXIT_AUDMD"))
+        drain(1.0)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    return all_ok
+
+
+async def push_full_envelope_from_ady(
+    host: str,
+    ady: dict,
+    *,
+    distance_overrides_m: Mapping[str, float] | None = None,
+    commit: bool = True,
+    port: int = DEFAULT_PORT,
+    timeout: float = 10.0,
+) -> bool:
+    """Push the full Audyssey envelope (all detected channels, A1Evo format)
+    to the AVR. Re-establishes the complete speaker layout AND lets caller
+    override per-channel distances atomically.
+
+    This is the safe replacement for ``push_speaker_distances(use_custom=True)``
+    when you need the layout preserved. The bare ``Distance + AudyFinFlg=NotFin``
+    envelope path snaps unmentioned fields to defaults on Fin commit, dropping
+    channels (verified twice in May 2026 — heights/centers/surrounds disappeared).
+
+    Returns True if all SET_SETDAT packets ACK'd (and Fin was committed when
+    requested), False if any packet NACK'd. NACK aborts before Fin so the AVR
+    state is unchanged.
+
+    Caller is responsible for any user confirmation per the
+    "signal-path writes need human approval" rule.
+    """
+    payload = build_full_envelope_payload(ady, distance_overrides_m=distance_overrides_m)
+    return await asyncio.get_running_loop().run_in_executor(
+        None,
+        _push_full_envelope_sync,
+        host,
+        port,
+        payload,
+        commit,
+        timeout,
+    )
+
+
 def _push_sync(
     host: str,
     port: int,

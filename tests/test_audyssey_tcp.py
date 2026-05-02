@@ -147,6 +147,174 @@ async def test_denon_set_speaker_distances_wraps_oserror() -> None:
             await driver.set_speaker_distances({"SW1": 30.72})
 
 
+def test_build_full_envelope_payload_per_channel_list_shape() -> None:
+    """Full-envelope payload: SpConfig/Distance/ChLevel/Crossover are
+    list-of-single-key-dicts (one per channel), not per-position lists.
+    The X3800H rejects per-position multi-key shape with NACK."""
+    ady = {
+        "enAmpAssignType": 0,
+        "ampAssignInfo": "00040302" + "0" * 80,
+        "detectedChannels": [
+            {"commandId": "FL", "customDistance": 4.0, "trimAdjustment": 0.5,
+             "customSpeakerType": "S", "customCrossover": 80,
+             "responseData": {"0": {}, "1": {}, "2": {}}},
+            {"commandId": "C", "customDistance": 3.5, "trimAdjustment": -1.0,
+             "customSpeakerType": "S", "customCrossover": 80,
+             "responseData": {"0": {}, "1": {}, "2": {}}},
+            {"commandId": "SW1", "customDistance": 2.5, "trimAdjustment": 0,
+             "customSpeakerType": "", "customCrossover": 0,
+             "responseData": {"0": {}, "1": {}, "2": {}}},
+        ],
+    }
+    payload = audyssey_tcp.build_full_envelope_payload(ady)
+    # Per-channel arrays: list of single-key dicts, NOT list of multi-key
+    # per-position dicts. Matches A1Evo / X3800H wire format.
+    assert payload["SpConfig"] == [{"FL": "S"}, {"C": "S"}, {"SW1": "E"}]
+    # Distance in cm.
+    assert payload["Distance"] == [{"FL": 400}, {"C": 350}, {"SW1": 250}]
+    # ChLevel is dB × 10 (A1Evo convention).
+    assert payload["ChLevel"] == [{"FL": 5}, {"C": -10}, {"SW1": 0}]
+    # Crossover: numeric Hz for "S" speakers, "F" for sub channels.
+    assert payload["Crossover"] == [{"FL": 80}, {"C": 80}, {"SW1": "F"}]
+    # AmpAssign mapped from enum.
+    assert payload["AmpAssign"] == "Normal"
+    # AssignBin from .ady's ampAssignInfo (the canonical layout source).
+    assert payload["AssignBin"] == ady["ampAssignInfo"]
+    # A1Evo's exact calibration settings (booleans, ints — not strings).
+    assert payload["AudyDynEq"] is False
+    assert payload["AudyEqRef"] == 0
+    assert payload["AudyMultEq"] is True
+    assert payload["AudyEqSet"] == "Flat"
+
+
+def test_build_full_envelope_payload_distance_overrides_apply() -> None:
+    """distance_overrides_m bumps specific channels (typical use: SW1 push
+    to compensate for FIR latency); other channels keep .ady values."""
+    ady = {
+        "enAmpAssignType": 0,
+        "ampAssignInfo": "x",
+        "detectedChannels": [
+            {"commandId": "FL", "customDistance": 4.0,
+             "customSpeakerType": "S", "customCrossover": 80, "trimAdjustment": 0},
+            {"commandId": "SW1", "customDistance": 2.47,
+             "customSpeakerType": "", "customCrossover": 0, "trimAdjustment": 0},
+        ],
+    }
+    payload = audyssey_tcp.build_full_envelope_payload(
+        ady, distance_overrides_m={"SW1": 17.91}
+    )
+    # SW1 overridden; FL keeps its .ady value.
+    distances = {list(d.keys())[0]: list(d.values())[0] for d in payload["Distance"]}
+    assert distances["FL"] == 400
+    assert distances["SW1"] == 1791
+
+
+def test_build_full_envelope_payload_defaults_missing_speaker_type() -> None:
+    """Missing/empty/'?' customSpeakerType defaults to 'E' for sub channels
+    (commandId starting with SW), 'S' for everything else."""
+    ady = {
+        "enAmpAssignType": 0, "ampAssignInfo": "x",
+        "detectedChannels": [
+            {"commandId": "TFL", "customDistance": 2.0, "customCrossover": 80,
+             "trimAdjustment": 0},  # no customSpeakerType
+            {"commandId": "SLA", "customDistance": 2.0, "customCrossover": 80,
+             "trimAdjustment": 0, "customSpeakerType": "?"},
+            {"commandId": "SW1", "customDistance": 2.0, "customCrossover": 0,
+             "trimAdjustment": 0, "customSpeakerType": ""},
+        ],
+    }
+    payload = audyssey_tcp.build_full_envelope_payload(ady)
+    types = {list(d.keys())[0]: list(d.values())[0] for d in payload["SpConfig"]}
+    assert types["TFL"] == "S"   # missing → S for non-sub
+    assert types["SLA"] == "S"   # "?" → S
+    assert types["SW1"] == "E"   # SW prefix → E
+
+
+def test_split_setdat_packets_single_packet_when_under_threshold() -> None:
+    payload = {"AmpAssign": "Normal", "AudyFinFlg": "NotFin"}
+    packets = audyssey_tcp.split_setdat_packets(payload)
+    assert len(packets) == 1
+    assert packets[0] == payload
+
+
+def test_split_setdat_packets_splits_at_510_byte_threshold() -> None:
+    """A typical 5.1.4-channel envelope is ~835 bytes — must split into
+    multiple packets each ≤ 510 bytes (matches A1Evo BINARY_PACKET_THRESHOLD)."""
+    big_array = [{f"CH{i}": "S"} for i in range(20)]
+    payload = {
+        "AmpAssign": "Normal",
+        "AssignBin": "0" * 96,
+        "SpConfig": big_array,
+        "Distance": [{f"CH{i}": 400} for i in range(20)],
+        "ChLevel": [{f"CH{i}": 0} for i in range(20)],
+        "Crossover": [{f"CH{i}": 80} for i in range(20)],
+        "AudyFinFlg": "NotFin",
+        "AudyDynEq": False,
+        "SWSetup": {"SWNum": 1, "SWMode": "N/A", "SWLayout": "N/A"},
+    }
+    packets = audyssey_tcp.split_setdat_packets(payload)
+    # Multiple packets, each ≤ threshold.
+    assert len(packets) >= 2
+    for p in packets:
+        body = json.dumps(p, separators=(",", ":")).encode("ascii")
+        frame = audyssey_tcp.build_frame("SET_SETDAT", body)
+        assert len(frame) <= audyssey_tcp.SET_SETDAT_PACKET_THRESHOLD
+    # Union of all packet keys equals the original key set.
+    seen = set()
+    for p in packets:
+        seen |= set(p.keys())
+    assert seen == set(payload.keys())
+
+
+def test_split_setdat_packets_preserves_canonical_order() -> None:
+    """Per A1Evo's protocol, params must arrive in DF_SETTING_DATA_PARAMETERS
+    order. Splitting must walk that order — never skip earlier-listed params."""
+    payload = {k: f"v{i}" for i, k in enumerate(audyssey_tcp.DF_SETTING_DATA_PARAMETERS)}
+    packets = audyssey_tcp.split_setdat_packets(payload)
+    seen_order = []
+    for p in packets:
+        seen_order.extend(p.keys())
+    assert seen_order == list(audyssey_tcp.DF_SETTING_DATA_PARAMETERS)
+
+
+def test_push_full_envelope_sync_aborts_fin_on_setdat_nack() -> None:
+    """Critical safety: if any SET_SETDAT packet NACKs, the Fin commit must
+    NOT be sent. Committing on a partial-state previously corrupted the
+    AVR's speaker layout (heights/center/surrounds dropped to defaults).
+    """
+    from unittest.mock import MagicMock
+    ack_frame = audyssey_tcp.build_frame("SET_SETDAT", b'{"Comm":"ACK"}')
+    nack_frame = audyssey_tcp.build_frame("ERROR     ", b'{"Comm":"NACK"}')
+
+    mock_sock = MagicMock()
+    mock_sock.recv.side_effect = [
+        ack_frame,                  # ENTER_AUDY ack
+        b"",
+        nack_frame,                 # First SET_SETDAT NACKs
+        b"",
+        ack_frame,                  # EXIT_AUDMD ack
+        b"",
+    ]
+    payload = audyssey_tcp.build_full_envelope_payload({
+        "enAmpAssignType": 0, "ampAssignInfo": "0" * 96,
+        "detectedChannels": [
+            {"commandId": "FL", "customDistance": 4.0, "customSpeakerType": "S",
+             "customCrossover": 80, "trimAdjustment": 0},
+        ],
+    })
+    with patch.object(audyssey_tcp.socket, "create_connection", return_value=mock_sock):
+        result = audyssey_tcp._push_full_envelope_sync(
+            "192.168.1.209", 1256, payload, commit=True, timeout=2.0,
+        )
+    assert result is False  # signals NACK to caller
+    sends = [args[0] for args, _ in mock_sock.sendall.call_args_list]
+    # Verify the Fin commit was NOT sent — only ENTER, SET_SETDAT, EXIT.
+    fin_sent = any(b'"AudyFinFlg":"Fin"' in s for s in sends)
+    assert not fin_sent, "Fin commit must not fire on NACK'd SET_SETDAT"
+    # EXIT_AUDMD must always fire to release the AVR's calibration mode.
+    assert any(b"EXIT_AUDMD" in s for s in sends)
+
+
 def test_denon_advertises_max_speaker_delay_ms() -> None:
     """Calibration code must be able to budget against this without an instance."""
     assert DenonDriver.MAX_SPEAKER_DELAY_MS == audyssey_tcp.MAX_APPLIED_DELAY_MS
