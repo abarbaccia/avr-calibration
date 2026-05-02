@@ -32,12 +32,32 @@ _DENON_MAX_DB: float = 18.0
 
 
 async def _connect_receiver(host: str):
-    """Create, setup, and update a DenonAVR instance. Raises DriverError on failure."""
+    """Create, setup, and update a DenonAVR instance. Raises DriverError on failure.
+
+    Workaround for denonavr library bug on ``avr-x-2016``-class receivers
+    (X3800H and similar): ``async_setup()`` calls ``_async_update_inputfuncs_avr``
+    first, which raises "Method does not work for receiver type avr-x-2016",
+    aborts, and never falls through to the working ``_async_update_inputfuncs_avr_x``.
+    Result: ``input_func_list`` ends up empty and ``async_set_input_func`` fails
+    for every input. Manually invoking the correct method here populates the
+    full input map (including hidden HDMI inputs that show up only via this
+    code path, e.g. AUX1 when un-hidden in the AVR's source-visibility menu).
+    """
     import denonavr
 
     try:
         receiver = denonavr.DenonAVR(host)
         await asyncio.wait_for(receiver.async_setup(), timeout=5.0)
+        # Defensive: if input_func_list is empty after setup, force the
+        # avr-x input enumeration. Tolerate any error so existing avr-class
+        # receivers (where this method is unavailable) keep working.
+        if not getattr(receiver, "input_func_list", None):
+            try:
+                await asyncio.wait_for(
+                    receiver.input._async_update_inputfuncs_avr_x(), timeout=5.0,
+                )
+            except (asyncio.TimeoutError, Exception):
+                pass
         await receiver.async_update()
         return receiver
     except asyncio.TimeoutError:

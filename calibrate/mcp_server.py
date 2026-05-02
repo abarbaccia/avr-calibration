@@ -3861,6 +3861,7 @@ async def _tool_design_modal_fir(
     return_coefficients: bool = False,
     anchor: dict | None = None,
     compensation_notch: bool = False,
+    gabor_n_cycles: int = 3,
 ) -> dict:
     """Design a modal-aware mixed-phase FIR with explicit per-mode treatment.
 
@@ -4167,6 +4168,7 @@ async def _tool_design_modal_fir(
             anchor_freq_hz=anchor_freq_for_designer,
             modal_cancel_max_boost_db=modal_cap_db,
             compensation_notch=bool(compensation_notch),
+            gabor_n_cycles=int(gabor_n_cycles),
         )
 
         _fir_design_cache[int(session_id)] = list(coeffs)
@@ -10094,6 +10096,28 @@ _TOOLS: list[Tool] = [
                     ),
                     "default": False,
                 },
+                "gabor_n_cycles": {
+                    "type": "integer",
+                    "description": (
+                        "Number of cycles in the Gabor anti-pulse envelope. "
+                        "Default 3 (industry standard, balanced spectral / "
+                        "temporal localization). Reduce to 2 to shrink the "
+                        "FIR pre-ring budget by ~T/2 per mode (e.g. saves "
+                        "~10 ms at 47 Hz, ~7 ms at 70 Hz) — useful when "
+                        "sub-vs-mains alignment requires latency savings. "
+                        "Tradeoff: shorter Gabor = wider frequency-domain "
+                        "skirt = more spectral leakage to adjacent 1/3-oct "
+                        "bands. Verify post-design that adjacent_band_peak_db "
+                        "stays under the profile's modal_cancel cap; if it "
+                        "trips, the iterative-fit loop will scale "
+                        "cancel_strength down or auto-demote to linear_notch. "
+                        "Use n_cycles=4 for stricter spectral confinement at "
+                        "the cost of more pre-ring."
+                    ),
+                    "default": 3,
+                    "minimum": 2,
+                    "maximum": 6,
+                },
             },
             "required": ["session_id"],
         },
@@ -10910,6 +10934,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             samplerate=int(arguments.get("samplerate", 48000)),
             return_coefficients=bool(arguments.get("return_coefficients", False)),
             anchor=arguments.get("anchor"),
+            gabor_n_cycles=int(arguments.get("gabor_n_cycles", 3)),
         )
     # ── LLM filter-design math tools ────────────────────────────────────────
     elif name == "evaluate_transfer_function":
