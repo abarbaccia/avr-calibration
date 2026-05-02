@@ -4009,6 +4009,7 @@ async def _tool_design_modal_fir(
     compensation_notch: bool = False,
     gabor_n_cycles: int = 3,
     auto_samplerate: bool = True,
+    skip_freqs_hz: list[float] | None = None,
 ) -> dict:
     """Design a modal-aware mixed-phase FIR with explicit per-mode treatment.
 
@@ -4155,6 +4156,44 @@ async def _tool_design_modal_fir(
                 )
                 for m in decay_modes
             ]
+
+            # Optional convenience: force-skip auto-classified modes whose
+            # frequency is within ±5% of any caller-supplied skip frequency.
+            # ±5% tolerance allows for slight measurement-to-measurement
+            # frequency variation (a "23 Hz" port-tune mode might be detected
+            # as 22.7 or 23.4 Hz on different runs). Ignored when the caller
+            # supplied an explicit ``intents`` list — in that case the caller
+            # already has full per-mode control.
+            if skip_freqs_hz:
+                skip_targets = [float(f) for f in skip_freqs_hz]
+                demoted: list[ModeIntent] = []
+                for io in intent_objs:
+                    matched = any(
+                        abs(io.freq_hz - sf) / sf <= 0.05
+                        for sf in skip_targets
+                        if sf > 0
+                    )
+                    if matched and io.treatment != "skip":
+                        demoted.append(
+                            ModeIntent(
+                                freq_hz=io.freq_hz,
+                                t60_ms=io.t60_ms,
+                                peak_db=io.peak_db,
+                                treatment="skip",
+                                cancel_strength=io.cancel_strength,
+                                bp_q=io.bp_q,
+                                envelope=io.envelope,
+                                rationale=(
+                                    f"forced skip via skip_freqs_hz "
+                                    f"(matched {io.freq_hz:.1f} Hz)"
+                                ),
+                                bp_q_user_set=io.bp_q_user_set,
+                                envelope_user_set=io.envelope_user_set,
+                            )
+                        )
+                    else:
+                        demoted.append(io)
+                intent_objs = demoted
 
         # Optional unified target-curve correction. When ``target_curve`` is
         # provided, build the source-FR points (1/3-octave SPL from the
@@ -11520,6 +11559,22 @@ _TOOLS: list[Tool] = [
                     "minimum": 2,
                     "maximum": 6,
                 },
+                "skip_freqs_hz": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": (
+                        "Convenience: list of frequencies (Hz) to force-skip "
+                        "during auto-classification. Any auto-classified mode "
+                        "within ±5% of one of these frequencies is demoted to "
+                        "``treatment='skip'``. Useful when a single mode "
+                        "(e.g. 23 Hz port-tune) needs exclusion without "
+                        "writing the full per-mode ``intents`` list. The "
+                        "±5% tolerance allows for slight measurement-to-"
+                        "measurement frequency variation. IGNORED when "
+                        "``intents`` is supplied — caller already has full "
+                        "control via that list."
+                    ),
+                },
             },
             "required": ["session_id"],
         },
@@ -12498,6 +12553,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return_coefficients=bool(arguments.get("return_coefficients", False)),
             anchor=arguments.get("anchor"),
             gabor_n_cycles=int(arguments.get("gabor_n_cycles", 3)),
+            skip_freqs_hz=arguments.get("skip_freqs_hz"),
         )
     elif name == "analyze_per_sub_modal_contribution":
         result = await _tool_analyze_per_sub_modal_contribution(

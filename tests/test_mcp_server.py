@@ -7097,6 +7097,96 @@ async def test_design_modal_fir_uses_supplied_intents_verbatim() -> None:
 
 
 @pytest.mark.asyncio
+async def test_skip_freqs_hz_demotes_classified_anti_pulse() -> None:
+    """Auto-classified anti_pulse mode listed in skip_freqs_hz → forced to skip."""
+    decay_modes = [
+        {"freq_hz": 70.3, "t60_ms": 1100, "peak_db": 9.0},   # anti_pulse
+        {"freq_hz": 47.0, "t60_ms": 450, "peak_db": 8.0},    # min_phase
+    ]
+    session = _make_modal_session(decay_modes)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_modal_fir(
+            session_id=1, num_taps=2048, skip_freqs_hz=[70.3],
+        )
+    assert result["ok"], result
+    treatments = {t["freq_hz"]: t["treatment"] for t in result["per_mode_treatments"]}
+    assert treatments[70.3] == "skip"
+    # 47 Hz mode untouched
+    assert treatments[47.0] == "min_phase"
+
+
+@pytest.mark.asyncio
+async def test_skip_freqs_hz_demotes_min_phase() -> None:
+    """Auto-classified min_phase mode listed in skip_freqs_hz → forced to skip."""
+    decay_modes = [
+        {"freq_hz": 47.0, "t60_ms": 450, "peak_db": 8.0},   # min_phase
+    ]
+    session = _make_modal_session(decay_modes)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_modal_fir(
+            session_id=1, num_taps=2048, skip_freqs_hz=[47.0],
+        )
+    assert result["ok"], result
+    assert result["per_mode_treatments"][0]["treatment"] == "skip"
+
+
+@pytest.mark.asyncio
+async def test_skip_freqs_hz_tolerance_within_5pct() -> None:
+    """skip target 23.0 Hz, mode at 23.4 Hz → within ±5%, skipped."""
+    decay_modes = [
+        {"freq_hz": 23.4, "t60_ms": 1100, "peak_db": 9.0},  # would be anti_pulse
+    ]
+    session = _make_modal_session(decay_modes)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_modal_fir(
+            session_id=1, num_taps=2048, skip_freqs_hz=[23.0],
+        )
+    assert result["ok"], result
+    assert result["per_mode_treatments"][0]["treatment"] == "skip"
+
+
+@pytest.mark.asyncio
+async def test_skip_freqs_hz_tolerance_outside_5pct() -> None:
+    """skip target 23.0 Hz, mode at 25.5 Hz → >+5%, NOT skipped."""
+    decay_modes = [
+        {"freq_hz": 25.5, "t60_ms": 1100, "peak_db": 9.0},  # anti_pulse
+    ]
+    session = _make_modal_session(decay_modes)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_modal_fir(
+            session_id=1, num_taps=2048, skip_freqs_hz=[23.0],
+        )
+    assert result["ok"], result
+    assert result["per_mode_treatments"][0]["treatment"] != "skip"
+
+
+@pytest.mark.asyncio
+async def test_skip_freqs_hz_ignored_when_intents_supplied() -> None:
+    """When intents is supplied, skip_freqs_hz is ignored — caller has full control."""
+    decay_modes = [
+        {"freq_hz": 70.0, "t60_ms": 1500, "peak_db": 12.0},
+    ]
+    intents = [
+        {"freq_hz": 70.0, "t60_ms": 1500, "peak_db": 12.0,
+         "treatment": "anti_pulse", "cancel_strength": 0.6},
+    ]
+    session = _make_modal_session(decay_modes)
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.return_value = [session]
+        result = await _tool_design_modal_fir(
+            session_id=1, intents=intents, num_taps=2048,
+            skip_freqs_hz=[70.0],
+        )
+    assert result["ok"], result
+    # intents win — anti_pulse stays anti_pulse despite skip_freqs_hz match
+    assert result["per_mode_treatments"][0]["treatment"] == "anti_pulse"
+
+
+@pytest.mark.asyncio
 async def test_design_modal_fir_anti_pulse_uses_pre_ring_budget() -> None:
     """Anti_pulse pre-ring is ≥ T/2 + Gabor_half so the envelope isn't clipped.
 
