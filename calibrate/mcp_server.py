@@ -7420,6 +7420,638 @@ async def _tool_check_system() -> dict:
         return _err(f"check_system error: {exc}")
 
 
+# ── Per-sub modal-FIR data + simulation tools (LLM-first allocation) ─────────
+#
+# These two tools support the per-sub modal-FIR recipe documented in CLAUDE.md
+# (LLM-first tool design — HARD RULE). The LLM decides the per-sub anti-pulse
+# strength allocation; these tools provide DATA (analyze_per_sub_modal_contribution)
+# and SIMULATION (simulate_per_sub_fir). They contain NO allocation algorithms.
+
+
+def _cluster_modes_across_subs(
+    per_session_modes: list[list[dict]],
+    octave_tolerance: float = 1.0 / 6.0,
+) -> list[dict]:
+    """Build the union of detected modes across subs, clustered by log-frequency.
+
+    Two modes from different sessions are considered the same physical mode
+    when their centre frequencies are within ``octave_tolerance`` octaves.
+    Returns a list of ``{freq_hz, members: [{session_idx, mode}]}``.
+    No decision-making — pure clustering of an a-priori list.
+    """
+    import math
+
+    flat: list[tuple[int, dict]] = []
+    for idx, modes in enumerate(per_session_modes):
+        for m in modes:
+            flat.append((idx, m))
+    # Sort by freq so we walk left-to-right and group nearby entries.
+    flat.sort(key=lambda x: float(x[1]["freq_hz"]))
+
+    clusters: list[dict] = []
+    for idx, m in flat:
+        f = float(m["freq_hz"])
+        if not clusters:
+            clusters.append({"members": [(idx, m)]})
+            continue
+        last_f = float(clusters[-1]["members"][-1][1]["freq_hz"])
+        # Octave distance, log-symmetric.
+        dist_octaves = abs(math.log2(f / last_f)) if last_f > 0 else 1.0
+        if dist_octaves <= octave_tolerance:
+            clusters[-1]["members"].append((idx, m))
+        else:
+            clusters.append({"members": [(idx, m)]})
+
+    out: list[dict] = []
+    for c in clusters:
+        members = c["members"]
+        # Geometric mean of member frequencies — represents the cluster centre.
+        import math as _math
+        log_sum = sum(_math.log(float(m["freq_hz"])) for _, m in members)
+        centre = _math.exp(log_sum / len(members))
+        out.append({
+            "freq_hz": centre,
+            "members": [{"session_idx": idx, "mode": m} for idx, m in members],
+        })
+    return out
+
+
+def _interp_phase_at(freqs: list[float], phases: list[float], target_hz: float) -> float | None:
+    """Wrap-safe linear interpolation of phase (radians) at a target frequency.
+
+    Returns None when ``freqs`` doesn't bracket ``target_hz`` or inputs are empty.
+    """
+    if not freqs or not phases or len(freqs) != len(phases):
+        return None
+    import math
+    if target_hz < freqs[0] or target_hz > freqs[-1]:
+        return None
+    for i in range(len(freqs) - 1):
+        if freqs[i] <= target_hz <= freqs[i + 1]:
+            f0, f1 = freqs[i], freqs[i + 1]
+            if f1 == f0:
+                return float(phases[i])
+            t = (target_hz - f0) / (f1 - f0)
+            # Use complex-vector interp to be wrap-safe.
+            v0 = complex(math.cos(phases[i]), math.sin(phases[i]))
+            v1 = complex(math.cos(phases[i + 1]), math.sin(phases[i + 1]))
+            v = (1 - t) * v0 + t * v1
+            return float(math.atan2(v.imag, v.real))
+    return float(phases[-1])
+
+
+async def _tool_analyze_per_sub_modal_contribution(
+    session_ids: list[int],
+) -> dict:
+    """Per-sub modal data for LLM-driven anti-pulse allocation.
+
+    For each detected mode (across the union of all subs' decay modes),
+    return each sub's individual contribution: peak dB, T60, phase angle,
+    fixability classification (from analyze_phase). The LLM uses this
+    data to choose per-sub anti-pulse strengths — different reasoning
+    patterns are valid (T60-weighted, peak-weighted, phase-aware) and
+    depend on room character.
+
+    No allocation algorithm here. Pure data extraction.
+
+    The ``modal_coupling_share`` field is the relative modal-energy
+    contribution (linear_peak² × T60) normalised to sum=1 across the
+    subs. It is *data-as-derived-fact*, not a recommendation; the LLM
+    may ignore it.
+    """
+    from .storage import SessionStore
+
+    if not session_ids or len(session_ids) < 2:
+        return _err("analyze_per_sub_modal_contribution requires ≥ 2 session_ids")
+
+    try:
+        store = SessionStore()
+        sessions_all = store.list_sessions()
+        sessions: list = []
+        for sid in session_ids:
+            s = next((x for x in sessions_all if x.id == int(sid)), None)
+            if s is None:
+                return _err(f"session {sid} not found")
+            sessions.append(s)
+
+        # Pull each sub's decay modes (prefer cached metadata, fall back to
+        # analyze_decay so the tool works against fresh measurements that
+        # haven't had decay analysis stamped into metadata yet).
+        per_session_modes: list[list[dict]] = []
+        for s in sessions:
+            meta = s.metadata or {}
+            if isinstance(meta, str):
+                import json as _json
+                try:
+                    meta = _json.loads(meta)
+                except Exception:
+                    meta = {}
+            modes = list(meta.get("decay_modes") or [])
+            if not modes:
+                # Fall back to running analyze_decay live.
+                dr = await _tool_analyze_decay(session_id=s.id)
+                if not dr.get("ok"):
+                    return _err(
+                        f"session {s.id} has no decay_modes and analyze_decay "
+                        f"failed: {dr.get('error')}"
+                    )
+                modes = list(dr.get("modes") or [])
+            per_session_modes.append(modes)
+
+        # Per-sub phase analysis (per-1/3-oct band fixability) for the
+        # mode-band lookups below. Keep results indexed by session position.
+        phase_bands_per_sub: list[list[dict]] = []
+        for s in sessions:
+            pr = await _tool_analyze_phase(session_id=s.id)
+            if pr.get("ok"):
+                phase_bands_per_sub.append(list(pr.get("bands") or []))
+            else:
+                phase_bands_per_sub.append([])
+
+        # Cluster modes across subs.
+        clusters = _cluster_modes_across_subs(per_session_modes)
+
+        # Helper: nearest 1/3-octave band from analyze_phase output.
+        def _fixability_at(idx: int, freq: float) -> str | None:
+            bands = phase_bands_per_sub[idx]
+            if not bands:
+                return None
+            nearest = min(
+                bands,
+                key=lambda b: abs(float(b["freq_hz"]) - freq),
+            )
+            return nearest.get("classification")
+
+        out_modes: list[dict] = []
+        import math
+        for c in clusters:
+            centre_hz = float(c["freq_hz"])
+            # Build per-sub entries, including subs that did NOT detect this
+            # mode (peak_db / t60_ms = 0 in that case — sub doesn't excite it).
+            entries: list[dict] = []
+            present_idx: set[int] = {m["session_idx"] for m in c["members"]}
+            members_by_idx = {m["session_idx"]: m["mode"] for m in c["members"]}
+
+            for idx, s in enumerate(sessions):
+                if idx in present_idx:
+                    mode = members_by_idx[idx]
+                    peak_db = float(mode.get("peak_db") or 0.0)
+                    t60_ms = float(mode.get("t60_ms") or 0.0)
+                else:
+                    peak_db = 0.0
+                    t60_ms = 0.0
+
+                # Phase angle interpolated from the FR phase array.
+                fr = s.start_fr
+                phase_rad: float | None = None
+                if fr is not None and getattr(fr, "phase", None):
+                    phase_rad = _interp_phase_at(
+                        list(fr.frequencies),
+                        list(fr.phase),
+                        centre_hz,
+                    )
+
+                entry = {
+                    "session_id": int(s.id),
+                    "peak_db": round(peak_db, 2),
+                    "t60_ms": round(t60_ms, 1),
+                    "phase_rad": round(phase_rad, 3) if phase_rad is not None else None,
+                    "fixability": _fixability_at(idx, centre_hz),
+                }
+                entries.append(entry)
+
+            # Modal coupling share: (linear_peak² × T60) per sub, normalised.
+            # Pure derived fact: who contributes how much modal energy.
+            energies: list[float] = []
+            for e in entries:
+                lin = 10.0 ** (float(e["peak_db"]) / 20.0) - 1.0
+                if lin < 0.0:
+                    lin = 0.0
+                energies.append((lin ** 2) * max(0.0, float(e["t60_ms"])))
+            total = sum(energies)
+            if total > 0:
+                shares = [round(en / total, 4) for en in energies]
+            else:
+                shares = [0.0 for _ in energies]
+
+            # Pairwise phase difference vs. the first sub (radians, wrapped to (-π, π]).
+            phase_diff_rad: float | None = None
+            if (
+                len(entries) >= 2
+                and entries[0]["phase_rad"] is not None
+                and entries[1]["phase_rad"] is not None
+            ):
+                d = float(entries[1]["phase_rad"]) - float(entries[0]["phase_rad"])
+                # Wrap to (-π, π].
+                while d <= -math.pi:
+                    d += 2 * math.pi
+                while d > math.pi:
+                    d -= 2 * math.pi
+                phase_diff_rad = round(d, 3)
+
+            # Predicted combined T60 — weighted by share. The longer-ringing
+            # sub dominates the tail when it carries most of the modal energy.
+            # This is a derived prediction; the LLM may treat it as a hint.
+            present_t60 = [
+                (float(e["t60_ms"]), shares[i])
+                for i, e in enumerate(entries)
+                if e["t60_ms"] > 0
+            ]
+            predicted_combined_t60_ms: float | None = None
+            if present_t60:
+                # Share-weighted mean of T60 across present subs, scaled up
+                # proportionally when shares don't sum to one (i.e., some
+                # subs absent). This is a conservative "energy-weighted T60"
+                # estimate; the recipe should treat it as a pre-FIR baseline.
+                share_sum = sum(s for _, s in present_t60)
+                if share_sum > 0:
+                    weighted = sum(t * s for t, s in present_t60) / share_sum
+                    predicted_combined_t60_ms = round(weighted, 1)
+
+            out_modes.append({
+                "freq_hz": round(centre_hz, 2),
+                "per_sub": entries,
+                "modal_coupling_share": shares,
+                "phase_diff_rad": phase_diff_rad,
+                "predicted_combined_t60_ms": predicted_combined_t60_ms,
+            })
+
+        # Sort modes by frequency for deterministic output.
+        out_modes.sort(key=lambda m: m["freq_hz"])
+
+        return _ok(
+            session_ids=[int(s.id) for s in sessions],
+            modes=out_modes,
+            note=(
+                "Per-mode data for LLM-driven per-sub anti-pulse allocation. "
+                "modal_coupling_share is (linear_peak² × T60) normalised to 1 "
+                "across the listed sessions — a *derived fact*, not a "
+                "recommendation. The LLM chooses how to weight strength: "
+                "T60-dominant rooms favour the longer-ringing sub; "
+                "phase-cancellation rooms may favour 50/50 to phase-cancel "
+                "via inverted anti-pulses; etc. Feed chosen strengths into "
+                "simulate_per_sub_fir to verify before applying."
+            ),
+        )
+    except Exception as exc:
+        return _err(f"analyze_per_sub_modal_contribution failed: {exc}")
+
+
+def _design_modal_fir_coefficients(
+    session,
+    intents: list[dict] | None,
+    target_curve: dict | None,
+    target_t60_ms: float,
+    peak_action_db: float,
+    short_loud_t60_factor: float,
+    short_loud_peak_db: float,
+    long_ringy_t60_factor: float,
+    anti_pulse_cancel_strength: float,
+    num_taps: int,
+    max_pre_ring_ms: float,
+    samplerate: int,
+    anchor: dict | None,
+    compensation_notch: bool,
+    gabor_n_cycles: int,
+) -> tuple[list[float], dict]:
+    """Reuse the design_modal_fir pipeline to produce coefficients.
+
+    Returns (coefficients, summary_dict). Raises on error so the caller can
+    surface a meaningful error message.
+    """
+    from .modal_fir import (
+        ModalAwareFIRDesigner,
+        ModeIntent,
+        latency_budget_breakdown,
+    )
+
+    meta = session.metadata or {}
+    if isinstance(meta, str):
+        import json as _json
+        meta = _json.loads(meta)
+    decay_modes = meta.get("decay_modes") or []
+    if not decay_modes:
+        raise ValueError(
+            f"session {session.id} has no decay_modes in metadata; "
+            f"re-measure or run analyze_decay first"
+        )
+
+    # Build base correction (passthrough impulse).
+    base_correction = [0.0] * int(num_taps)
+    base_correction[0] = 1.0
+
+    # Translate intents (dicts) to ModeIntent objects.
+    intent_objs: list | None = None
+    if intents:
+        intent_objs = [
+            ModeIntent(
+                freq_hz=float(i["freq_hz"]),
+                t60_ms=float(i.get("t60_ms", 0)),
+                peak_db=float(i.get("peak_db", 0)),
+                treatment=str(i["treatment"]),
+                cancel_strength=float(i.get("cancel_strength", 0.6)),
+                bp_q=float(i.get("bp_q", 1.5)),
+                envelope=str(i.get("envelope", "gabor")),
+                rationale=str(i.get("rationale", "")),
+                bp_q_user_set="bp_q" in i,
+                envelope_user_set="envelope" in i,
+            )
+            for i in intents
+        ]
+
+    # Optional target-curve magnitude correction.
+    target_curve_db: list[tuple[float, float]] | None = None
+    source_fr_db: list[tuple[float, float]] | None = None
+    magnitude_focus_hz: tuple[float, float] | None = None
+    if target_curve and isinstance(target_curve, dict):
+        pts = target_curve.get("points") or []
+        if pts:
+            target_curve_db = [
+                (
+                    float(p.get("freq", p.get("freq_hz", 0))),
+                    float(p.get("spl", p.get("spl_db", 0))),
+                )
+                for p in pts
+            ]
+        band = target_curve.get("band") or target_curve.get("focus_hz")
+        if isinstance(band, (list, tuple)) and len(band) == 2:
+            magnitude_focus_hz = (float(band[0]), float(band[1]))
+        try:
+            fr = session.start_fr
+            if fr is not None and getattr(fr, "frequencies", None):
+                source_fr_db = list(zip(
+                    [float(f) for f in fr.frequencies],
+                    [float(s) for s in fr.spl],
+                ))
+        except Exception:
+            source_fr_db = None
+
+    # Anchor handling — minimal: only "freq" mode supported in the simulate
+    # path. The LLM uses anchor="freq" or omits it; deep-bass-priority is a
+    # design-time choice that simulate_per_sub_fir does not need to recompute.
+    anchor_freq_for_designer: float | None = None
+    if anchor and target_curve_db and source_fr_db:
+        mode = str(anchor.get("mode", "band_mean"))
+        if mode == "freq":
+            af = float(anchor.get("freq_hz") or 0.0)
+            if af > 0:
+                anchor_freq_for_designer = af
+
+    try:
+        from .graph import SVS_PB12_NSD_PROFILE
+        modal_cap_db = float(SVS_PB12_NSD_PROFILE.modal_cancel_max_boost_db)
+    except Exception:
+        modal_cap_db = 14.0
+
+    designer = ModalAwareFIRDesigner(
+        sample_rate=int(samplerate),
+        n_taps=int(num_taps),
+        max_pre_ring_ms=float(max_pre_ring_ms),
+    )
+    coeffs, summary = designer.design(
+        decay_modes=decay_modes,
+        base_correction=base_correction,
+        intents=intent_objs,
+        target_t60_ms=float(target_t60_ms),
+        peak_action_db=float(peak_action_db),
+        short_loud_t60_factor=float(short_loud_t60_factor),
+        short_loud_peak_db=float(short_loud_peak_db),
+        long_ringy_t60_factor=float(long_ringy_t60_factor),
+        anti_pulse_cancel_strength=float(anti_pulse_cancel_strength),
+        target_curve_db=target_curve_db,
+        source_fr_db=source_fr_db,
+        magnitude_focus_hz=magnitude_focus_hz,
+        anchor_freq_hz=anchor_freq_for_designer,
+        modal_cancel_max_boost_db=modal_cap_db,
+        compensation_notch=bool(compensation_notch),
+        gabor_n_cycles=int(gabor_n_cycles),
+    )
+
+    summary_dict = {
+        "total_taps": summary.total_taps,
+        "sample_rate": summary.sample_rate,
+        "pre_delay_ms": round(summary.pre_delay_ms, 3),
+        "pre_delay_samples": summary.pre_delay_samples,
+        "peak_amplitude": round(summary.peak_amplitude, 4),
+        "per_mode_treatments": summary.mode_treatments,
+        "safety_budget": summary.safety_budget,
+        "compensation_notches": summary.compensation_notches,
+        "notes": list(summary.notes),
+        "latency_budget": latency_budget_breakdown(summary),
+    }
+    return list(coeffs), summary_dict
+
+
+async def _tool_simulate_per_sub_fir(
+    per_sub_specs: list[dict],
+) -> dict:
+    """Predict combined-FR + per-mode T60 reduction from per-sub FIR specs.
+
+    Each ``per_sub_spec`` mirrors ``design_modal_fir``'s input but adds an
+    ``output_index`` (informational only — simulate does NOT touch hardware).
+    The simulation runs the existing ModalAwareFIRDesigner per-sub (without
+    applying), multiplies each sub's measured complex spectrum by the FIR's
+    transfer function, sums coherently, and returns the predicted combined
+    response and per-mode T60 reduction.
+
+    NO allocation logic — the LLM supplies cancel_strength on each per-sub
+    intent. This tool is pure simulation.
+    """
+    from .storage import SessionStore
+
+    if not per_sub_specs or len(per_sub_specs) < 2:
+        return _err("simulate_per_sub_fir requires ≥ 2 per_sub_specs")
+
+    try:
+        import numpy as np
+
+        store = SessionStore()
+        all_sessions = store.list_sessions()
+
+        # Validate + load each per-sub spec's session and FR.
+        records: list[dict] = []
+        sample_rate: int | None = None
+        for spec in per_sub_specs:
+            sid = int(spec["session_id"])
+            session = next((s for s in all_sessions if s.id == sid), None)
+            if session is None:
+                return _err(f"session {sid} not found")
+            fr = session.start_fr
+            if not fr or not fr.frequencies or not fr.spl:
+                return _err(f"session {sid} has no FR data")
+            sr = getattr(fr, "sample_rate", None) or 48000
+            if sample_rate is None:
+                sample_rate = int(sr)
+
+            # Run the design pipeline, capturing coeffs (without applying).
+            try:
+                coeffs, summary = _design_modal_fir_coefficients(
+                    session=session,
+                    intents=spec.get("intents"),
+                    target_curve=spec.get("target_curve"),
+                    target_t60_ms=float(spec.get("target_t60_ms", 300.0)),
+                    peak_action_db=float(spec.get("peak_action_db", 3.0)),
+                    short_loud_t60_factor=float(spec.get("short_loud_t60_factor", 0.5)),
+                    short_loud_peak_db=float(spec.get("short_loud_peak_db", 12.0)),
+                    long_ringy_t60_factor=float(spec.get("long_ringy_t60_factor", 2.0)),
+                    anti_pulse_cancel_strength=float(spec.get("anti_pulse_cancel_strength", 0.6)),
+                    num_taps=int(spec.get("num_taps", 24576)),
+                    max_pre_ring_ms=float(spec.get("max_pre_ring_ms", 25.0)),
+                    samplerate=int(spec.get("samplerate", sample_rate or 48000)),
+                    anchor=spec.get("anchor"),
+                    compensation_notch=bool(spec.get("compensation_notch", False)),
+                    gabor_n_cycles=int(spec.get("gabor_n_cycles", 3)),
+                )
+            except ValueError as exc:
+                return _err(str(exc))
+
+            records.append({
+                "session_id": sid,
+                "output_index": int(spec.get("output_index", -1)),
+                "session": session,
+                "coeffs": coeffs,
+                "summary": summary,
+                "fir_samplerate": int(spec.get("samplerate", sample_rate or 48000)),
+                "intents": list(spec.get("intents") or []),
+            })
+
+        # Build a common FR grid (use the first session's frequencies; resample
+        # other subs onto it so we can sum coherently).
+        ref_fr = records[0]["session"].start_fr
+        ref_freqs = np.array([float(f) for f in ref_fr.frequencies], dtype=float)
+        if ref_freqs.size < 4:
+            return _err("reference FR too short to simulate")
+
+        # Pre-FIR per-sub complex spectra (linear amplitude × e^{j·phase})
+        # on the common grid. If a sub has no phase data, treat phase as
+        # zero (equivalent to assuming the LLM has min-phase-aligned subs).
+        def _interp(arr_x, arr_y, target_x):
+            return np.interp(target_x, arr_x, arr_y)
+
+        pre_spectra: list[np.ndarray] = []
+        post_spectra: list[np.ndarray] = []
+        post_fir_responses: list[np.ndarray] = []  # |H(f)| per-sub at common grid
+        for r in records:
+            fr = r["session"].start_fr
+            f = np.array([float(x) for x in fr.frequencies], dtype=float)
+            spl = np.array([float(x) for x in fr.spl], dtype=float)
+            phase = (
+                np.array([float(x) for x in fr.phase], dtype=float)
+                if getattr(fr, "phase", None)
+                else np.zeros_like(f)
+            )
+            spl_grid = _interp(f, spl, ref_freqs)
+            phase_grid = _interp(f, phase, ref_freqs)
+            amp_grid = 10.0 ** (spl_grid / 20.0)
+            spec_grid = amp_grid * np.exp(1j * phase_grid)
+            pre_spectra.append(spec_grid)
+
+            # FIR transfer function via FFT, evaluated at ref_freqs.
+            coeffs = np.array(r["coeffs"], dtype=float)
+            fir_sr = int(r["fir_samplerate"])
+            n_fft = max(8192, int(2 ** np.ceil(np.log2(len(coeffs) + 1))))
+            H = np.fft.rfft(coeffs, n=n_fft)
+            fir_freqs = np.fft.rfftfreq(n_fft, d=1.0 / fir_sr)
+            # Interp magnitude + unwrapped phase separately.
+            H_mag = np.abs(H)
+            H_phase = np.unwrap(np.angle(H))
+            mag_at = np.interp(ref_freqs, fir_freqs, H_mag)
+            phase_at = np.interp(ref_freqs, fir_freqs, H_phase)
+            H_at = mag_at * np.exp(1j * phase_at)
+
+            post = spec_grid * H_at
+            post_spectra.append(post)
+            post_fir_responses.append(mag_at)
+
+        # Sum coherently.
+        combined = np.sum(np.stack(post_spectra, axis=0), axis=0)
+        combined_db = 20.0 * np.log10(np.abs(combined) + 1e-12)
+
+        predicted_combined_fr_db = [
+            {"freq_hz": round(float(f), 2), "spl_db": round(float(d), 2)}
+            for f, d in zip(ref_freqs, combined_db)
+        ]
+
+        # Per-mode predicted T60 reduction. We use a magnitude-only proxy:
+        # at each mode frequency, compute the FIR magnitude reduction (in dB)
+        # weighted by each sub's energy share, and translate that to a
+        # T60-reduction percentage by the same scaling factor that
+        # design_modal_fir uses internally (≈ 60% × cancel_strength).
+        # This is a *prediction*, not a guarantee — the recipe's final word
+        # is the post-apply measurement.
+        mode_results: list[dict] = []
+        # Collect the union of mode frequencies the LLM asked to treat.
+        mode_freqs: list[float] = []
+        for r in records:
+            for it in r["intents"]:
+                if it.get("treatment") == "anti_pulse":
+                    mode_freqs.append(float(it["freq_hz"]))
+        # Deduplicate within 1/6 octave.
+        mode_freqs.sort()
+        deduped: list[float] = []
+        import math as _math
+        for f in mode_freqs:
+            if not deduped or abs(_math.log2(f / deduped[-1])) > 1.0 / 6.0:
+                deduped.append(f)
+
+        for f_mode in deduped:
+            # Per-sub strength at this mode (LLM-supplied).
+            per_strength: list[float] = []
+            for r in records:
+                strength = 0.0
+                for it in r["intents"]:
+                    if it.get("treatment") == "anti_pulse" and abs(_math.log2(
+                        float(it["freq_hz"]) / f_mode
+                    )) <= 1.0 / 6.0:
+                        strength = float(it.get("cancel_strength", 0.6))
+                        break
+                per_strength.append(round(strength, 3))
+
+            # Coherent-sum magnitude reduction at f_mode (data-driven).
+            idx = int(np.argmin(np.abs(ref_freqs - f_mode)))
+            pre_mag = float(np.abs(np.sum([s[idx] for s in pre_spectra])))
+            post_mag = float(np.abs(combined[idx]))
+            mag_reduction_db = round(
+                20.0 * _math.log10((pre_mag + 1e-12) / (post_mag + 1e-12)),
+                2,
+            )
+            # Approximate T60 reduction: anti-pulse drops T60 by roughly
+            # 60% × effective_strength where effective_strength is the
+            # coupling-share-weighted strength. Same scaling rule the
+            # design tool uses internally.
+            effective_strength = sum(per_strength) / max(len(per_strength), 1)
+            t60_reduction_pct = round(
+                100.0 * 0.6 * float(np.clip(effective_strength, 0.0, 1.0)),
+                1,
+            )
+            mode_results.append({
+                "freq_hz": round(f_mode, 2),
+                "per_sub_strength": per_strength,
+                "predicted_combined_mag_reduction_db": mag_reduction_db,
+                "predicted_combined_t60_reduction_pct": t60_reduction_pct,
+            })
+
+        return _ok(
+            per_sub=[
+                {
+                    "session_id": r["session_id"],
+                    "output_index": r["output_index"],
+                    "design_summary": r["summary"],
+                }
+                for r in records
+            ],
+            predicted_combined_fr_db=predicted_combined_fr_db,
+            predicted_per_mode_t60_reduction_pct=mode_results,
+            note=(
+                "Pure simulation. No hardware was touched. Verify the predicted "
+                "combined response, then call design_modal_fir + apply_fir per-sub "
+                "with the same intents to materialise the design."
+            ),
+        )
+    except Exception as exc:
+        return _err(f"simulate_per_sub_fir failed: {exc}")
+
+
 # ── MCP Server ─────────────────────────────────────────────────────────────────
 
 
@@ -10122,6 +10754,91 @@ _TOOLS: list[Tool] = [
             "required": ["session_id"],
         },
     ),
+    Tool(
+        name="analyze_per_sub_modal_contribution",
+        description=(
+            "Per-sub modal data for LLM-driven anti-pulse allocation. "
+            "Takes ≥ 2 solo-sub session_ids. For each detected mode "
+            "(across the union of all subs' decay modes), returns per-sub "
+            "peak_db, t60_ms, phase_rad, fixability classification, plus "
+            "modal_coupling_share (linear_peak² × T60 normalised to sum=1) "
+            "and a phase-difference / predicted-combined-T60 hint. "
+            "**No allocation algorithm.** The LLM uses this data to "
+            "choose per-sub anti-pulse strengths and feeds them into "
+            "simulate_per_sub_fir."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 2,
+                    "description": "≥ 2 solo-sub measurement sessions.",
+                },
+            },
+            "required": ["session_ids"],
+        },
+    ),
+    Tool(
+        name="simulate_per_sub_fir",
+        description=(
+            "Predict combined-FR + per-mode T60 reduction from per-sub FIR "
+            "specs WITHOUT applying anything. Each per-sub spec mirrors "
+            "design_modal_fir's input but adds output_index. Reuses the "
+            "ModalAwareFIRDesigner pipeline per-sub, then sums the "
+            "predicted spectra coherently. The LLM supplies cancel_strength "
+            "per intent; this tool runs no allocation logic. Use after "
+            "analyze_per_sub_modal_contribution to verify a strength "
+            "allocation before applying via design_modal_fir + apply_fir."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "per_sub_specs": {
+                    "type": "array",
+                    "minItems": 2,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": {"type": "integer"},
+                            "output_index": {"type": "integer"},
+                            "intents": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "freq_hz": {"type": "number"},
+                                        "t60_ms": {"type": "number"},
+                                        "peak_db": {"type": "number"},
+                                        "treatment": {
+                                            "type": "string",
+                                            "enum": ["anti_pulse", "linear_notch", "min_phase", "skip"],
+                                        },
+                                        "cancel_strength": {"type": "number"},
+                                        "bp_q": {"type": "number"},
+                                        "envelope": {"type": "string"},
+                                        "rationale": {"type": "string"},
+                                    },
+                                    "required": ["freq_hz", "treatment"],
+                                },
+                            },
+                            "target_curve": {"type": "object"},
+                            "target_t60_ms": {"type": "number"},
+                            "num_taps": {"type": "integer"},
+                            "max_pre_ring_ms": {"type": "number"},
+                            "samplerate": {"type": "integer"},
+                            "anchor": {"type": "object"},
+                            "compensation_notch": {"type": "boolean"},
+                            "gabor_n_cycles": {"type": "integer"},
+                        },
+                        "required": ["session_id"],
+                    },
+                },
+            },
+            "required": ["per_sub_specs"],
+        },
+    ),
     # ── LLM filter-design math tools ─────────────────────────────────────────
     Tool(
         name="evaluate_transfer_function",
@@ -10935,6 +11652,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return_coefficients=bool(arguments.get("return_coefficients", False)),
             anchor=arguments.get("anchor"),
             gabor_n_cycles=int(arguments.get("gabor_n_cycles", 3)),
+        )
+    elif name == "analyze_per_sub_modal_contribution":
+        result = await _tool_analyze_per_sub_modal_contribution(
+            session_ids=[int(x) for x in arguments["session_ids"]],
+        )
+    elif name == "simulate_per_sub_fir":
+        result = await _tool_simulate_per_sub_fir(
+            per_sub_specs=list(arguments["per_sub_specs"]),
         )
     # ── LLM filter-design math tools ────────────────────────────────────────
     elif name == "evaluate_transfer_function":
