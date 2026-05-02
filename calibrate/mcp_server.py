@@ -5368,17 +5368,26 @@ async def _tool_save_calibration_run(
     target: str,
     device_state: dict | None = None,
     run_type: str = "calibration",
+    goal: str | None = None,
+    hypothesis: str | None = None,
 ) -> dict:
     """Create a new calibration run record with optional equipment state snapshot.
 
     *run_type*: "calibration" (default, iterative EQ loop) or "validation"
     (read-only measurement sessions, no convergence criteria).
+
+    *goal* / *hypothesis*: feed the lessons system. Goal states the concrete
+    measurable target; hypothesis states why this run should achieve it.
     """
     from .storage import SessionStore
 
     try:
         store = SessionStore()
-        run_id = store.save_run(recipe_name, target, device_state=device_state, run_type=run_type)
+        run_id = store.save_run(
+            recipe_name, target,
+            device_state=device_state, run_type=run_type,
+            goal=goal, hypothesis=hypothesis,
+        )
         return _ok(run_id=run_id)
     except Exception as exc:
         return _err(f"save_calibration_run failed: {exc}")
@@ -5393,6 +5402,7 @@ async def _tool_update_calibration_run(
     error: str = "",
     target_curve_data: dict | None = None,
     sessions: list[dict] | None = None,
+    outcome: str | None = None,
 ) -> dict:
     """Update a calibration run with final results.
 
@@ -5412,6 +5422,7 @@ async def _tool_update_calibration_run(
             error=error,
             target_curve_data=target_curve_data,
             sessions=sessions,
+            outcome=outcome,
         )
         return _ok(run_id=run_id, updated=True)
     except Exception as exc:
@@ -5446,6 +5457,132 @@ async def _tool_save_calibration_iteration(
         return _ok(iteration_id=iter_id, run_id=run_id)
     except Exception as exc:
         return _err(f"save_calibration_iteration failed: {exc}")
+
+
+# ── Lessons system ──────────────────────────────────────────────────────────
+#
+# The lessons system captures "goal of this run" + "what we learned" so future
+# runs don't rediscover the same things. Two scopes:
+#   - room: specific to this room/hardware/state. Stays in DB until invalidated.
+#   - general: universal acoustics/tooling rule. Should be promoted to a
+#     codebase fix or a memory/ file, then marked promoted to keep the DB clean.
+
+async def _tool_record_lesson(
+    claim: str,
+    scope: str,
+    run_id: int | None = None,
+    category: str | None = None,
+    context: str | None = None,
+    confidence: float = 0.7,
+    evidence: dict | list | None = None,
+    target_curve: str | None = None,
+    tags: list[str] | None = None,
+    invalidators: list[dict] | None = None,
+) -> dict:
+    """Record a lesson learned from a calibration run.
+
+    Call after update_calibration_run with outcome filled in. Triage rule:
+    if the lesson would apply in any room → scope='general' (then file an
+    issue or write a memory file). If it depends on this room/hardware/state
+    → scope='room' with explicit invalidators so it stales out automatically
+    when conditions change.
+    """
+    from .storage import SessionStore
+
+    try:
+        store = SessionStore()
+        lesson_id = store.record_lesson(
+            claim=claim, scope=scope, run_id=run_id, category=category,
+            context=context, confidence=confidence, evidence=evidence,
+            target_curve=target_curve, tags=tags, invalidators=invalidators,
+        )
+        return _ok(lesson_id=lesson_id)
+    except Exception as exc:
+        return _err(f"record_lesson failed: {exc}")
+
+
+async def _tool_get_relevant_lessons(
+    category: str | None = None,
+    tags: list[str] | None = None,
+    scope: str | None = None,
+    target_curve: str | None = None,
+    limit: int = 10,
+    include_invalidated: bool = False,
+) -> dict:
+    """Return active lessons relevant to a planned action.
+
+    Call this BEFORE designing filters or starting a phase, with the
+    category/tags that describe what you're about to attempt. Avoids
+    rediscovering lessons from prior runs.
+    """
+    from .storage import SessionStore
+
+    try:
+        store = SessionStore()
+        lessons = store.get_relevant_lessons(
+            category=category, tags=tags, scope=scope,
+            target_curve=target_curve, limit=limit,
+            include_invalidated=include_invalidated,
+        )
+        return _ok(lessons=lessons, count=len(lessons))
+    except Exception as exc:
+        return _err(f"get_relevant_lessons failed: {exc}")
+
+
+async def _tool_list_lessons(limit: int = 50, status: str | None = None) -> dict:
+    """List all lessons (audit/review). Filter by status if provided."""
+    from .storage import SessionStore
+
+    try:
+        store = SessionStore()
+        return _ok(lessons=store.list_lessons(limit=limit, status=status))
+    except Exception as exc:
+        return _err(f"list_lessons failed: {exc}")
+
+
+async def _tool_invalidate_lessons(
+    events: list[str] | None = None,
+    codes: list[str] | None = None,
+    state_changed: bool = False,
+    reason: str | None = None,
+) -> dict:
+    """Mark lessons stale based on what changed in the room or codebase.
+
+    Call when:
+      - subs are physically moved (events=["sub_position_changed"])
+      - target curve changes (events=["target_curve_changed"])
+      - a code module that lessons referenced is edited
+        (codes=["calibrate.modal_fir.design_modal_fir"])
+      - bulk invalidation after any DSP state change (state_changed=True)
+    """
+    from .storage import SessionStore
+
+    try:
+        store = SessionStore()
+        ids = store.invalidate_lessons(
+            events=events, codes=codes, state_changed=state_changed, reason=reason,
+        )
+        return _ok(invalidated_ids=ids, count=len(ids))
+    except Exception as exc:
+        return _err(f"invalidate_lessons failed: {exc}")
+
+
+async def _tool_promote_lesson(lesson_id: int, promoted_to: str) -> dict:
+    """Mark a general-scope lesson as promoted (codebase fix or memory file).
+
+    *promoted_to* is a free-form pointer like 'memory:feedback_xyz.md' or
+    'code:calibrate/modal_fir.py:fix-X'.
+    """
+    from .storage import SessionStore
+
+    try:
+        store = SessionStore()
+        ok = store.promote_lesson(lesson_id, promoted_to)
+        if not ok:
+            return _err(f"lesson {lesson_id} not active or not found")
+        return _ok(lesson_id=lesson_id, promoted_to=promoted_to)
+    except Exception as exc:
+        return _err(f"promote_lesson failed: {exc}")
 
 
 async def _tool_get_config() -> dict:
@@ -7966,6 +8103,23 @@ _TOOLS: list[Tool] = [
                         "'validation' for read-only measurement sessions."
                     ),
                 },
+                "goal": {
+                    "type": "string",
+                    "description": (
+                        "What this run is trying to accomplish, in concrete terms — "
+                        "e.g. 'shorten 45 Hz T60 below 250 ms at MLP'. Required "
+                        "input for the lessons system; without a goal the post-run "
+                        "lesson cannot be tied to a hypothesis."
+                    ),
+                },
+                "hypothesis": {
+                    "type": "string",
+                    "description": (
+                        "Why you expect this run to work — e.g. 'modal FIR at 45 Hz "
+                        "Q=8 will deliver 4-6 dB at MLP based on prior PEQ delivering "
+                        "only 1.5 dB'. Compared to outcome on update_calibration_run."
+                    ),
+                },
             },
             "required": ["recipe_name", "target"],
         },
@@ -8013,6 +8167,15 @@ _TOOLS: list[Tool] = [
                     "description": (
                         "For validation runs: list of {session_id, label} dicts "
                         "recording each measurement taken."
+                    ),
+                },
+                "outcome": {
+                    "type": "string",
+                    "description": (
+                        "Free-form prose comparing actual result to hypothesis — "
+                        "e.g. 'delivered 1.5 dB at MLP, hypothesis was 4-6 dB. "
+                        "Adjacent-band T60 caps the achievable cut.' This is the "
+                        "seed for record_lesson; write it before recording lessons."
                     ),
                 },
             },
@@ -8065,6 +8228,184 @@ _TOOLS: list[Tool] = [
             },
             "required": ["run_id", "iteration", "rms_before", "rms_after",
                          "filters_proposed", "filters_applied"],
+        },
+    ),
+    Tool(
+        name="record_lesson",
+        description=(
+            "Record a lesson learned from a calibration run. Call after "
+            "update_calibration_run with outcome filled in. Triage rule: "
+            "scope='general' if the lesson would apply in any room (then "
+            "ALSO promote it: open an issue or write a memory file, then call "
+            "promote_lesson); scope='room' if it depends on this room/hardware/"
+            "state — provide explicit invalidators so it stales out automatically. "
+            "Cap at ~2 lessons per run; over-recording produces noise that "
+            "drowns the next run's pre-flight query."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "claim": {
+                    "type": "string",
+                    "description": (
+                        "The lesson sentence — concrete and falsifiable. "
+                        "BAD: 'EQ is hard'. GOOD: 'PEQ cuts at 45 Hz delivered "
+                        "only 1.5 dB at MLP because adjacent-band T60 > 300 ms.'"
+                    ),
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["room", "general"],
+                    "description": "'room' (this room only) or 'general' (universal — should be promoted)",
+                },
+                "run_id": {
+                    "type": "integer",
+                    "description": "Run that produced this lesson (from save_calibration_run)",
+                },
+                "category": {
+                    "type": "string",
+                    "description": (
+                        "Bucket for retrieval — e.g. 'modal_correction', "
+                        "'sub_alignment', 'measurement', 'tooling', 'target_curve'"
+                    ),
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional longer prose: when this applies and why",
+                },
+                "confidence": {
+                    "type": "number",
+                    "description": "0-1. Single-run lessons should be ~0.5-0.7; multi-run confirmed ~0.85+",
+                },
+                "evidence": {
+                    "description": "JSON object/list with the numbers backing the claim (RMS deltas, freq band, T60, etc.)",
+                },
+                "target_curve": {
+                    "type": "string",
+                    "description": "Target curve name this lesson is tied to (if any)",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Free-form tags for retrieval (e.g. ['45hz', 'modal', 'fir'])",
+                },
+                "invalidators": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["event", "state_hash", "code"]},
+                            "value": {"type": "string"},
+                        },
+                        "required": ["kind", "value"],
+                    },
+                    "description": (
+                        "What would make this lesson stale. kind='event' fires "
+                        "via invalidate_lessons (e.g. value='sub_position_changed'); "
+                        "'state_hash' fires when DSP state changes; 'code' fires "
+                        "when a code module is edited (value='calibrate.modal_fir.design_modal_fir')."
+                    ),
+                },
+            },
+            "required": ["claim", "scope"],
+        },
+    ),
+    Tool(
+        name="get_relevant_lessons",
+        description=(
+            "Return active lessons relevant to a planned action. Call BEFORE "
+            "designing filters, starting a phase, or attempting an alignment "
+            "you've tried before — avoids rediscovering documented issues. "
+            "Filter by category and tags to keep noise low."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "description": "e.g. 'modal_correction', 'sub_alignment'"},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Match if ANY tag overlaps (e.g. ['45hz', 'modal'])",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["room", "general"],
+                    "description": "Filter to room-specific or general lessons only",
+                },
+                "target_curve": {"type": "string", "description": "Restrict to lessons for this target curve (or untagged)"},
+                "limit": {"type": "integer", "description": "Max lessons to return (default 10)"},
+                "include_invalidated": {
+                    "type": "boolean",
+                    "description": "Include invalidated lessons for audit (default false)",
+                },
+            },
+        },
+    ),
+    Tool(
+        name="list_lessons",
+        description="List all lessons (audit/review). Filter by status: active, invalidated, promoted, superseded.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer"},
+                "status": {
+                    "type": "string",
+                    "enum": ["active", "invalidated", "promoted", "superseded"],
+                },
+            },
+        },
+    ),
+    Tool(
+        name="invalidate_lessons",
+        description=(
+            "Mark lessons stale based on what changed in the room or codebase. "
+            "Call this when subs move, target curves change, or code modules "
+            "that lessons reference are edited. Lessons remain in the DB with "
+            "status='invalidated' for audit; they no longer surface in "
+            "get_relevant_lessons."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "events": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Event invalidator values that fired (e.g. ['sub_position_changed', 'target_curve_changed'])",
+                },
+                "codes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Code module/function names that were edited",
+                },
+                "state_changed": {
+                    "type": "boolean",
+                    "description": "If true, invalidate any lesson whose state_hash differs from current",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Free-form reason recorded with each invalidated lesson",
+                },
+            },
+        },
+    ),
+    Tool(
+        name="promote_lesson",
+        description=(
+            "Mark a general-scope lesson as promoted to a codebase fix or "
+            "memory file. Use after you've actually filed the issue / written "
+            "the memory / fixed the code — keeps the lessons table from "
+            "accumulating universal facts that should live elsewhere."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "lesson_id": {"type": "integer"},
+                "promoted_to": {
+                    "type": "string",
+                    "description": "Pointer like 'memory:feedback_xyz.md' or 'code:calibrate/modal_fir.py:fix-X'",
+                },
+            },
+            "required": ["lesson_id", "promoted_to"],
         },
     ),
     Tool(
@@ -10125,6 +10466,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             target=arguments["target"],
             device_state=arguments.get("device_state"),
             run_type=arguments.get("run_type", "calibration"),
+            goal=arguments.get("goal"),
+            hypothesis=arguments.get("hypothesis"),
         )
     elif name == "update_calibration_run":
         result = await _tool_update_calibration_run(
@@ -10136,6 +10479,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             error=arguments.get("error", ""),
             target_curve_data=arguments.get("target_curve_data"),
             sessions=arguments.get("sessions"),
+            outcome=arguments.get("outcome"),
         )
     elif name == "save_calibration_iteration":
         result = await _tool_save_calibration_iteration(
@@ -10147,6 +10491,45 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             filters_applied=arguments.get("filters_applied", []),
             safety_ok=bool(arguments.get("safety_ok", True)),
             safety_error=arguments.get("safety_error", ""),
+        )
+    elif name == "record_lesson":
+        result = await _tool_record_lesson(
+            claim=str(arguments["claim"]),
+            scope=str(arguments["scope"]),
+            run_id=arguments.get("run_id"),
+            category=arguments.get("category"),
+            context=arguments.get("context"),
+            confidence=float(arguments.get("confidence", 0.7)),
+            evidence=arguments.get("evidence"),
+            target_curve=arguments.get("target_curve"),
+            tags=arguments.get("tags"),
+            invalidators=arguments.get("invalidators"),
+        )
+    elif name == "get_relevant_lessons":
+        result = await _tool_get_relevant_lessons(
+            category=arguments.get("category"),
+            tags=arguments.get("tags"),
+            scope=arguments.get("scope"),
+            target_curve=arguments.get("target_curve"),
+            limit=int(arguments.get("limit", 10)),
+            include_invalidated=bool(arguments.get("include_invalidated", False)),
+        )
+    elif name == "list_lessons":
+        result = await _tool_list_lessons(
+            limit=int(arguments.get("limit", 50)),
+            status=arguments.get("status"),
+        )
+    elif name == "invalidate_lessons":
+        result = await _tool_invalidate_lessons(
+            events=arguments.get("events"),
+            codes=arguments.get("codes"),
+            state_changed=bool(arguments.get("state_changed", False)),
+            reason=arguments.get("reason"),
+        )
+    elif name == "promote_lesson":
+        result = await _tool_promote_lesson(
+            lesson_id=int(arguments["lesson_id"]),
+            promoted_to=str(arguments["promoted_to"]),
         )
     elif name == "get_config":
         result = await _tool_get_config()

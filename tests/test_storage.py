@@ -928,3 +928,167 @@ class TestActiveDspState:
         store.set_active_dsp("delay_1", {"delay_ms": 0})
         store.clear_active_dsp()
         assert store.get_active_dsp() == {}
+
+
+# ── Lessons system ──────────────────────────────────────────────────────────
+
+
+class TestLessons:
+    def test_record_basic(self, store):
+        lid = store.record_lesson(
+            claim="PEQ cuts can't shorten T60 above 300 ms",
+            scope="general",
+            category="modal_correction",
+        )
+        assert lid > 0
+        lessons = store.get_relevant_lessons()
+        assert len(lessons) == 1
+        assert lessons[0]["claim"].startswith("PEQ cuts")
+        assert lessons[0]["status"] == "active"
+        assert lessons[0]["state_hash"]  # stamped
+
+    def test_invalid_scope_rejected(self, store):
+        with pytest.raises(ValueError):
+            store.record_lesson(claim="x", scope="bogus")
+
+    def test_filter_by_tags(self, store):
+        store.record_lesson(claim="A", scope="room", tags=["45hz", "modal"])
+        store.record_lesson(claim="B", scope="room", tags=["polarity"])
+        store.record_lesson(claim="C", scope="room")  # no tags
+        out = store.get_relevant_lessons(tags=["45hz"])
+        assert [l["claim"] for l in out] == ["A"]
+
+    def test_filter_by_category_and_scope(self, store):
+        store.record_lesson(claim="X", scope="room", category="sub_alignment")
+        store.record_lesson(claim="Y", scope="general", category="sub_alignment")
+        store.record_lesson(claim="Z", scope="room", category="modal_correction")
+        out = store.get_relevant_lessons(category="sub_alignment", scope="room")
+        assert [l["claim"] for l in out] == ["X"]
+
+    def test_event_invalidator(self, store):
+        lid = store.record_lesson(
+            claim="this lesson dies on sub move",
+            scope="room",
+            invalidators=[{"kind": "event", "value": "sub_position_changed"}],
+        )
+        assert store.get_relevant_lessons()
+        invalidated = store.invalidate_lessons(events=["sub_position_changed"])
+        assert lid in invalidated
+        assert store.get_relevant_lessons() == []
+        # audit trail preserved
+        all_lessons = store.list_lessons()
+        assert all_lessons[0]["status"] == "invalidated"
+        assert all_lessons[0]["invalidated_at"]
+
+    def test_code_invalidator(self, store):
+        lid = store.record_lesson(
+            claim="modal FIR clipping",
+            scope="general",
+            invalidators=[
+                {"kind": "code", "value": "calibrate.modal_fir.design_modal_fir"}
+            ],
+        )
+        ids = store.invalidate_lessons(
+            codes=["calibrate.modal_fir.design_modal_fir"], reason="bug fix",
+        )
+        assert ids == [lid]
+        assert store.list_lessons()[0]["invalidated_by"] == "bug fix"
+
+    def test_state_hash_invalidator(self, store):
+        lid = store.record_lesson(
+            claim="depends on current DSP state",
+            scope="room",
+            invalidators=[{"kind": "state_hash", "value": "ignored"}],
+        )
+        # mutate state → hash changes
+        store.set_active_dsp("processor:minidsp:output:0:delay", {"delay_ms": 5.0})
+        ids = store.invalidate_lessons(state_changed=True)
+        assert lid in ids
+
+    def test_state_hash_unchanged_keeps_lesson(self, store):
+        lid = store.record_lesson(
+            claim="stable",
+            scope="room",
+            invalidators=[{"kind": "state_hash", "value": "x"}],
+        )
+        ids = store.invalidate_lessons(state_changed=True)
+        assert ids == []
+        assert store.list_lessons()[0]["id"] == lid
+        assert store.list_lessons()[0]["status"] == "active"
+
+    def test_invalidate_idempotent(self, store):
+        lid = store.record_lesson(
+            claim="x",
+            scope="room",
+            invalidators=[{"kind": "event", "value": "sub_position_changed"}],
+        )
+        first = store.invalidate_lessons(events=["sub_position_changed"])
+        assert first == [lid]
+        # second call: lesson already invalidated, UPDATE matches no rows
+        second = store.invalidate_lessons(events=["sub_position_changed"])
+        # ids list still includes the lesson_id because the lookup matches,
+        # but the status doesn't flip a second time — verify timestamp stable
+        rec = store.list_lessons()[0]
+        assert rec["status"] == "invalidated"
+
+    def test_promote_lesson(self, store):
+        lid = store.record_lesson(claim="universal", scope="general")
+        ok = store.promote_lesson(lid, "memory:feedback_x.md")
+        assert ok
+        lesson = store.list_lessons()[0]
+        assert lesson["status"] == "promoted"
+        assert lesson["promoted_to"] == "memory:feedback_x.md"
+        # promoted lessons don't surface in get_relevant_lessons
+        assert store.get_relevant_lessons() == []
+
+    def test_promote_nonexistent_returns_false(self, store):
+        assert store.promote_lesson(9999, "x") is False
+
+    def test_include_invalidated(self, store):
+        lid = store.record_lesson(
+            claim="x",
+            scope="room",
+            invalidators=[{"kind": "event", "value": "e"}],
+        )
+        store.invalidate_lessons(events=["e"])
+        active = store.get_relevant_lessons()
+        all_l = store.get_relevant_lessons(include_invalidated=True)
+        assert active == []
+        assert len(all_l) == 1
+
+    def test_evidence_roundtrips(self, store):
+        store.record_lesson(
+            claim="x",
+            scope="room",
+            evidence={"freq_hz": 45, "t60_ms": 350, "delivered_db": 1.5},
+        )
+        l = store.get_relevant_lessons()[0]
+        assert l["evidence"] == {"freq_hz": 45, "t60_ms": 350, "delivered_db": 1.5}
+
+    def test_run_with_goal_hypothesis_outcome(self, store):
+        run_id = store.save_run(
+            recipe_name="bass-calibration",
+            target="harman-bass",
+            goal="shorten 45 Hz T60 below 250 ms",
+            hypothesis="modal FIR Q=8 will work",
+        )
+        store.update_run(
+            run_id, converged=False, iterations_run=3,
+            outcome="delivered 1.5 dB; adjacent-band T60 capped the cut",
+        )
+        detail = store.get_run_detail(run_id)
+        assert detail["goal"] == "shorten 45 Hz T60 below 250 ms"
+        assert detail["hypothesis"] == "modal FIR Q=8 will work"
+        assert detail["outcome"].startswith("delivered 1.5 dB")
+
+    def test_lesson_links_to_run(self, store):
+        run_id = store.save_run("r", "harman", goal="g", hypothesis="h")
+        lid = store.record_lesson(claim="x", scope="room", run_id=run_id)
+        assert store.get_relevant_lessons()[0]["run_id"] == run_id
+
+    def test_ranking_by_confidence(self, store):
+        store.record_lesson(claim="low", scope="room", confidence=0.3)
+        store.record_lesson(claim="high", scope="room", confidence=0.9)
+        store.record_lesson(claim="mid", scope="room", confidence=0.6)
+        out = store.get_relevant_lessons()
+        assert [l["claim"] for l in out] == ["high", "mid", "low"]

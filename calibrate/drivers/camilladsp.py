@@ -777,27 +777,31 @@ class CamillaDSPDriver(DSPDriver):
         Each output channel lists exactly those inputs routed to it (enabled).
         Outputs with no routed input get no sources (silence).
 
-        Muted outputs get no sources regardless of routing state — CamillaDSP
-        does NOT reliably honor the Gain filter's ``mute: true`` flag when a
-        Conv (FIR) or Delay filter sits earlier in the per-output pipeline.
-        Observed in run 15: muting sub_nearfield via Gain mute left the
-        delayed FIR output still reaching the Focusrite, contaminating every
-        solo measurement. Removing the mixer source is the only reliable
-        way to silence an output on this CamillaDSP configuration.
+        Muted outputs keep their source entries (routing stays inspectable in
+        GetConfigJson) but flip every source's ``mute: true``. This silences
+        the mixer output upstream of the per-output FIR/Delay/PEQ chain — so
+        the chain receives zero input and produces zero output, sidestepping
+        the run-15 issue where the per-output Gain filter's ``mute: true``
+        was not honored when Conv/Delay sat earlier in the per-output pipeline
+        (PR #96). The earlier fix worked by dropping mixer sources entirely,
+        which silently rewrote routing on every mute call and confused any
+        consumer that read the live config to verify state. Muting at the
+        mixer-source level is upstream of the failing per-output Gain, so
+        the same FIR-leak failure mode does not apply.
         """
         mapping: list[dict] = []
+        muted_output = lambda o: self._output_muted.get(o, False)
         for out_idx in range(self._output_channels):
             sources = []
-            if not self._output_muted.get(out_idx, False):
-                for inp_idx in range(self._input_channels):
-                    enabled = self._routing.get(inp_idx, {}).get(out_idx, False)
-                    if enabled:
-                        sources.append({
-                            "channel": inp_idx,
-                            "gain": 0.0,
-                            "inverted": False,
-                            "mute": False,
-                        })
+            for inp_idx in range(self._input_channels):
+                enabled = self._routing.get(inp_idx, {}).get(out_idx, False)
+                if enabled:
+                    sources.append({
+                        "channel": inp_idx,
+                        "gain": 0.0,
+                        "inverted": False,
+                        "mute": muted_output(out_idx),
+                    })
             mapping.append({"dest": out_idx, "sources": sources})
         mixers: dict = {
             "cal_matrix": {

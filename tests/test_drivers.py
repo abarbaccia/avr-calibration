@@ -2130,46 +2130,80 @@ async def test_camilladsp_rehydrate_tolerates_legacy_flat_keys() -> None:
 
 
 @pytest.mark.asyncio
-async def test_camilladsp_mute_removes_mixer_sources() -> None:
-    """Muting drops the output's mixer sources entirely.
+async def test_camilladsp_mute_flips_source_mute_flag() -> None:
+    """Muting flips ``mute: true`` on every routed source for that output;
+    routing structure is preserved.
 
-    Discovered in run 15: CamillaDSP's Gain-filter ``mute: true`` does not
-    reliably silence an output when the per-output pipeline has a Conv (FIR)
-    or Delay filter earlier. The only dependable way to silence is to remove
-    the mixer source so no signal reaches the output at all. This test pins
-    the driver to that behavior — if someone refactors the mixer build to
-    "restore" the source for a muted channel, the test fails.
+    Why source-mute and not source-removal: the original fix (PR #96) silenced
+    by dropping mixer sources entirely, which silently rewrote routing on
+    every mute call and confused any consumer that read the live config to
+    verify state. Per-mixer-source ``mute`` fires upstream of the per-output
+    FIR/Delay/PEQ chain, so the run-15 leak (Gain mute downstream of Conv/Delay
+    not honored) does not apply, and routing is preserved as inspectable data.
     """
     driver = CamillaDSPDriver(output_channels=4, input_channels=2, sub_outputs=[0, 1])
     _stub_client(driver)
 
-    # Route input 0 to outputs 0 and 1, then mute output 1.
     await driver.set_routing({0: {0: True, 1: True}, 1: {}})
     await driver.mute_outputs([1])
 
     mixer = driver._build_mixer()["cal_matrix"]
     mapping = {entry["dest"]: entry["sources"] for entry in mixer["mapping"]}
-    # Output 0 keeps its source.
+    # Output 0 unaffected — source still present and unmuted.
     assert len(mapping[0]) == 1
     assert mapping[0][0]["channel"] == 0
-    # Output 1 is muted — mixer sources are empty regardless of routing.
-    assert mapping[1] == []
+    assert mapping[0][0]["mute"] is False
+    # Output 1's source is preserved (routing inspectable) but muted.
+    assert len(mapping[1]) == 1
+    assert mapping[1][0]["channel"] == 0
+    assert mapping[1][0]["mute"] is True
 
 
 @pytest.mark.asyncio
-async def test_camilladsp_unmute_restores_mixer_sources() -> None:
-    """Unmute puts the sources back according to the current routing."""
+async def test_camilladsp_unmute_clears_source_mute_flag() -> None:
+    """Unmute clears the mute flag on the source; routing is unchanged throughout."""
     driver = CamillaDSPDriver(output_channels=4, input_channels=2, sub_outputs=[0, 1])
     _stub_client(driver)
 
     await driver.set_routing({0: {0: True, 1: True}, 1: {}})
     await driver.mute_outputs([1])
-    assert driver._build_mixer()["cal_matrix"]["mapping"][1]["sources"] == []
+    assert driver._build_mixer()["cal_matrix"]["mapping"][1]["sources"][0]["mute"] is True
 
     await driver.unmute_outputs([1])
     mapping = driver._build_mixer()["cal_matrix"]["mapping"]
     assert len(mapping[1]["sources"]) == 1
     assert mapping[1]["sources"][0]["channel"] == 0
+    assert mapping[1]["sources"][0]["mute"] is False
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_mute_does_not_mutate_routing() -> None:
+    """The set of routed (channel, dest) pairs is invariant under mute/unmute.
+
+    This is the structural property PR #96's fix violated: muting changed the
+    routing structure (sources disappeared), so any consumer of GetConfigJson
+    saw a different routing for muted outputs. Pin the property mechanically
+    so future refactors can't reintroduce that behavior.
+    """
+    driver = CamillaDSPDriver(output_channels=4, input_channels=2, sub_outputs=[0, 1])
+    _stub_client(driver)
+    await driver.set_routing({0: {0: True, 1: True}, 1: {2: True}})
+
+    def routing_pairs() -> set[tuple[int, int]]:
+        mapping = driver._build_mixer()["cal_matrix"]["mapping"]
+        return {
+            (src["channel"], entry["dest"])
+            for entry in mapping
+            for src in entry["sources"]
+        }
+
+    baseline = routing_pairs()
+    await driver.mute_outputs([0, 1])
+    assert routing_pairs() == baseline
+    await driver.unmute_outputs([0])
+    assert routing_pairs() == baseline
+    await driver.unmute_outputs([1])
+    assert routing_pairs() == baseline
 
 
 @pytest.mark.asyncio
@@ -2188,9 +2222,11 @@ async def test_camilladsp_rehydrate_restores_mute_state() -> None:
     }
     await driver.rehydrate_from_active_state(active_state)
     assert driver._output_muted.get(1) is True
-    # And the rebuilt mixer has no source for output 1.
+    # The source for output 1 stays in the mixer (routing inspectable) but
+    # carries mute: true so the per-output chain receives silence.
     mapping = driver._build_mixer()["cal_matrix"]["mapping"]
-    assert mapping[1]["sources"] == []
+    assert len(mapping[1]["sources"]) == 1
+    assert mapping[1]["sources"][0]["mute"] is True
 
 
 # ── Bug 1: _BridgeSweepContext — stop/start bridge around sweep ───────────────

@@ -27,6 +27,19 @@ this rule was implicit. Make it explicit.
    **BEFORE** running Phase 6 cleanup or telling the user "done."
 4. Reporting "calibration complete" without these calls is a recipe
    violation, regardless of how good the final FR looks.
+5. **Lessons system** — each run carries a goal/hypothesis/outcome and
+   produces ≤2 lessons:
+   - At START, the skill should pass `goal=...` and `hypothesis=...` to
+     `save_calibration_run`. If they aren't set, ask the user for them.
+   - At each phase START, call
+     `get_relevant_lessons(category=<phase domain>, tags=[...])` and read
+     prior lessons before designing filters. Don't rediscover documented
+     issues.
+   - At END, set `outcome=...` on `update_calibration_run` (prose comparing
+     actual to hypothesis). Then call `record_lesson(...)` for the 1-2
+     concrete, falsifiable claims this run produced. See CLAUDE.md
+     "Lessons system" for triage rules (`scope='room'` vs `'general'`)
+     and required `invalidators`.
 
 ## Goal
 
