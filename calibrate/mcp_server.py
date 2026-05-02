@@ -11847,11 +11847,23 @@ def create_app() -> Starlette:
         await _avr.close()
         await _dsp.close()
 
-    async def handle_mcp(request: Request) -> Response:
-        await http_manager.handle_request(
-            request.scope, request.receive, request._send
-        )
-        return Response()
+    # Streamable-HTTP transport is a complete ASGI app: handle_request()
+    # already sends http.response.start + body + http.response.end. If we
+    # wrap it in a Starlette HTTP endpoint (def f(request) -> Response) and
+    # `return Response()`, Starlette tries to send a SECOND
+    # http.response.start and uvicorn raises "Unexpected ASGI message
+    # 'http.response.start' sent, after response already completed", killing
+    # the worker mid-request. Use a class-based ASGI endpoint instead so
+    # Starlette treats it as a raw ASGI app and skips the response wrapping.
+    # Matches upstream FastMCP's StreamableHTTPASGIApp pattern.
+    class _StreamableHTTPEndpoint:
+        def __init__(self, manager: StreamableHTTPSessionManager) -> None:
+            self._manager = manager
+
+        async def __call__(self, scope, receive, send) -> None:
+            await self._manager.handle_request(scope, receive, send)
+
+    handle_mcp = _StreamableHTTPEndpoint(http_manager)
 
     async def handle_sse(request: Request) -> Response:
         async with sse.connect_sse(
