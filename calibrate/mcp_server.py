@@ -4674,6 +4674,38 @@ _HDMI_CHANNEL_MAP: dict[str, int] = {
 }
 
 
+def _resolve_peer_mute_set(
+    cfg, target: str | None,
+) -> list[tuple[object, int, str]]:
+    """Return [(driver, output_index, processor_ref), ...] for every DSP-output
+    transducer that is NOT in the target's resolved set.
+
+    Used by ``_tool_trigger_measurement(mute_peers=True)`` to silence peer
+    transducers (other subs, shakers, mains) for the duration of a solo
+    sweep — bass-management redirect at the AVR otherwise pollutes the IR
+    with sub-path latency. See
+    ``feedback_mute_other_devices_during_solo_cal.md``.
+
+    Returns an empty list if ``target`` is None, the graph has no driver
+    registry, or the target resolves to the full transducer set.
+    """
+    if target is None or _drivers is None:
+        return []
+    graph = cfg.signal_graph
+    target_set = {t.name for t in graph.resolve_target(target)}
+    if not target_set:
+        return []
+    peers: list[tuple[object, int, str]] = []
+    for t in graph.transducers:
+        if t.name in target_set:
+            continue
+        driver = _drivers.get(t.processor_ref)
+        if driver is None:
+            continue
+        peers.append((driver, int(t.output_index), t.processor_ref))
+    return peers
+
+
 async def _tool_trigger_measurement(
     label: str | None = None,
     position: str | None = None,
@@ -4683,6 +4715,7 @@ async def _tool_trigger_measurement(
     freq_max: int | None = None,
     sweep_channel: str | None = None,
     sweep_volume_db: float | None = None,
+    mute_peers: bool = False,
 ) -> dict:
     """Trigger a measurement via UMIK-1 + PyTTa.
 
@@ -4740,6 +4773,13 @@ async def _tool_trigger_measurement(
         engine = MeasurementEngine(cfg)
         route = cfg.measurement.get("playback_route", "usb")
 
+        # Target-aware peer mute (bass-management redirect contamination
+        # prevention). Resolved BEFORE sweep_context entry so we have a clean
+        # restoration list in finally even if the sweep raises.
+        _peer_mute_records: list[tuple[object, int, str]] = (
+            _resolve_peer_mute_set(cfg, target) if mute_peers else []
+        )
+
         # Resolve sweep range from explicit args / target / config defaults.
         resolved_min, resolved_max, sweep_range_source = _resolve_sweep_range(
             cfg, target, freq_min, freq_max,
@@ -4768,23 +4808,42 @@ async def _tool_trigger_measurement(
         graph = cfg.signal_graph
         targets = tuple(graph.transducers_by_role("sub")) or graph.transducers
 
-        if route == "hdmi" and _drivers is not None and resolved_out_channel is None and sweep_volume_db is None:
-            # Standard sub/combined sweep: let the graph compose all processor
-            # contexts (Denon + CamillaDSP). Mains sweeps bypass this path
-            # because CamillaDSP's sweep context is not part of the mains chain.
-            async with graph.sweep_context_for_route(route, targets, cfg, _drivers):
-                fr = await engine.measure(
-                    playback_device_override=cal_playback,
-                    freq_min=resolved_min,
-                    freq_max=resolved_max,
-                )
-        elif route == "hdmi":
-            # Legacy path used when the driver registry isn't populated (older
-            # test setups that patch `_dsp` directly without the lifespan).
-            # Behaves exactly as before the graph refactor.
-            denon_ctx = DenonSweepContext.from_config(cfg, sweep_volume_override=sweep_volume_db)
-            if denon_ctx:
-                async with denon_ctx:
+        # Mute peer transducers before any sweep-context entry so the AVR's
+        # bass-management redirect lands on muted DSP outputs. Per-driver
+        # batching keeps the CLI write count down. Always restore in finally.
+        if _peer_mute_records:
+            _peer_by_driver: dict[int, tuple[object, list[int]]] = {}
+            for drv, idx, _proc in _peer_mute_records:
+                slot = _peer_by_driver.setdefault(id(drv), (drv, []))
+                slot[1].append(idx)
+            for _drv, _idxs in _peer_by_driver.values():
+                await _drv.mute_outputs(_idxs)
+
+        try:
+            if route == "hdmi" and _drivers is not None and resolved_out_channel is None and sweep_volume_db is None:
+                # Standard sub/combined sweep: let the graph compose all processor
+                # contexts (Denon + CamillaDSP). Mains sweeps bypass this path
+                # because CamillaDSP's sweep context is not part of the mains chain.
+                async with graph.sweep_context_for_route(route, targets, cfg, _drivers):
+                    fr = await engine.measure(
+                        playback_device_override=cal_playback,
+                        freq_min=resolved_min,
+                        freq_max=resolved_max,
+                    )
+            elif route == "hdmi":
+                # Legacy path used when the driver registry isn't populated (older
+                # test setups that patch `_dsp` directly without the lifespan).
+                # Behaves exactly as before the graph refactor.
+                denon_ctx = DenonSweepContext.from_config(cfg, sweep_volume_override=sweep_volume_db)
+                if denon_ctx:
+                    async with denon_ctx:
+                        fr = await engine.measure(
+                            playback_device_override=cal_playback,
+                            freq_min=resolved_min,
+                            freq_max=resolved_max,
+                            out_channel_override=resolved_out_channel,
+                        )
+                else:
                     fr = await engine.measure(
                         playback_device_override=cal_playback,
                         freq_min=resolved_min,
@@ -4792,19 +4851,25 @@ async def _tool_trigger_measurement(
                         out_channel_override=resolved_out_channel,
                     )
             else:
-                fr = await engine.measure(
-                    playback_device_override=cal_playback,
-                    freq_min=resolved_min,
-                    freq_max=resolved_max,
-                    out_channel_override=resolved_out_channel,
-                )
-        else:
-            # USB mode keeps the persistent-session pattern so repeat
-            # measurements don't thrash the DSP source switch. The persistent
-            # session is equivalent to entering the DSP's sweep context once
-            # and holding it open across measurements.
-            await _ensure_sweep_session()
-            fr = await engine.measure(playback_device_override=cal_playback)
+                # USB mode keeps the persistent-session pattern so repeat
+                # measurements don't thrash the DSP source switch. The persistent
+                # session is equivalent to entering the DSP's sweep context once
+                # and holding it open across measurements.
+                await _ensure_sweep_session()
+                fr = await engine.measure(playback_device_override=cal_playback)
+        finally:
+            # Restore peer mute state on success AND failure — leaving peers
+            # muted after a sweep would silently break the next measurement.
+            if _peer_mute_records:
+                _peer_by_driver_unmute: dict[int, tuple[object, list[int]]] = {}
+                for drv, idx, _proc in _peer_mute_records:
+                    slot = _peer_by_driver_unmute.setdefault(id(drv), (drv, []))
+                    slot[1].append(idx)
+                for _drv, _idxs in _peer_by_driver_unmute.values():
+                    try:
+                        await _drv.unmute_outputs(_idxs)
+                    except Exception:
+                        log.exception("peer unmute failed for outputs %s", _idxs)
 
         # Compute IR-derived metadata at capture time. Query the DSP for the
         # current per-output FIR pre-delay so the onset detector can skip
@@ -8081,6 +8146,19 @@ _TOOLS: list[Tool] = [
                         "calibrated for subs)."
                     ),
                 },
+                "mute_peers": {
+                    "type": "boolean",
+                    "description": (
+                        "When true, mute every DSP-output transducer NOT in the "
+                        "resolved `target` set for the duration of the sweep, "
+                        "then restore. Prevents bass-management redirect "
+                        "contamination — e.g. a 'FL solo' sweep at 80 Hz "
+                        "crossover otherwise drives the subs in parallel via "
+                        "the AVR's LFE redirect, polluting the IR with sub-path "
+                        "latency. Requires `target` to be set. Default: false "
+                        "(backwards-compatible)."
+                    ),
+                },
             },
         },
     ),
@@ -10591,6 +10669,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             freq_max=(int(arguments["freq_max"]) if arguments.get("freq_max") is not None else None),
             sweep_channel=arguments.get("sweep_channel"),
             sweep_volume_db=(float(arguments["sweep_volume_db"]) if arguments.get("sweep_volume_db") is not None else None),
+            mute_peers=bool(arguments.get("mute_peers", False)),
         )
     elif name == "calibrate_level":
         result = await _tool_calibrate_level(

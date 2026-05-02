@@ -658,6 +658,212 @@ async def test_trigger_measurement_no_target_for_raw_capture() -> None:
     assert call_kwargs["target_curve"] is None
 
 
+# ── trigger_measurement: mute_peers (solo-cal contamination prevention) ────────
+
+def _mute_peers_setup():
+    """Build the shared graph + cfg + mock-driver fixture for mute_peers tests.
+
+    Layout mirrors the production rig: 2 mains (FL/FR on AVR), 2 subs and a
+    shaker on a single DSP. Solo-FL should mute everything except FL.
+    """
+    from calibrate.config import Config, DEFAULT_CONFIG
+    from calibrate.drivers.registry import DriverRegistry
+    from calibrate.graph import (
+        Processor, SignalGraph, SVS_PB12_NSD_PROFILE, Transducer,
+    )
+
+    graph = SignalGraph(
+        processors=(
+            Processor(name="avr", driver_ref="denon", kind="avr"),
+            Processor(name="dsp", driver_ref="minidsp", kind="dsp"),
+        ),
+        profiles=(SVS_PB12_NSD_PROFILE,),
+        transducers=(
+            Transducer(name="FL", role="main", processor_ref="avr",
+                       output_index=1, safety_profile_ref="svs_pb12_nsd"),
+            Transducer(name="FR", role="main", processor_ref="avr",
+                       output_index=2, safety_profile_ref="svs_pb12_nsd"),
+            Transducer(name="sub_l", role="sub", processor_ref="dsp",
+                       output_index=5, safety_profile_ref="svs_pb12_nsd"),
+            Transducer(name="sub_r", role="sub", processor_ref="dsp",
+                       output_index=6, safety_profile_ref="svs_pb12_nsd"),
+            Transducer(name="shaker", role="shaker", processor_ref="dsp",
+                       output_index=7, safety_profile_ref="svs_pb12_nsd"),
+        ),
+    )
+
+    cfg_data = {k: (dict(v) if isinstance(v, dict) else v)
+                for k, v in DEFAULT_CONFIG.items()}
+    cfg = Config(cfg_data)
+    cfg._signal_graph = graph  # type: ignore[attr-defined]
+
+    # Override the cached property by monkey-patching the descriptor: simplest is
+    # to wrap in a tiny stand-in object that exposes signal_graph + measurement.
+    class _CfgShim:
+        signal_graph = graph
+        measurement = cfg.measurement
+        mic = cfg.mic
+
+    avr = AsyncMock()
+    avr.mute_outputs = AsyncMock()
+    avr.unmute_outputs = AsyncMock()
+    dsp = AsyncMock()
+    dsp.mute_outputs = AsyncMock()
+    dsp.unmute_outputs = AsyncMock()
+    registry = DriverRegistry(drivers={"avr": avr, "dsp": dsp})
+
+    return _CfgShim(), registry, avr, dsp
+
+
+@pytest.mark.asyncio
+async def test_measure_with_mute_peers_mutes_non_target_outputs() -> None:
+    """target='FL' + mute_peers=True → subs (5,6) and shaker (7) muted; FL not."""
+    cfg_shim, registry, avr, dsp = _mute_peers_setup()
+
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(return_value=MagicMock())
+    mock_store = MagicMock()
+    mock_store.save_measurement.return_value = 11
+
+    mock_sd = MagicMock()
+    mock_sd.query_devices.return_value = [
+        {"name": "UMIK-1", "max_input_channels": 1}
+    ]
+
+    with (
+        patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement.compute_session_metadata",
+              return_value={"ir": {}}),
+        patch("calibrate.storage.SessionStore", return_value=mock_store),
+        patch.object(sut, "DenonSweepContext") as MockCtx,
+        patch("calibrate.drivers.minidsp.MinidspSweepContext") as MockMinidspCtx,
+        patch.object(sut, "_config", return_value=cfg_shim),
+        patch.object(sut, "_drivers", registry),
+    ):
+        MockCtx.from_config.return_value = None
+        MockMinidspCtx.from_config.return_value = None
+        result = await _tool_trigger_measurement(target="FL", mute_peers=True)
+
+    assert result["ok"], result
+    # FR + shaker outputs on the DSP get muted (5, 6, 7) — order doesn't matter.
+    dsp.mute_outputs.assert_awaited_once()
+    muted_idxs = sorted(dsp.mute_outputs.await_args.args[0])
+    assert muted_idxs == [5, 6, 7]
+    # FR (avr output 2) is the only remaining peer; FL itself is the target.
+    avr.mute_outputs.assert_awaited_once()
+    avr_muted = sorted(avr.mute_outputs.await_args.args[0])
+    assert avr_muted == [2]
+    # Verify FL (output 1) was NOT muted.
+    assert 1 not in avr_muted
+
+
+@pytest.mark.asyncio
+async def test_measure_with_mute_peers_restores_state_on_success() -> None:
+    """Successful sweep → unmute called for the same outputs that were muted."""
+    cfg_shim, registry, avr, dsp = _mute_peers_setup()
+
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(return_value=MagicMock())
+    mock_store = MagicMock()
+    mock_store.save_measurement.return_value = 12
+
+    mock_sd = MagicMock()
+    mock_sd.query_devices.return_value = [
+        {"name": "UMIK-1", "max_input_channels": 1}
+    ]
+
+    with (
+        patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement.compute_session_metadata",
+              return_value={"ir": {}}),
+        patch("calibrate.storage.SessionStore", return_value=mock_store),
+        patch.object(sut, "DenonSweepContext") as MockCtx,
+        patch("calibrate.drivers.minidsp.MinidspSweepContext") as MockMinidspCtx,
+        patch.object(sut, "_config", return_value=cfg_shim),
+        patch.object(sut, "_drivers", registry),
+    ):
+        MockCtx.from_config.return_value = None
+        MockMinidspCtx.from_config.return_value = None
+        result = await _tool_trigger_measurement(target="FL", mute_peers=True)
+
+    assert result["ok"], result
+    dsp.unmute_outputs.assert_awaited_once()
+    avr.unmute_outputs.assert_awaited_once()
+    assert sorted(dsp.unmute_outputs.await_args.args[0]) == [5, 6, 7]
+    assert sorted(avr.unmute_outputs.await_args.args[0]) == [2]
+
+
+@pytest.mark.asyncio
+async def test_measure_with_mute_peers_restores_state_on_failure() -> None:
+    """Sweep failure → peers still unmuted via finally."""
+    cfg_shim, registry, avr, dsp = _mute_peers_setup()
+
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(side_effect=RuntimeError("boom"))
+
+    mock_sd = MagicMock()
+    mock_sd.query_devices.return_value = [
+        {"name": "UMIK-1", "max_input_channels": 1}
+    ]
+
+    with (
+        patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch.object(sut, "DenonSweepContext") as MockCtx,
+        patch("calibrate.drivers.minidsp.MinidspSweepContext") as MockMinidspCtx,
+        patch.object(sut, "_config", return_value=cfg_shim),
+        patch.object(sut, "_drivers", registry),
+    ):
+        MockCtx.from_config.return_value = None
+        MockMinidspCtx.from_config.return_value = None
+        result = await _tool_trigger_measurement(target="FL", mute_peers=True)
+
+    assert not result["ok"]
+    # Peers must STILL be unmuted even though the sweep raised — leaving them
+    # muted would silently break the next measurement.
+    dsp.unmute_outputs.assert_awaited_once()
+    avr.unmute_outputs.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_measure_without_mute_peers_does_not_mute() -> None:
+    """Default mute_peers=False → no mute calls; backwards-compatible behaviour."""
+    cfg_shim, registry, avr, dsp = _mute_peers_setup()
+
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(return_value=MagicMock())
+    mock_store = MagicMock()
+    mock_store.save_measurement.return_value = 13
+
+    mock_sd = MagicMock()
+    mock_sd.query_devices.return_value = [
+        {"name": "UMIK-1", "max_input_channels": 1}
+    ]
+
+    with (
+        patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement.compute_session_metadata",
+              return_value={"ir": {}}),
+        patch("calibrate.storage.SessionStore", return_value=mock_store),
+        patch.object(sut, "DenonSweepContext") as MockCtx,
+        patch("calibrate.drivers.minidsp.MinidspSweepContext") as MockMinidspCtx,
+        patch.object(sut, "_config", return_value=cfg_shim),
+        patch.object(sut, "_drivers", registry),
+    ):
+        MockCtx.from_config.return_value = None
+        MockMinidspCtx.from_config.return_value = None
+        result = await _tool_trigger_measurement(target="FL")  # default False
+
+    assert result["ok"], result
+    dsp.mute_outputs.assert_not_awaited()
+    dsp.unmute_outputs.assert_not_awaited()
+    avr.mute_outputs.assert_not_awaited()
+    avr.unmute_outputs.assert_not_awaited()
+
+
 # ── calibrate_level ────────────────────────────────────────────────────────────
 
 def _make_fr(spl_db: float) -> MagicMock:
