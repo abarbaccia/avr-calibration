@@ -319,6 +319,7 @@ class CamillaDSPDriver(DSPDriver):
         cal_lfe_input_channel: int | None = None,
         cal_playback_device: str | None = None,
         routed_outputs: list[int] | None = None,
+        queuelimit: int | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -366,6 +367,7 @@ class CamillaDSPDriver(DSPDriver):
             self._capture_samplerate = None
             self._resampler = None
         self._chunksize = chunksize
+        self._queuelimit = int(queuelimit) if queuelimit is not None else None
         self._capture_device = dict(capture_device) if capture_device else dict(_DEFAULT_CAPTURE_DEVICE)
         self._playback_device = dict(playback_device) if playback_device else dict(_DEFAULT_PLAYBACK_DEVICE)
         # Keep the declared device channel counts aligned with the driver's
@@ -867,6 +869,8 @@ class CamillaDSPDriver(DSPDriver):
             devices["capture_samplerate"] = self._capture_samplerate
         if self._resampler is not None:
             devices["resampler"] = dict(self._resampler)
+        if self._queuelimit is not None:
+            devices["queuelimit"] = self._queuelimit
         return {
             "devices": devices,
             "filters": self._build_filters(),
