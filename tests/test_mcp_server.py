@@ -7466,3 +7466,137 @@ async def test_save_run_with_goal_and_outcome(lesson_store) -> None:
     assert detail["goal"].startswith("shorten 45")
     assert detail["hypothesis"].startswith("modal FIR")
     assert detail["outcome"].startswith("delivered 1.5")
+
+
+# ── push_avr_speaker_layout (full-envelope safe path) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_push_avr_speaker_layout_calls_full_envelope_from_ady(tmp_path) -> None:
+    """The MCP tool reads the .ady, applies overrides, and dispatches through
+    the new safe push_full_envelope_from_ady path (not the deprecated bare
+    use_custom path)."""
+    import json as _json
+    from calibrate.mcp_server import _tool_push_avr_speaker_layout
+
+    ady = {
+        "enAmpAssignType": 0,
+        "ampAssignInfo": "0" * 96,
+        "detectedChannels": [
+            {"commandId": "FL", "customDistance": 4.0,
+             "customSpeakerType": "S", "customCrossover": 80, "trimAdjustment": 0},
+            {"commandId": "C", "customDistance": 3.5,
+             "customSpeakerType": "S", "customCrossover": 80, "trimAdjustment": 0},
+            {"commandId": "SW1", "customDistance": 2.5,
+             "customSpeakerType": "", "customCrossover": 0, "trimAdjustment": 0},
+        ],
+    }
+    p = tmp_path / "test.ady"
+    p.write_text(_json.dumps(ady))
+
+    mock_avr = MagicMock()
+    mock_avr._host = "192.168.1.209"
+
+    with patch("calibrate.mcp_server._avr", mock_avr), \
+         patch("calibrate.drivers.denon.audyssey_tcp.push_full_envelope_from_ady",
+               new=AsyncMock(return_value=True)) as mock_push:
+        result = await _tool_push_avr_speaker_layout(
+            ady_path=str(p),
+            distance_overrides_m={"SW1": 17.91},
+            commit=True,
+        )
+
+    assert result["ok"]
+    assert result["applied"] is True
+    assert result["committed"] is True
+    assert sorted(result["channels_in_envelope"]) == ["C", "FL", "SW1"]
+    mock_push.assert_awaited_once()
+    kwargs = mock_push.await_args.kwargs
+    assert kwargs["host"] == "192.168.1.209"
+    assert kwargs["ady"]["detectedChannels"][2]["commandId"] == "SW1"
+    assert kwargs["distance_overrides_m"] == {"SW1": 17.91}
+    assert kwargs["commit"] is True
+
+
+@pytest.mark.asyncio
+async def test_push_avr_speaker_layout_reports_partial_on_nack(tmp_path) -> None:
+    """If the underlying push returns False (NACK aborted before Fin), the
+    MCP tool surfaces applied=False and a clear partial-state message."""
+    import json as _json
+    from calibrate.mcp_server import _tool_push_avr_speaker_layout
+
+    ady = {
+        "enAmpAssignType": 0, "ampAssignInfo": "0" * 96,
+        "detectedChannels": [
+            {"commandId": "FL", "customDistance": 4.0,
+             "customSpeakerType": "S", "customCrossover": 80, "trimAdjustment": 0},
+        ],
+    }
+    p = tmp_path / "test.ady"
+    p.write_text(_json.dumps(ady))
+
+    mock_avr = MagicMock()
+    mock_avr._host = "192.168.1.209"
+
+    with patch("calibrate.mcp_server._avr", mock_avr), \
+         patch("calibrate.drivers.denon.audyssey_tcp.push_full_envelope_from_ady",
+               new=AsyncMock(return_value=False)):
+        result = await _tool_push_avr_speaker_layout(
+            ady_path=str(p), commit=True,
+        )
+
+    assert result["ok"]
+    assert result["applied"] is False
+    assert result["committed"] is False
+    assert "PARTIAL" in result["message"]
+    assert "Fin NOT sent" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_push_avr_speaker_layout_rejects_missing_ady(tmp_path) -> None:
+    from calibrate.mcp_server import _tool_push_avr_speaker_layout
+    mock_avr = MagicMock(_host="192.168.1.209")
+    with patch("calibrate.mcp_server._avr", mock_avr):
+        result = await _tool_push_avr_speaker_layout(
+            ady_path=str(tmp_path / "nope.ady"),
+        )
+    assert not result["ok"]
+    assert "not found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_push_avr_speaker_layout_rejects_empty_ady(tmp_path) -> None:
+    """An .ady without detectedChannels can't build an envelope — fail loudly."""
+    import json as _json
+    from calibrate.mcp_server import _tool_push_avr_speaker_layout
+    p = tmp_path / "empty.ady"
+    p.write_text(_json.dumps({"detectedChannels": [], "ampAssignInfo": ""}))
+    mock_avr = MagicMock(_host="192.168.1.209")
+    with patch("calibrate.mcp_server._avr", mock_avr):
+        result = await _tool_push_avr_speaker_layout(ady_path=str(p))
+    assert not result["ok"]
+    assert "no detectedChannels" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_set_speaker_distances_use_custom_surfaces_deprecation_error() -> None:
+    """The MCP tool layer for the OLD path: when use_custom=True, the
+    underlying audyssey_tcp.push_speaker_distances raises a deprecation
+    DriverError; the MCP tool must surface it as ok=False with a clear error."""
+    from calibrate.mcp_server import _tool_set_speaker_distances
+
+    class _RealAvrLikeDriver:
+        async def set_speaker_distances(self, channel_distances_m, *, n_positions=1, commit=False, use_custom=False):
+            from calibrate.drivers.denon.audyssey_tcp import push_speaker_distances
+            await push_speaker_distances(
+                "192.168.1.209", channel_distances_m,
+                n_positions=n_positions, commit=commit, use_custom=use_custom,
+            )
+
+    with patch("calibrate.mcp_server._avr", _RealAvrLikeDriver()):
+        result = await _tool_set_speaker_distances(
+            distances={"SW1": 17.91}, commit=True, use_custom=True,
+        )
+    assert not result["ok"]
+    assert "deprecated" in result["error"].lower()
+    assert "push_full_envelope_from_ady" in result["error"]

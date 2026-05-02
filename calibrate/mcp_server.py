@@ -4286,6 +4286,94 @@ async def _tool_set_speaker_distances(
     )
 
 
+async def _tool_push_avr_speaker_layout(
+    ady_path: str,
+    distance_overrides_m: dict[str, float] | None = None,
+    commit: bool = False,
+) -> dict:
+    """Push the full Audyssey envelope (all detected channels) from an .ady file.
+
+    SAFE replacement for ``set_speaker_distances(use_custom=True)`` — the bare
+    envelope path was deprecated 2026-05-02 because it wipes speaker presence
+    on Fin commit. This tool sends the complete A1Evo-format envelope split
+    across ≤510-byte packets, preserving every detected channel atomically.
+    Aborts before Fin if any preceding SET_SETDAT NACKs.
+
+    Use cases:
+      - Recover a corrupted AVR speaker layout from a known-good .ady
+      - Push SW1 distance to compensate for sub-chain FIR latency without
+        wiping the rest of the speaker config
+      - Atomic re-establishment of speaker layout + distance trim in one write
+
+    Args:
+        ady_path: Path to a parsed Audyssey backup (.ady) file. The file's
+            ``detectedChannels`` and ``ampAssignInfo`` are the canonical source
+            of layout truth; pushing them re-establishes whatever channels the
+            AVR may have lost.
+        distance_overrides_m: Optional per-channel distance overrides in meters,
+            e.g. ``{"SW1": 17.91}`` to push the sub forward to compensate for a
+            45 ms FIR pre-delay. Other channels keep their .ady values.
+        commit: When True, sends ``AudyFinFlg=Fin`` to persist to NVRAM. When
+            False, the changes are volatile (lost on AVR power cycle).
+
+    Signal-path-write rule applies — recipes/agents MUST get explicit user
+    confirmation before calling with ``commit=True``.
+    """
+    import json as _json
+    if _avr is None:
+        return _err("no AVR driver loaded")
+    if not hasattr(_avr, "_host") or not getattr(_avr, "_host", None):
+        return _err("AVR driver has no host configured")
+    try:
+        with open(ady_path) as f:
+            ady = _json.load(f)
+    except FileNotFoundError:
+        return _err(f"ady file not found: {ady_path!r}")
+    except _json.JSONDecodeError as exc:
+        return _err(f"ady file is not valid JSON: {exc}")
+    detected = ady.get("detectedChannels", [])
+    if not detected:
+        return _err(
+            f"ady file at {ady_path!r} has no detectedChannels — cannot build "
+            "envelope. Verify the file is a real Audyssey backup."
+        )
+    overrides = dict(distance_overrides_m or {})
+    try:
+        from .drivers.denon import audyssey_tcp
+        ok = await audyssey_tcp.push_full_envelope_from_ady(
+            host=_avr._host,  # type: ignore[attr-defined]
+            ady=ady,
+            distance_overrides_m=overrides,
+            commit=bool(commit),
+        )
+    except Exception as exc:
+        return _err(f"audyssey full-envelope push failed: {exc}")
+
+    channels = sorted({c["commandId"] for c in detected if c.get("commandId")})
+    parts = [
+        f"{'Pushed' if ok else 'PARTIAL — SET_SETDAT NACKd, Fin NOT sent'} full "
+        f"envelope ({len(channels)} channels: {channels}).",
+    ]
+    if overrides:
+        parts.append(
+            "Distance overrides: "
+            + ", ".join(f"{ch}={m:.2f}m" for ch, m in overrides.items())
+            + "."
+        )
+    if ok and commit:
+        parts.append("Persisted to NVRAM.")
+    elif ok and not commit:
+        parts.append("Volatile — pass commit=True to persist.")
+    return _ok(
+        applied=ok,
+        committed=bool(commit) and ok,
+        channels_in_envelope=channels,
+        distance_overrides_m=overrides,
+        ady_path=ady_path,
+        message=" ".join(parts),
+    )
+
+
 # ── Audyssey FIR upload ────────────────────────────────────────────────
 # Module-level cache of AVR-format polyphase-decimated coefficient vectors.
 # Keyed by (cache_key, channel_id) → list[float] of length 1024 (speaker)
@@ -7685,25 +7773,70 @@ _TOOLS: list[Tool] = [
                 "use_custom": {
                     "type": "boolean",
                     "description": (
-                        "When true, uses the OCA-style envelope bypass: payload "
-                        "is {Distance, AudyFinFlg=NotFin}, followed by an explicit "
-                        "AudyFinFlg=Fin commit before EXIT_AUDMD. Verified to "
-                        "extend the firmware applied-delay cap from ~38 ms (UI "
-                        "limit) to ~55 ms (envelope limit) on X3800H. ``commit`` "
-                        "is forced to True when this is set — the Fin commit IS "
-                        "the bypass mechanism. CRITICAL: caller must NOT enter "
-                        "Manual Setup > Distances on the AVR after pushing — "
-                        "that re-validates and snaps back to the 6 m cap. "
-                        "Side effect: minimal envelope (Distance + NotFin only) "
-                        "doesn't carry MultEQ EQ params, so the AVR may apply "
-                        "defaults for AudyMultEq/AudyEqRef/AudyEqSet on commit, "
-                        "drifting mains FR by ±5-10 dB in mids. For full-state "
-                        "preservation see scripts/audyssey_push_full_envelope.py."
+                        "DEPRECATED — raises an error. The OCA-style envelope "
+                        "bypass (Distance + AudyFinFlg=NotFin → Fin) corrupts "
+                        "the speaker layout on commit (verified twice in May "
+                        "2026: surrounds wiped 2026-04-30, heights wiped "
+                        "2026-05-02). Use push_avr_speaker_layout instead, "
+                        "passing a .ady file path and distance_overrides_m."
                     ),
                     "default": False,
                 },
             },
             "required": ["distances"],
+        },
+    ),
+    Tool(
+        name="push_avr_speaker_layout",
+        description=(
+            "Push the FULL Audyssey envelope (every detected channel) from a "
+            ".ady backup, optionally overriding specific distances. SAFE "
+            "replacement for set_speaker_distances(use_custom=True) — the bare "
+            "envelope path was deprecated 2026-05-02 because it wipes speaker "
+            "presence on Fin commit. This tool sends the complete A1Evo-format "
+            "envelope split across ≤510-byte packets, preserving every detected "
+            "channel atomically. Aborts before Fin if any preceding SET_SETDAT "
+            "NACKs. "
+            "Use cases: (1) recover a corrupted speaker layout from a known-good "
+            ".ady, (2) push SW1 distance to compensate for sub-chain FIR latency "
+            "without wiping the rest of the layout, (3) atomic re-establishment "
+            "of speaker config + distance trim in one write. "
+            "REQUIRES EXPLICIT USER CONFIRMATION before calling with commit=True."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "ady_path": {
+                    "type": "string",
+                    "description": (
+                        "Path to a parsed Audyssey backup (.ady) file on the "
+                        "container's filesystem. The file's detectedChannels "
+                        "and ampAssignInfo are the canonical source of layout "
+                        "truth. Pushing them re-establishes whatever channels "
+                        "the AVR may have lost via prior bad pushes."
+                    ),
+                },
+                "distance_overrides_m": {
+                    "type": "object",
+                    "description": (
+                        "Optional per-channel distance overrides in METERS "
+                        "(e.g. {\"SW1\": 17.91} for sub-chain FIR-latency "
+                        "compensation). Keys are Audyssey commandIds (FL, C, "
+                        "FR, SLA, SRA, TFL, TFR, TRL, TRR, SBL, SBR, SW1-SW4). "
+                        "Channels not listed here keep their .ady distance values."
+                    ),
+                    "additionalProperties": {"type": "number"},
+                },
+                "commit": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, send AudyFinFlg=Fin to persist to NVRAM. "
+                        "If false (default), changes are volatile."
+                    ),
+                    "default": False,
+                },
+            },
+            "required": ["ady_path"],
         },
     ),
     Tool(
@@ -10393,6 +10526,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         )
     elif name in ("set_volume", "avr_set_volume", "set_denon_volume"):
         result = await _tool_avr_set_volume(float(arguments["level_db"]))
+    elif name == "push_avr_speaker_layout":
+        result = await _tool_push_avr_speaker_layout(
+            ady_path=str(arguments["ady_path"]),
+            distance_overrides_m=arguments.get("distance_overrides_m"),
+            commit=bool(arguments.get("commit", False)),
+        )
     elif name == "set_speaker_distances":
         result = await _tool_set_speaker_distances(
             distances=dict(arguments["distances"]),

@@ -33,6 +33,8 @@ import struct
 import time
 from typing import Mapping
 
+from ..base import DriverError
+
 # Empirically measured on Denon X3800H. Two distinct ceilings depending on
 # whether the OCA-style envelope bypass is used:
 #   - Standard ``Distance``-only writes: ~38 ms applied delay variance,
@@ -590,7 +592,13 @@ async def push_speaker_distances(
     EXIT_AUDMD and clamps the applied delay to the firmware variance cap
     (~38 ms / 6 m on X3800H).
 
-    With ``use_custom=True``, uses the verified bypass: payload is
+    ``use_custom=True`` is **DEPRECATED** — it raises ``DriverError``.
+    The bare envelope does extend the applied-delay cap to ~55 ms but
+    wipes the speaker layout on Fin commit (verified twice in May 2026).
+    Use ``push_full_envelope_from_ady()`` instead — it sends a complete
+    A1Evo-format envelope that preserves every detected channel atomically.
+
+    Historical context: ``use_custom`` was the verified bypass: payload is
     ``{"Distance": [...], "AudyFinFlg": "NotFin"}``, followed by an
     explicit ``{"AudyFinFlg":"Fin"}`` commit before EXIT_AUDMD. The
     firmware accepts the larger Distance values; applied delay extends
@@ -610,12 +618,19 @@ async def push_speaker_distances(
     "signal-path-writes need human approval" rule.
     """
     if use_custom:
-        payload = build_envelope_distance_payload(
-            channel_distances_m, n_positions=n_positions
+        # The bare Distance + AudyFinFlg=NotFin → Fin envelope DOES extend
+        # the applied-delay cap, but unmentioned fields (SpConfig, ChLevel,
+        # etc.) get reset to firmware defaults on Fin commit. That's how the
+        # X3800H lost its surrounds 2026-04-30 and heights 2026-05-02. Use
+        # ``push_full_envelope_from_ady()`` instead — it sends the full
+        # A1Evo-format envelope split across ≤510B packets, which preserves
+        # every detected channel atomically.
+        raise DriverError(
+            "push_speaker_distances(use_custom=True) is deprecated — it wipes "
+            "speaker layout on commit. Use push_full_envelope_from_ady() instead, "
+            "passing a parsed .ady file. See PR #144 for details."
         )
-        commit = True  # NotFin envelope requires Fin commit to bypass the cap
-    else:
-        payload = build_distance_payload(channel_distances_m, n_positions=n_positions)
+    payload = build_distance_payload(channel_distances_m, n_positions=n_positions)
     await asyncio.get_running_loop().run_in_executor(
         None,
         _push_sync,
