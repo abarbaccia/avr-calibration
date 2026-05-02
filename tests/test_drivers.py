@@ -1148,6 +1148,86 @@ def test_camilladsp_is_a_dsp_driver() -> None:
     assert isinstance(driver, _DSPDriverBase)
 
 
+def test_camilladsp_init_routes_all_routed_outputs_not_just_subs() -> None:
+    """Regression for 2026-05-02: shaker (output 7) was silent on every
+    container restart because initial routing was keyed off sub_outputs
+    only. Driver must accept a wider routed_outputs list and apply it.
+    """
+    driver = CamillaDSPDriver(
+        sub_outputs=[5, 6],
+        routed_outputs=[5, 6, 7],   # subs + shaker
+        output_channels=10,
+    )
+    # input 0 → 5, 6, 7 enabled; everything else disabled.
+    row = driver._routing[0]
+    assert row[5] is True
+    assert row[6] is True
+    assert row[7] is True
+    assert row[0] is False
+    assert row[8] is False
+    # _sub_outputs preserved for sub-only operations (default FIR-clear
+    # target etc.) — the shaker is NOT a sub.
+    assert driver._sub_outputs == [5, 6]
+
+
+def test_camilladsp_init_routed_outputs_defaults_to_sub_outputs() -> None:
+    """Back-compat: omitting routed_outputs falls back to sub_outputs so
+    legacy callers (tests, older configs) still work."""
+    driver = CamillaDSPDriver(sub_outputs=[5, 6], output_channels=8)
+    row = driver._routing[0]
+    assert row[5] is True
+    assert row[6] is True
+    assert row[7] is False  # shaker would be silent here — back-compat
+
+
+def test_make_camilladsp_routes_shaker_from_signal_graph(tmp_path) -> None:
+    """The registry must walk the signal_graph and pass every transducer
+    output (subs + shaker) into routed_outputs — closes the loop end-to-end."""
+    import yaml
+    from calibrate.config import Config
+    from calibrate.drivers.registry import _make_camilladsp
+
+    cfg_data = {
+        "avr_driver": "denon",
+        "dsp_driver": "camilladsp",
+        "denon": {"host": "127.0.0.1"},
+        "camilladsp": {
+            "host": "127.0.0.1", "port": 1234,
+            "input_channels": 2, "output_channels": 10,
+            "samplerate": 48_000, "chunksize": 1024,
+        },
+        "signal_graph": {
+            "sources": [{"name": "lfe", "type": "analog"}],
+            "processors": [
+                {"name": "denon", "driver_ref": "denon", "kind": "avr"},
+                {"name": "camilla", "driver_ref": "camilladsp", "kind": "dsp",
+                 "outputs": [str(i) for i in range(10)]},
+            ],
+            "transducers": [
+                {"name": "sub_a", "role": "sub", "processor_ref": "camilla",
+                 "output_index": 5, "safety_profile_ref": "svs_pb12_nsd"},
+                {"name": "sub_b", "role": "sub", "processor_ref": "camilla",
+                 "output_index": 6, "safety_profile_ref": "svs_pb12_nsd"},
+                {"name": "shaker_a", "role": "shaker", "processor_ref": "camilla",
+                 "output_index": 7, "safety_profile_ref": "svs_pb12_nsd"},
+            ],
+            "profiles": [
+                {"name": "svs_pb12_nsd", "min_boost_freq_hz": 25,
+                 "max_boost_per_band_db": 6, "max_cumulative_boost_db": 9,
+                 "hpf_freq_hz": 18, "hpf_order": 4},
+            ],
+        },
+    }
+    cfg = Config(cfg_data)
+    proc = next(p for p in cfg.signal_graph.processors if p.kind == "dsp")
+    driver = _make_camilladsp(cfg, proc)
+    row = driver._routing[0]
+    # Subs AND shaker routed at init — no post-startup tool call needed.
+    assert row[5] is True, "sub_a not routed"
+    assert row[6] is True, "sub_b not routed"
+    assert row[7] is True, "shaker not routed — would silently drop on restart"
+
+
 def test_camilladsp_capabilities_reflect_single_pipeline_model() -> None:
     driver = CamillaDSPDriver(processing_rate=48_000)
     caps = driver.capabilities
