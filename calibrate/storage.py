@@ -203,6 +203,38 @@ CREATE TABLE IF NOT EXISTS active_dsp_state (
     timestamp   TEXT NOT NULL,
     data        TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS lessons (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      TEXT    NOT NULL,
+    run_id          INTEGER REFERENCES calibration_runs(id),
+    scope           TEXT    NOT NULL,
+    category        TEXT,
+    claim           TEXT    NOT NULL,
+    context         TEXT,
+    confidence      REAL    NOT NULL DEFAULT 0.7,
+    evidence        TEXT,
+    state_hash      TEXT,
+    target_curve    TEXT,
+    status          TEXT    NOT NULL DEFAULT 'active',
+    invalidated_at  TEXT,
+    invalidated_by  TEXT,
+    superseded_by   INTEGER REFERENCES lessons(id),
+    promoted_to     TEXT,
+    tags            TEXT
+);
+
+CREATE TABLE IF NOT EXISTS lesson_invalidators (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    lesson_id   INTEGER NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+    kind        TEXT    NOT NULL,
+    value       TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_lessons_status ON lessons(status);
+CREATE INDEX IF NOT EXISTS idx_lessons_scope ON lessons(scope);
+CREATE INDEX IF NOT EXISTS idx_lesson_inv_lesson ON lesson_invalidators(lesson_id);
+CREATE INDEX IF NOT EXISTS idx_lesson_inv_value ON lesson_invalidators(kind, value);
 """
 
 
@@ -308,6 +340,18 @@ class SessionStore:
             if "full_state_snapshot" not in run_cols:
                 conn.execute(
                     "ALTER TABLE calibration_runs ADD COLUMN full_state_snapshot TEXT DEFAULT NULL"
+                )
+            if "goal" not in run_cols:
+                conn.execute(
+                    "ALTER TABLE calibration_runs ADD COLUMN goal TEXT DEFAULT NULL"
+                )
+            if "hypothesis" not in run_cols:
+                conn.execute(
+                    "ALTER TABLE calibration_runs ADD COLUMN hypothesis TEXT DEFAULT NULL"
+                )
+            if "outcome" not in run_cols:
+                conn.execute(
+                    "ALTER TABLE calibration_runs ADD COLUMN outcome TEXT DEFAULT NULL"
                 )
 
             iter_cols = {row[1] for row in conn.execute("PRAGMA table_info(calibration_iterations)")}
@@ -543,6 +587,8 @@ class SessionStore:
         target: str,
         device_state: dict | None = None,
         run_type: str = "calibration",
+        goal: str | None = None,
+        hypothesis: str | None = None,
     ) -> int:
         """Create a new calibration run record. Returns the run id.
 
@@ -558,9 +604,10 @@ class SessionStore:
         with self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO calibration_runs"
-                " (timestamp, recipe_name, target, device_state, run_type, full_state_snapshot)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (ts, recipe_name, target, ds_json, run_type, snapshot),
+                " (timestamp, recipe_name, target, device_state, run_type,"
+                "  full_state_snapshot, goal, hypothesis)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts, recipe_name, target, ds_json, run_type, snapshot, goal, hypothesis),
             )
             return cur.lastrowid
 
@@ -574,23 +621,39 @@ class SessionStore:
         error: str = "",
         target_curve_data: dict | None = None,
         sessions: list[dict] | None = None,
+        outcome: str | None = None,
     ) -> None:
         """Update a calibration run with final results.
 
         *sessions* is a list of {"session_id": N, "label": "..."} dicts for
         validation runs that record multiple measurement sessions.
+
+        *outcome* is a free-form prose summary of what actually happened —
+        especially how the result compared to the run's hypothesis. Used by
+        the lessons system as the seed for record_lesson().
         """
         snapshot = self.snapshot_full_dsp_state()
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE calibration_runs"
-                " SET converged=?, iterations_run=?, baseline_rms=?, final_rms=?, error=?,"
-                "     target_curve_data=?, sessions=?, full_state_snapshot=?"
-                " WHERE id=?",
-                (int(converged), iterations_run, baseline_rms, final_rms, error or None,
-                 json.dumps(target_curve_data) if target_curve_data else None,
-                 json.dumps(sessions) if sessions else None, snapshot, run_id),
-            )
+            if outcome is not None:
+                conn.execute(
+                    "UPDATE calibration_runs"
+                    " SET converged=?, iterations_run=?, baseline_rms=?, final_rms=?, error=?,"
+                    "     target_curve_data=?, sessions=?, full_state_snapshot=?, outcome=?"
+                    " WHERE id=?",
+                    (int(converged), iterations_run, baseline_rms, final_rms, error or None,
+                     json.dumps(target_curve_data) if target_curve_data else None,
+                     json.dumps(sessions) if sessions else None, snapshot, outcome, run_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE calibration_runs"
+                    " SET converged=?, iterations_run=?, baseline_rms=?, final_rms=?, error=?,"
+                    "     target_curve_data=?, sessions=?, full_state_snapshot=?"
+                    " WHERE id=?",
+                    (int(converged), iterations_run, baseline_rms, final_rms, error or None,
+                     json.dumps(target_curve_data) if target_curve_data else None,
+                     json.dumps(sessions) if sessions else None, snapshot, run_id),
+                )
 
     def save_iteration(
         self,
@@ -799,6 +862,229 @@ class SessionStore:
         the latest active_dsp_state (which is overwritten per-key).
         """
         return json.dumps(self.get_active_dsp())
+
+    def state_hash(self) -> str:
+        """SHA-256 of the current active DSP state — stamps lessons for invalidation.
+
+        Two lessons recorded with different state_hashes describe different
+        physical DSP states; if any field changed (delay, polarity, EQ filter,
+        gain), the hash changes.
+        """
+        import hashlib
+        return hashlib.sha256(self.snapshot_full_dsp_state().encode()).hexdigest()
+
+    # ── Lessons ─────────────────────────────────────────────────────────────
+
+    def record_lesson(
+        self,
+        claim: str,
+        scope: str,
+        run_id: int | None = None,
+        category: str | None = None,
+        context: str | None = None,
+        confidence: float = 0.7,
+        evidence: dict | list | None = None,
+        target_curve: str | None = None,
+        tags: list[str] | None = None,
+        invalidators: list[dict] | None = None,
+    ) -> int:
+        """Record a lesson learned from a calibration run.
+
+        *scope*: ``"room"`` (specific to this room/hardware/state) or
+        ``"general"`` (universal acoustics/tooling rule — should be promoted
+        to codebase or memory and then marked promoted).
+
+        *invalidators*: list of ``{"kind": "...", "value": "..."}`` dicts.
+        ``kind`` is one of:
+          - ``"event"``      — fires when invalidate_lessons() is called with this value
+          - ``"state_hash"`` — lesson invalid once active DSP state hash changes
+          - ``"code"``       — lesson invalid once named code module/function changes
+
+        ``value`` is the event name (e.g. ``"sub_position_changed"``,
+        ``"target_curve_changed"``), the original state hash, or
+        ``"calibrate.modal_fir.design_modal_fir"`` for code anchors.
+        """
+        if scope not in ("room", "general"):
+            raise ValueError(f"scope must be 'room' or 'general', got {scope!r}")
+        now = datetime.now(timezone.utc).isoformat()
+        sh = self.state_hash()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO lessons"
+                " (created_at, run_id, scope, category, claim, context, confidence,"
+                "  evidence, state_hash, target_curve, tags)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    now, run_id, scope, category, claim, context, confidence,
+                    json.dumps(evidence) if evidence is not None else None,
+                    sh, target_curve,
+                    json.dumps(tags) if tags else None,
+                ),
+            )
+            lesson_id = cur.lastrowid
+            for inv in invalidators or []:
+                conn.execute(
+                    "INSERT INTO lesson_invalidators (lesson_id, kind, value)"
+                    " VALUES (?, ?, ?)",
+                    (lesson_id, inv["kind"], inv["value"]),
+                )
+            return lesson_id
+
+    def get_relevant_lessons(
+        self,
+        category: str | None = None,
+        tags: list[str] | None = None,
+        scope: str | None = None,
+        target_curve: str | None = None,
+        limit: int = 10,
+        include_invalidated: bool = False,
+    ) -> list[dict]:
+        """Return active lessons relevant to a planned action.
+
+        Ranking: confidence × recency. ``tags`` matches if ANY tag overlaps.
+        Pass ``include_invalidated=True`` for the audit trail; default returns
+        only ``status='active'`` lessons.
+        """
+        clauses: list[str] = []
+        params: list = []
+        if not include_invalidated:
+            clauses.append("status = 'active'")
+        if scope:
+            clauses.append("scope = ?")
+            params.append(scope)
+        if category:
+            clauses.append("category = ?")
+            params.append(category)
+        if target_curve:
+            clauses.append("(target_curve IS NULL OR target_curve = ?)")
+            params.append(target_curve)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = (
+            f"SELECT * FROM lessons {where} "
+            f"ORDER BY confidence DESC, created_at DESC LIMIT ?"
+        )
+        params.append(max(limit * 4, limit))  # over-fetch for tag filter
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            inv_rows = conn.execute(
+                "SELECT lesson_id, kind, value FROM lesson_invalidators"
+            ).fetchall()
+        invs_by_lesson: dict[int, list[dict]] = {}
+        for ir in inv_rows:
+            invs_by_lesson.setdefault(ir["lesson_id"], []).append(
+                {"kind": ir["kind"], "value": ir["value"]}
+            )
+        results: list[dict] = []
+        wanted_tags = set(tags or [])
+        for r in rows:
+            d = dict(r)
+            for col in ("evidence", "tags"):
+                if d.get(col):
+                    try:
+                        d[col] = json.loads(d[col])
+                    except (json.JSONDecodeError, TypeError):
+                        d[col] = None
+            if wanted_tags:
+                lesson_tags = set(d.get("tags") or [])
+                if not (wanted_tags & lesson_tags):
+                    continue
+            d["invalidators"] = invs_by_lesson.get(d["id"], [])
+            results.append(d)
+            if len(results) >= limit:
+                break
+        return results
+
+    def list_lessons(self, limit: int = 50, status: str | None = None) -> list[dict]:
+        """List lessons with optional status filter — for audit/review UIs."""
+        sql = "SELECT * FROM lessons"
+        params: list = []
+        if status:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            for col in ("evidence", "tags"):
+                if d.get(col):
+                    try:
+                        d[col] = json.loads(d[col])
+                    except (json.JSONDecodeError, TypeError):
+                        d[col] = None
+            out.append(d)
+        return out
+
+    def invalidate_lessons(
+        self,
+        events: list[str] | None = None,
+        codes: list[str] | None = None,
+        state_changed: bool = False,
+        reason: str | None = None,
+    ) -> list[int]:
+        """Mark lessons stale based on what changed.
+
+        - ``events``: event-kind invalidator values that fired (e.g.
+          ``["sub_position_changed", "target_curve_changed"]``).
+        - ``codes``: code-kind invalidator values for modules/functions that
+          were edited (e.g. ``["calibrate.modal_fir.design_modal_fir"]``).
+        - ``state_changed``: if True, any lesson whose ``state_hash`` differs
+          from the current store state_hash is invalidated.
+
+        Returns the list of invalidated lesson ids. Lessons stay in the DB
+        with ``status='invalidated'`` for the audit trail.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        invalidated: set[int] = set()
+        with self._connect() as conn:
+            triggers: list[tuple[str, str]] = []
+            for e in events or []:
+                triggers.append(("event", e))
+            for c in codes or []:
+                triggers.append(("code", c))
+            for kind, value in triggers:
+                rows = conn.execute(
+                    "SELECT DISTINCT lesson_id FROM lesson_invalidators"
+                    " WHERE kind=? AND value=?",
+                    (kind, value),
+                ).fetchall()
+                for r in rows:
+                    invalidated.add(r["lesson_id"])
+            if state_changed:
+                current = self.state_hash()
+                rows = conn.execute(
+                    "SELECT l.id FROM lessons l"
+                    " JOIN lesson_invalidators i ON i.lesson_id = l.id"
+                    " WHERE i.kind = 'state_hash' AND l.state_hash != ?",
+                    (current,),
+                ).fetchall()
+                for r in rows:
+                    invalidated.add(r["id"])
+            if invalidated:
+                placeholders = ",".join("?" * len(invalidated))
+                conn.execute(
+                    f"UPDATE lessons SET status='invalidated',"
+                    f" invalidated_at=?, invalidated_by=?"
+                    f" WHERE id IN ({placeholders}) AND status='active'",
+                    (now, reason or "auto", *invalidated),
+                )
+        return sorted(invalidated)
+
+    def promote_lesson(self, lesson_id: int, promoted_to: str) -> bool:
+        """Mark a general-scope lesson as promoted (codebase fix or memory file).
+
+        ``promoted_to`` is a free-form pointer like
+        ``"memory:feedback_xyz.md"`` or ``"code:calibrate/modal_fir.py:fix-X"``.
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE lessons SET status='promoted', promoted_to=?"
+                " WHERE id=? AND status='active'",
+                (promoted_to, lesson_id),
+            )
+            return cur.rowcount > 0
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 

@@ -58,6 +58,38 @@ Claude sees **actions** ("measure", "apply EQ"), not **hardware** ("set Denon in
 "POST to minidsp-rs"). The MCP server is a thin facade. Each tool handler is ~5 lines
 delegating to a plugin driver. Hardware protocol complexity stays in the drivers.
 
+### Lessons system — capture goal + learnings
+
+Each calibration run carries three short prose fields and produces ≤2 lessons.
+Avoids rediscovering documented issues across runs.
+
+| When | Tool | What |
+|---|---|---|
+| Run start | `save_calibration_run(goal, hypothesis)` | concrete measurable target + why this run should achieve it |
+| Phase start | `get_relevant_lessons(category, tags)` | pull prior lessons before designing filters / starting alignment |
+| Run end | `update_calibration_run(outcome)` | prose comparing actual to hypothesis |
+| Run end | `record_lesson(claim, scope, invalidators)` | one or two falsifiable claims |
+
+**Triage — `scope='general'` vs `scope='room'`:**
+- **general** = universal acoustics / tooling rule. Apply in any room. *Must* also be
+  promoted: open an issue, fix the codebase, or write a `memory/` file, then call
+  `promote_lesson` to mark it dealt with. Don't let general lessons accumulate in the DB.
+- **room** = depends on this room/hardware/state. Stays in DB until invalidated. Always
+  attach `invalidators` so the lesson stales out automatically when conditions change:
+  - `{"kind": "event", "value": "sub_position_changed"}` — fires via `invalidate_lessons`
+  - `{"kind": "event", "value": "target_curve_changed"}`
+  - `{"kind": "state_hash", "value": "_"}` — fires on any DSP state change
+  - `{"kind": "code", "value": "calibrate.modal_fir.design_modal_fir"}` — when that module is fixed
+
+**When to call `invalidate_lessons`:** subs physically moved, target curve replaced,
+a code module that lessons depend on was edited (`codes=[...]`), or any structural
+hardware change (`state_changed=True`).
+
+**Discipline — cap lessons-per-run at ~2** with confidence ≥ 0.5. Over-recording
+drowns the next pre-flight query in noise. A lesson should be falsifiable and
+specific: "PEQ cuts at 45 Hz delivered 1.5 dB at MLP because adjacent-band T60 > 300 ms"
+not "EQ is hard."
+
 ### LLM-first tool design — HARD RULE
 
 **Tools provide DATA and SIMULATION. The LLM provides JUDGMENT.**

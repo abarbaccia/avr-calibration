@@ -7369,3 +7369,100 @@ async def test_restore_listening_mode_handles_no_dsp_processor() -> None:
 
     assert not result["ok"]
     assert "no DSP processor" in result["error"]
+
+
+# ── Lessons system tools ────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def lesson_store(tmp_path):
+    """Real SessionStore on a tmp DB, patched in for lesson tool tests."""
+    from calibrate.storage import SessionStore
+    store = SessionStore(db_path=tmp_path / "lessons.db")
+    with patch("calibrate.storage.SessionStore", return_value=store):
+        yield store
+
+
+@pytest.mark.asyncio
+async def test_record_lesson_persists(lesson_store) -> None:
+    from calibrate.mcp_server import _tool_record_lesson
+    result = await _tool_record_lesson(
+        claim="PEQ cuts can't shorten T60 above 300 ms",
+        scope="general",
+        category="modal_correction",
+        confidence=0.9,
+        tags=["modal", "t60"],
+    )
+    assert result["ok"]
+    assert result["lesson_id"] > 0
+    rows = lesson_store.list_lessons()
+    assert rows[0]["claim"].startswith("PEQ cuts")
+
+
+@pytest.mark.asyncio
+async def test_record_lesson_invalid_scope(lesson_store) -> None:
+    from calibrate.mcp_server import _tool_record_lesson
+    result = await _tool_record_lesson(claim="x", scope="bogus")
+    assert not result["ok"]
+
+
+@pytest.mark.asyncio
+async def test_get_relevant_lessons_filters(lesson_store) -> None:
+    from calibrate.mcp_server import _tool_record_lesson, _tool_get_relevant_lessons
+    await _tool_record_lesson(claim="A", scope="room", tags=["45hz"])
+    await _tool_record_lesson(claim="B", scope="room", tags=["polarity"])
+    out = await _tool_get_relevant_lessons(tags=["45hz"])
+    assert out["ok"]
+    assert out["count"] == 1
+    assert out["lessons"][0]["claim"] == "A"
+
+
+@pytest.mark.asyncio
+async def test_invalidate_and_promote(lesson_store) -> None:
+    from calibrate.mcp_server import (
+        _tool_record_lesson, _tool_invalidate_lessons, _tool_promote_lesson,
+        _tool_get_relevant_lessons,
+    )
+    a = await _tool_record_lesson(
+        claim="depends on sub position",
+        scope="room",
+        invalidators=[{"kind": "event", "value": "sub_position_changed"}],
+    )
+    b = await _tool_record_lesson(claim="universal rule", scope="general")
+
+    inv = await _tool_invalidate_lessons(events=["sub_position_changed"])
+    assert inv["ok"] and a["lesson_id"] in inv["invalidated_ids"]
+
+    prom = await _tool_promote_lesson(
+        lesson_id=b["lesson_id"], promoted_to="memory:feedback_x.md",
+    )
+    assert prom["ok"]
+
+    active = await _tool_get_relevant_lessons()
+    assert active["count"] == 0  # one invalidated, one promoted
+
+
+@pytest.mark.asyncio
+async def test_save_run_with_goal_and_outcome(lesson_store) -> None:
+    from calibrate.mcp_server import (
+        _tool_save_calibration_run, _tool_update_calibration_run,
+    )
+    r = await _tool_save_calibration_run(
+        recipe_name="bass-calibration",
+        target="harman-bass",
+        goal="shorten 45 Hz T60 below 250 ms",
+        hypothesis="modal FIR Q=8 will deliver 4-6 dB at MLP",
+    )
+    assert r["ok"]
+    rid = r["run_id"]
+
+    upd = await _tool_update_calibration_run(
+        run_id=rid, converged=False, iterations_run=2,
+        outcome="delivered 1.5 dB; T60 capped the cut",
+    )
+    assert upd["ok"]
+
+    detail = lesson_store.get_run_detail(rid)
+    assert detail["goal"].startswith("shorten 45")
+    assert detail["hypothesis"].startswith("modal FIR")
+    assert detail["outcome"].startswith("delivered 1.5")
