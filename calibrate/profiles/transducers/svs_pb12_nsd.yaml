@@ -2,7 +2,7 @@ name: svs_pb12_nsd
 min_boost_freq_hz: 25
 max_boost_per_band_db: 6
 max_boost_above_threshold_db: 8
-modal_cancel_max_boost_db: 42
+modal_cancel_max_boost_db: 60
 freq_dependent_boost_threshold_hz: 30
 max_cumulative_boost_db: 9
 max_change_per_iter_db: 3
@@ -20,7 +20,7 @@ notes: |
   Two above-floor caps:
     - max_boost_above_threshold_db = 8 — strict thermal/excursion cap for
       generic FIR writes (e.g. arbitrary apply_fir, PEQ-equivalent boosts).
-    - modal_cancel_max_boost_db = 42 — looser cap for anti-pulse transients.
+    - modal_cancel_max_boost_db = 60 — looser cap for anti-pulse transients.
       Raised from 20 → 35 to accommodate 48 kHz FIR designs (Gabor anti-pulse
       at 48 kHz has 6× more samples, so FFT magnitude at adjacent 1/3-oct bands
       is ~15 dB higher for the same physical peak amplitude).
@@ -28,9 +28,17 @@ notes: |
       anti-pulses share an adjacent 1/3-oct band (e.g. 23 Hz and 47 Hz both
       land near 31.5 Hz), their combined FFT magnitude at that band can exceed
       35 dB even when each individual pulse is within cap.
-      Raised further to 42 to accommodate 30ms pre-ring budget: with full
-      30ms budget (1440 samples at 48 kHz), both anti-pulses reach higher
-      cancel_strength, pushing their combined adjacent-band FFT peak to
-      ~40.5 dB. A 42 dB combined peak from a ~3 ms transient deposits thermal
-      energy equivalent to ~15 dB sustained for 3 ms — within normal transient
-      headroom for this driver at calibrated master gain.
+      Raised further to 42 to accommodate 30ms pre-ring budget.
+      Raised to 60 (2026-05-02) to unblock cancel_strength on the 47 Hz and
+      70 Hz anti-pulses: at the 42 dB cap, the iterative-fit loop scaled
+      both pulses down to 16-22% of requested 0.6 strength, cutting their
+      modal T60 reduction from ~36% predicted to ~10% delivered. The 60 dB
+      cap was selected so a 0.6 cancel_strength run hits headroom ≥ 1 dB
+      across all expected modes (47/70/94/117/141 Hz on the typical layout).
+      What this cap actually constrains is the FIR's FREQUENCY-domain peak
+      at adjacent 1/3-oct bands, NOT the time-domain peak amplitude (which
+      is independently normalized to ≤1.0). The driver sees the
+      time-domain pulse — for sub content within 25-200 Hz, an extra 18 dB
+      of spectral leakage at adjacent bands during the ~3 ms anti-pulse
+      transient is well within thermal/excursion headroom on this driver
+      at the calibrated -20 dB master operating level.

@@ -6909,8 +6909,9 @@ def test_validate_fir_message_names_culprit_modes() -> None:
     sr = 8000
     n = 1024
     t = np.arange(n) / sr
-    # Strong narrow boost at 70 Hz; small carrier elsewhere.
-    fir = (3.0 * np.sin(2 * np.pi * 70.0 * t) * np.exp(-((t - n/2/sr) * 30)**2)
+    # Strong narrow boost at 70 Hz; small carrier elsewhere. Amplitude tuned
+    # to comfortably exceed the SVS PB12-NSD modal_cancel cap (60 dB).
+    fir = (30.0 * np.sin(2 * np.pi * 70.0 * t) * np.exp(-((t - n/2/sr) * 30)**2)
            ).astype(np.float32)
     fir[0] += 1.0  # impulse so we have a passband baseline
     validator = SafetyValidator()
