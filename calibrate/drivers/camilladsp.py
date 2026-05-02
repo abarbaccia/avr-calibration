@@ -318,10 +318,18 @@ class CamillaDSPDriver(DSPDriver):
         cal_capture_channels: int | None = None,
         cal_lfe_input_channel: int | None = None,
         cal_playback_device: str | None = None,
+        routed_outputs: list[int] | None = None,
     ) -> None:
         self._host = host
         self._port = port
         self._sub_outputs = sub_outputs or [0, 1]
+        # routed_outputs = every transducer output that should receive the
+        # LFE input on driver init. Distinct from _sub_outputs (which scopes
+        # sub-only operations like default FIR-clear targets) so the shaker
+        # and any future non-sub transducer also get default routing without
+        # being mistakenly treated as a sub. Falls back to _sub_outputs for
+        # back-compat with callers that don't supply the new param.
+        self._routed_outputs = list(routed_outputs) if routed_outputs is not None else list(self._sub_outputs)
         self._output_channels = output_channels
         self._input_channels = input_channels
         # capture_channels is the PHYSICAL channel count opened on the ALSA
@@ -387,17 +395,20 @@ class CamillaDSPDriver(DSPDriver):
         self._max_peq_slots = max_peq_slots
         self._client = _CamillaWSClient(host, port)
 
-        # Default routing: input 0 → configured sub_outputs only; everything
-        # else silent. Broadcasting a sweep to every 18i20 analog output at
-        # full gain would blast any wired main/tweeter, so the driver starts
-        # in the minimum safe state. Callers expand the routing explicitly
-        # via set_routing() (or during setup from a camilladsp.routing block).
+        # Default routing: input 0 → every transducer output declared by
+        # the signal graph (subs + shaker + future non-sub channels). Other
+        # outputs silent. Broadcasting a sweep to every 18i20 analog output
+        # at full gain would blast any wired main/tweeter, so the driver
+        # starts in the minimum safe state — but "minimum safe" must
+        # include the shaker, which used to be missing because routing was
+        # keyed off `sub_outputs` alone (that bug silenced the shaker on
+        # every container restart, fixed 2026-05-02).
         self._routing: dict[int, dict[int, bool]] = {
             inp: {out: False for out in range(output_channels)}
             for inp in range(input_channels)
         }
-        for out in self._sub_outputs:
-            self._routing[0][out] = True
+        for out in self._routed_outputs:
+            self._routing[0][int(out)] = True
 
         # Shadow state — each mutation rebuilds the pipeline from this.
         self._output_eq: dict[int, list[dict]] = {}   # output_index → filter specs

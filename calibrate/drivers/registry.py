@@ -162,10 +162,20 @@ def _make_camilladsp(config: Config, proc) -> CamillaDSPDriver:
     # the default "camilladsp" — useful when two CamillaDSP instances run on
     # different sockets. Falls back to the standard "camilladsp" key.
     cam = getattr(config, proc.config_key or "camilladsp", None) or config.camilladsp
+    # Route the LFE input to every transducer the signal graph places on
+    # this DSP processor — subs AND non-sub transducers like shakers. The
+    # legacy sub_outputs list only knows about subs, so on its own it
+    # silenced the shaker on every container restart (caught 2026-05-02).
+    routed_outputs = sorted({
+        int(t.output_index)
+        for t in config.signal_graph.transducers
+        if t.processor_ref == proc.name
+    })
     kwargs: dict = {
         "host": cam.get("host", "127.0.0.1"),
         "port": int(cam.get("port", 1234)),
         "sub_outputs": config.sub_outputs,
+        "routed_outputs": routed_outputs or list(config.sub_outputs),
         "output_channels": int(cam.get("output_channels", 10)),
         "input_channels": int(cam.get("input_channels", 2)),
         "processing_rate": int(cam.get("samplerate", 48_000)),
