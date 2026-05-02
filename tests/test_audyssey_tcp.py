@@ -277,6 +277,18 @@ def test_split_setdat_packets_preserves_canonical_order() -> None:
     assert seen_order == list(audyssey_tcp.DF_SETTING_DATA_PARAMETERS)
 
 
+def test_push_speaker_distances_use_custom_raises_deprecation() -> None:
+    """use_custom=True is deprecated 2026-05-02 — it wipes speaker layout
+    on Fin commit. Calling it must raise DriverError pointing at the new path."""
+    import asyncio
+    with pytest.raises(DriverError) as exc:
+        asyncio.run(audyssey_tcp.push_speaker_distances(
+            "192.168.1.209", {"SW1": 17.91}, use_custom=True,
+        ))
+    assert "deprecated" in str(exc.value).lower()
+    assert "push_full_envelope_from_ady" in str(exc.value)
+
+
 def test_push_full_envelope_sync_aborts_fin_on_setdat_nack() -> None:
     """Critical safety: if any SET_SETDAT packet NACKs, the Fin commit must
     NOT be sent. Committing on a partial-state previously corrupted the
