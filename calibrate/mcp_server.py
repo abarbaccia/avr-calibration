@@ -6439,6 +6439,246 @@ async def _tool_set_routing(routing: dict) -> dict:
         return _err(f"set_routing error: {exc}")
 
 
+def _expected_avr_speakers_from_config(cfg) -> set[str]:
+    """Derive the set of expected AVR speaker positions from config.speakers.
+
+    Positions in the YAML follow Denon's convention (L, C, R, SL, SR, SBL,
+    SBR, TFL, TFR, TRL, TRR, …) so we just collect them. Reads from the
+    ``speakers:`` top-level YAML block (Config has no first-class accessor
+    for it — the field is purely declarative metadata for this check).
+    """
+    positions: set[str] = set()
+    raw_data = getattr(cfg, "_data", None) or {}
+    for spec in raw_data.get("speakers", []) or []:
+        for pos in spec.get("positions", []) or []:
+            positions.add(str(pos).upper())
+    return positions
+
+
+def _diff_avr_speaker_config(expected: set[str], replies: dict[str, str]) -> list[dict]:
+    """Compare expected positions against Denon SSSPC* replies.
+
+    Reports MISSING speakers — i.e. expected by config but reported NO by
+    the AVR. Each entry shape::
+
+        {"position": "C", "avr_field": "SSSPCCEN",
+         "raw_value": "SSSPCCEN NO",
+         "message": "Center configured in config.speakers but AVR reports absent"}
+
+    Heights are not checked (the X3800H has 6+ different SSSPC codes for
+    height layouts and getting the mapping wrong would yield false alarms).
+    The major-channel check still catches the failure mode that lost FL/C/R
+    /surrounds tonight — a partial SET_SETDAT payload writing a 2.1 layout.
+    """
+    drift: list[dict] = []
+    # Position → (SSSPC field, friendly name). Heights deliberately omitted.
+    checks = [
+        (("C",), "SSSPCCEN", "Center"),
+        (("SL", "SR"), "SSSPCSUA", "Surrounds"),
+        (("SBL", "SBR"), "SSSPCSBK", "Surround Back"),
+    ]
+    for positions, field, name in checks:
+        if not any(p in expected for p in positions):
+            continue
+        raw = replies.get(field + " ?", "") or ""
+        # Reply format: "SSSPCCEN YES" or "SSSPCCEN NO" (or sometimes
+        # multiple lines if AVR streams unrelated state). Look for the
+        # SPECIFIC field on its own line.
+        present: bool | None = None
+        for line in raw.split("\r"):
+            line = line.strip()
+            if line.startswith(field + " "):
+                token = line[len(field) + 1:].strip().upper()
+                if token == "YES":
+                    present = True
+                    break
+                if token == "NO":
+                    present = False
+                    break
+        if present is False:
+            drift.append({
+                "position": ",".join(positions),
+                "avr_field": field,
+                "raw_value": next(
+                    (line.strip() for line in raw.split("\r")
+                     if line.strip().startswith(field + " ")),
+                    "",
+                ),
+                "message": (
+                    f"{name} configured in config.speakers but AVR reports "
+                    f"absent — the AVR's speaker layout was likely corrupted "
+                    f"(e.g. by a partial Audyssey SET_SETDAT payload). "
+                    f"Restore from .ady backup via MultEQ Editor or re-run "
+                    f"Audyssey."
+                ),
+            })
+    return drift
+
+
+async def _tool_restore_listening_mode(
+    master_gain_db: float = -20.0,
+    lfe_input: int = 0,
+    dry_run: bool = False,
+) -> dict:
+    """Restore the system to a known-good 'ready to listen' state.
+
+    Idempotent. The signal graph is the source of truth: every transducer
+    bound to a DSP processor must have ``lfe_input`` routed to its
+    ``output_index`` in the cal_matrix, and the DSP master must sit at
+    the documented persistent operating level. Outputs that are NOT bound
+    to a transducer are left untouched (e.g. unused channels, mains that
+    bypass the DSP).
+
+    Bug class this catches: tonight's silent shaker — `shaker_mqb1` was
+    in the signal graph at output 7 but missing from the cal_matrix, so
+    no signal reached it regardless of its output gain. A pure inspection
+    of `get_output_state` would not have flagged this.
+
+    What this does:
+      - Route ``lfe_input`` → every transducer's ``output_index`` (boolean
+        true) on the active DSP. Existing rows for non-transducer outputs
+        are not modified.
+      - Set the DSP master gain to ``master_gain_db`` (default -20 dB).
+
+    What this does NOT do (these are *tuning* state, not invariants —
+    silently restoring them would be dangerous):
+      - Per-output gain / delay / polarity
+      - FIR coefficients (a stale broken FIR re-applied here would
+        amplify modes by tens of dB, which we just spent the night fixing)
+      - Audyssey / AVR speaker distance
+
+    Tuning-state drift is *reported* in the `tuning_drift` field so the
+    operator can review and decide whether each non-default value is a
+    deliberate calibration or stale state to clean up.
+    """
+    try:
+        cfg = _config()
+        graph = cfg.signal_graph
+        # Identify the DSP processor — only its outputs are routed via
+        # cal_matrix. AVR-level transducers (mains on speaker wire) live
+        # outside this matrix and are not touched.
+        dsp_procs = [p for p in graph.processors if p.kind == "dsp"]
+        if not dsp_procs:
+            return _err(
+                "restore_listening_mode: no DSP processor in signal graph"
+            )
+        if len(dsp_procs) > 1:
+            return _err(
+                "restore_listening_mode: multi-DSP graphs not yet supported "
+                "(would need a per-processor matrix dispatch)"
+            )
+        dsp_proc = dsp_procs[0]
+        bound_outputs = sorted(
+            t.output_index for t in graph.transducers
+            if t.processor_ref == dsp_proc.name
+        )
+
+        # Read the live routing for the diff. The driver exposes _routing
+        # internally; fall back to "unknown" if a future driver doesn't.
+        live_routing: dict = getattr(_dsp, "_routing", {}) or {}
+        live_row = dict(live_routing.get(int(lfe_input), {}))
+
+        added: list[int] = []
+        already_routed: list[int] = []
+        for out_idx in bound_outputs:
+            if not bool(live_row.get(int(out_idx), False)):
+                added.append(int(out_idx))
+            else:
+                already_routed.append(int(out_idx))
+
+        # Tuning-state drift report (advisory, not auto-corrected).
+        # Anything non-default on a *bound* output is flagged.
+        gains = getattr(_dsp, "_output_gain", {}) or {}
+        delays = getattr(_dsp, "_output_delay", {}) or {}
+        polarities = getattr(_dsp, "_output_polarity", {}) or {}
+        firs = getattr(_dsp, "_fir_state", {}) or {}
+        tuning_drift = []
+        for out_idx in bound_outputs:
+            entry = {"output_index": int(out_idx)}
+            non_default = False
+            g = gains.get(out_idx)
+            if g is not None and abs(float(g)) > 1e-6:
+                entry["gain_db"] = round(float(g), 3)
+                non_default = True
+            d = delays.get(out_idx)
+            if d is not None and abs(float(d)) > 1e-6:
+                entry["delay_ms"] = round(float(d), 3)
+                non_default = True
+            if bool(polarities.get(out_idx, False)):
+                entry["polarity_inverted"] = True
+                non_default = True
+            fir = firs.get(out_idx)
+            if fir is not None and len(fir) > 0:
+                entry["fir_taps"] = int(len(fir))
+                non_default = True
+            if non_default:
+                tuning_drift.append(entry)
+
+        # AVR speaker-layout drift check (read-only — never auto-fixes the
+        # AVR config). Soft-fails: if the AVR isn't reachable we still
+        # apply the DSP changes but report the AVR check as skipped.
+        avr_speaker_drift: list[dict] = []
+        avr_speaker_check_status = "ok"
+        avr_speaker_check_error: str | None = None
+        try:
+            expected_positions = _expected_avr_speakers_from_config(_config())
+            if expected_positions and _avr is not None and hasattr(_avr, "telnet_query"):
+                replies = await _avr.telnet_query(  # type: ignore[union-attr]
+                    ["SSSPCCEN ?", "SSSPCSUA ?", "SSSPCSBK ?"],
+                    require_power_on=True,
+                )
+                avr_speaker_drift = _diff_avr_speaker_config(
+                    expected_positions, replies,
+                )
+            else:
+                avr_speaker_check_status = "skipped"
+                avr_speaker_check_error = (
+                    "no speakers in config or AVR driver missing telnet_query"
+                )
+        except DriverError as exc:
+            avr_speaker_check_status = "skipped"
+            avr_speaker_check_error = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            avr_speaker_check_status = "error"
+            avr_speaker_check_error = str(exc)
+
+        applied = not dry_run
+        if applied and added:
+            await _dsp.set_routing(  # type: ignore[union-attr]
+                {int(lfe_input): {int(o): True for o in added}}
+            )
+        master_changed = False
+        if applied:
+            await _dsp.set_master_gain(float(master_gain_db))  # type: ignore[union-attr]
+            master_changed = True
+
+        return _ok(
+            applied=applied,
+            dsp_processor=dsp_proc.name,
+            lfe_input=int(lfe_input),
+            bound_outputs=bound_outputs,
+            routed_added=added,
+            already_routed=already_routed,
+            master_gain_db=float(master_gain_db) if master_changed else None,
+            tuning_drift=tuning_drift,
+            avr_speaker_drift=avr_speaker_drift,
+            avr_speaker_check_status=avr_speaker_check_status,
+            avr_speaker_check_error=avr_speaker_check_error,
+            message=(
+                f"{'Would route' if dry_run else 'Routed'} input {lfe_input} → "
+                f"outputs {added} ({len(already_routed)} already routed); "
+                f"master gain {'would be' if dry_run else 'set to'} "
+                f"{master_gain_db:+.1f} dB; {len(tuning_drift)} output(s) "
+                f"with non-default tuning state; "
+                f"{len(avr_speaker_drift)} AVR speaker(s) MISSING vs config."
+            ),
+        )
+    except DriverError as exc:
+        return _err(str(exc))
+    except Exception as exc:
+        return _err(f"restore_listening_mode error: {exc}")
+
+
 async def _tool_analyze_decay(
     session_id: int | None = None,
     t60_threshold_ms: float = 300.0,
@@ -8344,6 +8584,53 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="restore_listening_mode",
+        description=(
+            "Restore the system to a known-good 'ready to listen' state. Idempotent. "
+            "Reads the signal graph as the source of truth and ensures every transducer's "
+            "output has the LFE input routed to it in the cal_matrix, then sets the DSP "
+            "master gain to the documented persistent operating level (default -20 dB). "
+            "Outputs not bound to any transducer (unused channels, mains that bypass the "
+            "DSP) are not touched. Per-output tuning state (gain, delay, polarity, FIR) "
+            "is *reported* under tuning_drift but NEVER auto-changed — restoring stale "
+            "tuning state is dangerous. Call at the start of a session, after a "
+            "calibration ends, or whenever something feels off (silent shaker, missing "
+            "channel, etc.)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "master_gain_db": {
+                    "type": "number",
+                    "description": (
+                        "Persistent operating level for the DSP master gain. "
+                        "Default -20 dB matches the documented sub-chain-vs-mains "
+                        "level offset for this hardware."
+                    ),
+                    "default": -20.0,
+                },
+                "lfe_input": {
+                    "type": "integer",
+                    "description": (
+                        "DSP input channel that carries the LFE signal. "
+                        "Default 0; matches the cal_capture mixer's output 0 "
+                        "→ cal_matrix input 0 wiring."
+                    ),
+                    "default": 0,
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": (
+                        "When true, return the diff that *would* be applied "
+                        "without writing to the DSP. Use to preview drift "
+                        "before committing."
+                    ),
+                    "default": False,
+                },
+            },
+        },
+    ),
+    Tool(
         name="analyze_decay",
         description=(
             "Analyze room-mode T60 decay in the impulse response from a stored measurement. "
@@ -9943,6 +10230,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         )
     elif name == "set_routing":
         result = await _tool_set_routing(arguments["routing"])
+    elif name == "restore_listening_mode":
+        result = await _tool_restore_listening_mode(
+            master_gain_db=float(arguments.get("master_gain_db", -20.0)),
+            lfe_input=int(arguments.get("lfe_input", 0)),
+            dry_run=bool(arguments.get("dry_run", False)),
+        )
     elif name == "analyze_decay":
         result = await _tool_analyze_decay(
             session_id=int(arguments["session_id"]) if "session_id" in arguments else None,

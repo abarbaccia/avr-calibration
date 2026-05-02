@@ -7124,3 +7124,248 @@ async def test_set_speaker_distances_skips_audyssey_check_when_unsupported() -> 
         result = await _tool_set_speaker_distances(distances={"SW1": 30.72}, commit=True)
     assert result["ok"]
     assert result["audyssey"] is None
+
+
+# ── restore_listening_mode ────────────────────────────────────────────────────
+
+
+def _make_listening_mode_config(
+    *,
+    transducer_outputs: list[tuple[str, str, int]] = (
+        ("sub_a", "sub", 5),
+        ("sub_b", "sub", 6),
+        ("shaker_a", "shaker", 7),
+    ),
+    speaker_positions: list[str] | None = None,
+):
+    """Return a Config-like object with a signal graph and speakers block."""
+    from calibrate.graph import (
+        SignalGraph, Source, Processor, Transducer, TransducerProfile,
+    )
+    transducers = tuple(
+        Transducer(
+            name=name, role=role, processor_ref="camilla",
+            output_index=idx, safety_profile_ref="svs_pb12_nsd",
+        )
+        for name, role, idx in transducer_outputs
+    )
+    graph = SignalGraph(
+        sources=(Source(name="lfe", type="analog"),),
+        processors=(
+            Processor(name="denon", driver_ref="denon", kind="avr", outputs=()),
+            Processor(name="camilla", driver_ref="camilladsp", kind="dsp",
+                      outputs=tuple(str(i) for i in range(20))),
+        ),
+        transducers=transducers,
+        profiles=(
+            TransducerProfile(
+                name="svs_pb12_nsd", min_boost_freq_hz=25.0,
+                max_boost_per_band_db=6.0, max_cumulative_boost_db=9.0,
+                hpf_freq_hz=18.0, hpf_order=4,
+            ),
+        ),
+    )
+    cfg = MagicMock()
+    cfg.signal_graph = graph
+    speakers = []
+    if speaker_positions:
+        speakers = [{"model": "Test", "positions": speaker_positions}]
+    cfg._data = {"speakers": speakers}
+    return cfg
+
+
+@pytest.mark.asyncio
+async def test_restore_listening_mode_routes_unrouted_transducers(mock_avr) -> None:
+    """The tool routes every transducer's output that wasn't already routed."""
+    from calibrate.mcp_server import _tool_restore_listening_mode
+
+    cfg = _make_listening_mode_config()
+    dsp = AsyncMock()
+    # input 0 already routes to outputs 5 and 6 (subs); output 7 (shaker)
+    # missing — exactly tonight's bug.
+    dsp._routing = {0: {5: True, 6: True}}
+    dsp._output_gain = {}
+    dsp._output_delay = {}
+    dsp._output_polarity = {}
+    dsp._fir_state = {}
+
+    with patch("calibrate.mcp_server._config", return_value=cfg), \
+         patch("calibrate.mcp_server._dsp", dsp):
+        result = await _tool_restore_listening_mode()
+
+    assert result["ok"], result
+    assert result["applied"] is True
+    assert result["routed_added"] == [7]
+    assert sorted(result["already_routed"]) == [5, 6]
+    # set_routing called exactly once with the missing output.
+    dsp.set_routing.assert_awaited_once_with({0: {7: True}})
+    # Master gain set to the documented operating level.
+    dsp.set_master_gain.assert_awaited_once_with(-20.0)
+    assert result["master_gain_db"] == -20.0
+
+
+@pytest.mark.asyncio
+async def test_restore_listening_mode_dry_run_writes_nothing(mock_avr) -> None:
+    """dry_run=True returns the diff but does not call set_routing or set_master_gain."""
+    from calibrate.mcp_server import _tool_restore_listening_mode
+
+    cfg = _make_listening_mode_config()
+    dsp = AsyncMock()
+    dsp._routing = {0: {5: True, 6: True}}  # shaker still missing
+    dsp._output_gain = {}
+    dsp._output_delay = {}
+    dsp._output_polarity = {}
+    dsp._fir_state = {}
+
+    with patch("calibrate.mcp_server._config", return_value=cfg), \
+         patch("calibrate.mcp_server._dsp", dsp):
+        result = await _tool_restore_listening_mode(dry_run=True)
+
+    assert result["ok"]
+    assert result["applied"] is False
+    assert result["routed_added"] == [7]
+    assert result["master_gain_db"] is None
+    dsp.set_routing.assert_not_called()
+    dsp.set_master_gain.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_restore_listening_mode_idempotent_when_fully_routed(mock_avr) -> None:
+    """No-op routing path when every transducer is already routed."""
+    from calibrate.mcp_server import _tool_restore_listening_mode
+
+    cfg = _make_listening_mode_config()
+    dsp = AsyncMock()
+    dsp._routing = {0: {5: True, 6: True, 7: True}}
+    dsp._output_gain = {}
+    dsp._output_delay = {}
+    dsp._output_polarity = {}
+    dsp._fir_state = {}
+
+    with patch("calibrate.mcp_server._config", return_value=cfg), \
+         patch("calibrate.mcp_server._dsp", dsp):
+        result = await _tool_restore_listening_mode()
+
+    assert result["ok"]
+    assert result["routed_added"] == []
+    dsp.set_routing.assert_not_called()
+    # Master gain is still asserted — that's the other half of the
+    # invariant and cheap to write idempotently.
+    dsp.set_master_gain.assert_awaited_once_with(-20.0)
+
+
+@pytest.mark.asyncio
+async def test_restore_listening_mode_reports_tuning_drift(mock_avr) -> None:
+    """Non-default per-output state appears in tuning_drift but is NOT
+    auto-restored — restoring stale calibration state is too dangerous."""
+    from calibrate.mcp_server import _tool_restore_listening_mode
+
+    cfg = _make_listening_mode_config()
+    dsp = AsyncMock()
+    dsp._routing = {0: {5: True, 6: True, 7: True}}
+    dsp._output_gain = {5: -3.0, 6: -3.0}     # tonight's level trim
+    dsp._output_delay = {5: 38.0, 6: 38.0}    # tonight's placeholder delay
+    dsp._output_polarity = {6: True}
+    dsp._fir_state = {6: [0.0] * 1024}
+
+    with patch("calibrate.mcp_server._config", return_value=cfg), \
+         patch("calibrate.mcp_server._dsp", dsp):
+        result = await _tool_restore_listening_mode()
+
+    assert result["ok"]
+    drift = {entry["output_index"]: entry for entry in result["tuning_drift"]}
+    assert drift[5]["gain_db"] == -3.0
+    assert drift[5]["delay_ms"] == 38.0
+    assert drift[6]["polarity_inverted"] is True
+    assert drift[6]["fir_taps"] == 1024
+    # Tool did NOT call set_output_gain/delay/polarity or clear_fir.
+    dsp.set_output_gain.assert_not_called()
+    dsp.set_output_delay.assert_not_called()
+    dsp.set_output_polarity.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_restore_listening_mode_flags_missing_avr_speakers() -> None:
+    """When config.speakers expects a Center but the AVR reports SSSPCCEN NO,
+    the drift report includes the missing speaker. Tonight's failure mode."""
+    from calibrate.mcp_server import _tool_restore_listening_mode
+
+    cfg = _make_listening_mode_config(
+        speaker_positions=["L", "C", "R", "SL", "SR"],
+    )
+    dsp = AsyncMock()
+    dsp._routing = {0: {5: True, 6: True, 7: True}}
+    dsp._output_gain = {}
+    dsp._output_delay = {}
+    dsp._output_polarity = {}
+    dsp._fir_state = {}
+    avr = AsyncMock()
+    # Simulate the corrupted state we observed: SSSPCCEN NO, SSSPCSUA NO.
+    avr.telnet_query.return_value = {
+        "SSSPCCEN ?": "SSSPCCEN NO",
+        "SSSPCSUA ?": "SSSPCSUA NO",
+        "SSSPCSBK ?": "SSSPCSBK NO",
+    }
+
+    with patch("calibrate.mcp_server._config", return_value=cfg), \
+         patch("calibrate.mcp_server._dsp", dsp), \
+         patch("calibrate.mcp_server._avr", avr):
+        result = await _tool_restore_listening_mode()
+
+    assert result["ok"]
+    drift = {d["avr_field"]: d for d in result["avr_speaker_drift"]}
+    # Both Center and Surrounds reported missing.
+    assert "SSSPCCEN" in drift
+    assert "SSSPCSUA" in drift
+    # SBK not in config.speakers → not flagged.
+    assert "SSSPCSBK" not in drift
+    assert result["avr_speaker_check_status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_restore_listening_mode_skips_avr_check_when_unreachable() -> None:
+    """AVR being off / unreachable is a SOFT FAIL — DSP work still applies."""
+    from calibrate.mcp_server import _tool_restore_listening_mode
+
+    cfg = _make_listening_mode_config(speaker_positions=["L", "C", "R"])
+    dsp = AsyncMock()
+    dsp._routing = {0: {5: True, 6: True, 7: True}}
+    dsp._output_gain = {}
+    dsp._output_delay = {}
+    dsp._output_polarity = {}
+    dsp._fir_state = {}
+    avr = AsyncMock()
+    avr.telnet_query.side_effect = DriverError("AVR power is 'STANDBY'")
+
+    with patch("calibrate.mcp_server._config", return_value=cfg), \
+         patch("calibrate.mcp_server._dsp", dsp), \
+         patch("calibrate.mcp_server._avr", avr):
+        result = await _tool_restore_listening_mode()
+
+    assert result["ok"]  # whole tool still succeeds
+    assert result["avr_speaker_check_status"] == "skipped"
+    assert "STANDBY" in (result["avr_speaker_check_error"] or "")
+    # DSP work still happened.
+    dsp.set_master_gain.assert_awaited_once_with(-20.0)
+
+
+@pytest.mark.asyncio
+async def test_restore_listening_mode_handles_no_dsp_processor() -> None:
+    """An invalid graph with no DSP processor returns an error, not a crash."""
+    from calibrate.mcp_server import _tool_restore_listening_mode
+    from calibrate.graph import SignalGraph, Source, Processor
+
+    cfg = MagicMock()
+    cfg.signal_graph = SignalGraph(
+        sources=(Source(name="lfe", type="analog"),),
+        processors=(
+            Processor(name="denon", driver_ref="denon", kind="avr", outputs=()),
+        ),
+    )
+    cfg._data = {}
+
+    with patch("calibrate.mcp_server._config", return_value=cfg):
+        result = await _tool_restore_listening_mode()
+
+    assert not result["ok"]
+    assert "no DSP processor" in result["error"]
