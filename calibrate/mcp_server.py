@@ -7500,6 +7500,106 @@ def _interp_phase_at(freqs: list[float], phases: list[float], target_hz: float) 
     return float(phases[-1])
 
 
+def _compute_phase_bands_for_session(
+    session: Any,
+    min_hz: float = 20.0,
+    max_hz: float = 120.0,
+) -> list[dict]:
+    """Compute the same 1/3-oct phase-band classification as
+    ``_tool_analyze_phase``, but operate on a Session object directly so
+    callers iterating over many sessions don't pay a fresh
+    ``store.list_sessions()`` per iteration. Returns the bands list (the
+    same shape ``_tool_analyze_phase`` puts in its ``bands`` key) — empty
+    list when the session lacks usable FR data.
+    """
+    fr = getattr(session, "start_fr", None)
+    if not fr or not getattr(fr, "frequencies", None) or not getattr(fr, "spl", None):
+        return []
+    try:
+        import numpy as np
+        from scipy.signal import hilbert
+    except Exception:
+        return []
+
+    freqs = np.array(fr.frequencies)
+    spl = np.array(fr.spl)
+    mask = (freqs >= min_hz) & (freqs <= max_hz)
+    freqs_band = freqs[mask]
+    spl_band = spl[mask]
+    if len(freqs_band) < 10:
+        return []
+
+    log_mag = spl_band / 20.0 * np.log(10)
+    min_phase_rad = -np.imag(hilbert(log_mag))
+
+    measured_phase_band = None
+    if getattr(fr, "phase", None):
+        measured_phase = np.array(fr.phase)
+        measured_phase_band = measured_phase[mask]
+
+    def _gd(phase_data: Any, freq_data: Any) -> tuple[Any, Any]:
+        if len(phase_data) < 2:
+            return np.array([]), np.array([])
+        unwrapped = np.unwrap(phase_data)
+        d_phase = np.diff(unwrapped)
+        d_freq = np.diff(freq_data)
+        omega_diff = 2.0 * np.pi * d_freq
+        with np.errstate(divide="ignore", invalid="ignore"):
+            gd_arr = np.where(np.abs(omega_diff) > 1e-12, -d_phase / omega_diff, 0.0)
+        mid_freqs = (freq_data[:-1] + freq_data[1:]) / 2.0
+        return mid_freqs, gd_arr * 1000.0
+
+    mp_gd_freqs, mp_gd_ms = _gd(min_phase_rad, freqs_band)
+    excess_gd_ms = None
+    if measured_phase_band is not None:
+        _, meas_gd_ms = _gd(measured_phase_band, freqs_band)
+        if len(meas_gd_ms) > 0 and len(mp_gd_ms) > 0:
+            n = min(len(meas_gd_ms), len(mp_gd_ms))
+            excess_gd_ms = meas_gd_ms[:n] - mp_gd_ms[:n]
+
+    bands: list[dict] = []
+    for centre in _THIRD_OCTAVE_CENTRES:
+        if centre < min_hz or centre > max_hz:
+            continue
+        factor = 2 ** (1 / 6)
+        lo = centre / factor
+        hi = centre * factor
+        band_mask = (freqs_band >= lo) & (freqs_band < hi)
+        if not np.any(band_mask):
+            continue
+        avg_spl = float(np.mean(spl_band[band_mask]))
+        gd_mask = (mp_gd_freqs >= lo) & (mp_gd_freqs < hi) if len(mp_gd_freqs) > 0 else np.array([])
+        mp_gd = float(np.mean(mp_gd_ms[gd_mask])) if np.any(gd_mask) else 0.0
+        entry: dict = {
+            "freq_hz": centre,
+            "spl_db": round(avg_spl, 1),
+            "min_phase_group_delay_ms": round(mp_gd, 1),
+        }
+        if excess_gd_ms is not None:
+            egdm = (mp_gd_freqs >= lo) & (mp_gd_freqs < hi) if len(mp_gd_freqs) > 0 else np.array([])
+            if np.any(egdm):
+                excess_vals = excess_gd_ms[: len(mp_gd_freqs)][egdm]
+                if len(excess_vals) > 0:
+                    avg_excess = float(np.mean(np.abs(excess_vals)))
+                    entry["excess_group_delay_ms"] = round(avg_excess, 1)
+                    classification, fixable = _classify_fixability(centre, avg_excess)
+                    entry["classification"] = classification
+                    entry["fixable"] = fixable
+                else:
+                    entry["excess_group_delay_ms"] = 0.0
+                    entry["classification"] = "fixable"
+                    entry["fixable"] = True
+            else:
+                entry["excess_group_delay_ms"] = 0.0
+                entry["classification"] = "fixable"
+                entry["fixable"] = True
+        else:
+            entry["classification"] = None
+            entry["fixable"] = None
+        bands.append(entry)
+    return bands
+
+
 async def _tool_analyze_per_sub_modal_contribution(
     session_ids: list[int],
 ) -> dict:
@@ -7525,20 +7625,40 @@ async def _tool_analyze_per_sub_modal_contribution(
         return _err("analyze_per_sub_modal_contribution requires ≥ 2 session_ids")
 
     try:
+        import gc
+        from .decay import analyze_decay as _analyze_decay_fn
+
         store = SessionStore()
-        sessions_all = store.list_sessions()
-        sessions: list = []
-        for sid in session_ids:
-            s = next((x for x in sessions_all if x.id == int(sid)), None)
+
+        # Memory-conscious extraction: load each session ONE AT A TIME via
+        # get_session() (single row), pull only the small derived data we
+        # need (decay modes, phase bands, FR freq+phase arrays), then drop
+        # the heavy Session object before loading the next one.
+        #
+        # IMPORTANT: We deliberately do NOT call _tool_analyze_decay or
+        # _tool_analyze_phase here, because each of those calls
+        # store.list_sessions() — which materialises EVERY session in the
+        # SQLite store (base64-decoded IRs included) into memory. With
+        # ≳50 sessions on the 4 GiB Pi that single call alone OOM-kills
+        # the worker. Instead, we call the underlying analytics directly
+        # against the single fetched Session, then drop the Session before
+        # loading the next.
+        session_id_list: list[int] = [int(sid) for sid in session_ids]
+        per_session_modes: list[list[dict]] = []
+        phase_bands_per_sub: list[list[dict]] = []
+        # Compact per-session cache of (frequencies, phase) ONLY — release
+        # the full Session (which carries the IR + SPL arrays) after pulling
+        # these. We re-interp phase per cluster centre below.
+        fr_phase_per_sub: list[tuple[list[float], list[float]] | None] = []
+
+        for sid in session_id_list:
+            s = store.get_session(sid)
             if s is None:
                 return _err(f"session {sid} not found")
-            sessions.append(s)
 
-        # Pull each sub's decay modes (prefer cached metadata, fall back to
-        # analyze_decay so the tool works against fresh measurements that
-        # haven't had decay analysis stamped into metadata yet).
-        per_session_modes: list[list[dict]] = []
-        for s in sessions:
+            # Decay modes — prefer cached metadata, fall back to running
+            # decay analysis directly on THIS session's IR (no
+            # list_sessions() inside the helper path).
             meta = s.metadata or {}
             if isinstance(meta, str):
                 import json as _json
@@ -7548,27 +7668,61 @@ async def _tool_analyze_per_sub_modal_contribution(
                     meta = {}
             modes = list(meta.get("decay_modes") or [])
             if not modes:
-                # Fall back to running analyze_decay live.
-                dr = await _tool_analyze_decay(session_id=s.id)
-                if not dr.get("ok"):
+                ir = s.impulse_response
+                if not ir:
                     return _err(
-                        f"session {s.id} has no decay_modes and analyze_decay "
-                        f"failed: {dr.get('error')}"
+                        f"session {sid} has no decay_modes and no impulse "
+                        "response — re-run measure to capture IR"
                     )
-                modes = list(dr.get("modes") or [])
+                sample_rate = (
+                    s.start_fr.sample_rate if s.start_fr else 48000
+                )
+                try:
+                    decoded = _analyze_decay_fn(
+                        ir,
+                        sample_rate=sample_rate,
+                        t60_threshold_ms=300.0,
+                        freq_min=20.0,
+                        freq_max=200.0,
+                    )
+                except Exception as exc:
+                    return _err(
+                        f"session {sid} has no decay_modes and analyze_decay "
+                        f"failed: {exc}"
+                    )
+                modes = [
+                    {
+                        "freq_hz": m.freq_hz,
+                        "t60_ms": m.t60_ms,
+                        "peak_db": m.peak_db,
+                        "suggested_q": m.suggested_q,
+                        "priority": m.priority,
+                    }
+                    for m in decoded
+                ]
             per_session_modes.append(modes)
 
-        # Per-sub phase analysis (per-1/3-oct band fixability) for the
-        # mode-band lookups below. Keep results indexed by session position.
-        phase_bands_per_sub: list[list[dict]] = []
-        for s in sessions:
-            pr = await _tool_analyze_phase(session_id=s.id)
-            if pr.get("ok"):
-                phase_bands_per_sub.append(list(pr.get("bands") or []))
-            else:
-                phase_bands_per_sub.append([])
+            # Per-1/3-oct phase bands. Compute inline so we don't pay
+            # another list_sessions() in _tool_analyze_phase.
+            phase_bands_per_sub.append(
+                _compute_phase_bands_for_session(s)
+            )
 
-        # Cluster modes across subs.
+            # Compact phase samples for later interp at cluster centres.
+            fr = s.start_fr
+            if fr is not None and getattr(fr, "phase", None):
+                fr_phase_per_sub.append((list(fr.frequencies), list(fr.phase)))
+            else:
+                fr_phase_per_sub.append(None)
+
+            # Drop the heavy Session reference (impulse_response + SPL +
+            # phase arrays) before loading the next one, then force a GC
+            # cycle so the IR blob is actually freed.
+            del s
+            del fr
+            gc.collect()
+
+        # Cluster modes across subs (operates on small dicts — cheap).
         clusters = _cluster_modes_across_subs(per_session_modes)
 
         # Helper: nearest 1/3-octave band from analyze_phase output.
@@ -7592,7 +7746,7 @@ async def _tool_analyze_per_sub_modal_contribution(
             present_idx: set[int] = {m["session_idx"] for m in c["members"]}
             members_by_idx = {m["session_idx"]: m["mode"] for m in c["members"]}
 
-            for idx, s in enumerate(sessions):
+            for idx, sid in enumerate(session_id_list):
                 if idx in present_idx:
                     mode = members_by_idx[idx]
                     peak_db = float(mode.get("peak_db") or 0.0)
@@ -7601,18 +7755,19 @@ async def _tool_analyze_per_sub_modal_contribution(
                     peak_db = 0.0
                     t60_ms = 0.0
 
-                # Phase angle interpolated from the FR phase array.
-                fr = s.start_fr
+                # Phase angle interpolated from the cached compact phase
+                # samples (no full Session held in scope).
                 phase_rad: float | None = None
-                if fr is not None and getattr(fr, "phase", None):
+                phase_pair = fr_phase_per_sub[idx]
+                if phase_pair is not None:
                     phase_rad = _interp_phase_at(
-                        list(fr.frequencies),
-                        list(fr.phase),
+                        phase_pair[0],
+                        phase_pair[1],
                         centre_hz,
                     )
 
                 entry = {
-                    "session_id": int(s.id),
+                    "session_id": int(sid),
                     "peak_db": round(peak_db, 2),
                     "t60_ms": round(t60_ms, 1),
                     "phase_rad": round(phase_rad, 3) if phase_rad is not None else None,
@@ -7680,7 +7835,7 @@ async def _tool_analyze_per_sub_modal_contribution(
         out_modes.sort(key=lambda m: m["freq_hz"])
 
         return _ok(
-            session_ids=[int(s.id) for s in sessions],
+            session_ids=session_id_list,
             modes=out_modes,
             note=(
                 "Per-mode data for LLM-driven per-sub anti-pulse allocation. "
