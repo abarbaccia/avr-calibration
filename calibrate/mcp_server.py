@@ -4683,6 +4683,7 @@ async def _tool_trigger_measurement(
     freq_max: int | None = None,
     sweep_channel: str | None = None,
     sweep_volume_db: float | None = None,
+    sound_mode: str | None = None,
 ) -> dict:
     """Trigger a measurement via UMIK-1 + PyTTa.
 
@@ -4715,6 +4716,20 @@ async def _tool_trigger_measurement(
         measurement only. Mains typically need -10 to -15 dB; the default
         sub calibration volume (-31.1 dB) is too quiet for mains at MLP.
         Does not persist to config.
+      - ``sound_mode``: per-call AVR sound mode override. Trade-offs:
+          * "PURE DIRECT" — raw mains response, no Audyssey, no bass mgmt.
+            Use for distance/level cal of mains alone.
+          * "DIRECT" — bass mgmt active, Audyssey off. Use to verify
+            sub-mains integration without Audyssey on top.
+          * "STEREO" / "MULTI CH STEREO" / "DOLBY SURROUND" — Audyssey
+            ACTIVE. Use to verify how the corrections actually sound.
+        If None, uses the existing config-driven behavior
+        (``denon_pure_direct`` flag).
+
+    Auto-routing: when ``sweep_channel`` is provided the route is forced
+    to "hdmi" regardless of ``measurement.playback_route`` config — a
+    per-channel mains sweep is a no-op on the USB sub path, so the prior
+    behavior (silently honoring the config flag) was a foot-gun.
     """
     try:
         import sounddevice as sd
@@ -4738,7 +4753,14 @@ async def _tool_trigger_measurement(
 
         cfg = _config()
         engine = MeasurementEngine(cfg)
-        route = cfg.measurement.get("playback_route", "usb")
+        # Auto-route: a per-channel sweep_channel only makes sense on HDMI.
+        # Honor config only when the caller has not implied HDMI by passing
+        # sweep_channel — eliminates the silent-fallback foot-gun where a
+        # mains sweep routed via USB and produced garbage.
+        if sweep_channel is not None:
+            route = "hdmi"
+        else:
+            route = cfg.measurement.get("playback_route", "usb")
 
         # Resolve sweep range from explicit args / target / config defaults.
         resolved_min, resolved_max, sweep_range_source = _resolve_sweep_range(
@@ -4768,7 +4790,13 @@ async def _tool_trigger_measurement(
         graph = cfg.signal_graph
         targets = tuple(graph.transducers_by_role("sub")) or graph.transducers
 
-        if route == "hdmi" and _drivers is not None and resolved_out_channel is None and sweep_volume_db is None:
+        if (
+            route == "hdmi"
+            and _drivers is not None
+            and resolved_out_channel is None
+            and sweep_volume_db is None
+            and sound_mode is None
+        ):
             # Standard sub/combined sweep: let the graph compose all processor
             # contexts (Denon + CamillaDSP). Mains sweeps bypass this path
             # because CamillaDSP's sweep context is not part of the mains chain.
@@ -4782,7 +4810,11 @@ async def _tool_trigger_measurement(
             # Legacy path used when the driver registry isn't populated (older
             # test setups that patch `_dsp` directly without the lifespan).
             # Behaves exactly as before the graph refactor.
-            denon_ctx = DenonSweepContext.from_config(cfg, sweep_volume_override=sweep_volume_db)
+            denon_ctx = DenonSweepContext.from_config(
+                cfg,
+                sweep_volume_override=sweep_volume_db,
+                sound_mode_override=sound_mode,
+            )
             if denon_ctx:
                 async with denon_ctx:
                     fr = await engine.measure(
@@ -8904,6 +8936,23 @@ _TOOLS: list[Tool] = [
                         "calibrated for subs)."
                     ),
                 },
+                "sound_mode": {
+                    "type": "string",
+                    "enum": [
+                        "PURE DIRECT",
+                        "DIRECT",
+                        "STEREO",
+                        "MULTI CH STEREO",
+                        "DOLBY SURROUND",
+                    ],
+                    "description": (
+                        "Per-call AVR sound mode override (HDMI route only). "
+                        "PURE DIRECT = raw mains, no Audyssey, no bass mgmt; "
+                        "DIRECT = bass mgmt active, Audyssey off; "
+                        "STEREO/MULTI CH STEREO/DOLBY SURROUND = Audyssey ACTIVE. "
+                        "Default: config denon_pure_direct flag."
+                    ),
+                },
             },
         },
     ),
@@ -11510,6 +11559,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             freq_max=(int(arguments["freq_max"]) if arguments.get("freq_max") is not None else None),
             sweep_channel=arguments.get("sweep_channel"),
             sweep_volume_db=(float(arguments["sweep_volume_db"]) if arguments.get("sweep_volume_db") is not None else None),
+            sound_mode=arguments.get("sound_mode"),
         )
     elif name == "calibrate_level":
         result = await _tool_calibrate_level(

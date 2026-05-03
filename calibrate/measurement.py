@@ -525,8 +525,30 @@ class MeasurementEngine:
         finally:
             _traceback.walk_stack = _orig_walk_stack
 
+        # Strategy selection.
+        #   - cal-mode override → legacy PortAudio HDMI/USB strategy with the
+        #     loopback device handed in via playback_device_override.
+        #   - "hdmi" without cal-mode → direct-ALSA aplay subprocess (PortAudio
+        #     inside the container can't see vc4hdmi0; aplay can).
+        #   - "usb" → unchanged (PortAudio sees miniDSP fine).
         from .drivers.playback import playback_for_route
-        strategy = playback_for_route(route)
+
+        use_aplay_hdmi = (
+            route == "hdmi"
+            and not playback_device_override  # cal-mode keeps PortAudio path
+        )
+        if use_aplay_hdmi:
+            alsa_device = cfg.get("hdmi_playback_device") or "hdmi:CARD=vc4hdmi0,DEV=0"
+            hdmi_channels = int(cfg.get("hdmi_channels", 8))
+            # Ensure we always have room for the requested out_channel.
+            hdmi_channels = max(hdmi_channels, out_channel)
+            strategy = playback_for_route(
+                route,
+                hdmi_alsa_device=alsa_device,
+                hdmi_channels=hdmi_channels,
+            )
+        else:
+            strategy = playback_for_route(route)
 
         # Lock: protects sd.default.device (module-level global) and serializes
         # play_and_record() so concurrent measure() calls don't clobber each other.

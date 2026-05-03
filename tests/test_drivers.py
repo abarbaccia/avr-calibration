@@ -2689,3 +2689,70 @@ class TestCamillaDSPMultirate:
         assert driver._processing_rate == 8000
         assert driver._capture_samplerate == 48000
         assert driver._resampler == {"type": "AsyncSinc", "profile": "Balanced"}
+
+
+# ── DenonSweepContext.sound_mode_override ─────────────────────────────────────
+
+
+def test_denon_sweep_sound_mode_override_validates_value():
+    """sound_mode_override rejects values outside VALID_SOUND_MODES."""
+    with pytest.raises(ValueError, match="sound_mode_override"):
+        DenonSweepContext(
+            host="192.168.1.209", sweep_input="Videocore",
+            sweep_volume=-10.0, sound_mode_override="JAZZ CLUB",
+        )
+
+
+def test_denon_sweep_sound_mode_override_normalizes_case():
+    """Lowercase value is normalized to uppercase canonical form."""
+    ctx = DenonSweepContext(
+        host="192.168.1.209", sweep_input="Videocore",
+        sweep_volume=-10.0, sound_mode_override="pure direct",
+    )
+    assert ctx._sound_mode_override == "PURE DIRECT"
+
+
+def test_denon_sweep_from_config_passes_sound_mode_override():
+    """from_config() forwards sound_mode_override to the constructor."""
+    cfg = _denon_sweep_config()
+    ctx = DenonSweepContext.from_config(cfg, sound_mode_override="DIRECT")
+    assert ctx._sound_mode_override == "DIRECT"
+
+
+@pytest.mark.asyncio
+async def test_denon_sweep_enter_uses_sound_mode_override():
+    """sound_mode_override forces that exact mode regardless of pure_direct."""
+    mock_mod, mock_receiver = _make_sweep_receiver()
+
+    with patch.dict(sys.modules, {"denonavr": mock_mod}):
+        with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
+            # pure_direct=False would normally skip sound-mode setting; the
+            # override must take priority and force STEREO instead.
+            ctx = DenonSweepContext(
+                host="192.168.1.209", sweep_input="Videocore",
+                sweep_volume=-10.0, settle_ms=100,
+                pure_direct=False, sound_mode_override="STEREO",
+            )
+            await ctx.__aenter__()
+
+    mock_receiver.soundmode.async_set_sound_mode.assert_called_once_with("STEREO")
+
+
+@pytest.mark.asyncio
+async def test_denon_sweep_exit_restores_sound_mode_after_override():
+    """Exit restores the saved sound mode when override was applied."""
+    mock_mod, mock_receiver = _make_sweep_receiver(sound_mode="DTS SURROUND")
+
+    with patch.dict(sys.modules, {"denonavr": mock_mod}):
+        with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
+            ctx = DenonSweepContext(
+                host="192.168.1.209", sweep_input="Videocore",
+                sweep_volume=-10.0, settle_ms=100,
+                pure_direct=False, sound_mode_override="STEREO",
+            )
+            await ctx.__aenter__()
+            mock_receiver.soundmode.async_set_sound_mode.reset_mock()
+            await ctx.__aexit__(None, None, None)
+
+    # On exit, the saved DTS SURROUND must be restored.
+    mock_receiver.soundmode.async_set_sound_mode.assert_any_call("DTS SURROUND")

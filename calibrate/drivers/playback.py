@@ -333,8 +333,188 @@ class MultichannelPlayback:
         return recording, n_recorded
 
 
-def playback_for_route(route: str) -> PlaybackStrategy:
-    """Factory: return the right playback strategy for the configured route."""
+class HDMIAplayPlayback:
+    """HDMI sweep playback via the ``aplay`` subprocess (direct ALSA), capture via PortAudio.
+
+    Why this exists:
+        Inside the avr-calibration container on the Pi 5 (Docker, ``--privileged``,
+        ``--network=host``) PortAudio enumerates only the ALSA Loopback PCMs and
+        does NOT see ``vc4hdmi0`` even though ``aplay -L`` and ``speaker-test
+        -D hdmi:CARD=vc4hdmi0,DEV=0`` work cleanly. The result is that the prior
+        ``HDMIPlayback`` route silently fell back to a Loopback device, the sweep
+        never reached the AVR, and cross-correlation reported "Sweep not detected."
+
+        ``aplay`` invokes the ALSA hw device directly, bypassing PortAudio's
+        broken enumeration. Capture stays on PortAudio/sounddevice (the UMIK
+        path works fine).
+
+    Sequence (mirrors ``USBPlayback``):
+        recording-first → sleep PRE_DELAY_S → spawn aplay → wait for aplay to
+        exit → small POST_DELAY_S settle → stop recording. The 1 s pre-delay
+        guarantees the noise-floor window in ``validate_recording`` lands on
+        pre-sweep silence.
+
+    Multi-channel layout:
+        Builds an N-channel S16_LE buffer and writes the sweep onto channel
+        ``out_channel - 1`` (1-based input). Other channels are silent. So
+        ``out_channel=1, channels=8`` puts the sweep on FL only and zero-fills
+        the rest of the 8-ch HDMI stream.
+    """
+
+    PRE_DELAY_S: float = 1.0
+    """Seconds of recording before playback starts. Mirrors ``USBPlayback`` so
+    the deconvolution alignment math (sweep-pad shared anchor) is identical."""
+
+    POST_DELAY_S: float = 0.5
+    """Seconds of trailing capture after aplay exits, to capture the room reverb tail."""
+
+    def __init__(self, alsa_device: str, channels: int = 8) -> None:
+        if not alsa_device:
+            raise ValueError("HDMIAplayPlayback requires a non-empty ALSA device string")
+        if channels < 1:
+            raise ValueError(f"channels must be >= 1, got {channels}")
+        self.alsa_device = alsa_device
+        self.channels = int(channels)
+
+    def play_and_record(self, sweep, sample_rate, in_channel, out_channel):
+        import subprocess
+        import time as _time
+
+        import numpy as np
+        import sounddevice as sd
+
+        sweep_array = sweep.timeSignal[:, 0].astype(np.float32)
+        n_samples = len(sweep_array)
+        n_channels = max(self.channels, out_channel)
+
+        # Build N-channel int16 PCM with sweep on out_channel-1, others silent.
+        sweep_int16 = (np.clip(sweep_array, -1.0, 1.0) * 32767).astype(np.int16)
+        out_buf = np.zeros((n_samples, n_channels), dtype=np.int16)
+        out_buf[:, out_channel - 1] = sweep_int16
+        pcm_bytes = out_buf.tobytes()
+
+        in_dev = int(sd.default.device[0])
+
+        pre_samples = int(self.PRE_DELAY_S * sample_rate)
+        post_samples = int(self.POST_DELAY_S * sample_rate)
+        rec_n = pre_samples + n_samples + post_samples
+        rec_buf = np.zeros((rec_n, 1), dtype=np.float32)
+        rec_pos = [0]
+
+        def _rec_callback(indata, frames, time_info, status):
+            end = min(rec_pos[0] + frames, rec_n)
+            count = end - rec_pos[0]
+            if count > 0:
+                rec_buf[rec_pos[0]:end] = indata[:count, in_channel - 1 : in_channel]
+            rec_pos[0] = end
+
+        in_stream = sd.InputStream(
+            device=in_dev,
+            samplerate=sample_rate,
+            channels=in_channel,
+            dtype="float32",
+            callback=_rec_callback,
+        )
+
+        aplay_cmd = [
+            "aplay",
+            "-D", self.alsa_device,
+            "-c", str(n_channels),
+            "-r", str(sample_rate),
+            "-f", "S16_LE",
+            "-t", "raw",
+            "-q",  # quiet — don't pollute MCP logs with progress chatter
+            "-",
+        ]
+
+        proc = None
+        try:
+            in_stream.start()
+            _time.sleep(self.PRE_DELAY_S)
+            proc = subprocess.Popen(
+                aplay_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                stdout_b, stderr_b = proc.communicate(
+                    input=pcm_bytes,
+                    timeout=max(30.0, n_samples / sample_rate + 10.0),
+                )
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                raise RuntimeError(
+                    f"aplay -D {self.alsa_device!r} timed out — HDMI sink may be unplugged"
+                )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"aplay -D {self.alsa_device!r} failed (rc={proc.returncode}): "
+                    f"{stderr_b.decode('utf-8', errors='replace').strip()}"
+                )
+            # Drain any trailing room reverb tail.
+            _time.sleep(self.POST_DELAY_S)
+        finally:
+            try:
+                in_stream.stop()
+            except Exception:
+                pass
+            try:
+                in_stream.close()
+            except Exception:
+                pass
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        n_recorded = rec_pos[0]
+        sweep_1d = sweep.timeSignal[:, 0]
+        rec_1d = rec_buf[:n_recorded, 0].astype(np.float64)
+
+        if len(rec_1d) > 0:
+            peak = float(np.max(np.abs(rec_1d)))
+            floor_n = min(int(0.5 * sample_rate), len(rec_1d) // 2)
+            floor_rms = float(np.sqrt(np.mean(rec_1d[:floor_n] ** 2)))
+            sig_rms = float(np.sqrt(np.mean(rec_1d[floor_n:] ** 2)))
+            log.info(
+                "HDMIAplayPlayback: device=%s ch=%d/%d pre=%.0fms n_sweep=%d "
+                "rec_n=%d n_recorded=%d peak=%.1f dBFS floor=%.1f dBFS "
+                "sig=%.1f dBFS SNR=%.1f dB",
+                self.alsa_device, out_channel, n_channels,
+                self.PRE_DELAY_S * 1000, n_samples, rec_n, n_recorded,
+                20 * np.log10(peak + 1e-12),
+                20 * np.log10(floor_rms + 1e-12),
+                20 * np.log10(sig_rms + 1e-12),
+                20 * np.log10(sig_rms / (floor_rms + 1e-12)),
+            )
+        else:
+            log.warning("HDMIAplayPlayback: recording is empty (0 samples captured)")
+
+        return sweep_1d, rec_1d
+
+
+def playback_for_route(
+    route: str,
+    *,
+    hdmi_alsa_device: str | None = None,
+    hdmi_channels: int = 8,
+) -> PlaybackStrategy:
+    """Factory: return the right playback strategy for the configured route.
+
+    HDMI path:
+      - ``hdmi_alsa_device`` set → ``HDMIAplayPlayback`` (direct ALSA via
+        the ``aplay`` subprocess; bypasses PortAudio's broken vc4hdmi0
+        enumeration inside containers).
+      - ``hdmi_alsa_device`` None → legacy PortAudio-based ``HDMIPlayback``,
+        kept for back-compat with callers that don't yet plumb a device.
+    """
     if route == "hdmi":
+        if hdmi_alsa_device:
+            return HDMIAplayPlayback(
+                alsa_device=hdmi_alsa_device, channels=hdmi_channels,
+            )
         return HDMIPlayback()
     return USBPlayback()
