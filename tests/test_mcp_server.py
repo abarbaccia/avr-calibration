@@ -149,6 +149,18 @@ def valid_filters():
     ]
 
 
+@pytest.fixture
+def _empty_signal_graph():
+    """Patch _config to a graph with no transducers — bypasses the apply_fir /
+    clear_fir output_index guard for tests that intentionally pass arbitrary
+    indices (tap-count failures, missing-cache, dispatch shape, etc.)."""
+    from calibrate import mcp_server as _mod
+    cfg = MagicMock()
+    cfg.signal_graph.transducers = []
+    with patch.object(_mod, "_config", return_value=cfg):
+        yield cfg
+
+
 # ── get_device_state ───────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -1267,6 +1279,117 @@ def test_create_app_returns_starlette_app() -> None:
     assert "/sse" in route_paths
 
 
+def test_mcp_endpoint_is_raw_asgi_not_http_function() -> None:
+    """Regression: /mcp must be a raw ASGI app, not a function-style HTTP endpoint.
+
+    StreamableHTTPSessionManager.handle_request() is a complete ASGI app —
+    it sends http.response.start, body, and http.response.end on its own.
+    If /mcp is wired as a function endpoint that calls handle_request() and
+    then returns Response(), Starlette's request_response wrapper sends a
+    SECOND http.response.start, which uvicorn rejects with:
+
+        RuntimeError: Unexpected ASGI message 'http.response.start' sent,
+        after response already completed.
+
+    That raises mid-request, the session manager task crashes, and the
+    server process dies. The fix is to make /mcp a class-based ASGI
+    endpoint so Starlette skips the response wrapping (see Starlette's
+    Route.__init__: function/method endpoints get request_response;
+    class endpoints are treated as raw ASGI).
+    """
+    import inspect
+    from calibrate.mcp_server import create_app
+
+    app = create_app()
+    mcp_routes = [r for r in app.routes if getattr(r, "path", None) == "/mcp"]
+    assert len(mcp_routes) == 1
+    endpoint = mcp_routes[0].endpoint
+    # The endpoint must NOT be a plain function/method — that branch in
+    # Starlette wraps it with request_response and triggers the double-send.
+    assert not inspect.isfunction(endpoint), (
+        "/mcp endpoint is a function — Starlette will wrap it with "
+        "request_response and the streamable-http transport will collide "
+        "with the wrapper's response, killing the server."
+    )
+    assert not inspect.ismethod(endpoint)
+    # And it must be callable as an ASGI app: __call__(scope, receive, send).
+    assert callable(endpoint)
+    sig = inspect.signature(endpoint.__call__)
+    assert list(sig.parameters)[:3] == ["scope", "receive", "send"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_endpoint_does_not_double_send_response() -> None:
+    """Regression: hitting /mcp must not trigger the double-start ASGI bug.
+
+    Drives the Starlette app directly with a stub send() that raises if
+    http.response.start is sent twice — exactly what uvicorn does. We stub
+    the streamable-http session manager to emit a normal complete response
+    so we exercise the endpoint wiring (not the session protocol).
+    """
+    from unittest.mock import patch, AsyncMock
+
+    from calibrate.mcp_server import create_app
+
+    sent_messages: list[dict] = []
+    start_count = 0
+
+    async def fake_handle_request(scope, receive, send):
+        # Emit a complete ASGI response, the way the real session manager
+        # does for a finished tool call.
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"{}"})
+
+    async def recording_send(message):
+        nonlocal start_count
+        if message["type"] == "http.response.start":
+            start_count += 1
+            if start_count > 1:
+                # uvicorn does exactly this — surface the regression.
+                raise RuntimeError(
+                    "Unexpected ASGI message 'http.response.start' sent, "
+                    "after response already completed."
+                )
+        sent_messages.append(message)
+
+    async def empty_receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"content-type", b"application/json")],
+        "server": ("testserver", 80),
+        "client": ("testclient", 12345),
+    }
+
+    # Skip the lifespan (driver setup) by patching it out — we only want
+    # to exercise the route → endpoint wiring.
+    app = create_app()
+
+    # Reach into the route and swap the session manager's handle_request
+    # for our fake. The endpoint instance holds a ref to the real manager.
+    mcp_route = next(r for r in app.routes if getattr(r, "path", None) == "/mcp")
+    endpoint = mcp_route.endpoint
+    with patch.object(
+        endpoint._manager, "handle_request", side_effect=fake_handle_request
+    ):
+        # Call the route's underlying ASGI app directly (skips lifespan).
+        await mcp_route.app(scope, empty_receive, recording_send)
+
+    assert start_count == 1, (
+        f"expected exactly one http.response.start, got {start_count}; "
+        f"messages: {[m['type'] for m in sent_messages]}"
+    )
+
+
 # ── get_config ───────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -1839,6 +1962,54 @@ async def test_call_tool_set_master_gain_dispatch(mock_dsp) -> None:
 
 # ── apply_fir / clear_fir ────────────────────────────────────────────────────
 
+
+@pytest.mark.asyncio
+async def test_apply_fir_rejects_unbound_output_index(mock_dsp) -> None:
+    """apply_fir must reject indices not bound to a transducer when graph has any."""
+    from calibrate.graph import SignalGraph, Transducer
+    from calibrate import mcp_server as _mod
+    graph = SignalGraph(
+        sources=[], processors=[],
+        transducers=[
+            Transducer(name="sub", role="sub", processor_ref="dsp", output_index=5,
+                       safety_profile_ref="svs_pb12_nsd", position=None),
+        ],
+        groups=[], profiles=[],
+    )
+    cfg = MagicMock()
+    cfg.signal_graph = graph
+    with patch.object(_mod, "_config", return_value=cfg):
+        # output 4 is not bound — should be rejected
+        result = await _tool_apply_fir(output_index=4, coefficients=[0.0, 1.0])
+        assert not result["ok"]
+        assert "not bound" in result["error"]
+        assert "5=sub" in result["error"]
+        # output 5 is bound — should pass the guard
+        result_ok = await _tool_apply_fir(output_index=5, coefficients=[0.0, 1.0])
+        assert result_ok["ok"]
+
+
+@pytest.mark.asyncio
+async def test_clear_fir_rejects_unbound_output_index(mock_dsp) -> None:
+    """clear_fir must reject indices not bound to a transducer when graph has any."""
+    from calibrate.graph import SignalGraph, Transducer
+    from calibrate import mcp_server as _mod
+    graph = SignalGraph(
+        sources=[], processors=[],
+        transducers=[
+            Transducer(name="sub", role="sub", processor_ref="dsp", output_index=5,
+                       safety_profile_ref="svs_pb12_nsd", position=None),
+        ],
+        groups=[], profiles=[],
+    )
+    cfg = MagicMock()
+    cfg.signal_graph = graph
+    with patch.object(_mod, "_config", return_value=cfg):
+        result = await _tool_clear_fir(output_index=4)
+        assert not result["ok"]
+        assert "not bound" in result["error"]
+
+
 @pytest.mark.asyncio
 async def test_apply_fir_success(mock_dsp) -> None:
     coeffs = [0.0] * 127 + [1.0]  # 128 taps, impulse at end
@@ -1850,7 +2021,7 @@ async def test_apply_fir_success(mock_dsp) -> None:
 
 
 @pytest.mark.asyncio
-async def test_apply_fir_too_many_taps(mock_dsp) -> None:
+async def test_apply_fir_too_many_taps(mock_dsp, _empty_signal_graph) -> None:
     mock_dsp.apply_fir.side_effect = DriverError("too many FIR taps: 2049 > 2048")
     result = await _tool_apply_fir(output_index=0, coefficients=[0.0] * 2049)
     assert not result["ok"]
@@ -1866,7 +2037,7 @@ async def test_apply_fir_driver_error(mock_dsp) -> None:
 
 
 @pytest.mark.asyncio
-async def test_clear_fir_success(mock_dsp) -> None:
+async def test_clear_fir_success(mock_dsp, _empty_signal_graph) -> None:
     result = await _tool_clear_fir(output_index=2)
     assert result["ok"]
     assert result["output_index"] == 2
@@ -1874,7 +2045,7 @@ async def test_clear_fir_success(mock_dsp) -> None:
 
 
 @pytest.mark.asyncio
-async def test_clear_fir_driver_error(mock_dsp) -> None:
+async def test_clear_fir_driver_error(mock_dsp, _empty_signal_graph) -> None:
     mock_dsp.clear_fir.side_effect = DriverError("clear failed")
     result = await _tool_clear_fir(output_index=0)
     assert not result["ok"]
@@ -1930,7 +2101,7 @@ async def test_apply_fir_rejects_missing_source(mock_dsp) -> None:
 
 
 @pytest.mark.asyncio
-async def test_apply_fir_missing_design_in_cache(mock_dsp) -> None:
+async def test_apply_fir_missing_design_in_cache(mock_dsp, _empty_signal_graph) -> None:
     from calibrate import mcp_server as _mod
     _mod._fir_design_cache.pop(9999, None)
     result = await _tool_apply_fir(output_index=0, design_session_id=9999)
@@ -1982,7 +2153,7 @@ async def test_apply_fir_safe_coefficients_proceed(mock_dsp) -> None:
 
 
 @pytest.mark.asyncio
-async def test_call_tool_clear_fir_dispatch(mock_dsp) -> None:
+async def test_call_tool_clear_fir_dispatch(mock_dsp, _empty_signal_graph) -> None:
     from calibrate.mcp_server import call_tool
     texts = await call_tool("clear_fir", {"output_index": 0})
     data = json.loads(texts[0].text)

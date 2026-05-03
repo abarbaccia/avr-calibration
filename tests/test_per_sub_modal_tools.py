@@ -48,6 +48,20 @@ def _two_sub_fixtures() -> tuple[MagicMock, MagicMock]:
     return sa, sb
 
 
+def _wire_store_mock(MockStore: MagicMock, *sessions: MagicMock) -> None:
+    """Configure a SessionStore mock to support both list_sessions() and
+    get_session(id) — the production tool prefers the single-row fetch
+    to avoid OOM on the Pi when the store has many sessions.
+    """
+    by_id = {int(s.id): s for s in sessions}
+
+    def _by_id(sid: int) -> MagicMock | None:
+        return by_id.get(int(sid))
+
+    MockStore.return_value.list_sessions.return_value = list(sessions)
+    MockStore.return_value.get_session.side_effect = _by_id
+
+
 # ─── analyze_per_sub_modal_contribution ─────────────────────────────────────
 
 
@@ -56,7 +70,7 @@ async def test_returns_modes_for_two_subs() -> None:
     """Sanity check: shape + per-sub data for both sessions."""
     sa, sb = _two_sub_fixtures()
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [sa, sb]
+        _wire_store_mock(MockStore, sa, sb)
         result = await _tool_analyze_per_sub_modal_contribution(
             session_ids=[911, 912],
         )
@@ -82,7 +96,7 @@ async def test_modal_coupling_share_sums_to_one_per_mode() -> None:
     when neither sub excites the mode)."""
     sa, sb = _two_sub_fixtures()
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [sa, sb]
+        _wire_store_mock(MockStore, sa, sb)
         result = await _tool_analyze_per_sub_modal_contribution(
             session_ids=[911, 912],
         )
@@ -104,7 +118,7 @@ async def test_uses_decay_modes_from_session_metadata() -> None:
     with patch("calibrate.storage.SessionStore") as MockStore, patch(
         "calibrate.mcp_server._tool_analyze_decay"
     ) as mock_decay:
-        MockStore.return_value.list_sessions.return_value = [sa, sb]
+        _wire_store_mock(MockStore, sa, sb)
         result = await _tool_analyze_per_sub_modal_contribution(
             session_ids=[911, 912],
         )
@@ -132,7 +146,7 @@ async def test_handles_modes_present_in_only_one_sub() -> None:
     ]
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [sa, sb]
+        _wire_store_mock(MockStore, sa, sb)
         result = await _tool_analyze_per_sub_modal_contribution(
             session_ids=[911, 912],
         )
@@ -146,6 +160,42 @@ async def test_handles_modes_present_in_only_one_sub() -> None:
     sb_entry = next(e for e in entries if e["session_id"] == 912)
     assert sa_entry["peak_db"] == 0.0
     assert sb_entry["peak_db"] > 0.0
+
+
+# ─── memory: per-sub tool must NOT call list_sessions() ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_does_not_call_list_sessions_oom_regression() -> None:
+    """Regression: analyze_per_sub_modal_contribution must fetch each session
+    via get_session() (single SQLite row) — never list_sessions(), which
+    materialises every session's IR blob into memory and OOM-kills the
+    worker on the 4 GiB Pi.
+
+    Repro before this fix: a single call with two session_ids on a Pi with
+    ~50 stored sessions caused the MCP server log to end with 'Killed' (no
+    traceback) — the kernel OOM-killer fired. The fix is to load one
+    session at a time, drop the heavy Session reference between iterations,
+    and force a GC cycle so the IR blob is actually freed. Helper analytics
+    (decay, phase) run inline against the fetched Session — never via the
+    public _tool_analyze_decay/_tool_analyze_phase entrypoints, which each
+    call list_sessions() internally.
+    """
+    sa, sb = _two_sub_fixtures()
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        _wire_store_mock(MockStore, sa, sb)
+        result = await _tool_analyze_per_sub_modal_contribution(
+            session_ids=[911, 912],
+        )
+
+    assert result["ok"], result
+    assert MockStore.return_value.list_sessions.call_count == 0, (
+        "analyze_per_sub_modal_contribution called list_sessions() — "
+        "this loads every session's IR blob into memory and OOM-kills "
+        "the worker on the Pi. Use get_session(id) instead."
+    )
+    # And get_session must be called once per id (no redundant fetches).
+    assert MockStore.return_value.get_session.call_count == 2
 
 
 # ─── simulate_per_sub_fir ───────────────────────────────────────────────────
@@ -195,7 +245,7 @@ async def test_predicts_combined_fr_for_simple_synthesis() -> None:
     ]
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [sa, sb]
+        _wire_store_mock(MockStore, sa, sb)
         result = await _tool_simulate_per_sub_fir(per_sub_specs=specs)
 
     assert result["ok"], result
@@ -252,7 +302,7 @@ async def test_per_sub_intents_pass_through() -> None:
     ]
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [sa, sb]
+        _wire_store_mock(MockStore, sa, sb)
         result = await _tool_simulate_per_sub_fir(per_sub_specs=specs)
 
     assert result["ok"], result
@@ -293,7 +343,7 @@ async def test_does_not_apply_to_hardware() -> None:
         patch("calibrate.mcp_server._tool_set_output_gain") as mock_set_gain,
         patch("calibrate.mcp_server._tool_apply_eq") as mock_apply_eq,
     ):
-        MockStore.return_value.list_sessions.return_value = [sa, sb]
+        _wire_store_mock(MockStore, sa, sb)
         result = await _tool_simulate_per_sub_fir(per_sub_specs=specs)
 
     assert result["ok"], result
@@ -331,7 +381,7 @@ async def test_reuses_modal_aware_fir_designer() -> None:
             autospec=True,
         ) as mock_design,
     ):
-        MockStore.return_value.list_sessions.return_value = [sa, sb]
+        _wire_store_mock(MockStore, sa, sb)
         # Build a realistic return: passthrough impulse + summary.
         from calibrate.modal_fir import DesignSummary
         coeffs = [0.0] * 4096
