@@ -443,6 +443,7 @@ class MeasurementEngine:
         freq_min: int | None = None,
         freq_max: int | None = None,
         out_channel_override: int | None = None,
+        route: str | None = None,
     ) -> FrequencyResponse:
         """Run a full sweep measurement. Hardware-agnostic.
 
@@ -500,7 +501,11 @@ class MeasurementEngine:
         sample_rate: int = cfg.get("sample_rate", 48000)
         in_channel: int = cfg.get("input_channel", 1)
         out_channel: int = out_channel_override if out_channel_override is not None else cfg.get("output_channel", 1)
-        route = cfg.get("playback_route", "usb")
+        # Caller-supplied route wins over cfg — eliminates the foot-gun where
+        # mcp_server auto-routes to "hdmi" for sweep_channel=FL but the engine
+        # then silently goes USB because cfg.measurement.playback_route="usb".
+        if route is None:
+            route = cfg.get("playback_route", "usb")
 
         # Generate sweep before acquiring the lock — pure computation, no global state.
         # pytta 0.1.1 uses camelCase params and fftDegree instead of duration.

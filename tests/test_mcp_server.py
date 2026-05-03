@@ -5839,6 +5839,68 @@ async def test_trigger_measurement_sweep_channel_forces_hdmi_route() -> None:
     # measure() received the resolved HDMI channel index for FL (=1).
     measure_kwargs = mock_engine.measure.await_args.kwargs
     assert measure_kwargs["out_channel_override"] == 1
+    # Route is plumbed through to engine.measure() — engine no longer reads
+    # cfg.playback_route which would have given "usb" here.
+    assert measure_kwargs["route"] == "hdmi"
+
+
+@pytest.mark.asyncio
+async def test_trigger_measurement_hdmi_ignores_cal_mode_loopback() -> None:
+    """HDMI sweep must NOT inherit cal_mode_active loopback override.
+
+    Foot-gun regression: when a sub-cal session leaves cal_mode_active=True
+    on the DSP driver, a subsequent mains sweep (sweep_channel=FL) was
+    silently routed to hw:Loopback,0,0 instead of the AVR/HDMI path.
+    """
+    from calibrate.config import Config, DEFAULT_CONFIG
+
+    mock_sd = MagicMock()
+    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
+
+    mock_fr = MagicMock()
+    mock_engine = MagicMock()
+    mock_engine.measure = AsyncMock(return_value=mock_fr)
+
+    mock_store = MagicMock()
+    mock_store.save_measurement.return_value = 99
+
+    mock_ctx_instance = AsyncMock()
+    mock_ctx_instance.__aenter__ = AsyncMock(return_value=mock_ctx_instance)
+    mock_ctx_instance.__aexit__ = AsyncMock(return_value=False)
+
+    # DSP driver in cal mode with a loopback override device set.
+    mock_dsp = MagicMock()
+    mock_dsp.cal_mode_active = True
+    mock_dsp.cal_playback_device = "hw:Loopback,0,0"
+
+    cfg_data = {k: (dict(v) if isinstance(v, dict) else v)
+                for k, v in DEFAULT_CONFIG.items()}
+    cfg_data["measurement"] = {
+        **cfg_data["measurement"],
+        "playback_route": "usb",
+        "denon_sweep_input": "AUX1",
+    }
+    cfg_data["denon"] = {**cfg_data.get("denon", {}), "host": "192.168.1.209"}
+
+    with (
+        patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
+        patch("calibrate.storage.SessionStore", return_value=mock_store),
+        patch.object(sut, "DenonSweepContext") as MockCtx,
+        patch.object(sut, "_drivers", None),
+        patch.object(sut, "_dsp", mock_dsp),
+        patch.object(sut, "_config", return_value=Config(cfg_data)),
+    ):
+        MockCtx.from_config.return_value = mock_ctx_instance
+        result = await sut._tool_trigger_measurement(sweep_channel="FL")
+
+    assert result["ok"], result
+    measure_kwargs = mock_engine.measure.await_args.kwargs
+    # Critical: cal_playback_device must be DROPPED on HDMI route — otherwise
+    # the sweep plays into snd-aloop instead of HDMI.
+    assert measure_kwargs["playback_device_override"] is None
+    assert measure_kwargs["route"] == "hdmi"
 
 
 @pytest.mark.asyncio
