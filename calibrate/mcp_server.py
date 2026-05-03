@@ -6151,6 +6151,26 @@ async def _tool_apply_fir(
     if coefficients is None and design_session_id is None:
         return _err("apply_fir: provide either coefficients or design_session_id")
 
+    # Reject writes to outputs that aren't bound to a transducer in the
+    # signal graph. This is a hard guard against off-by-one wiring
+    # mistakes (e.g. apply_fir(output_index=4) when the sub bus starts at
+    # 5) — the FIR would land on an unrouted channel and silently do
+    # nothing, which is exactly the failure mode that motivated this check.
+    try:
+        graph = _config().signal_graph
+        bound = {int(t.output_index): t.name for t in graph.transducers}
+        if int(output_index) not in bound:
+            valid = ", ".join(
+                f"{idx}={name}" for idx, name in sorted(bound.items())
+            ) or "(no transducers in signal graph)"
+            return _err(
+                f"apply_fir: output_index={output_index} is not bound to "
+                f"any transducer. Valid: {valid}. Call get_signal_graph "
+                f"to confirm."
+            )
+    except Exception:
+        pass
+
     source: str
     intent = "general"
     if design_session_id is not None:
@@ -6357,6 +6377,19 @@ async def _tool_design_corrective_fir(
 
 async def _tool_clear_fir(output_index: int) -> dict:
     """Clear FIR coefficients and reset output to passthrough."""
+    try:
+        graph = _config().signal_graph
+        bound = {int(t.output_index): t.name for t in graph.transducers}
+        if int(output_index) not in bound:
+            valid = ", ".join(
+                f"{idx}={name}" for idx, name in sorted(bound.items())
+            ) or "(no transducers in signal graph)"
+            return _err(
+                f"clear_fir: output_index={output_index} is not bound to "
+                f"any transducer. Valid: {valid}."
+            )
+    except Exception:
+        pass
     try:
         await _dsp.clear_fir(output_index)  # type: ignore[union-attr]
     except DriverError as exc:
@@ -9588,7 +9621,14 @@ _TOOLS: list[Tool] = [
             "properties": {
                 "output_index": {
                     "type": "integer",
-                    "description": "DSP output index (0-3)",
+                    "description": (
+                        "DSP output index. Must match a transducer's "
+                        "output_index in the signal graph — call "
+                        "get_signal_graph first if unsure. Writing to an "
+                        "index that isn't bound to a transducer is "
+                        "rejected (prevents off-by-one wiring mistakes "
+                        "where the FIR ends up on an unrouted channel)."
+                    ),
                 },
                 "coefficients": {
                     "type": "array",
@@ -9625,7 +9665,11 @@ _TOOLS: list[Tool] = [
             "properties": {
                 "output_index": {
                     "type": "integer",
-                    "description": "DSP output index (0-3)",
+                    "description": (
+                        "DSP output index. Must match a transducer's "
+                        "output_index in the signal graph (see "
+                        "get_signal_graph)."
+                    ),
                 },
             },
             "required": ["output_index"],
