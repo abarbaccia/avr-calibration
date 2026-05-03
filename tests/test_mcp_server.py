@@ -2037,7 +2037,7 @@ async def test_apply_fir_driver_error(mock_dsp) -> None:
 
 
 @pytest.mark.asyncio
-async def test_clear_fir_success(mock_dsp) -> None:
+async def test_clear_fir_success(mock_dsp, _empty_signal_graph) -> None:
     result = await _tool_clear_fir(output_index=2)
     assert result["ok"]
     assert result["output_index"] == 2
