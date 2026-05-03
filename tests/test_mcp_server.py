@@ -149,6 +149,18 @@ def valid_filters():
     ]
 
 
+@pytest.fixture
+def _empty_signal_graph():
+    """Patch _config to a graph with no transducers — bypasses the apply_fir /
+    clear_fir output_index guard for tests that intentionally pass arbitrary
+    indices (tap-count failures, missing-cache, dispatch shape, etc.)."""
+    from calibrate import mcp_server as _mod
+    cfg = MagicMock()
+    cfg.signal_graph.transducers = []
+    with patch.object(_mod, "_config", return_value=cfg):
+        yield cfg
+
+
 # ── get_device_state ───────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -1950,6 +1962,54 @@ async def test_call_tool_set_master_gain_dispatch(mock_dsp) -> None:
 
 # ── apply_fir / clear_fir ────────────────────────────────────────────────────
 
+
+@pytest.mark.asyncio
+async def test_apply_fir_rejects_unbound_output_index(mock_dsp) -> None:
+    """apply_fir must reject indices not bound to a transducer when graph has any."""
+    from calibrate.graph import SignalGraph, Transducer
+    from calibrate import mcp_server as _mod
+    graph = SignalGraph(
+        sources=[], processors=[],
+        transducers=[
+            Transducer(name="sub", role="sub", processor_ref="dsp", output_index=5,
+                       safety_profile_ref="svs_pb12_nsd", position=None),
+        ],
+        groups=[], profiles=[],
+    )
+    cfg = MagicMock()
+    cfg.signal_graph = graph
+    with patch.object(_mod, "_config", return_value=cfg):
+        # output 4 is not bound — should be rejected
+        result = await _tool_apply_fir(output_index=4, coefficients=[0.0, 1.0])
+        assert not result["ok"]
+        assert "not bound" in result["error"]
+        assert "5=sub" in result["error"]
+        # output 5 is bound — should pass the guard
+        result_ok = await _tool_apply_fir(output_index=5, coefficients=[0.0, 1.0])
+        assert result_ok["ok"]
+
+
+@pytest.mark.asyncio
+async def test_clear_fir_rejects_unbound_output_index(mock_dsp) -> None:
+    """clear_fir must reject indices not bound to a transducer when graph has any."""
+    from calibrate.graph import SignalGraph, Transducer
+    from calibrate import mcp_server as _mod
+    graph = SignalGraph(
+        sources=[], processors=[],
+        transducers=[
+            Transducer(name="sub", role="sub", processor_ref="dsp", output_index=5,
+                       safety_profile_ref="svs_pb12_nsd", position=None),
+        ],
+        groups=[], profiles=[],
+    )
+    cfg = MagicMock()
+    cfg.signal_graph = graph
+    with patch.object(_mod, "_config", return_value=cfg):
+        result = await _tool_clear_fir(output_index=4)
+        assert not result["ok"]
+        assert "not bound" in result["error"]
+
+
 @pytest.mark.asyncio
 async def test_apply_fir_success(mock_dsp) -> None:
     coeffs = [0.0] * 127 + [1.0]  # 128 taps, impulse at end
@@ -1961,7 +2021,7 @@ async def test_apply_fir_success(mock_dsp) -> None:
 
 
 @pytest.mark.asyncio
-async def test_apply_fir_too_many_taps(mock_dsp) -> None:
+async def test_apply_fir_too_many_taps(mock_dsp, _empty_signal_graph) -> None:
     mock_dsp.apply_fir.side_effect = DriverError("too many FIR taps: 2049 > 2048")
     result = await _tool_apply_fir(output_index=0, coefficients=[0.0] * 2049)
     assert not result["ok"]
@@ -1985,7 +2045,7 @@ async def test_clear_fir_success(mock_dsp) -> None:
 
 
 @pytest.mark.asyncio
-async def test_clear_fir_driver_error(mock_dsp) -> None:
+async def test_clear_fir_driver_error(mock_dsp, _empty_signal_graph) -> None:
     mock_dsp.clear_fir.side_effect = DriverError("clear failed")
     result = await _tool_clear_fir(output_index=0)
     assert not result["ok"]
@@ -2041,7 +2101,7 @@ async def test_apply_fir_rejects_missing_source(mock_dsp) -> None:
 
 
 @pytest.mark.asyncio
-async def test_apply_fir_missing_design_in_cache(mock_dsp) -> None:
+async def test_apply_fir_missing_design_in_cache(mock_dsp, _empty_signal_graph) -> None:
     from calibrate import mcp_server as _mod
     _mod._fir_design_cache.pop(9999, None)
     result = await _tool_apply_fir(output_index=0, design_session_id=9999)
@@ -2093,7 +2153,7 @@ async def test_apply_fir_safe_coefficients_proceed(mock_dsp) -> None:
 
 
 @pytest.mark.asyncio
-async def test_call_tool_clear_fir_dispatch(mock_dsp) -> None:
+async def test_call_tool_clear_fir_dispatch(mock_dsp, _empty_signal_graph) -> None:
     from calibrate.mcp_server import call_tool
     texts = await call_tool("clear_fir", {"output_index": 0})
     data = json.loads(texts[0].text)

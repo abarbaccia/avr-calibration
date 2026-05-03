@@ -6156,13 +6156,16 @@ async def _tool_apply_fir(
     # mistakes (e.g. apply_fir(output_index=4) when the sub bus starts at
     # 5) — the FIR would land on an unrouted channel and silently do
     # nothing, which is exactly the failure mode that motivated this check.
+    # Only enforces when the graph has transducers; legacy / minimal
+    # configs (e.g. test fixtures with no signal_graph block) skip the
+    # check rather than block every index.
     try:
         graph = _config().signal_graph
         bound = {int(t.output_index): t.name for t in graph.transducers}
-        if int(output_index) not in bound:
+        if bound and int(output_index) not in bound:
             valid = ", ".join(
                 f"{idx}={name}" for idx, name in sorted(bound.items())
-            ) or "(no transducers in signal graph)"
+            )
             return _err(
                 f"apply_fir: output_index={output_index} is not bound to "
                 f"any transducer. Valid: {valid}. Call get_signal_graph "
@@ -6380,10 +6383,10 @@ async def _tool_clear_fir(output_index: int) -> dict:
     try:
         graph = _config().signal_graph
         bound = {int(t.output_index): t.name for t in graph.transducers}
-        if int(output_index) not in bound:
+        if bound and int(output_index) not in bound:
             valid = ", ".join(
                 f"{idx}={name}" for idx, name in sorted(bound.items())
-            ) or "(no transducers in signal graph)"
+            )
             return _err(
                 f"clear_fir: output_index={output_index} is not bound to "
                 f"any transducer. Valid: {valid}."
