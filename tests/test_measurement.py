@@ -217,6 +217,32 @@ class TestMeasure:
         assert all(40 <= f <= 100 for f in fr.frequencies)
 
     @pytest.mark.asyncio
+    async def test_route_param_overrides_cfg_playback_route(self):
+        """Caller-supplied route="hdmi" must beat cfg.playback_route="usb".
+
+        Regression: engine used to read cfg.measurement.playback_route directly,
+        which silently dropped mcp_server's auto-route to "hdmi" for mains
+        sweeps. The route param plumbs that decision through.
+        """
+        cfg = make_config()
+        cfg.measurement["playback_route"] = "usb"
+        # Bypass HDMI device name-search inside measure() — the mocked
+        # sounddevice in this suite doesn't carry full PortAudio metadata.
+        cfg.measurement["hdmi_device_index"] = 0
+        engine, _, mock_sweep, mock_recording = self._make_engine_with_mocks(cfg)
+        mock_strategy = self._make_playback_mock(mock_sweep, mock_recording)
+        with patch(
+            "calibrate.drivers.playback.playback_for_route",
+            return_value=mock_strategy,
+        ) as mock_factory:
+            await engine.measure(route="hdmi")
+        # playback_for_route is called with the explicit route, not cfg's "usb".
+        # Note: when route=="hdmi" without cal-mode override, measure() takes
+        # the direct-aplay branch; either way the route arg drives the choice.
+        called_route = mock_factory.call_args[0][0]
+        assert called_route == "hdmi"
+
+    @pytest.mark.asyncio
     async def test_pytta_import_error_raises_runtime_error(self):
         engine = MeasurementEngine(make_config())
         with patch.dict(sys.modules, {"pytta": None}):

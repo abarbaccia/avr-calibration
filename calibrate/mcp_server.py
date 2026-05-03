@@ -4780,8 +4780,14 @@ async def _tool_trigger_measurement(
         # When the DSP driver is in cal mode, route the sweep into its loopback
         # capture device so the sweep enters CamillaDSP via snd-aloop. Bypasses
         # the AVR — Audyssey/MultEQ filters cannot color the cal stimulus.
+        # Cal-mode loopback only makes sense for the USB/CamillaDSP path. For
+        # an HDMI sweep we must IGNORE cal_playback_device — otherwise an HDMI
+        # mains sweep silently goes into snd-aloop instead of the AVR/HDMI.
         cal_active = bool(getattr(_dsp, "cal_mode_active", False))
-        cal_playback = getattr(_dsp, "cal_playback_device", None) if cal_active else None
+        if cal_active and route != "hdmi":
+            cal_playback = getattr(_dsp, "cal_playback_device", None)
+        else:
+            cal_playback = None
 
         # Graph composes the right stack: HDMI route → AVR neutralisation
         # (DenonSweepContext) + DSP HDMI-mode context (source=Analog +
@@ -4805,6 +4811,7 @@ async def _tool_trigger_measurement(
                     playback_device_override=cal_playback,
                     freq_min=resolved_min,
                     freq_max=resolved_max,
+                    route=route,
                 )
         elif route == "hdmi":
             # Legacy path used when the driver registry isn't populated (older
@@ -4822,6 +4829,7 @@ async def _tool_trigger_measurement(
                         freq_min=resolved_min,
                         freq_max=resolved_max,
                         out_channel_override=resolved_out_channel,
+                        route=route,
                     )
             else:
                 fr = await engine.measure(
@@ -4829,6 +4837,7 @@ async def _tool_trigger_measurement(
                     freq_min=resolved_min,
                     freq_max=resolved_max,
                     out_channel_override=resolved_out_channel,
+                    route=route,
                 )
         else:
             # USB mode keeps the persistent-session pattern so repeat
@@ -4836,7 +4845,10 @@ async def _tool_trigger_measurement(
             # session is equivalent to entering the DSP's sweep context once
             # and holding it open across measurements.
             await _ensure_sweep_session()
-            fr = await engine.measure(playback_device_override=cal_playback)
+            fr = await engine.measure(
+                playback_device_override=cal_playback,
+                route=route,
+            )
 
         # Compute IR-derived metadata at capture time. Query the DSP for the
         # current per-output FIR pre-delay so the onset detector can skip
