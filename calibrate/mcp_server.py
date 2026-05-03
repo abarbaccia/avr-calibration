@@ -715,12 +715,17 @@ async def _tool_compute_deviation(
     Returns RMS deviation, per-band errors, convergence status, and excluded zones.
     """
     from .storage import SessionStore
+    import gc
     import math
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        # Single-row fetch: full-band sweeps (60 Hz – 20 kHz @ 48 kHz) carry
+        # ~131k-point FR + IR + coherence + phase per session. list_sessions()
+        # materialises EVERY row, which OOM-kills the worker on the 4 GiB Pi
+        # once a handful of full-band sessions accumulate. Same fix pattern as
+        # PR #153 (analyze_per_sub_modal_contribution).
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -769,9 +774,21 @@ async def _tool_compute_deviation(
         geometry_ranges: list[tuple[float, float]] = []
         if exclude_geometry:
             try:
-                geometry_ranges = await _get_geometry_band_ranges(
-                    session_id, min_hz=band_lo, max_hz=band_hi,
+                # Compute geometry bands directly off the already-loaded
+                # session (no second list_sessions pass). _tool_analyze_phase
+                # would re-materialise every session; on full-band sweeps that
+                # alone is enough to OOM the worker.
+                phase_bands = _compute_phase_bands_for_session(
+                    session, min_hz=band_lo, max_hz=band_hi,
                 )
+                factor = 2 ** (1 / 6)
+                for pband in phase_bands:
+                    if pband.get("classification") != "geometry":
+                        continue
+                    centre_hz = float(pband["freq_hz"])
+                    geometry_ranges.append(
+                        (centre_hz / factor, centre_hz * factor)
+                    )
             except Exception as exc:
                 log.warning(
                     "compute_deviation: geometry exclusion unavailable (%s); "
@@ -920,7 +937,37 @@ async def _tool_compute_deviation(
         # ringing (T60 > 400 ms) that calls for physical treatment.
         excluded_band_diagnostics: list[dict] = []
         try:
-            decay_result = await _tool_analyze_decay(session_id=session_id)
+            # Run decay analysis directly on the already-loaded IR rather
+            # than calling _tool_analyze_decay (which would do another
+            # full list_sessions() and blow memory on full-band sweeps).
+            from .decay import analyze_decay as _analyze_decay_inline
+            decay_modes_inline: list[dict] = []
+            ir_inline = getattr(session, "impulse_response", None)
+            if ir_inline:
+                sample_rate_inline = (
+                    fr.sample_rate if getattr(fr, "sample_rate", None) else 48000
+                )
+                try:
+                    decoded_modes = _analyze_decay_inline(
+                        ir_inline,
+                        sample_rate=sample_rate_inline,
+                        t60_threshold_ms=300.0,
+                        freq_min=20.0,
+                        freq_max=200.0,
+                    )
+                    decay_modes_inline = [
+                        {
+                            "freq_hz": m.freq_hz,
+                            "t60_ms": m.t60_ms,
+                            "peak_db": m.peak_db,
+                        }
+                        for m in decoded_modes
+                    ]
+                    decay_result = {"ok": True, "modes": decay_modes_inline}
+                except Exception as decay_exc:
+                    decay_result = {"ok": False, "error": str(decay_exc)}
+            else:
+                decay_result = {"ok": False, "error": "no impulse response"}
             if decay_result.get("ok"):
                 for mode in decay_result.get("modes", []):
                     freq_hz = float(mode.get("freq_hz", 0.0))
@@ -955,6 +1002,18 @@ async def _tool_compute_deviation(
                 "compute_deviation: analyze_decay raised (%s); "
                 "excluded_band_diagnostics will be empty", exc,
             )
+
+        # Drop heavy session-scoped data (FR arrays + IR) before returning.
+        # On full-band sweeps these can be tens of megabytes apiece; without
+        # the explicit del + gc the worker stays bloated long enough that a
+        # follow-up call accumulates and OOMs.
+        try:
+            del ir_inline  # type: ignore[name-defined]
+        except Exception:
+            pass
+        del fr
+        del session
+        gc.collect()
 
         # Geometry-dominated flag: when more than half the in-band points
         # are excluded as geometry nulls, the RMS / mean / max stats are

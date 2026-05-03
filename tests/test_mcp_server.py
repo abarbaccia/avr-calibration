@@ -2571,9 +2571,13 @@ def _make_deviation_session(session_id: int, freqs: list[float], spls: list[floa
     mock_fr = MagicMock()
     mock_fr.frequencies = freqs
     mock_fr.spl = spls
+    mock_fr.phase = None
+    mock_fr.coherence = None
+    mock_fr.sample_rate = 48000
     session = MagicMock()
     session.id = session_id
     session.start_fr = mock_fr
+    session.impulse_response = None
     session.label = f"dev-{session_id}"
     return session
 
@@ -2589,6 +2593,7 @@ async def test_compute_deviation_basic() -> None:
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
+        MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(session_id=1, target_curve=target)
     assert result["ok"]
     assert result["converged"] is True
@@ -2614,6 +2619,7 @@ async def test_compute_deviation_geometry_dominated_flag() -> None:
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
+        MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(session_id=1, target_curve=target)
     assert "geometry_dominated" in result
     assert isinstance(result["geometry_dominated"], bool)
@@ -2631,6 +2637,7 @@ async def test_compute_deviation_null_zone_excluded() -> None:
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
+        MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(
             session_id=1, target_curve=target, null_threshold_db=15.0
         )
@@ -2652,6 +2659,7 @@ async def test_compute_deviation_rolloff_excluded() -> None:
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
+        MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(
             session_id=1, target_curve=target, port_rolloff_hz=28.0
         )
@@ -2669,6 +2677,7 @@ async def test_compute_deviation_not_converged() -> None:
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
+        MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(session_id=1, target_curve=target)
     assert result["ok"]
     assert result["converged"] is False
@@ -2681,6 +2690,7 @@ async def test_compute_deviation_session_not_found() -> None:
     target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = []
+        MockStore.return_value.get_session.side_effect = lambda sid, _ses=[]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(session_id=99, target_curve=target)
     assert not result["ok"]
     assert "session 99 not found" in result["error"]
@@ -2695,6 +2705,7 @@ async def test_compute_deviation_empty_target_points() -> None:
     target = {"points": [], "band": [20, 100]}
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
+        MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(session_id=1, target_curve=target)
     assert not result["ok"]
     assert "points" in result["error"]
@@ -2710,6 +2721,7 @@ async def test_compute_deviation_returns_summary_bands() -> None:
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
+        MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(session_id=1, target_curve=target)
     assert result["ok"]
     assert len(result["summary"]) > 0
@@ -2729,6 +2741,7 @@ async def test_call_tool_compute_deviation_dispatch() -> None:
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
+        MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         texts = await call_tool("compute_deviation", {
             "session_id": 1,
             "target_curve": target,
@@ -2753,6 +2766,7 @@ async def test_compute_deviation_exclude_geometry_false_keeps_geometry_bands() -
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
+        MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(
             session_id=1, target_curve=target, exclude_geometry=False,
         )
@@ -2767,8 +2781,9 @@ async def test_compute_deviation_exclude_geometry_true_auto_excludes() -> None:
     """With exclude_geometry=True (default) and phase data classifying a
     band as 'geometry', compute_deviation excludes it from RMS automatically.
 
-    Patches _get_geometry_band_ranges directly so we don't need to reproduce
-    the entire analyze_phase pipeline just to verify the wiring.
+    Patches _compute_phase_bands_for_session directly so we don't need to
+    reproduce the entire analyze_phase pipeline just to verify the wiring.
+    50 Hz @ 1/6-octave wide centred → factor 2**(1/6) ≈ 1.122 → (44.5, 56.1).
     """
     freqs = [30.0, 40.0, 50.0, 63.0, 80.0]
     target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
@@ -2778,14 +2793,20 @@ async def test_compute_deviation_exclude_geometry_true_auto_excludes() -> None:
     spls = [75.0, 75.0, 65.0, 75.0, 75.0]
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore, \
-         patch("calibrate.mcp_server._get_geometry_band_ranges", return_value=[(47.0, 53.0)]):
+         patch(
+             "calibrate.mcp_server._compute_phase_bands_for_session",
+             return_value=[{"freq_hz": 50.0, "classification": "geometry"}],
+         ):
         MockStore.return_value.list_sessions.return_value = [session]
+        MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(
             session_id=1, target_curve=target, exclude_geometry=True,
         )
     assert result["ok"]
     assert result["excluded_geometry_points"] >= 1
-    assert result["geometry_bands"] == [{"lo_hz": 47.0, "hi_hz": 53.0}]
+    assert len(result["geometry_bands"]) == 1
+    gb = result["geometry_bands"][0]
+    assert gb["lo_hz"] < 50.0 < gb["hi_hz"]
     # 50 Hz's -10 dB error is excluded — RMS should be ~0.
     assert result["rms_db"] < 0.5
 
@@ -2802,28 +2823,40 @@ async def test_compute_deviation_excluded_band_diagnostics() -> None:
     # 50 Hz is a deep null; 22/25 Hz below port rolloff (default 28 Hz).
     spls = [65.0, 70.0, 74.0, 75.0, 50.0, 76.0, 75.0]
     session = _make_deviation_session(1, freqs, spls)
+    # compute_deviation now runs analyze_decay inline against the session's
+    # impulse_response — give it a non-empty IR so the inline path engages.
+    session.impulse_response = [0.0] * 1024
 
-    # Mock analyze_decay: 5 modes.
+    # Mocked decay modes returned by patched analyze_decay:
     # - 24 Hz @ 600 ms → port_rolloff, included
     # - 50 Hz @ 700 ms → null_zone, included
     # - 63 Hz @ 800 ms → geometry, included
     # - 40 Hz @ 900 ms → NOT excluded (normal band), filtered out
     # - 25 Hz @ 200 ms → port_rolloff but T60 below threshold, filtered out
-    decay_payload = {
-        "ok": True,
-        "modes": [
-            {"freq_hz": 24.0, "t60_ms": 600.0, "peak_db": 6.0},
-            {"freq_hz": 50.0, "t60_ms": 700.0, "peak_db": 4.5},
-            {"freq_hz": 63.0, "t60_ms": 800.0, "peak_db": 3.2},
-            {"freq_hz": 40.0, "t60_ms": 900.0, "peak_db": 8.0},
-            {"freq_hz": 25.0, "t60_ms": 200.0, "peak_db": 5.0},
-        ],
-    }
+    Mode = MagicMock
+    decay_modes = [
+        Mode(freq_hz=24.0, t60_ms=600.0, peak_db=6.0, suggested_q=4.0, priority=1),
+        Mode(freq_hz=50.0, t60_ms=700.0, peak_db=4.5, suggested_q=4.0, priority=1),
+        Mode(freq_hz=63.0, t60_ms=800.0, peak_db=3.2, suggested_q=4.0, priority=1),
+        Mode(freq_hz=40.0, t60_ms=900.0, peak_db=8.0, suggested_q=4.0, priority=1),
+        Mode(freq_hz=25.0, t60_ms=200.0, peak_db=5.0, suggested_q=4.0, priority=1),
+    ]
+    # MagicMock kwargs become attributes — but freq_hz etc. need explicit set.
+    for m, vals in zip(
+        decay_modes,
+        [(24.0, 600.0, 6.0), (50.0, 700.0, 4.5), (63.0, 800.0, 3.2),
+         (40.0, 900.0, 8.0), (25.0, 200.0, 5.0)],
+    ):
+        m.freq_hz, m.t60_ms, m.peak_db = vals
 
     with patch("calibrate.storage.SessionStore") as MockStore, \
-         patch("calibrate.mcp_server._get_geometry_band_ranges", return_value=[(60.0, 66.0)]), \
-         patch("calibrate.mcp_server._tool_analyze_decay", return_value=decay_payload):
+         patch(
+             "calibrate.mcp_server._compute_phase_bands_for_session",
+             return_value=[{"freq_hz": 63.0, "classification": "geometry"}],
+         ), \
+         patch("calibrate.decay.analyze_decay", return_value=decay_modes):
         MockStore.return_value.list_sessions.return_value = [session]
+        MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(
             session_id=1, target_curve=target,
         )
@@ -2853,10 +2886,70 @@ async def test_compute_deviation_excluded_band_diagnostics_graceful_on_failure()
          patch("calibrate.mcp_server._tool_analyze_decay",
                side_effect=RuntimeError("no impulse response")):
         MockStore.return_value.list_sessions.return_value = [session]
+        MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(session_id=1, target_curve=target)
 
     assert result["ok"]
     assert result["excluded_band_diagnostics"] == []
+
+
+@pytest.mark.asyncio
+async def test_compute_deviation_full_band_sweep_no_oom() -> None:
+    """Regression: full-band sweep (60 Hz – 20 kHz @ 48 kHz, ~131k FR points)
+    must NOT load every session into memory — it has to use get_session.
+
+    On the 4 GiB Pi the old code path (list_sessions()) materialised every
+    stored session's FR + IR + coherence + phase arrays, OOM-killing the
+    MCP worker as soon as a handful of full-band sessions accumulated.
+    This test asserts the tool works at full-band density AND only fetches
+    the requested session row.
+    """
+    import numpy as np
+
+    # ~131k frequency bins, mimics the deconvolved sweep grid
+    n_bins = 131072
+    freqs = np.linspace(20.0, 20000.0, n_bins).tolist()
+    spls = (np.full(n_bins, 75.0) + np.random.default_rng(0).normal(0, 0.5, n_bins)).tolist()
+    target = {
+        "points": [
+            {"freq": 30, "spl": 79.0},
+            {"freq": 80, "spl": 75.0},
+            {"freq": 1000, "spl": 75.0},
+            {"freq": 20000, "spl": 70.0},
+        ],
+        "band": [80, 20000],
+    }
+    session = _make_deviation_session(952, freqs, spls)
+
+    # If the tool reaches for list_sessions, this side_effect explodes the
+    # test rather than silently OOM-ing — making the regression unmissable.
+    def _fail_list() -> list:
+        raise AssertionError(
+            "compute_deviation must not call list_sessions() — that path "
+            "materialises every stored session and OOMs on full-band data"
+        )
+
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        MockStore.return_value.list_sessions.side_effect = _fail_list
+        MockStore.return_value.get_session.side_effect = (
+            lambda sid: session if sid == 952 else None
+        )
+        # Both summary resolutions that the live agent uses on full-band runs
+        for resolution in ("third_octave", "twelfth_octave"):
+            result = await _tool_compute_deviation(
+                session_id=952,
+                target_curve=target,
+                resolution=resolution,
+                # Skip geometry exclusion (no phase data on this synthetic FR)
+                exclude_geometry=False,
+            )
+            assert result["ok"], f"{resolution}: {result.get('error')}"
+            assert "rms_db" in result
+            assert isinstance(result["summary"], list)
+            assert len(result["summary"]) > 0
+            for entry in result["summary"]:
+                assert "freq_hz" in entry
+                assert "error_db" in entry
 
 
 # ── anchor_target ────────────────────────────────────────────────────────────
