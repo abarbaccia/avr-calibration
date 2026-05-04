@@ -468,10 +468,24 @@ def _push_full_sync(
                 )
                 return summary
 
-        if init_coefs_required:
-            time.sleep(0.02)
-            sock.sendall(build_frame("INIT_COEFS"))
-            summary["init_coefs_ack"] = did_ack(drain(1.5), "INIT_COEFS")
+        # INIT_COEFS — the deleted reference sends this UNCONDITIONALLY
+        # before the SET_COEFDT stream. We previously gated it on
+        # DType=Fixed (X3800H reports Float), but the May 4 silent-MultEQ
+        # bug suggests the AVR's MultEQ engine wants this signal to know
+        # the new bank is being written. ACK is best-effort — the
+        # X3800H sometimes returns no reply (memory:
+        # audyssey_disfil_init_probe.py findings). Treat no-reply as OK
+        # but NOT NACK — fail fast on explicit NACK.
+        time.sleep(0.05)
+        sock.sendall(build_frame("INIT_COEFS"))
+        init_frames = drain(2.0)
+        summary["init_coefs_ack"] = did_ack(init_frames, "INIT_COEFS")
+        # Count NACKs in init_frames as a soft signal — bail only if
+        # we see an explicit NACK, not on silent no-reply.
+        init_nacks = count_nacks(init_frames)
+        if init_nacks > 0:
+            summary["error"] = "INIT_COEFS NACK"
+            return summary
 
         # Pre-coef settle. Run 29's verification probe (commit_fin=False)
         # caught 3 NACKs in the first channel's stream and zero in every
