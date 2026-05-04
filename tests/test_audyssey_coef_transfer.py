@@ -180,11 +180,12 @@ def test_first_packet_header_for_sw1_at_44100() -> None:
     assert first["param_data"][:4] == bytes.fromhex("01" + "01" + "0d" + "00")
 
 
-def test_coefficients_serialize_as_be_float32() -> None:
-    """Wire format is big-endian float32. Confirmed by pcap-decode of real
-    AVR traffic (scripts/audyssey_pcap_decode.py uses '>f') and by
-    ratbuddyssey's FloatInt32 union. The prior LE encoding caused ~1-2%
-    packet NACK + FINZ_COEFS-never-ACKs on multi-channel uploads."""
+def test_coefficients_serialize_as_le_float32() -> None:
+    """Wire format is LITTLE-endian float32, per OCA's transfer.js
+    canonical reference (oca_transfer.py:1495 uses
+    `struct.pack('<f', f)`). The X3800H accepts LE; we briefly tried
+    BE on 2026-05-04 morning based on a wrong pcap_decode.py reading
+    and reverted after finding OCA."""
     coefs = [0.25, -0.5, 0.125]
     pkts = build_coef_packets(
         coefs,
@@ -198,15 +199,15 @@ def test_coefficients_serialize_as_be_float32() -> None:
     coef_bytes = info["param_data"][4:]
     assert len(coef_bytes) == len(coefs) * 4
     decoded = [
-        struct.unpack(">f", coef_bytes[i * 4: (i + 1) * 4])[0]
+        struct.unpack("<f", coef_bytes[i * 4: (i + 1) * 4])[0]
         for i in range(len(coefs))
     ]
     np.testing.assert_allclose(decoded, coefs, atol=1e-7)
 
 
-def test_coefficient_wire_bytes_match_pcap_format() -> None:
+def test_coefficient_wire_bytes_match_oca_format() -> None:
     """Pin the exact wire bytes for a known float so the encoding can't
-    silently regress to little-endian. 0.25 in IEEE 754 BE = 0x3E800000."""
+    silently regress to big-endian. 0.25 in IEEE 754 LE = 0x0000803E."""
     pkts = build_coef_packets(
         [0.25],
         channel_id="FL",
@@ -215,8 +216,8 @@ def test_coefficient_wire_bytes_match_pcap_format() -> None:
     )
     info = _parse_packet_header(pkts[0])
     coef_bytes = info["param_data"][4:]  # skip stream header
-    assert coef_bytes == bytes.fromhex("3E800000"), (
-        f"expected BE bytes 3E800000 for 0.25, got {coef_bytes.hex().upper()}"
+    assert coef_bytes == bytes.fromhex("0000803E"), (
+        f"expected LE bytes 0000803E for 0.25, got {coef_bytes.hex().upper()}"
     )
 
 

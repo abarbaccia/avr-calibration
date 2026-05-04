@@ -447,45 +447,20 @@ def _push_full_sync(
                 summary["error"] = "SET_SETDAT NACK"
                 return summary
 
-        # SET_DISFIL — declares which channel/EqType slots will receive
-        # new coefficients. Without this step the X3800H's MultEQ engine
-        # buffers coef streams but never engages them at runtime — silent
-        # output through STEREO/MULTI CH STEREO modes despite a clean
-        # FINZ + Fin commit. See ratbuddyssey DisFil.cs:43-100.
-        for body_dict in (setdisfil_bodies or []):
-            body = json.dumps(body_dict, separators=(",", ":")).encode("ascii")
-            sock.sendall(build_frame("SET_DISFIL", body))
-            ack = did_ack(drain(2.5), "SET_DISFIL")
-            summary["setdisfil_acks"].append({
-                "ChData": body_dict.get("ChData"),
-                "EqType": body_dict.get("EqType"),
-                "ack": ack,
-            })
-            if not ack:
-                summary["error"] = (
-                    f"SET_DISFIL NACK on {body_dict.get('ChData')}/"
-                    f"{body_dict.get('EqType')}"
-                )
-                return summary
+        # NOTE: SET_DISFIL is NOT used by OCA / A1Evo Acoustica
+        # (transfer.js / oca_transfer.py don't send it). We briefly
+        # added it 2026-05-04 evening based on the deleted
+        # scripts/audyssey_push_full_filters.py — that script is a
+        # different (probably non-working) port. Removed after finding
+        # OCA's reference implementation.
 
-        # INIT_COEFS — the deleted reference sends this UNCONDITIONALLY
-        # before the SET_COEFDT stream. We previously gated it on
-        # DType=Fixed (X3800H reports Float), but the May 4 silent-MultEQ
-        # bug suggests the AVR's MultEQ engine wants this signal to know
-        # the new bank is being written. ACK is best-effort — the
-        # X3800H sometimes returns no reply (memory:
-        # audyssey_disfil_init_probe.py findings). Treat no-reply as OK
-        # but NOT NACK — fail fast on explicit NACK.
-        time.sleep(0.05)
-        sock.sendall(build_frame("INIT_COEFS"))
-        init_frames = drain(2.0)
-        summary["init_coefs_ack"] = did_ack(init_frames, "INIT_COEFS")
-        # Count NACKs in init_frames as a soft signal — bail only if
-        # we see an explicit NACK, not on silent no-reply.
-        init_nacks = count_nacks(init_frames)
-        if init_nacks > 0:
-            summary["error"] = "INIT_COEFS NACK"
-            return summary
+        # INIT_COEFS — sent only when DType=fixed per OCA
+        # (oca_transfer.py:1476). X3800H reports DType=Float so this
+        # is normally skipped.
+        if init_coefs_required:
+            time.sleep(0.02)
+            sock.sendall(build_frame("INIT_COEFS"))
+            summary["init_coefs_ack"] = did_ack(drain(1.5), "INIT_COEFS")
 
         # Pre-coef settle. Run 29's verification probe (commit_fin=False)
         # caught 3 NACKs in the first channel's stream and zero in every

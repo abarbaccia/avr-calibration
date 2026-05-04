@@ -432,7 +432,6 @@ def test_commit_fin_false_skips_fin_packet(monkeypatch) -> None:
     sock = _FakeSocket([
         [_ack_frame("ENTER_AUDY")],   # stage 0: ENTER_AUDY
         [_ack_frame("SET_SETDAT")],   # stage 1: SET_SETDAT chunk
-        [],                           # stage 2: INIT_COEFS (no ACK on X3800H)
         [],                           # stage 2: coef pkt (no NACK)
         [_ack_frame("FINZ_COEFS")],   # stage 3: FINZ
         [_ack_frame("EXIT_AUDMD")],   # stage 4: EXIT (Fin skipped)
@@ -450,7 +449,6 @@ def test_commit_fin_true_sends_fin_when_no_nacks(monkeypatch) -> None:
     sock = _FakeSocket([
         [_ack_frame("ENTER_AUDY")],    # stage 0
         [_ack_frame("SET_SETDAT")],    # stage 1
-        [],                            # stage 2: INIT_COEFS no-reply
         [],                            # stage 2: coef pkt (clean)
         [_ack_frame("FINZ_COEFS")],    # stage 3: FINZ
         [_ack_frame("SET_SETDAT")],    # stage 4: Fin commit ACK
@@ -469,7 +467,6 @@ def test_abort_fin_on_nack_blocks_commit(monkeypatch) -> None:
     sock = _FakeSocket([
         [_ack_frame("ENTER_AUDY")],    # stage 0
         [_ack_frame("SET_SETDAT")],    # stage 1
-        [],                            # stage 2: INIT_COEFS no-reply
         [_nack_frame()],               # stage 2: coef pkt → NACK
         [_ack_frame("FINZ_COEFS")],    # stage 3: FINZ
         [_ack_frame("EXIT_AUDMD")],    # stage 4: EXIT (Fin gated off)
@@ -489,7 +486,6 @@ def test_abort_fin_on_nack_false_lets_fin_through(monkeypatch) -> None:
     sock = _FakeSocket([
         [_ack_frame("ENTER_AUDY")],    # stage 0
         [_ack_frame("SET_SETDAT")],    # stage 1
-        [],                            # stage 2: INIT_COEFS no-reply
         [_nack_frame()],               # stage 2: coef pkt → NACK
         [_ack_frame("FINZ_COEFS")],    # stage 3: FINZ
         [_ack_frame("SET_SETDAT")],    # stage 4: Fin (forced through)
@@ -507,7 +503,6 @@ def test_per_channel_nack_breakdown(monkeypatch) -> None:
     sock = _FakeSocket([
         [_ack_frame("ENTER_AUDY")],    # stage 0
         [_ack_frame("SET_SETDAT")],    # stage 1
-        [],                            # stage 2: INIT_COEFS no-reply
         [],                            # stage 2: pkt1, no NACK
         [_nack_frame()],               # stage 3: pkt2, one NACK
         [_ack_frame("FINZ_COEFS")],    # stage 4: FINZ

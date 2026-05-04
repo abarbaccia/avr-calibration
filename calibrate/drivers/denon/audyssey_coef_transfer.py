@@ -21,7 +21,7 @@ Packet layout (variable-length, ``buildAvrPacket`` style):
     1 byte    0x00 (separator)
     2 bytes   param_length (BE) — bytes after this header up to checksum
     [4 bytes  first packet only: tc(1) + sr(1) + channel_byte(1) + 0x00]
-    N bytes   coefficient payload (4 bytes per BE float32)
+    N bytes   coefficient payload (4 bytes per LE float32, per OCA)
     1 byte    checksum (sum of preceding bytes & 0xFF)
 
 Float layout per packet:
@@ -199,18 +199,16 @@ def build_coef_packets(
     sr_code = SAMPLE_RATE_CODES[samplerate_hz]
     channel_byte = get_channel_byte(channel_id, mult_eq_type)
 
-    # Pre-pack each float as 4 big-endian bytes. The wire format is
-    # big-endian — confirmed by pcap-decode of real AVR traffic
-    # (scripts/audyssey_pcap_decode.py reads coefficients as ">f")
-    # and by ratbuddyssey's FloatInt32 union (parser.cs:18-35), which
-    # treats coefs as float32 bits read as signed Int32 BE. The prior
-    # little-endian encoding was inherited from a flawed comment in the
-    # audyssey-rew-tuner port and explained the persistent ~1-2% packet
-    # NACK rate plus FINZ_COEFS-never-ACKs failure mode on multi-channel
-    # uploads (a fraction of garbage-decoded floats blew past the AVR's
-    # coefficient-validity check, aborting the commit).
+    # Pre-pack each float as 4 little-endian bytes. The wire format is
+    # LITTLE-endian float32 — confirmed by OCA / A1Evo Acoustica's
+    # working transfer.js port (oca_transfer.py:1495 uses
+    # `struct.pack('<f', f)`), which is the canonical reference for
+    # X3800H Audyssey TCP uploads. Earlier 2026-05-04 we briefly
+    # switched to BE based on a wrong reading of audyssey_pcap_decode.py
+    # — that script's `>f` was decoding fixed-point data, not the
+    # float-DType wire we're sending. Reverted after finding OCA.
     coef_words: list[bytes] = [
-        struct.pack(">f", float(c)) for c in coefficients
+        struct.pack("<f", float(c)) for c in coefficients
     ]
 
     cfg = packet_config_for(len(coef_words))
