@@ -7944,6 +7944,61 @@ async def test_push_avr_speaker_layout_calls_full_envelope_from_ady(tmp_path) ->
 
 
 @pytest.mark.asyncio
+async def test_push_avr_speaker_layout_passes_level_and_xo_overrides(tmp_path) -> None:
+    """level_overrides_db and crossover_overrides_hz flow through to the
+    driver verbatim, and the envelope payload reflects them: ChLevel scales
+    by ×10, Crossover replaces customCrossover for Small speakers (Large/Sub
+    stay 'F')."""
+    import json as _json
+    from calibrate.drivers.denon.audyssey_tcp import build_full_envelope_payload
+    from calibrate.mcp_server import _tool_push_avr_speaker_layout
+
+    ady = {
+        "enAmpAssignType": 0, "ampAssignInfo": "0" * 96,
+        "detectedChannels": [
+            {"commandId": "FL", "customDistance": 4.0,
+             "customSpeakerType": "S", "customCrossover": 80, "trimAdjustment": 0},
+            {"commandId": "C", "customDistance": 3.5,
+             "customSpeakerType": "S", "customCrossover": 80, "trimAdjustment": 0},
+            {"commandId": "SW1", "customDistance": 2.5,
+             "customSpeakerType": "E", "customCrossover": 0, "trimAdjustment": 0},
+        ],
+    }
+    p = tmp_path / "test.ady"
+    p.write_text(_json.dumps(ady))
+
+    mock_avr = MagicMock(_host="192.168.1.209")
+    with patch("calibrate.mcp_server._avr", mock_avr), \
+         patch("calibrate.drivers.denon.audyssey_tcp.push_full_envelope_from_ady",
+               new=AsyncMock(return_value=True)) as mock_push:
+        result = await _tool_push_avr_speaker_layout(
+            ady_path=str(p),
+            level_overrides_db={"FL": -1.5, "C": 0.0},
+            crossover_overrides_hz={"FL": 100, "SW1": 120},  # SW1 ignored (sub)
+            commit=False,
+        )
+
+    assert result["ok"]
+    kwargs = mock_push.await_args.kwargs
+    assert kwargs["level_overrides_db"] == {"FL": -1.5, "C": 0.0}
+    assert kwargs["crossover_overrides_hz"] == {"FL": 100, "SW1": 120}
+
+    # Verify envelope construction directly: level overrides scale ×10,
+    # crossover override replaces FL's value, SW1 stays "F" despite override.
+    payload = build_full_envelope_payload(
+        ady,
+        level_overrides_db={"FL": -1.5, "C": 0.0},
+        crossover_overrides_hz={"FL": 100, "SW1": 120},
+    )
+    chlevel = {list(d.keys())[0]: list(d.values())[0] for d in payload["ChLevel"]}
+    crossover = {list(d.keys())[0]: list(d.values())[0] for d in payload["Crossover"]}
+    assert chlevel["FL"] == -15  # -1.5 dB × 10
+    assert chlevel["C"] == 0
+    assert crossover["FL"] == 100
+    assert crossover["SW1"] == "F"  # sub channel ignores xo override
+
+
+@pytest.mark.asyncio
 async def test_push_avr_speaker_layout_reports_partial_on_nack(tmp_path) -> None:
     """If the underlying push returns False (NACK aborted before Fin), the
     MCP tool surfaces applied=False and a clear partial-state message."""

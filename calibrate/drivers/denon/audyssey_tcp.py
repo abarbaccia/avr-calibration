@@ -317,6 +317,8 @@ def _parse_response_frames(stream: bytearray) -> list[dict]:
 def build_full_envelope_payload(
     ady: dict,
     distance_overrides_m: Mapping[str, float] | None = None,
+    level_overrides_db: Mapping[str, float] | None = None,
+    crossover_overrides_hz: Mapping[str, int] | None = None,
 ) -> dict:
     """Build the full-envelope SET_SETDAT payload from a parsed .ady file.
 
@@ -326,15 +328,25 @@ def build_full_envelope_payload(
     .ady has, or whenever you want a complete write that won't reset
     unmentioned fields on Fin commit.
 
-    `distance_overrides_m` lets a caller bump specific channels' distance
-    values (typical use: SW1 distance push to compensate for FIR latency).
-    Other channels keep their .ady values.
+    Override maps let a caller bump specific channels' fields atomically:
+      * ``distance_overrides_m`` — per-channel distance in METERS (typical use:
+        SW1 distance push to compensate for FIR latency).
+      * ``level_overrides_db`` — per-channel trim in dB (range typically
+        ±12 dB, AVR clamps further).
+      * ``crossover_overrides_hz`` — per-channel crossover in Hz (40-250,
+        Small speakers only — ignored for Large/Sub channels which always
+        emit "F").
+
+    Channels not listed keep their .ady values; sending all three together is
+    the safe one-shot path for distance + level + crossover updates.
 
     Per A1Evo convention: the four per-channel arrays are lists of single-key
     dicts (one per channel), not per-position multi-key dicts. The X3800H
     rejects the per-position shape with a NACK.
     """
-    overrides = dict(distance_overrides_m or {})
+    dist_ov = dict(distance_overrides_m or {})
+    lvl_ov = dict(level_overrides_db or {})
+    xo_ov = dict(crossover_overrides_hz or {})
     enmp_to_ampassign = {0: "Normal", 1: "BiAmp", 2: "SBack", 3: "Front", 4: "Surr"}
 
     distance: list[dict] = []
@@ -351,14 +363,15 @@ def build_full_envelope_payload(
         if not sp or sp == "?":
             sp = "E" if cid.startswith("SW") else "S"
         # Distance: override if requested, else .ady's customDistance.
-        m = overrides.get(cid, float(ch.get("customDistance", 0) or 0))
-        # ChLevel: dB × 10 per A1Evo convention.
-        trim = float(ch.get("trimAdjustment", 0) or 0)
+        m = dist_ov.get(cid, float(ch.get("customDistance", 0) or 0))
+        # ChLevel: dB × 10 per A1Evo convention. Override if requested.
+        trim = lvl_ov.get(cid, float(ch.get("trimAdjustment", 0) or 0))
         # Crossover: "F" for sub/Large, numeric Hz (40-250) for Small.
+        # Override applies only to Small speakers; Large/Sub stay "F".
         if sp in ("E", "L"):
             xover: int | str = "F"
         else:
-            xv = int(ch.get("customCrossover", 80) or 80)
+            xv = int(xo_ov.get(cid, ch.get("customCrossover", 80) or 80))
             xover = xv if 40 <= xv <= 250 else 80
         spconfig.append({cid: sp})
         distance.append({cid: round(m * 100)})
@@ -501,13 +514,15 @@ async def push_full_envelope_from_ady(
     ady: dict,
     *,
     distance_overrides_m: Mapping[str, float] | None = None,
+    level_overrides_db: Mapping[str, float] | None = None,
+    crossover_overrides_hz: Mapping[str, int] | None = None,
     commit: bool = True,
     port: int = DEFAULT_PORT,
     timeout: float = 10.0,
 ) -> bool:
     """Push the full Audyssey envelope (all detected channels, A1Evo format)
     to the AVR. Re-establishes the complete speaker layout AND lets caller
-    override per-channel distances atomically.
+    atomically override per-channel distances, levels, and crossovers.
 
     This is the safe replacement for ``push_speaker_distances(use_custom=True)``
     when you need the layout preserved. The bare ``Distance + AudyFinFlg=NotFin``
@@ -521,7 +536,12 @@ async def push_full_envelope_from_ady(
     Caller is responsible for any user confirmation per the
     "signal-path writes need human approval" rule.
     """
-    payload = build_full_envelope_payload(ady, distance_overrides_m=distance_overrides_m)
+    payload = build_full_envelope_payload(
+        ady,
+        distance_overrides_m=distance_overrides_m,
+        level_overrides_db=level_overrides_db,
+        crossover_overrides_hz=crossover_overrides_hz,
+    )
     return await asyncio.get_running_loop().run_in_executor(
         None,
         _push_full_envelope_sync,
