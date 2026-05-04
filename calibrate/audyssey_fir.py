@@ -501,11 +501,23 @@ def design_correction_ir(
     window = np.hanning(target_taps)
     windowed = truncated * window
 
-    # Normalise peak |coefficient| to ≤ 0.5 so subsequent polyphase math
-    # has headroom (the AVR's filter engine clips on overflow).
+    # Normalise to unity DC gain so a target_gain_db = [0, 0, ..., 0]
+    # input produces a true passthrough at 0 dB. Prior versions
+    # normalised peak to 0.5 — that gave every FIR a -6 dB baseline
+    # and combined with the polyphase decimation made pushed FIRs
+    # near-silent through MultEQ (verified on X3800H 2026-05-04: same
+    # channel measured -32 dB SPL in PURE DIRECT vs sweep-not-detected
+    # in STEREO/MULTI CH STEREO with the pushed FIR active).
+    #
+    # The Hann window has a DC gain of ~0.5 inherently (mean of cosine
+    # squared envelope), so we scale by 2.0/dc_gain to compensate.
+    # Cap peak at 0.95 to keep headroom against the AVR's filter clip.
+    dc_gain = float(np.sum(windowed))
+    if dc_gain != 0:
+        windowed = windowed * (1.0 / dc_gain)
     peak = float(np.max(np.abs(windowed)))
-    if peak > 0:
-        windowed = windowed * (0.5 / peak)
+    if peak > 0.95:
+        windowed = windowed * (0.95 / peak)
     return windowed.tolist()
 
 
