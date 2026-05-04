@@ -362,6 +362,7 @@ def _push_full_sync(
     timeout: float,
     commit_fin: bool = True,
     abort_fin_on_nack: bool = True,
+    pre_coef_settle_ms: float = 500.0,
 ) -> dict:
     """Synchronous TCP push of the full upload sequence. Returns a dict
     summarising acks received per stage; raises on hard TCP errors.
@@ -448,6 +449,18 @@ def _push_full_sync(
             time.sleep(0.02)
             sock.sendall(build_frame("INIT_COEFS"))
             summary["init_coefs_ack"] = did_ack(drain(1.5), "INIT_COEFS")
+
+        # Pre-coef settle. Run 29's verification probe (commit_fin=False)
+        # caught 3 NACKs in the first channel's stream and zero in every
+        # subsequent boundary — startup transient, not per-channel. Give
+        # the AVR's DSP time to fully transition into SET_COEFDT-receive
+        # state, and drain any pending frames the envelope phase may have
+        # queued (X3800H sometimes emits status frames after SET_SETDAT
+        # acks).
+        if pre_coef_settle_ms > 0:
+            pre_frames = drain(pre_coef_settle_ms / 1000.0)
+            summary["pre_coef_frames"] = [f["cmd"] for f in pre_frames]
+            summary["pre_coef_nacks"] = count_nacks(pre_frames)
 
         # Coefficient streams. AVR doesn't ACK coef packets, but it WILL
         # send a frame with body {"Comm":"NACK"} when a specific packet
@@ -549,6 +562,7 @@ async def push_avr_filters(
     timeout: float = 30.0,
     commit_fin: bool = True,
     abort_fin_on_nack: bool = True,
+    pre_coef_settle_ms: float = 500.0,
 ) -> dict:
     """Upload custom FIR coefficients to one or more AVR channels via the
     Audyssey TCP/1256 protocol.
@@ -686,6 +700,7 @@ async def push_avr_filters(
         timeout,
         commit_fin,
         abort_fin_on_nack,
+        pre_coef_settle_ms,
     )
 
     # ok = every protocol-required step succeeded AND the Fin commit
