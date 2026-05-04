@@ -365,10 +365,23 @@ class DenonSweepContext:
     sweep input/volume, waits for settle. On exit: restores saved state
     (best-effort, exceptions caught).
 
-    Volume safety: sweep_volume must be <= MAX_SWEEP_VOLUME_DB (default 0 dB / reference).
+    Volume safety: sweep_volume must be <= MAX_SWEEP_VOLUME_DB.
+
+    Default lowered to -15 dB after 2026-05-04 incident: a corrupted FIR
+    push (SET_DISFIL with empty FilData/DispData) produced loud
+    distorted output through MultEQ at sweep_volume_db=0 / AVR -40,
+    audible from another room. Reference (0 dB) is appropriate for
+    Audyssey baseline measurements where the response is expected; for
+    everything else, a lower ceiling protects ears + speakers if the
+    audio path is corrupted in a way the safety validator can't see.
+
+    Override per-call by passing sweep_volume_override into
+    DenonSweepContext.from_config — but the validator still caps at
+    MAX_SWEEP_VOLUME_DB. To raise the absolute ceiling, change this
+    constant intentionally, with a code review.
     """
 
-    MAX_SWEEP_VOLUME_DB: float = 0.0  # reference level — configurable ceiling
+    MAX_SWEEP_VOLUME_DB: float = -15.0  # protective ceiling (was 0)
 
     VALID_SOUND_MODES: tuple[str, ...] = (
         "PURE DIRECT",

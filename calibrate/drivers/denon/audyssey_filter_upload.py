@@ -363,6 +363,7 @@ def _push_full_sync(
     commit_fin: bool = True,
     abort_fin_on_nack: bool = True,
     pre_coef_settle_ms: float = 500.0,
+    setdisfil_bodies: list[dict] | None = None,
 ) -> dict:
     """Synchronous TCP push of the full upload sequence. Returns a dict
     summarising acks received per stage; raises on hard TCP errors.
@@ -382,6 +383,7 @@ def _push_full_sync(
     summary: dict = {
         "enter_audy_ack": False,
         "setdat_acks": [],
+        "setdisfil_acks": [],
         "init_coefs_ack": None,
         "coef_packets_sent": 0,
         "coef_nack_count": 0,
@@ -443,6 +445,27 @@ def _push_full_sync(
             if not ack:
                 # NACK on a chunk = bail rather than push partial state.
                 summary["error"] = "SET_SETDAT NACK"
+                return summary
+
+        # SET_DISFIL — declares which channel/EqType slots will receive
+        # new coefficients. Without this step the X3800H's MultEQ engine
+        # buffers coef streams but never engages them at runtime — silent
+        # output through STEREO/MULTI CH STEREO modes despite a clean
+        # FINZ + Fin commit. See ratbuddyssey DisFil.cs:43-100.
+        for body_dict in (setdisfil_bodies or []):
+            body = json.dumps(body_dict, separators=(",", ":")).encode("ascii")
+            sock.sendall(build_frame("SET_DISFIL", body))
+            ack = did_ack(drain(2.5), "SET_DISFIL")
+            summary["setdisfil_acks"].append({
+                "ChData": body_dict.get("ChData"),
+                "EqType": body_dict.get("EqType"),
+                "ack": ack,
+            })
+            if not ack:
+                summary["error"] = (
+                    f"SET_DISFIL NACK on {body_dict.get('ChData')}/"
+                    f"{body_dict.get('EqType')}"
+                )
                 return summary
 
         if init_coefs_required:
@@ -650,6 +673,33 @@ async def push_avr_filters(
     )
     setdat_chunks = chunk_setdat_payload(ordered)
 
+    # Build SET_DISFIL bodies — one per (channel, EqType). The official
+    # MultEQ Editor and the deleted scripts/audyssey_push_full_filters.py
+    # (commit ea8fd76) send these AFTER the SET_SETDAT envelope and
+    # BEFORE SET_COEFDT. Without SET_DISFIL the X3800H buffers our
+    # coefficient streams but never engages them at runtime — the
+    # symptom is silent MultEQ playback after a successful Fin commit.
+    # Source: ratbuddyssey DisFil.cs:43-100, .ady fields
+    # dispLargeData (FilData) and dispSmallData (DispData).
+    setdisfil_bodies: list[dict] = []
+    for ch in ady.get("detectedChannels", []):
+        cid = ch.get("commandId")
+        if not cid:
+            continue
+        # Only push DISFIL for channels we're actually uploading coefs
+        # for. Other channels keep their existing DISFIL state.
+        if cid not in channel_filters:
+            continue
+        large = ch.get("dispLargeData") or []
+        small = ch.get("dispSmallData") or []
+        for eq in ("Audy", "Flat"):
+            setdisfil_bodies.append({
+                "EqType": eq,
+                "ChData": cid,
+                "FilData": list(large),
+                "DispData": list(small),
+            })
+
     # Build coefficient packet streams in channel order.
     if target_curves is None:
         from calibrate.drivers.denon.audyssey_coef_transfer import (
@@ -701,6 +751,7 @@ async def push_avr_filters(
         commit_fin,
         abort_fin_on_nack,
         pre_coef_settle_ms,
+        setdisfil_bodies,
     )
 
     # ok = every protocol-required step succeeded AND the Fin commit
