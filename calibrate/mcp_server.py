@@ -4550,6 +4550,8 @@ async def _tool_apply_avr_fir(
     target_curves: list[str] | None = None,
     samplerates_hz: list[int] | None = None,
     inter_packet_delay_ms: float = 5.0,
+    commit_fin: bool = True,
+    abort_fin_on_nack: bool = True,
 ) -> dict:
     """Push cached AVR-format FIR coefficients to the receiver.
 
@@ -4633,6 +4635,8 @@ async def _tool_apply_avr_fir(
         "channel_filters": channel_filters,
         "distances_override_m": overrides or None,
         "inter_packet_delay_ms": float(inter_packet_delay_ms),
+        "commit_fin": bool(commit_fin),
+        "abort_fin_on_nack": bool(abort_fin_on_nack),
     }
     if tc_arg:
         push_kwargs["target_curves"] = tc_arg
@@ -8940,6 +8944,31 @@ _TOOLS: list[Tool] = [
                         "Helps less-buffered receivers keep up. Default 5."
                     ),
                     "default": 5.0,
+                },
+                "commit_fin": {
+                    "type": "boolean",
+                    "description": (
+                        "When True (default), send the AudyFinFlg=Fin commit "
+                        "after FINZ_COEFS to persist coefficients to NVRAM. "
+                        "Set False for non-destructive verification — the "
+                        "AVR's persisted state is unchanged after EXIT_AUDMD. "
+                        "Use False to verify a multi-channel push end-to-end "
+                        "before risking the X3800H's documented Fin-commit-"
+                        "wipes-ChSetup failure mode."
+                    ),
+                    "default": True,
+                },
+                "abort_fin_on_nack": {
+                    "type": "boolean",
+                    "description": (
+                        "When True (default), the Fin commit is gated on "
+                        "zero NACKs during the SET_COEFDT stream. NACKs "
+                        "indicate a corrupted coefficient bank; committing "
+                        "on top of one wipes ChSetup on the X3800H. Set "
+                        "False only if you specifically want to ignore the "
+                        "gate (e.g. for protocol probing)."
+                    ),
+                    "default": True,
                 },
             },
             "required": ["host", "ady_path", "cache_key"],

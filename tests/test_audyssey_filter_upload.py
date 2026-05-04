@@ -340,3 +340,182 @@ def test_parse_frames_skips_invalid_checksum() -> None:
 
 def test_parse_frames_empty_stream() -> None:
     assert parse_frames(bytearray()) == []
+
+
+# ── Fin-commit gating (added 2026-05-04 after run 29 wiped ChSetup) ────────
+
+
+class _FakeSocket:
+    """In-memory socket stand-in modeling per-stage recv behavior.
+
+    Test data is a list of stage-buckets — each bucket is the list of
+    bytes that recv() will deliver during ONE drain stage. Each
+    sendall() advances the stage. Within a stage, recv() returns one
+    frame per call until the bucket empties; subsequent recv() in the
+    same stage raises socket.timeout so drain breaks.
+
+    This matches how _push_full_sync uses the socket: send a frame,
+    drain to read its response; send the next, drain again.
+    """
+
+    def __init__(self, stage_buckets: list[list[bytes]]) -> None:
+        self._stages: list[list[bytes]] = [list(s) for s in stage_buckets]
+        # Initial drain (for the implicit pre-stage state, if any) reads
+        # nothing — frames only become available after the first send.
+        self._current_stage_idx = -1
+        self.sent: list[bytes] = []
+        self.timeout = 5.0
+        self.closed = False
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.append(bytes(data))
+        self._current_stage_idx += 1
+
+    def settimeout(self, t: float) -> None:
+        self.timeout = t
+
+    def recv(self, n: int) -> bytes:
+        import socket as _socket
+        if 0 <= self._current_stage_idx < len(self._stages):
+            bucket = self._stages[self._current_stage_idx]
+            if bucket:
+                return bucket.pop(0)
+        raise _socket.timeout("no more rx data this stage")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _ack_frame(cmd: str) -> bytes:
+    """Build an ACK response frame for *cmd*."""
+    from calibrate.drivers.denon.audyssey_tcp import build_frame
+    f = bytearray(build_frame(cmd, b'{"Comm":"ACK"}'))
+    f[0] = ord("R")
+    f[-1] = sum(f[:-1]) & 0xFF
+    return bytes(f)
+
+
+def _nack_frame(cmd: str = "SET_COEFDT") -> bytes:
+    from calibrate.drivers.denon.audyssey_tcp import build_frame
+    f = bytearray(build_frame(cmd, b'{"Comm":"NACK"}'))
+    f[0] = ord("R")
+    f[-1] = sum(f[:-1]) & 0xFF
+    return bytes(f)
+
+
+def _run_push_sync(monkeypatch, fake_sock, **kwargs):
+    """Helper to invoke _push_full_sync against a fake socket with
+    sensible defaults for the chunked + coef args."""
+    import socket as _socket
+
+    from calibrate.drivers.denon import audyssey_filter_upload as afu
+
+    monkeypatch.setattr(
+        _socket, "create_connection", lambda *_a, **_k: fake_sock
+    )
+    monkeypatch.setattr(
+        afu.time, "sleep", lambda *_a, **_k: None
+    )
+    defaults = dict(
+        host="x", port=1, setdat_chunks=[{"AudyMultEQ": True}],
+        coef_packet_streams=[(b"\x00" * 4, True)],  # one packet, end_of_channel
+        init_coefs_required=False,
+        coef_wait_init_ms=0, coef_wait_final_ms=0,
+        inter_packet_delay_ms=0, timeout=1.0,
+    )
+    defaults.update(kwargs)
+    return afu._push_full_sync(**defaults)
+
+
+def test_commit_fin_false_skips_fin_packet(monkeypatch) -> None:
+    """commit_fin=False MUST NOT send the AudyFinFlg=Fin packet."""
+    sock = _FakeSocket([
+        [_ack_frame("ENTER_AUDY")],   # stage 0: ENTER_AUDY
+        [_ack_frame("SET_SETDAT")],   # stage 1: SET_SETDAT chunk
+        [],                           # stage 2: coef pkt (no NACK)
+        [_ack_frame("FINZ_COEFS")],   # stage 3: FINZ
+        [_ack_frame("EXIT_AUDMD")],   # stage 4: EXIT (Fin skipped)
+    ])
+    summary = _run_push_sync(monkeypatch, sock, commit_fin=False)
+    assert summary["fin_commit_attempted"] is False
+    assert summary["fin_commit_ack"] is False
+    assert summary.get("fin_skipped_reason", "").startswith("commit_fin=False")
+    fin_bodies = [s for s in sock.sent if b'"Fin"' in s]
+    assert fin_bodies == [], f"unexpected Fin commit on wire: {fin_bodies!r}"
+
+
+def test_commit_fin_true_sends_fin_when_no_nacks(monkeypatch) -> None:
+    """Default path: clean stream → Fin commit IS sent."""
+    sock = _FakeSocket([
+        [_ack_frame("ENTER_AUDY")],    # stage 0
+        [_ack_frame("SET_SETDAT")],    # stage 1
+        [],                            # stage 2: coef pkt (clean)
+        [_ack_frame("FINZ_COEFS")],    # stage 3: FINZ
+        [_ack_frame("SET_SETDAT")],    # stage 4: Fin commit ACK
+        [_ack_frame("EXIT_AUDMD")],    # stage 5: EXIT
+    ])
+    summary = _run_push_sync(monkeypatch, sock, commit_fin=True)
+    assert summary["fin_commit_attempted"] is True
+    assert summary["fin_commit_ack"] is True
+    fin_sends = [s for s in sock.sent if b'"Fin"' in s]
+    assert len(fin_sends) == 1
+
+
+def test_abort_fin_on_nack_blocks_commit(monkeypatch) -> None:
+    """If a NACK frame appears during the coef stream, the Fin commit
+    MUST be skipped — committing on a partial bank wipes ChSetup."""
+    sock = _FakeSocket([
+        [_ack_frame("ENTER_AUDY")],    # stage 0
+        [_ack_frame("SET_SETDAT")],    # stage 1
+        [_nack_frame()],               # stage 2: coef pkt → NACK
+        [_ack_frame("FINZ_COEFS")],    # stage 3: FINZ
+        [_ack_frame("EXIT_AUDMD")],    # stage 4: EXIT (Fin gated off)
+    ])
+    summary = _run_push_sync(
+        monkeypatch, sock, commit_fin=True, abort_fin_on_nack=True,
+    )
+    assert summary["coef_nack_count"] >= 1
+    assert summary["fin_commit_attempted"] is False
+    assert "NACK" in summary.get("fin_skipped_reason", "")
+    fin_bodies = [s for s in sock.sent if b'"Fin"' in s]
+    assert fin_bodies == []
+
+
+def test_abort_fin_on_nack_false_lets_fin_through(monkeypatch) -> None:
+    """abort_fin_on_nack=False bypasses the gate (protocol-probing only)."""
+    sock = _FakeSocket([
+        [_ack_frame("ENTER_AUDY")],    # stage 0
+        [_ack_frame("SET_SETDAT")],    # stage 1
+        [_nack_frame()],               # stage 2: coef pkt → NACK
+        [_ack_frame("FINZ_COEFS")],    # stage 3: FINZ
+        [_ack_frame("SET_SETDAT")],    # stage 4: Fin (forced through)
+        [_ack_frame("EXIT_AUDMD")],    # stage 5: EXIT
+    ])
+    summary = _run_push_sync(
+        monkeypatch, sock, commit_fin=True, abort_fin_on_nack=False,
+    )
+    assert summary["coef_nack_count"] >= 1
+    assert summary["fin_commit_attempted"] is True
+
+
+def test_per_channel_nack_breakdown(monkeypatch) -> None:
+    """coef_nack_per_channel should record one entry per end_of_channel."""
+    sock = _FakeSocket([
+        [_ack_frame("ENTER_AUDY")],    # stage 0
+        [_ack_frame("SET_SETDAT")],    # stage 1
+        [],                            # stage 2: pkt1, no NACK
+        [_nack_frame()],               # stage 3: pkt2, one NACK
+        [_ack_frame("FINZ_COEFS")],    # stage 4: FINZ
+        [_ack_frame("EXIT_AUDMD")],    # stage 5: EXIT
+    ])
+    summary = _run_push_sync(
+        monkeypatch, sock,
+        coef_packet_streams=[
+            (b"\x00" * 4, True),   # end of ch 1
+            (b"\x00" * 4, True),   # end of ch 2
+        ],
+        commit_fin=False,
+    )
+    assert len(summary["coef_nack_per_channel"]) == 2
+    assert summary["coef_nack_per_channel"][0] == 0
+    assert summary["coef_nack_per_channel"][1] >= 1

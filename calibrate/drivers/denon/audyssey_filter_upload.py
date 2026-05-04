@@ -360,9 +360,20 @@ def _push_full_sync(
     coef_wait_final_ms: float,
     inter_packet_delay_ms: float,
     timeout: float,
+    commit_fin: bool = True,
+    abort_fin_on_nack: bool = True,
 ) -> dict:
     """Synchronous TCP push of the full upload sequence. Returns a dict
     summarising acks received per stage; raises on hard TCP errors.
+
+    ``commit_fin`` — when False, skip the AudyFinFlg=Fin commit packet.
+    The AVR's persisted Audyssey state is unchanged after EXIT_AUDMD.
+    Use this for non-destructive multi-channel verification.
+
+    ``abort_fin_on_nack`` — when True (default), if any NACK frames
+    were observed during the SET_COEFDT stream, refuse to send the
+    Fin commit. Committing on top of a partially-corrupted coefficient
+    bank is the documented X3800H ChSetup-wipe trigger.
     """
     sock = socket.create_connection((host, port), timeout=timeout)
     sock.settimeout(timeout)
@@ -372,7 +383,10 @@ def _push_full_sync(
         "setdat_acks": [],
         "init_coefs_ack": None,
         "coef_packets_sent": 0,
+        "coef_nack_count": 0,
+        "coef_nack_per_channel": [],
         "finz_coefs_ack": False,
+        "fin_commit_attempted": False,
         "fin_commit_ack": False,
         "exit_audmd_ack": False,
     }
@@ -405,6 +419,16 @@ def _push_full_sync(
                 continue
         return False
 
+    def count_nacks(frames: list[dict]) -> int:
+        n = 0
+        for f in frames:
+            try:
+                if json.loads(f["data"]).get("Comm") == "NACK":
+                    n += 1
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+        return n
+
     try:
         sock.sendall(build_frame("ENTER_AUDY"))
         summary["enter_audy_ack"] = did_ack(drain(1.0), "ENTER_AUDY")
@@ -426,18 +450,26 @@ def _push_full_sync(
             summary["init_coefs_ack"] = did_ack(drain(1.5), "INIT_COEFS")
 
         # Coefficient streams. AVR doesn't ACK coef packets, but it WILL
-        # send a frame named "ERROR" with body {"Comm":"NACK"} when a
-        # specific packet is malformed or the stream falls behind.
-        # We pace per-packet (typically 5ms) and add a longer pause
-        # between channels (100ms — matching A1Evo's behaviour).
+        # send a frame with body {"Comm":"NACK"} when a specific packet
+        # is malformed or the stream falls behind. Drain at every
+        # end-of-channel boundary so per-channel NACK rate is observable
+        # — needed because the Fin commit on top of a partially-NACK'd
+        # coefficient bank wipes ChSetup on the X3800H.
         between_channel_pause_ms = 100.0
+        per_channel_running_nacks = 0
         for pkt, end_of_channel in coef_packet_streams:
             sock.sendall(pkt)
             if inter_packet_delay_ms > 0:
                 time.sleep(inter_packet_delay_ms / 1000.0)
             summary["coef_packets_sent"] += 1
-            if end_of_channel and between_channel_pause_ms > 0:
-                time.sleep(between_channel_pause_ms / 1000.0)
+            if end_of_channel:
+                # Drain briefly so any in-flight NACK frames land before
+                # we move on to the next channel.
+                between_frames = drain(between_channel_pause_ms / 1000.0)
+                ch_nacks = count_nacks(between_frames)
+                summary["coef_nack_per_channel"].append(ch_nacks)
+                summary["coef_nack_count"] += ch_nacks
+                per_channel_running_nacks = 0
 
         # Allow the AVR to finish processing the coefficient bank.
         if coef_wait_init_ms > 0:
@@ -446,6 +478,9 @@ def _push_full_sync(
             # Drain anything the AVR queued during processing — some
             # firmwares emit a status frame here.
             mid_frames = drain(coef_wait_final_ms / 1000.0)
+            mid_nacks = count_nacks(mid_frames)
+            summary["coef_nack_count"] += mid_nacks
+            summary["mid_nack_count"] = mid_nacks
             summary["mid_wait_frames"] = [
                 {
                     "cmd": f["cmd"],
@@ -457,16 +492,30 @@ def _push_full_sync(
         sock.sendall(build_frame("FINZ_COEFS"))
         finz_frames = drain(20.0)
         summary["finz_coefs_ack"] = did_ack(finz_frames, "FINZ_COEFS")
+        summary["coef_nack_count"] += count_nacks(finz_frames)
         summary["finz_frames"] = [f["cmd"] for f in finz_frames]
 
-        # Final commit — this is the bit that makes the firmware persist
-        # the new calibration AND skip the on-EXIT_AUDMD re-validation
-        # that would otherwise snap Distance back to the variance cap.
-        time.sleep(0.02)
-        sock.sendall(build_frame("SET_SETDAT", b'{"AudyFinFlg":"Fin"}'))
-        fin_frames = drain(5.0)
-        summary["fin_commit_ack"] = did_ack(fin_frames, "SET_SETDAT")
-        summary["fin_frames"] = [f["cmd"] for f in fin_frames]
+        # Final commit gate. Refuse to send Fin if (a) commit_fin=False
+        # was explicitly requested, or (b) any NACKs were observed in
+        # the coef stream and abort_fin_on_nack is True. Committing on
+        # a partial bank is the documented X3800H ChSetup-wipe trigger.
+        should_commit = commit_fin
+        if should_commit and abort_fin_on_nack and summary["coef_nack_count"] > 0:
+            should_commit = False
+            summary["fin_skipped_reason"] = (
+                f"{summary['coef_nack_count']} NACK(s) observed during coef "
+                f"stream — Fin commit aborted to prevent ChSetup wipe"
+            )
+        elif not commit_fin:
+            summary["fin_skipped_reason"] = "commit_fin=False (caller requested no commit)"
+
+        if should_commit:
+            summary["fin_commit_attempted"] = True
+            time.sleep(0.02)
+            sock.sendall(build_frame("SET_SETDAT", b'{"AudyFinFlg":"Fin"}'))
+            fin_frames = drain(5.0)
+            summary["fin_commit_ack"] = did_ack(fin_frames, "SET_SETDAT")
+            summary["fin_frames"] = [f["cmd"] for f in fin_frames]
 
         time.sleep(0.02)
         sock.sendall(build_frame("EXIT_AUDMD"))
@@ -498,6 +547,8 @@ async def push_avr_filters(
     inter_packet_delay_ms: float = 5.0,
     port: int = DEFAULT_PORT,
     timeout: float = 30.0,
+    commit_fin: bool = True,
+    abort_fin_on_nack: bool = True,
 ) -> dict:
     """Upload custom FIR coefficients to one or more AVR channels via the
     Audyssey TCP/1256 protocol.
@@ -534,10 +585,23 @@ async def push_avr_filters(
             X3800H's CoefWaitTime.Final is 15000.
         inter_packet_delay_ms: pause between individual SET_COEFDT
             packets. Helps less-buffered receivers keep up.
+        commit_fin: when True (default), send the AudyFinFlg=Fin commit
+            after FINZ_COEFS to persist coefficients to NVRAM. Set False
+            for non-destructive verification — the AVR's persisted state
+            stays unchanged after EXIT_AUDMD. Use this for multi-channel
+            wire-format verification before risking a real commit.
+        abort_fin_on_nack: when True (default), refuse the Fin commit if
+            ANY NACK frames were observed during the SET_COEFDT stream.
+            Committing on a partially-corrupted coefficient bank is the
+            documented X3800H ChSetup-wipe trigger.
 
     Returns:
-        Summary dict with per-stage ACK status. ``ok`` field is True
-        only if every required ACK was received.
+        Summary dict with per-stage ACK status + per-channel NACK
+        counts (``coef_nack_per_channel``) + total stream NACK count
+        (``coef_nack_count``). ``ok`` is True only when every required
+        ACK landed AND the Fin commit was attempted AND ACKed.
+        ``fin_skipped_reason`` is populated when the Fin commit was
+        gated by either ``commit_fin=False`` or NACK-on-stream.
     """
     if not channel_filters:
         raise ValueError("channel_filters is empty — nothing to upload")
@@ -620,16 +684,28 @@ async def push_avr_filters(
         coef_wait_final_ms,
         inter_packet_delay_ms,
         timeout,
+        commit_fin,
+        abort_fin_on_nack,
     )
 
-    summary["ok"] = (
+    # ok = every protocol-required step succeeded AND the Fin commit
+    # actually persisted (so callers can distinguish a successful push
+    # from a non-destructive verification or a NACK-aborted commit).
+    base_acks_ok = (
         summary.get("enter_audy_ack")
         and all(summary.get("setdat_acks", []))
         and (summary.get("init_coefs_ack") is None or summary["init_coefs_ack"])
         and summary.get("finz_coefs_ack")
-        and summary.get("fin_commit_ack")
         and summary.get("exit_audmd_ack")
     )
+    summary["ok"] = bool(
+        base_acks_ok
+        and summary.get("fin_commit_attempted")
+        and summary.get("fin_commit_ack")
+    )
+    # Separately surface "verification mode succeeded" — every ACK we
+    # asked for landed, just no Fin commit was attempted.
+    summary["verified"] = bool(base_acks_ok and not summary.get("fin_commit_attempted"))
     summary["channel_count"] = len(channel_filters)
     return summary
 
