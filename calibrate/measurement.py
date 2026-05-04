@@ -543,7 +543,16 @@ class MeasurementEngine:
             and not playback_device_override  # cal-mode keeps PortAudio path
         )
         if use_aplay_hdmi:
-            alsa_device = cfg.get("hdmi_playback_device") or "hdmi:CARD=vc4hdmi0,DEV=0"
+            # Use default:CARD=vc4hdmi0, NOT the hdmi: plugin — the hdmi:
+            # ALSA plugin silently downmixes multichannel PCM to stereo
+            # (verified 2026-05-04: SSINFAISSIG=02 stereo via hdmi:, =12
+            # via default:). That made every C/SL/SR/LFE sweep land as a
+            # Dolby Surround upmix at the AVR instead of an isolated per-
+            # channel measurement, and the LFE channel got dropped entirely.
+            # The hw:/plughw: devices on this Pi (vc4hdmi0) reject S16_LE
+            # — they only accept IEC958_SUBFRAME_LE. default: handles the
+            # PCM→IEC958 framing AND preserves channel count.
+            alsa_device = cfg.get("hdmi_playback_device") or "default:CARD=vc4hdmi0"
             hdmi_channels = int(cfg.get("hdmi_channels", 8))
             # Ensure we always have room for the requested out_channel.
             hdmi_channels = max(hdmi_channels, out_channel)

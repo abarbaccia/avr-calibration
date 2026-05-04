@@ -4350,6 +4350,8 @@ async def _tool_set_speaker_distances(
 async def _tool_push_avr_speaker_layout(
     ady_path: str,
     distance_overrides_m: dict[str, float] | None = None,
+    level_overrides_db: dict[str, float] | None = None,
+    crossover_overrides_hz: dict[str, int] | None = None,
     commit: bool = False,
 ) -> dict:
     """Push the full Audyssey envelope (all detected channels) from an .ady file.
@@ -4398,13 +4400,17 @@ async def _tool_push_avr_speaker_layout(
             f"ady file at {ady_path!r} has no detectedChannels — cannot build "
             "envelope. Verify the file is a real Audyssey backup."
         )
-    overrides = dict(distance_overrides_m or {})
+    dist_ov = dict(distance_overrides_m or {})
+    lvl_ov = dict(level_overrides_db or {})
+    xo_ov = {k: int(v) for k, v in (crossover_overrides_hz or {}).items()}
     try:
         from .drivers.denon import audyssey_tcp
         ok = await audyssey_tcp.push_full_envelope_from_ady(
             host=_avr._host,  # type: ignore[attr-defined]
             ady=ady,
-            distance_overrides_m=overrides,
+            distance_overrides_m=dist_ov,
+            level_overrides_db=lvl_ov,
+            crossover_overrides_hz=xo_ov,
             commit=bool(commit),
         )
     except Exception as exc:
@@ -4415,11 +4421,23 @@ async def _tool_push_avr_speaker_layout(
         f"{'Pushed' if ok else 'PARTIAL — SET_SETDAT NACKd, Fin NOT sent'} full "
         f"envelope ({len(channels)} channels: {channels}).",
     ]
-    if overrides:
+    if dist_ov:
         parts.append(
             "Distance overrides: "
-            + ", ".join(f"{ch}={m:.2f}m" for ch, m in overrides.items())
+            + ", ".join(f"{ch}={m:.2f}m" for ch, m in dist_ov.items())
             + "."
+        )
+    if lvl_ov:
+        parts.append(
+            "Level overrides: "
+            + ", ".join(f"{ch}={d:+.1f}dB" for ch, d in lvl_ov.items())
+            + "."
+        )
+    if xo_ov:
+        parts.append(
+            "Crossover overrides: "
+            + ", ".join(f"{ch}={hz}Hz" for ch, hz in xo_ov.items())
+            + " (Small speakers only — Large/Sub channels keep 'F')."
         )
     if ok and commit:
         parts.append("Persisted to NVRAM.")
@@ -4429,7 +4447,9 @@ async def _tool_push_avr_speaker_layout(
         applied=ok,
         committed=bool(commit) and ok,
         channels_in_envelope=channels,
-        distance_overrides_m=overrides,
+        distance_overrides_m=dist_ov,
+        level_overrides_db=lvl_ov,
+        crossover_overrides_hz=xo_ov,
         ady_path=ady_path,
         message=" ".join(parts),
     )
@@ -4449,6 +4469,16 @@ async def _tool_design_avr_fir(
     samplerate_hz: float = 48000.0,
 ) -> dict:
     """Design + polyphase-decimate an AVR-format FIR for one channel.
+
+    TODO(filter-design-refactor): split into a DSP-agnostic ``design_fir``
+    (target_curve → coefficients) plus an Audyssey-specific apply adapter
+    (polyphase decimation + AVR upload). The current shape couples target →
+    coefficients → AVR-format in one tool, so a recipe that wants the same
+    target on a non-AVR DSP (CamillaDSP, miniDSP, generic FIR-capable
+    processor) has to reach for a different design function. The recipe must
+    branch on DSP capability today; once the refactor lands, the recipe will
+    call one ``design_fir`` and route the output to whichever apply tool
+    matches the hardware. See recipes/custom/mains-calibration.md Phase 6.
 
     Pipeline: ``target_curve_db`` (per-frequency gain targets) →
     16,321-tap (speaker) / 16,055-tap (sub) impulse response →
@@ -8755,6 +8785,27 @@ _TOOLS: list[Tool] = [
                     ),
                     "additionalProperties": {"type": "number"},
                 },
+                "level_overrides_db": {
+                    "type": "object",
+                    "description": (
+                        "Optional per-channel trim overrides in dB (e.g. "
+                        "{\"FL\": -1.5, \"C\": 0.0}). AVR clamps to its supported "
+                        "range (typically ±12 dB). Channels not listed keep "
+                        "their .ady trimAdjustment values."
+                    ),
+                    "additionalProperties": {"type": "number"},
+                },
+                "crossover_overrides_hz": {
+                    "type": "object",
+                    "description": (
+                        "Optional per-channel crossover overrides in Hz, range "
+                        "40-250 (e.g. {\"FL\": 80, \"SLA\": 100}). Applies only "
+                        "to Small speakers — Large and sub channels always emit "
+                        "'F' regardless. Channels not listed keep their .ady "
+                        "customCrossover values."
+                    ),
+                    "additionalProperties": {"type": "integer"},
+                },
                 "commit": {
                     "type": "boolean",
                     "description": (
@@ -11593,6 +11644,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_push_avr_speaker_layout(
             ady_path=str(arguments["ady_path"]),
             distance_overrides_m=arguments.get("distance_overrides_m"),
+            level_overrides_db=arguments.get("level_overrides_db"),
+            crossover_overrides_hz=arguments.get("crossover_overrides_hz"),
             commit=bool(arguments.get("commit", False)),
         )
     elif name == "set_speaker_distances":

@@ -1,0 +1,24 @@
+{
+  "name": "Harman +4 (in-room, full-range)",
+  "description": "Olive/Welti in-room preference target with a +4 dB bass shelf relative to the 1 kHz midrange. Bass plateau of +4 dB from 20 Hz to ~60 Hz, gentle knee through the upper bass, flat 200 Hz–1 kHz, then a ~1 dB/octave downward tilt through the treble (canonical Harman 'tilt' from research). 'More steep than regular Harman' in the bass region but identical to standard Harman above the typical 80 Hz crossover. Use as a unified target across mains + subs — anchored at 1 kHz, not at 80 Hz like the bass-only curves. Reference: 1 kHz = 0 dB.",
+  "reference_freq_hz": 1000,
+  "points": [
+    { "freq_hz": 20,    "offset_db":  4.0 },
+    { "freq_hz": 30,    "offset_db":  4.0 },
+    { "freq_hz": 50,    "offset_db":  4.0 },
+    { "freq_hz": 60,    "offset_db":  3.8 },
+    { "freq_hz": 80,    "offset_db":  3.0 },
+    { "freq_hz": 100,   "offset_db":  2.2 },
+    { "freq_hz": 150,   "offset_db":  1.0 },
+    { "freq_hz": 200,   "offset_db":  0.3 },
+    { "freq_hz": 300,   "offset_db":  0.0 },
+    { "freq_hz": 500,   "offset_db":  0.0 },
+    { "freq_hz": 1000,  "offset_db":  0.0 },
+    { "freq_hz": 2000,  "offset_db": -1.0 },
+    { "freq_hz": 5000,  "offset_db": -2.3 },
+    { "freq_hz": 10000, "offset_db": -3.3 },
+    { "freq_hz": 20000, "offset_db": -4.3 }
+  ],
+  "default": false,
+  "tags": ["home-theater", "music", "harman", "in-room", "full-range"]
+}
