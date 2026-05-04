@@ -4549,7 +4549,7 @@ async def _tool_apply_avr_fir(
     distances_override_m: dict[str, float] | None = None,
     target_curves: list[str] | None = None,
     samplerates_hz: list[int] | None = None,
-    inter_packet_delay_ms: float = 5.0,
+    inter_packet_delay_ms: float = 25.0,
     commit_fin: bool = True,
     abort_fin_on_nack: bool = True,
 ) -> dict:
@@ -8941,9 +8941,14 @@ _TOOLS: list[Tool] = [
                     "type": "number",
                     "description": (
                         "Pause between SET_COEFDT packets in ms. "
-                        "Helps less-buffered receivers keep up. Default 5."
+                        "Default 25 — verified on X3800H 2026-05-04 to "
+                        "drive coef_nack_count to 0 across 1-channel "
+                        "commits. The prior default of 5 ms produced "
+                        "high NACK rates (~30%) that aborted the Fin "
+                        "commit gate. Decrease only if profiling shows "
+                        "a less-aggressive pacing is sufficient."
                     ),
-                    "default": 5.0,
+                    "default": 25.0,
                 },
                 "commit_fin": {
                     "type": "boolean",

@@ -557,7 +557,7 @@ async def push_avr_filters(
     init_coefs_required: bool | None = None,
     coef_wait_init_ms: float | None = None,
     coef_wait_final_ms: float | None = None,
-    inter_packet_delay_ms: float = 5.0,
+    inter_packet_delay_ms: float = 25.0,
     port: int = DEFAULT_PORT,
     timeout: float = 30.0,
     commit_fin: bool = True,
