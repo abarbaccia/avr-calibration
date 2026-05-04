@@ -447,20 +447,35 @@ def design_correction_ir(
     *,
     is_sub: bool,
     samplerate_hz: float = 48000.0,
+    phase: str = "minimum",
 ) -> list[float]:
-    """Design a minimum-phase FIR impulse response to apply ``target_gain_db``
-    at ``target_freqs_hz``, of the right length for XT32 polyphase
+    """Design a FIR impulse response to apply ``target_gain_db`` at
+    ``target_freqs_hz``, of the right length for XT32 polyphase
     decimation (16,321 taps for speakers, 16,055 for subs).
 
-    Approach: linear-magnitude inverse FFT of an interpolated target
-    response, with a Hann window and zero-padding to the AVR-expected
-    length. Outside the supplied frequency range gain tapers to 0 dB.
+    Args:
+        target_freqs_hz / target_gain_db: target magnitude curve points.
+            Levels DO ride the FIR — for a shape-only correction, normalise
+            your input to mean 0 dB before passing.
+        is_sub: pick speaker (16,321) vs sub (16,055) input length.
+        samplerate_hz: design sample rate; the AVR's 48 kHz bank is the
+            canonical match.
+        phase:
+            "minimum" (default) — minimum-phase FIR. Energy concentrated
+                AFTER the impulse peak; no pre-ring / no pre-echo. This is
+                what mains MultEQ FIRs should be — a linear-phase FIR
+                produces audible smearing on transients (drums, claps).
+            "linear" — symmetric Hann-windowed IR with the peak at the
+                centre. Use when the upstream calibration explicitly
+                wants linear-phase (rare; mostly historical).
 
-    Returns a Python list of float taps. Pass to ``convert_xt32`` to
+    Returns: Python list of float taps. Pass to ``convert_xt32`` to
     polyphase-decimate to the AVR-format 1024/704 coefficients.
     """
     if len(target_freqs_hz) != len(target_gain_db):
         raise ValueError("target_freqs_hz and target_gain_db must be same length")
+    if phase not in ("minimum", "linear"):
+        raise ValueError(f"phase must be 'minimum' or 'linear', got {phase!r}")
 
     target_taps = (
         FILTER_CONFIGS["xt32Sub"]["input_length"] if is_sub
@@ -470,55 +485,86 @@ def design_correction_ir(
     while n_fft < target_taps:
         n_fft *= 2
 
-    # Frequency grid for the FFT bins (one-sided).
+    # Build target magnitude on the FFT bin grid.
     bins = np.fft.rfftfreq(n_fft, d=1.0 / samplerate_hz)
-    # Interpolate target curve on a log axis (much more natural for audio).
     freqs = np.asarray(target_freqs_hz, dtype=np.float64)
     gains = np.asarray(target_gain_db, dtype=np.float64)
     log_bins = np.log10(np.maximum(bins, 1e-3))
     log_freqs = np.log10(np.maximum(freqs, 1e-3))
     gain_db = np.interp(log_bins, log_freqs, gains, left=gains[0], right=gains[-1])
-    # Outside the supplied range, taper toward 0 dB to avoid wild boost
-    # at DC and Nyquist.
     below = bins < freqs[0]
     above = bins > freqs[-1]
     gain_db = np.where(below, 0.0, gain_db)
     gain_db = np.where(above, 0.0, gain_db)
+    # Floor magnitude well above zero — the homomorphic min-phase
+    # transform diverges on log(very small), so any bin that interpolates
+    # to a deep null produces NaNs. -40 dB is a reasonable floor that
+    # leaves the desired shape intact while keeping the Hilbert stable.
+    if phase == "minimum":
+        gain_db = np.maximum(gain_db, -40.0)
     magnitude = 10.0 ** (gain_db / 20.0)
 
-    # Inverse FFT → linear-phase IR centred at n_fft/2.
+    # Linear-phase IR (symmetric, peak at n_fft/2). This is the starting
+    # point for both phase modes — minimum_phase converts it.
     spectrum = magnitude.astype(np.complex128)
     ir_full = np.fft.irfft(spectrum, n=n_fft)
-    # Centre the response and trim/pad to the AVR-expected length.
     centred = np.fft.fftshift(ir_full)
-    mid = n_fft // 2
-    half = target_taps // 2
-    start = mid - half
-    end = start + target_taps
-    truncated = centred[start:end]
 
-    # Hann-window the truncated IR to suppress edge ringing.
-    window = np.hanning(target_taps)
-    windowed = truncated * window
+    if phase == "minimum":
+        # Edge case: a flat 0 dB target → causal delta.
+        if np.allclose(gain_db, 0.0, atol=1e-9):
+            ir = np.zeros(target_taps)
+            ir[0] = 1.0
+        else:
+            # Cepstral / homomorphic minimum-phase construction.
+            # Algorithm (Oppenheim & Schafer): given desired |H(e^jw)|,
+            #   1. log_mag = log(|H|)            # real cepstrum input
+            #   2. c = ifft(log_mag)              # complex cepstrum (real-valued here)
+            #   3. window c with [1, 2, 2, ..., 2, 1, 0, 0, ..., 0]  # causal half ×2
+            #   4. H_min = exp(fft(c_windowed))   # min-phase complex spectrum
+            #   5. ir   = ifft(H_min)             # min-phase IR (causal, peak ~ idx 0)
+            # This is robust where scipy's minimum_phase isn't.
+            log_mag = np.log(np.maximum(magnitude, 1e-6))
+            # Build symmetric two-sided log-magnitude (length n_fft).
+            full_log_mag = np.concatenate([log_mag, log_mag[-2:0:-1]])
+            assert len(full_log_mag) == n_fft, f"{len(full_log_mag)} vs {n_fft}"
+            c = np.fft.ifft(full_log_mag).real
+            # Windowing: keep DC and Nyquist as-is, double the causal
+            # samples (1..n/2-1), zero everything else.
+            w = np.zeros(n_fft)
+            w[0] = 1
+            w[n_fft // 2] = 1
+            w[1:n_fft // 2] = 2
+            c_windowed = c * w
+            log_h_min = np.fft.fft(c_windowed)
+            h_min = np.exp(log_h_min)
+            ir_full = np.fft.ifft(h_min).real
+            # Min-phase IR is causal — take the first `target_taps`.
+            if len(ir_full) >= target_taps:
+                ir = ir_full[:target_taps]
+            else:
+                ir = np.concatenate([ir_full, np.zeros(target_taps - len(ir_full))])
+    else:  # phase == "linear"
+        mid = n_fft // 2
+        half = target_taps // 2
+        start = mid - half
+        end = start + target_taps
+        ir = centred[start:end]
+        # Hann window suppresses edge ringing in the linear-phase case
+        # where the IR was truncated from a longer symmetric kernel.
+        ir = ir * np.hanning(target_taps)
 
-    # Normalise to unity DC gain so a target_gain_db = [0, 0, ..., 0]
-    # input produces a true passthrough at 0 dB. Prior versions
-    # normalised peak to 0.5 — that gave every FIR a -6 dB baseline
-    # and combined with the polyphase decimation made pushed FIRs
-    # near-silent through MultEQ (verified on X3800H 2026-05-04: same
-    # channel measured -32 dB SPL in PURE DIRECT vs sweep-not-detected
-    # in STEREO/MULTI CH STEREO with the pushed FIR active).
-    #
-    # The Hann window has a DC gain of ~0.5 inherently (mean of cosine
-    # squared envelope), so we scale by 2.0/dc_gain to compensate.
-    # Cap peak at 0.95 to keep headroom against the AVR's filter clip.
-    dc_gain = float(np.sum(windowed))
+    # Normalise to unity DC gain so a flat 0 dB target produces a true
+    # passthrough. The Hann-windowed linear-phase path has DC gain ~0.5
+    # inherently (Hann's mean is 0.5), and minimum_phase usually emits
+    # close to unity already — both are normalised here for consistency.
+    dc_gain = float(np.sum(ir))
     if dc_gain != 0:
-        windowed = windowed * (1.0 / dc_gain)
-    peak = float(np.max(np.abs(windowed)))
+        ir = ir * (1.0 / dc_gain)
+    peak = float(np.max(np.abs(ir)))
     if peak > 0.95:
-        windowed = windowed * (0.95 / peak)
-    return windowed.tolist()
+        ir = ir * (0.95 / peak)
+    return ir.tolist()
 
 
 def design_passthrough_ir(*, is_sub: bool) -> list[float]:
