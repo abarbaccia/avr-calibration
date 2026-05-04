@@ -1361,9 +1361,8 @@ async def _tool_compare_sessions(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        sa = next((s for s in sessions if s.id == session_a), None)
-        sb = next((s for s in sessions if s.id == session_b), None)
+        sa = store.get_session(session_a)
+        sb = store.get_session(session_b)
         if sa is None:
             return _err(f"session {session_a} not found")
         if sb is None:
@@ -1434,8 +1433,7 @@ async def _tool_simulate_eq(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -1561,8 +1559,7 @@ async def _tool_per_filter_contribution(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -1706,8 +1703,7 @@ async def _tool_sensitivity_analysis(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -1865,8 +1861,7 @@ async def _tool_fit_correction_filter(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -2334,8 +2329,7 @@ async def _tool_predict_rms(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -2462,8 +2456,7 @@ async def _tool_optimize_q(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -2605,8 +2598,7 @@ async def _tool_analyze_phase(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -2762,9 +2754,8 @@ async def _tool_compare_sub_phase(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        sa = next((s for s in sessions if s.id == session_a), None)
-        sb = next((s for s in sessions if s.id == session_b), None)
+        sa = store.get_session(session_a)
+        sb = store.get_session(session_b)
         if sa is None:
             return _err(f"session {session_a} not found")
         if sb is None:
@@ -2967,11 +2958,9 @@ async def _tool_optimize_sub_alignment(
             return _err("optimize_sub_alignment: need at least 2 session_ids")
 
         store = SessionStore()
-        sessions = store.list_sessions()
-        by_id = {s.id: s for s in sessions}
         subs = []
         for sid in session_ids:
-            s = by_id.get(sid)
+            s = store.get_session(sid)
             if s is None:
                 return _err(f"session {sid} not found")
             if not s.impulse_response:
@@ -3307,11 +3296,9 @@ async def _tool_sweep_inter_sub_delay(
             return _err("sweep_inter_sub_delay: need at least 2 session_ids")
 
         store = SessionStore()
-        sessions = store.list_sessions()
-        by_id = {s.id: s for s in sessions}
         subs = []
         for sid in session_ids:
-            s = by_id.get(sid)
+            s = store.get_session(sid)
             if s is None:
                 return _err(f"session {sid} not found")
             if not s.impulse_response:
@@ -3497,8 +3484,7 @@ async def _tool_design_fir(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -4012,8 +3998,7 @@ async def _tool_design_modal_fir(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -5430,8 +5415,7 @@ async def _tool_fit_shelf_for_target(
             return _err("target_curve must be {'points': [{freq, spl}, ...]}")
 
         store = SessionStore()
-        sessions = store.list_sessions()
-        sess = next((s for s in sessions if s.id == session_id), None)
+        sess = store.get_session(session_id)
         if sess is None:
             return _err(f"session {session_id} not found")
         if not sess.start_fr or not sess.start_fr.frequencies:
@@ -6425,8 +6409,7 @@ async def _tool_design_corrective_fir(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
         if not session.start_fr or not session.start_fr.frequencies:
@@ -7169,8 +7152,7 @@ async def _tool_recommend_fir_phase(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -7343,9 +7325,8 @@ async def _tool_verify_fir_effect(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        pre = next((s for s in sessions if s.id == pre_session_id), None)
-        post = next((s for s in sessions if s.id == post_session_id), None)
+        pre = store.get_session(pre_session_id)
+        post = store.get_session(post_session_id)
         if pre is None:
             return _err(f"pre_session_id {pre_session_id} not found")
         if post is None:
@@ -7467,9 +7448,8 @@ async def _tool_verify_input_eq_effect(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        pre = next((s for s in sessions if s.id == pre_session_id), None)
-        post = next((s for s in sessions if s.id == post_session_id), None)
+        pre = store.get_session(pre_session_id)
+        post = store.get_session(post_session_id)
         if pre is None:
             return _err(f"pre_session_id {pre_session_id} not found")
         if post is None:
@@ -8190,14 +8170,13 @@ async def _tool_simulate_per_sub_fir(
         import numpy as np
 
         store = SessionStore()
-        all_sessions = store.list_sessions()
 
         # Validate + load each per-sub spec's session and FR.
         records: list[dict] = []
         sample_rate: int | None = None
         for spec in per_sub_specs:
             sid = int(spec["session_id"])
-            session = next((s for s in all_sessions if s.id == sid), None)
+            session = store.get_session(sid)
             if session is None:
                 return _err(f"session {sid} not found")
             fr = session.start_fr
