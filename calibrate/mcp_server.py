@@ -289,7 +289,7 @@ async def _tool_get_measurement_history(
     from .storage import SessionStore
     try:
         store = SessionStore()
-        sessions = store.list_sessions()[:limit]
+        sessions = store.list_sessions(limit=limit)
         result = []
         for s in sessions:
             fr = s.start_fr
@@ -420,7 +420,7 @@ async def _tool_get_fr_summary(
             sessions = [store.get_session(sid) for sid in session_ids]
             sessions = [s for s in sessions if s is not None]
         else:
-            sessions = store.list_sessions()[:limit]
+            sessions = store.list_sessions(limit=limit)
 
         result = []
         for s in sessions:

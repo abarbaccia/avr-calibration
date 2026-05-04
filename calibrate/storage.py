@@ -431,12 +431,24 @@ class SessionStore:
                 (fr.to_json(), session_id),
             )
 
-    def list_sessions(self) -> list[Session]:
-        """Return all sessions, most recent first."""
+    def list_sessions(self, limit: int | None = None) -> list[Session]:
+        """Return sessions, most recent first.
+
+        Pass *limit* to cap rows at the SQL layer. Each session deserializes
+        full FR + IR + metadata blobs, so loading all rows from a long-running
+        DB will OOM on a 4 GB Pi. Callers that only need the latest N
+        measurements MUST pass limit.
+        """
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM sessions ORDER BY id DESC"
-            ).fetchall()
+            if limit is None:
+                rows = conn.execute(
+                    "SELECT * FROM sessions ORDER BY id DESC"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM sessions ORDER BY id DESC LIMIT ?",
+                    (int(limit),),
+                ).fetchall()
         return [self._row_to_session(r) for r in rows]
 
     def get_session(self, session_id: int) -> Optional[Session]:

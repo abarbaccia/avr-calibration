@@ -141,6 +141,23 @@ class TestListSessions:
         sessions = store.list_sessions()
         assert sessions[0].start_fr.frequencies == [30.0, 60.0]
 
+    def test_limit_caps_rows_at_sql_layer(self, store):
+        # Regression: list_sessions used to materialize all rows then [:limit].
+        # On a long-running DB this OOMs the MCP server (each row carries
+        # full FR + IR blobs). Verify limit is honored and ordering is preserved.
+        for i in range(7):
+            store.save_measurement(make_fr(timestamp=f"2026-03-20T{10+i:02d}:00:00+00:00"))
+        sessions = store.list_sessions(limit=3)
+        assert len(sessions) == 3
+        assert sessions[0].timestamp == "2026-03-20T16:00:00+00:00"
+        assert sessions[2].timestamp == "2026-03-20T14:00:00+00:00"
+
+    def test_limit_none_returns_all(self, store):
+        for _ in range(4):
+            store.save_measurement(make_fr())
+        assert len(store.list_sessions(limit=None)) == 4
+        assert len(store.list_sessions()) == 4
+
 
 # ── get_session ───────────────────────────────────────────────────────────────
 
