@@ -476,17 +476,40 @@ def _push_full_sync(
 
         # Coefficient streams. AVR doesn't ACK coef packets, but it WILL
         # send a frame with body {"Comm":"NACK"} when a specific packet
-        # is malformed or the stream falls behind. Drain at every
-        # end-of-channel boundary so per-channel NACK rate is observable
-        # — needed because the Fin commit on top of a partially-NACK'd
-        # coefficient bank wipes ChSetup on the X3800H.
+        # is malformed or the stream falls behind. We drain a small
+        # window after every packet to detect transient NACKs and
+        # re-send the offending packet up to MAX_PACKET_RETRIES times
+        # before giving up. NACKs seen here are application-layer
+        # backpressure (firmware busy / NVRAM staging), not TCP loss —
+        # retry is the standard remedy for this class of protocol.
         between_channel_pause_ms = 100.0
-        per_channel_running_nacks = 0
+        per_packet_drain_ms = 8.0  # small window to catch a NACK
+        retry_settle_ms = 250.0     # extra wait before resending
+        MAX_PACKET_RETRIES = 3
+        summary.setdefault("coef_packet_retries", 0)
+        summary.setdefault("coef_packets_unrecovered", 0)
         for pkt, end_of_channel in coef_packet_streams:
-            sock.sendall(pkt)
-            if inter_packet_delay_ms > 0:
-                time.sleep(inter_packet_delay_ms / 1000.0)
-            summary["coef_packets_sent"] += 1
+            attempt = 0
+            while True:
+                sock.sendall(pkt)
+                if inter_packet_delay_ms > 0:
+                    time.sleep(inter_packet_delay_ms / 1000.0)
+                summary["coef_packets_sent"] += 1
+                # Drain a tiny window inline so NACKs are caught at
+                # source instead of bleeding into the next packets.
+                inline_frames = drain(per_packet_drain_ms / 1000.0)
+                inline_nacks = count_nacks(inline_frames)
+                if inline_nacks == 0:
+                    break  # packet accepted (or no response yet — fine)
+                # NACK observed for this packet. Retry with a longer
+                # settle so the AVR's busy state can clear.
+                if attempt >= MAX_PACKET_RETRIES:
+                    summary["coef_packets_unrecovered"] += 1
+                    summary["coef_nack_count"] += inline_nacks
+                    break
+                attempt += 1
+                summary["coef_packet_retries"] += 1
+                time.sleep(retry_settle_ms / 1000.0)
             if end_of_channel:
                 # Drain briefly so any in-flight NACK frames land before
                 # we move on to the next channel.
@@ -494,7 +517,6 @@ def _push_full_sync(
                 ch_nacks = count_nacks(between_frames)
                 summary["coef_nack_per_channel"].append(ch_nacks)
                 summary["coef_nack_count"] += ch_nacks
-                per_channel_running_nacks = 0
 
         # Allow the AVR to finish processing the coefficient bank.
         if coef_wait_init_ms > 0:
