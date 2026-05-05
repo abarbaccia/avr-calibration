@@ -2,6 +2,21 @@
 
 AI-first home theater calibration — closed-loop bass optimization for Denon X3800H + miniDSP 2x4 HD + SVS PB12-NSD.
 
+## Operating mode — be aggressive
+
+There is a real deadline. Push forward on real problems; do not wrap up
+sessions with "let's pick this up tomorrow" language. When you hit a wall:
+
+1. Propose the next concrete diagnostic / fix, with specifics.
+2. Rank by likelihood and blast radius.
+3. Pick the highest-leverage one and execute.
+
+Recovery paths exist (push_avr_speaker_layout, MultEQ Editor, .ady backups,
+PSMULTEQ:OFF). Don't stop at the first AVR crash — recover and push on.
+The user prefers honest failures + retries over premature wrap-ups.
+
+When in doubt: keep going, take action, course-correct on user feedback.
+
 ## Architecture — Claude is the Orchestrator
 
 **Core principle: Claude Code drives calibration, not Python.**

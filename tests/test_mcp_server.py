@@ -84,6 +84,20 @@ from calibrate.mcp_server import (
 from calibrate.drivers.base import DriverError
 
 
+def _wire_mock_store(MockStore, sessions):
+    """Configure both list_sessions and get_session on the mocked store.
+
+    Production code now uses store.get_session(id) for single-row lookups
+    (see commit replacing list_sessions+find-by-id pattern). Tests still
+    set list_sessions.return_value for backward shape; this helper wires
+    get_session to do the matching id lookup against the same list.
+    """
+    MockStore.return_value.list_sessions.return_value = sessions
+    MockStore.return_value.get_session.side_effect = (
+        lambda sid: next((s for s in sessions if s.id == sid), None)
+    )
+
+
 # ── Fixtures ───────────────────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -1780,7 +1794,7 @@ def _make_session_with_ir(session_id: int, peak_time_s: float = 0.005,
 async def test_analyze_ir_latest_session() -> None:
     session = _make_session_with_ir(session_id=3, peak_time_s=0.008, positive_peak=True)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_analyze_ir()
     assert result["ok"]
     assert result["session_id"] == 3
@@ -1795,7 +1809,7 @@ async def test_analyze_ir_negative_peak_sign() -> None:
     """Inverted polarity should report peak_sign = -1."""
     session = _make_session_with_ir(session_id=1, positive_peak=False)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_analyze_ir()
     assert result["ok"]
     assert result["peak_sign"] == -1
@@ -1806,7 +1820,7 @@ async def test_analyze_ir_by_session_id() -> None:
     older = _make_session_with_ir(session_id=2, peak_time_s=0.010)
     newer = _make_session_with_ir(session_id=5, peak_time_s=0.005)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [newer, older]
+        _wire_mock_store(MockStore, [newer, older])
         result = await _tool_analyze_ir(session_id=2)
     assert result["ok"]
     assert result["session_id"] == 2
@@ -1817,7 +1831,7 @@ async def test_analyze_ir_by_session_id() -> None:
 async def test_analyze_ir_session_not_found() -> None:
     session = _make_session_with_ir(session_id=1)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_analyze_ir(session_id=99)
     assert not result["ok"]
     assert "not found" in result["error"]
@@ -1826,7 +1840,7 @@ async def test_analyze_ir_session_not_found() -> None:
 @pytest.mark.asyncio
 async def test_analyze_ir_no_sessions() -> None:
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = []
+        _wire_mock_store(MockStore, [])
         result = await _tool_analyze_ir()
     assert not result["ok"]
     assert "no measurements found" in result["error"]
@@ -1839,7 +1853,7 @@ async def test_analyze_ir_missing_ir() -> None:
     session.start_fr = MagicMock()
     session.impulse_response = None
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_analyze_ir()
     assert not result["ok"]
     assert "no impulse response" in result["error"]
@@ -1850,7 +1864,7 @@ async def test_analyze_ir_solo_sub_no_cross_path_warning() -> None:
     """Solo-sub measurements (peak in normal acoustic range) emit no warning."""
     session = _make_session_with_ir(session_id=1, peak_time_s=0.008)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_analyze_ir()
     assert result["ok"]
     assert result.get("cross_path_warning") is None
@@ -1861,7 +1875,7 @@ async def test_analyze_ir_long_chain_emits_cross_path_warning() -> None:
     """A peak past 80 ms means FIR/buffer latency dominates — flag for cross-path misuse."""
     session = _make_session_with_ir(session_id=1, peak_time_s=0.140)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_analyze_ir(search_window_ms=200.0)
     assert result["ok"]
     assert result["cross_path_warning"] is not None
@@ -1874,9 +1888,9 @@ async def test_analyze_ir_delay_computation() -> None:
     sub1 = _make_session_with_ir(session_id=1, peak_time_s=0.005)
     sub2 = _make_session_with_ir(session_id=2, peak_time_s=0.012)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [sub1]
+        _wire_mock_store(MockStore, [sub1])
         r1 = await _tool_analyze_ir(session_id=1)
-        MockStore.return_value.list_sessions.return_value = [sub2]
+        _wire_mock_store(MockStore, [sub2])
         r2 = await _tool_analyze_ir(session_id=2)
     delay_offset_ms = (r2["peak_time_s"] - r1["peak_time_s"]) * 1000.0
     assert abs(delay_offset_ms - 7.0) < 1.0, f"Expected ~7ms offset, got {delay_offset_ms:.2f}ms"
@@ -1887,7 +1901,7 @@ async def test_call_tool_analyze_ir_dispatch() -> None:
     from calibrate.mcp_server import call_tool
     session = _make_session_with_ir(session_id=1)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         texts = await call_tool("analyze_ir", {})
     data = json.loads(texts[0].text)
     assert data["ok"]
@@ -2251,7 +2265,7 @@ def _make_session_clean_ir(session_id: int = 1) -> MagicMock:
 async def test_analyze_decay_latest_session() -> None:
     session = _make_session_with_ringing_ir(session_id=5)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_analyze_decay()
     assert result["ok"]
     assert result["session_id"] == 5
@@ -2268,7 +2282,7 @@ async def test_analyze_decay_by_session_id() -> None:
     older = _make_session_with_ringing_ir(session_id=3)
     newer = _make_session_clean_ir(session_id=7)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [newer, older]
+        _wire_mock_store(MockStore, [newer, older])
         result = await _tool_analyze_decay(session_id=3)
     assert result["ok"]
     assert result["session_id"] == 3
@@ -2278,7 +2292,7 @@ async def test_analyze_decay_by_session_id() -> None:
 async def test_analyze_decay_session_not_found() -> None:
     session = _make_session_with_ringing_ir(session_id=1)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_analyze_decay(session_id=9999)
     assert not result["ok"]
     assert "not found" in result["error"]
@@ -2287,7 +2301,7 @@ async def test_analyze_decay_session_not_found() -> None:
 @pytest.mark.asyncio
 async def test_analyze_decay_no_sessions() -> None:
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = []
+        _wire_mock_store(MockStore, [])
         result = await _tool_analyze_decay()
     assert not result["ok"]
     assert "no measurements found" in result["error"]
@@ -2300,7 +2314,7 @@ async def test_analyze_decay_session_missing_ir() -> None:
     session.start_fr = MagicMock()
     session.impulse_response = None
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_analyze_decay()
     assert not result["ok"]
     assert "no impulse response" in result["error"]
@@ -2310,7 +2324,7 @@ async def test_analyze_decay_session_missing_ir() -> None:
 async def test_analyze_decay_clean_ir() -> None:
     session = _make_session_clean_ir(session_id=2)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_analyze_decay(t60_threshold_ms=300.0)
     assert result["ok"]
     assert result["mode_count"] == 0
@@ -2322,7 +2336,7 @@ async def test_analyze_decay_threshold_param() -> None:
     """A mode with T60~600ms should be filtered out when threshold is 800ms."""
     session = _make_session_with_ringing_ir(session_id=1)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_analyze_decay(t60_threshold_ms=2000.0)
     assert result["ok"]
     assert result["mode_count"] == 0
@@ -2333,7 +2347,7 @@ async def test_analyze_decay_freq_range_param() -> None:
     """A 50Hz mode should not appear when freq_min=80."""
     session = _make_session_with_ringing_ir(session_id=1)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_analyze_decay(freq_min=80.0, freq_max=200.0)
     assert result["ok"]
     # 50Hz mode should be excluded from the 80-200Hz range
@@ -2346,7 +2360,7 @@ async def test_call_tool_analyze_decay_dispatch() -> None:
     from calibrate.mcp_server import call_tool
     session = _make_session_with_ringing_ir(session_id=1)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         texts = await call_tool("analyze_decay", {})
     data = json.loads(texts[0].text)
     assert data["ok"]
@@ -2362,7 +2376,7 @@ async def test_recommend_fir_phase_recommends_mixed_for_long_t60() -> None:
     sized so the FIR impulse covers at least 2× the worst T60."""
     session = _make_session_with_ringing_ir(session_id=1)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_recommend_fir_phase(session_id=1, t60_threshold_ms=300.0)
     assert result["ok"], result
     assert result["recommendation"] == "mixed"
@@ -2382,7 +2396,7 @@ async def test_recommend_fir_phase_recommends_minimum_when_clean() -> None:
     """A clean IR with no ringing modes → recommendation: minimum."""
     session = _make_session_clean_ir(session_id=5)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_recommend_fir_phase(session_id=5)
     assert result["ok"]
     assert result["recommendation"] == "minimum"
@@ -2394,7 +2408,7 @@ async def test_recommend_fir_phase_threshold_gate() -> None:
     """Setting a very high t60 threshold rules out all modes → minimum."""
     session = _make_session_with_ringing_ir(session_id=1)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_recommend_fir_phase(
             session_id=1, t60_threshold_ms=10_000.0,
         )
@@ -2405,7 +2419,7 @@ async def test_recommend_fir_phase_threshold_gate() -> None:
 @pytest.mark.asyncio
 async def test_recommend_fir_phase_session_not_found() -> None:
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = []
+        _wire_mock_store(MockStore, [])
         result = await _tool_recommend_fir_phase(session_id=9999)
     assert not result["ok"]
     assert "not found" in result["error"]
@@ -2418,7 +2432,7 @@ async def test_recommend_fir_phase_missing_ir() -> None:
     session.impulse_response = None
     session.start_fr = MagicMock()
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_recommend_fir_phase(session_id=1)
     assert not result["ok"]
     assert "no impulse response" in result["error"]
@@ -2429,7 +2443,7 @@ async def test_call_tool_recommend_fir_phase_dispatch() -> None:
     from calibrate.mcp_server import call_tool
     session = _make_session_with_ringing_ir(session_id=1)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         texts = await call_tool(
             "recommend_fir_phase",
             {"session_id": 1, "t60_threshold_ms": 300.0},
@@ -2445,7 +2459,7 @@ async def test_recommend_fir_phase_suggests_preringing_and_latency() -> None:
     estimated_latency_ms, and whether it fits in the AVR mains-distance budget."""
     session = _make_session_with_ringing_ir(session_id=1)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_recommend_fir_phase(
             session_id=1,
             t60_threshold_ms=300.0,
@@ -2465,7 +2479,7 @@ async def test_recommend_fir_phase_clamps_preringing_to_budget() -> None:
     """If preringing_ms exceeds mains_distance_budget_ms, clamp and flag."""
     session = _make_session_with_ringing_ir(session_id=1)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_recommend_fir_phase(
             session_id=1,
             t60_threshold_ms=300.0,
@@ -2503,7 +2517,7 @@ async def test_get_measurement_history_min_hz_filters_low_freqs() -> None:
     spls  = [ 1.0,  2.0,  3.0,   4.0,   5.0]
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_get_measurement_history(limit=1, min_hz=20.0, fmt="full")
     assert result["ok"]
     data = result["sessions"][0]
@@ -2517,7 +2531,7 @@ async def test_get_measurement_history_max_hz_filters_high_freqs() -> None:
     spls  = [ 1.0,  2.0,  3.0,   4.0,   5.0]
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_get_measurement_history(limit=1, max_hz=100.0, fmt="full")
     data = result["sessions"][0]
     assert data["freq_hz"] == [10.0, 20.0, 50.0, 100.0]
@@ -2530,7 +2544,7 @@ async def test_get_measurement_history_min_max_hz_combined() -> None:
     spls  = [ 1.0,  2.0,  3.0,   4.0,   5.0]
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_get_measurement_history(limit=1, min_hz=20.0, max_hz=100.0, fmt="full")
     data = result["sessions"][0]
     assert data["freq_hz"] == [20.0, 50.0, 100.0]
@@ -2543,7 +2557,7 @@ async def test_get_measurement_history_decimation() -> None:
     spls  = [ 1.0,  2.0,  3.0,  4.0,  5.0,  6.0]
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_get_measurement_history(limit=1, decimation=2, fmt="full")
     data = result["sessions"][0]
     assert data["freq_hz"] == [10.0, 30.0, 50.0]
@@ -2556,7 +2570,7 @@ async def test_get_measurement_history_rounds_floats() -> None:
     spls  = [-5.12345678,   -3.98765432]
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_get_measurement_history(limit=1, fmt="full")
     data = result["sessions"][0]
     assert data["freq_hz"] == [20.14, 40.28]
@@ -2592,7 +2606,7 @@ async def test_compute_deviation_basic() -> None:
     spls = [75.5, 75.8, 74.5, 75.2, 74.9]
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(session_id=1, target_curve=target)
     assert result["ok"]
@@ -2618,7 +2632,7 @@ async def test_compute_deviation_geometry_dominated_flag() -> None:
     spls = [75.0, 75.0, 75.0, 75.0, 75.0]
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(session_id=1, target_curve=target)
     assert "geometry_dominated" in result
@@ -2636,7 +2650,7 @@ async def test_compute_deviation_null_zone_excluded() -> None:
     spls = [74.0, 75.0, 55.0, 76.0, 75.0]
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(
             session_id=1, target_curve=target, null_threshold_db=15.0
@@ -2658,7 +2672,7 @@ async def test_compute_deviation_rolloff_excluded() -> None:
     spls = [65.0, 70.0, 74.0, 75.0, 75.0, 76.0, 75.0]
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(
             session_id=1, target_curve=target, port_rolloff_hz=28.0
@@ -2676,7 +2690,7 @@ async def test_compute_deviation_not_converged() -> None:
     spls = [80.0, 70.0, 82.0, 68.0, 81.0]
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(session_id=1, target_curve=target)
     assert result["ok"]
@@ -2689,7 +2703,7 @@ async def test_compute_deviation_session_not_found() -> None:
     """Session ID not in store → error."""
     target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = []
+        _wire_mock_store(MockStore, [])
         MockStore.return_value.get_session.side_effect = lambda sid, _ses=[]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(session_id=99, target_curve=target)
     assert not result["ok"]
@@ -2704,7 +2718,7 @@ async def test_compute_deviation_empty_target_points() -> None:
     session = _make_deviation_session(1, freqs, spls)
     target = {"points": [], "band": [20, 100]}
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(session_id=1, target_curve=target)
     assert not result["ok"]
@@ -2720,7 +2734,7 @@ async def test_compute_deviation_returns_summary_bands() -> None:
     spls = [77.0] * len(freqs)  # 2 dB above target everywhere
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(session_id=1, target_curve=target)
     assert result["ok"]
@@ -2740,7 +2754,7 @@ async def test_call_tool_compute_deviation_dispatch() -> None:
     target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 100, "spl": 75.0}], "band": [20, 100]}
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         texts = await call_tool("compute_deviation", {
             "session_id": 1,
@@ -2765,7 +2779,7 @@ async def test_compute_deviation_exclude_geometry_false_keeps_geometry_bands() -
     spls = [75.5, 75.8, 74.5, 75.2, 74.9]
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(
             session_id=1, target_curve=target, exclude_geometry=False,
@@ -2797,7 +2811,7 @@ async def test_compute_deviation_exclude_geometry_true_auto_excludes() -> None:
              "calibrate.mcp_server._compute_phase_bands_for_session",
              return_value=[{"freq_hz": 50.0, "classification": "geometry"}],
          ):
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(
             session_id=1, target_curve=target, exclude_geometry=True,
@@ -2855,7 +2869,7 @@ async def test_compute_deviation_excluded_band_diagnostics() -> None:
              return_value=[{"freq_hz": 63.0, "classification": "geometry"}],
          ), \
          patch("calibrate.decay.analyze_decay", return_value=decay_modes):
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(
             session_id=1, target_curve=target,
@@ -2885,7 +2899,7 @@ async def test_compute_deviation_excluded_band_diagnostics_graceful_on_failure()
     with patch("calibrate.storage.SessionStore") as MockStore, \
          patch("calibrate.mcp_server._tool_analyze_decay",
                side_effect=RuntimeError("no impulse response")):
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         MockStore.return_value.get_session.side_effect = lambda sid, _ses=[session]: next((s for s in _ses if s.id == sid), None)
         result = await _tool_compute_deviation(session_id=1, target_curve=target)
 
@@ -3186,7 +3200,7 @@ async def test_verify_fir_effect_within_tolerance() -> None:
         {"freq_hz": 80.0, "fir_effect_db": -3.0},
     ]
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [pre_session, post_session]
+        _wire_mock_store(MockStore, [pre_session, post_session])
         result = await _tool_verify_fir_effect(
             pre_session_id=1, post_session_id=2,
             predicted_effect=predicted, tolerance_db=2.0,
@@ -3216,7 +3230,7 @@ async def test_verify_fir_effect_flags_off_spec_band() -> None:
         {"freq_hz": 80.0, "fir_effect_db": -3.0},
     ]
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [pre_session, post_session]
+        _wire_mock_store(MockStore, [pre_session, post_session])
         result = await _tool_verify_fir_effect(
             pre_session_id=1, post_session_id=2,
             predicted_effect=predicted, tolerance_db=2.0,
@@ -3236,7 +3250,7 @@ async def test_verify_fir_effect_requires_predicted() -> None:
     pre_session = _make_deviation_session(1, [50.0], [80.0])
     post_session = _make_deviation_session(2, [50.0], [77.0])
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [pre_session, post_session]
+        _wire_mock_store(MockStore, [pre_session, post_session])
         result = await _tool_verify_fir_effect(
             pre_session_id=1, post_session_id=2, predicted_effect=[],
         )
@@ -3252,7 +3266,7 @@ async def test_call_tool_verify_fir_effect_dispatch() -> None:
     post_session = _make_deviation_session(2, freqs, [77.0, 79.0, 82.0, 77.0, 75.0])
     predicted = [{"freq_hz": f, "fir_effect_db": -3.0} for f in freqs]
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [pre_session, post_session]
+        _wire_mock_store(MockStore, [pre_session, post_session])
         texts = await call_tool("verify_fir_effect", {
             "pre_session_id": 1, "post_session_id": 2,
             "predicted_effect": predicted, "tolerance_db": 2.0,
@@ -3279,7 +3293,7 @@ async def test_compare_sessions_basic() -> None:
     session_b = _make_deviation_session(2, freqs_b, spls_b)
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session_a, session_b]
+        _wire_mock_store(MockStore, [session_a, session_b])
         result = await _tool_compare_sessions(session_a=1, session_b=2)
     assert result["ok"]
     assert result["session_a"]["id"] == 1
@@ -3298,7 +3312,7 @@ async def test_compare_sessions_session_not_found() -> None:
     spls = [75.0] * len(freqs)
     session = _make_deviation_session(2, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_compare_sessions(session_a=99, session_b=2)
     assert not result["ok"]
     assert "session 99 not found" in result["error"]
@@ -3312,7 +3326,7 @@ async def test_compare_sessions_session_b_not_found() -> None:
     spls = [75.0] * len(freqs)
     session = _make_deviation_session(1, freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_compare_sessions(session_a=1, session_b=99)
     assert not result["ok"]
     assert "session 99 not found" in result["error"]
@@ -3328,7 +3342,7 @@ async def test_compare_sessions_returns_statistics() -> None:
     session_a = _make_deviation_session(1, freqs, spls_a)
     session_b = _make_deviation_session(2, freqs, spls_b)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session_a, session_b]
+        _wire_mock_store(MockStore, [session_a, session_b])
         result = await _tool_compare_sessions(session_a=1, session_b=2)
     assert result["ok"]
     assert "avg_delta_db" in result
@@ -3346,7 +3360,7 @@ async def test_call_tool_compare_sessions_dispatch() -> None:
     session_a = _make_deviation_session(1, freqs, [70.0] * len(freqs))
     session_b = _make_deviation_session(2, freqs, [73.0] * len(freqs))
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session_a, session_b]
+        _wire_mock_store(MockStore, [session_a, session_b])
         texts = await call_tool("compare_sessions", {
             "session_a": 1,
             "session_b": 2,
@@ -3476,7 +3490,7 @@ async def test_get_measurement_history_compact_format() -> None:
     spls  = [-1.5,  2.3,  0.0]
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_get_measurement_history(limit=1, fmt="compact")
     data = result["sessions"][0]
     assert "fr" in data
@@ -3493,7 +3507,7 @@ async def test_get_measurement_history_compact_with_range() -> None:
     spls  = [ 1.0,  2.0,  3.0,   4.0,   5.0]
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_get_measurement_history(
             limit=1, min_hz=20.0, max_hz=100.0, fmt="compact"
         )
@@ -3514,7 +3528,7 @@ async def test_get_measurement_history_compact_downsamples_group_delay() -> None
         "position": "MLP",
     }
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_get_measurement_history(limit=1, fmt="compact")
     data = result["sessions"][0]
     assert "metadata" in data
@@ -3537,7 +3551,7 @@ async def test_get_measurement_history_full_keeps_group_delay() -> None:
         "group_delay": {"freq_hz": [20.0], "gd_ms": [1.0]},
     }
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_get_measurement_history(limit=1, fmt="full")
     data = result["sessions"][0]
     assert "group_delay" in data["metadata"]
@@ -3624,7 +3638,7 @@ async def test_simulate_eq_basic_prediction() -> None:
         {"type": "peaking", "freq": 50.0, "gain_db": -8.0, "q": 2.0},
     ]
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_simulate_eq(session_id=1, filters=filters)
     assert result["ok"]
     assert result["num_filters"] == 1
@@ -3653,7 +3667,7 @@ async def test_simulate_eq_hpf_skipped() -> None:
 
     filters = [{"type": "hpf", "freq": 18.0}]
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_simulate_eq(
             session_id=1, filters=filters, min_hz=15.0, max_hz=100.0,
         )
@@ -3675,7 +3689,7 @@ async def test_simulate_eq_low_shelf_response() -> None:
 
     filters = [{"type": "low_shelf", "freq": 35.0, "gain_db": 5.0, "q": 0.5}]
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_simulate_eq(
             session_id=1, filters=filters, min_hz=20.0, max_hz=100.0,
         )
@@ -3695,7 +3709,7 @@ async def test_simulate_eq_low_shelf_response() -> None:
 @pytest.mark.asyncio
 async def test_simulate_eq_session_not_found() -> None:
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = []
+        _wire_mock_store(MockStore, [])
         result = await _tool_simulate_eq(session_id=999, filters=[])
     assert not result["ok"]
     assert "999" in result["error"]
@@ -3709,7 +3723,7 @@ async def test_call_tool_simulate_eq_dispatch() -> None:
     spls = [75.0, 78.0, 80.0, 76.0, 74.0]
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         texts = await call_tool("simulate_eq", {
             "session_id": 1,
             "filters": [{"type": "peaking", "freq": 60.0, "gain_db": -3.0, "q": 1.0}],
@@ -3733,7 +3747,7 @@ async def test_optimize_q_finds_reasonable_q() -> None:
     session = _make_fr_session(freqs, spls)
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_optimize_q(
             session_id=1, freq_hz=50.0, target_gain_db=-10.0,
         )
@@ -3755,7 +3769,7 @@ async def test_optimize_q_custom_band() -> None:
     session = _make_fr_session(freqs, spls)
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_optimize_q(
             session_id=1, freq_hz=60.0, target_gain_db=-6.0,
             band_hz=[40.0, 80.0],
@@ -3767,7 +3781,7 @@ async def test_optimize_q_custom_band() -> None:
 @pytest.mark.asyncio
 async def test_optimize_q_session_not_found() -> None:
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = []
+        _wire_mock_store(MockStore, [])
         result = await _tool_optimize_q(
             session_id=999, freq_hz=50.0, target_gain_db=-5.0,
         )
@@ -3784,7 +3798,7 @@ async def test_call_tool_optimize_q_dispatch() -> None:
     spls = [75.0 + 5.0 * np.exp(-((f - 50) ** 2) / 100) for f in freqs]
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         texts = await call_tool("optimize_q", {
             "session_id": 1, "freq_hz": 50.0, "target_gain_db": -5.0,
         })
@@ -3808,7 +3822,7 @@ async def test_analyze_phase_with_phase_data() -> None:
     session = _make_fr_session_with_phase(freqs, spls, phase)
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_analyze_phase(session_id=1)
     assert result["ok"]
     assert result["has_phase_data"] is True
@@ -3833,7 +3847,7 @@ async def test_analyze_phase_without_phase_data() -> None:
     session.start_fr.phase = None  # Explicitly no phase
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_analyze_phase(session_id=1)
     assert result["ok"]
     assert result["has_phase_data"] is False
@@ -3872,7 +3886,7 @@ def test_classify_fixability_tiers() -> None:
 @pytest.mark.asyncio
 async def test_analyze_phase_session_not_found() -> None:
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = []
+        _wire_mock_store(MockStore, [])
         result = await _tool_analyze_phase(session_id=999)
     assert not result["ok"]
     assert "999" in result["error"]
@@ -3883,7 +3897,7 @@ async def test_analyze_phase_insufficient_data() -> None:
     """Too few data points in range → error."""
     session = _make_fr_session_with_phase([30.0], [75.0], [0.0])
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_analyze_phase(session_id=1)
     assert not result["ok"]
     assert "insufficient" in result["error"]
@@ -3899,7 +3913,7 @@ async def test_call_tool_analyze_phase_dispatch() -> None:
     phase = [-0.05 * f for f in freqs]
     session = _make_fr_session_with_phase(freqs, spls, phase)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         texts = await call_tool("analyze_phase", {"session_id": 1})
     data = json.loads(texts[0].text)
     assert data["ok"]
@@ -3924,7 +3938,7 @@ async def test_compare_sub_phase_reinforcing() -> None:
     session_b = _make_fr_session_with_phase(freqs, spls_b, phase_b, session_id=2)
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session_a, session_b]
+        _wire_mock_store(MockStore, [session_a, session_b])
         result = await _tool_compare_sub_phase(session_a=1, session_b=2)
     assert result["ok"]
     assert result["reinforcing_bands"] > 0
@@ -3950,7 +3964,7 @@ async def test_compare_sub_phase_cancelling() -> None:
     session_b = _make_fr_session_with_phase(freqs, spls_b, phase_b, session_id=2)
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session_a, session_b]
+        _wire_mock_store(MockStore, [session_a, session_b])
         result = await _tool_compare_sub_phase(session_a=1, session_b=2)
     assert result["ok"]
     assert result["cancelling_bands"] > 0
@@ -3965,7 +3979,7 @@ async def test_compare_sub_phase_missing_phase() -> None:
     session_b = _make_fr_session_with_phase(freqs, spls, session_id=2)
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session_a, session_b]
+        _wire_mock_store(MockStore, [session_a, session_b])
         result = await _tool_compare_sub_phase(session_a=1, session_b=2)
     assert not result["ok"]
     assert "phase data" in result["error"]
@@ -3974,7 +3988,7 @@ async def test_compare_sub_phase_missing_phase() -> None:
 @pytest.mark.asyncio
 async def test_compare_sub_phase_session_not_found() -> None:
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = []
+        _wire_mock_store(MockStore, [])
         result = await _tool_compare_sub_phase(session_a=1, session_b=2)
     assert not result["ok"]
     assert "not found" in result["error"]
@@ -3991,7 +4005,7 @@ async def test_call_tool_compare_sub_phase_dispatch() -> None:
     sa = _make_fr_session_with_phase(freqs, spls, phase, session_id=1)
     sb = _make_fr_session_with_phase(freqs, spls, phase, session_id=2)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [sa, sb]
+        _wire_mock_store(MockStore, [sa, sb])
         texts = await call_tool("compare_sub_phase", {
             "session_a": 1, "session_b": 2,
         })
@@ -4013,7 +4027,7 @@ async def test_design_fir_minimum_phase() -> None:
     session = _make_fr_session(freqs, spls)
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_fir(
             session_id=1, num_taps=256, phase_mode="minimum",
         )
@@ -4036,7 +4050,7 @@ async def test_design_fir_linear_phase() -> None:
     session = _make_fr_session(freqs, spls)
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_fir(
             session_id=1, num_taps=512, phase_mode="linear",
         )
@@ -4065,7 +4079,7 @@ async def test_design_fir_mixed_phase_reports_bounded_latency() -> None:
     # Use a small preringing window so the test is rate-agnostic: at the
     # fallback fir_fs=96 kHz, 2 ms = 192 samples (well within num_taps=1024).
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_fir(
             session_id=1, num_taps=1024, phase_mode="mixed", preringing_ms=2.0,
         )
@@ -4096,7 +4110,7 @@ async def test_design_fir_mixed_phase_with_zero_preringing_matches_minimum() -> 
     session = _make_fr_session(freqs, spls)
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_fir(
             session_id=1, num_taps=256, phase_mode="mixed", preringing_ms=0.0,
         )
@@ -4122,7 +4136,7 @@ async def test_design_fir_mixed_phase_magnitude_tracks_min_phase_in_focus_band()
     session = _make_fr_session(freqs, spls)
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         min_result = await _tool_design_fir(
             session_id=1, num_taps=2048, phase_mode="minimum",
             freq_focus_hz=[25, 90],
@@ -4165,7 +4179,7 @@ async def test_design_fir_with_target_curve() -> None:
         ]
     }
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_fir(
             session_id=1, target_curve=target, num_taps=256,
         )
@@ -4182,7 +4196,7 @@ async def test_design_fir_invalid_tap_count() -> None:
 
     # No _dsp attached → falls back to the built-in miniDSP defaults (64-2048).
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_fir(session_id=1, num_taps=32)
     assert not result["ok"]
     assert "64" in result["error"] and "2048" in result["error"]
@@ -4217,7 +4231,7 @@ async def test_design_fir_uses_driver_capabilities() -> None:
     srv._dsp = _StubDSP()  # type: ignore[assignment]
     try:
         with patch("calibrate.storage.SessionStore") as MockStore:
-            MockStore.return_value.list_sessions.return_value = [session]
+            _wire_mock_store(MockStore, [session])
             # 8192 taps would fail the old hardcoded 2048 limit — should pass now.
             result = await _tool_design_fir(session_id=1, num_taps=8192)
         assert result["ok"], result
@@ -4230,7 +4244,7 @@ async def test_design_fir_uses_driver_capabilities() -> None:
 @pytest.mark.asyncio
 async def test_design_fir_session_not_found() -> None:
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = []
+        _wire_mock_store(MockStore, [])
         result = await _tool_design_fir(session_id=999)
     assert not result["ok"]
     assert "999" in result["error"]
@@ -4247,7 +4261,7 @@ async def test_design_fir_coefficients_normalized() -> None:
     session = _make_fr_session(freqs, spls)
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_fir(
             session_id=1, num_taps=256, phase_mode="minimum",
         )
@@ -4265,7 +4279,7 @@ async def test_call_tool_design_fir_dispatch() -> None:
     spls = [75.0] * len(freqs)
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         texts = await call_tool("design_fir", {
             "session_id": 1, "num_taps": 128,
         })
@@ -4289,7 +4303,7 @@ async def test_call_tool_design_fir_dispatch_return_coefficients_false() -> None
     session = _make_fr_session(freqs, spls)
     _mod._fir_design_cache.pop(1, None)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         texts = await call_tool("design_fir", {
             "session_id": 1,
             "num_taps": 128,
@@ -4319,7 +4333,7 @@ async def test_design_fir_return_coefficients_false_caches_only() -> None:
 
     _mod._fir_design_cache.pop(1, None)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         design = await _tool_design_fir(
             session_id=1, num_taps=128, return_coefficients=False,
         )
@@ -4381,7 +4395,7 @@ async def test_design_fir_anchor_none_preserves_legacy_behavior() -> None:
         {"freq": 120, "spl": 73},
     ]}
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         a = await _tool_design_fir(
             session_id=1, target_curve=target, num_taps=128, phase_mode="minimum",
         )
@@ -4425,7 +4439,7 @@ async def test_design_fir_anchor_freq_yields_cuts_above_anchor() -> None:
         {"freq": 100, "spl": 0}, {"freq": 120, "spl": 0},
     ]}
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_fir(
             session_id=1, target_curve=target,
             num_taps=512, phase_mode="minimum",
@@ -4465,7 +4479,7 @@ async def test_design_fir_anchor_deep_bass_priority_picks_low_anchor() -> None:
         {"freq": 100, "spl": 0}, {"freq": 120, "spl": 0},
     ]}
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_fir(
             session_id=1, target_curve=target,
             num_taps=512, phase_mode="minimum",
@@ -4578,7 +4592,7 @@ async def test_per_filter_contribution_basic() -> None:
 
     filters = [{"type": "peaking", "freq": 50.0, "gain_db": -5.0, "q": 2.0}]
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_per_filter_contribution(
             filters=filters, session_id=1, query_freqs=[50.0, 80.0],
         )
@@ -4604,7 +4618,7 @@ async def test_per_filter_contribution_default_freqs() -> None:
 
     filters = [{"type": "peaking", "freq": 50.0, "gain_db": -3.0, "q": 2.0}]
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_per_filter_contribution(
             filters=filters, session_id=1,
         )
@@ -4615,7 +4629,7 @@ async def test_per_filter_contribution_default_freqs() -> None:
 @pytest.mark.asyncio
 async def test_per_filter_contribution_session_not_found() -> None:
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = []
+        _wire_mock_store(MockStore, [])
         result = await _tool_per_filter_contribution(
             filters=[], session_id=999,
         )
@@ -4683,7 +4697,7 @@ async def test_sensitivity_analysis_basic() -> None:
         "band": [20, 120],
     }
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_sensitivity_analysis(
             filters=filters, session_id=1, target_curve=target,
         )
@@ -4703,7 +4717,7 @@ async def test_sensitivity_analysis_basic() -> None:
 async def test_sensitivity_analysis_session_not_found() -> None:
     target = {"points": [{"freq": 20, "spl": 75}, {"freq": 120, "spl": 75}], "band": [20, 120]}
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = []
+        _wire_mock_store(MockStore, [])
         result = await _tool_sensitivity_analysis(
             filters=[], session_id=999, target_curve=target,
         )
@@ -4724,7 +4738,7 @@ async def test_fit_correction_filter_finds_cut() -> None:
         "band": [20, 120],
     }
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_fit_correction_filter(
             session_id=1, target_curve=target,
             freq_range=[40.0, 80.0],
@@ -4742,7 +4756,7 @@ async def test_fit_correction_filter_finds_cut() -> None:
 async def test_fit_correction_filter_session_not_found() -> None:
     target = {"points": [{"freq": 20, "spl": 75}, {"freq": 120, "spl": 75}], "band": [20, 120]}
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = []
+        _wire_mock_store(MockStore, [])
         result = await _tool_fit_correction_filter(
             session_id=999, target_curve=target, freq_range=[20, 120],
         )
@@ -4763,7 +4777,7 @@ async def test_fit_correction_filter_respects_constraints() -> None:
         "band": [20, 120],
     }
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_fit_correction_filter(
             session_id=1, target_curve=target,
             freq_range=[40.0, 80.0],
@@ -4798,7 +4812,7 @@ async def test_fit_correction_filter_joint_beats_single_on_3_peaks() -> None:
         "band": [20, 120],
     }
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         single = await _tool_fit_correction_filter(
             session_id=1, target_curve=target,
             freq_range=[25.0, 100.0], num_filters=1,
@@ -4832,7 +4846,7 @@ async def test_fit_correction_filter_joint_respects_bounds() -> None:
         "band": [20, 120],
     }
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_fit_correction_filter(
             session_id=1, target_curve=target,
             freq_range=[25.0, 100.0], num_filters=2,
@@ -4850,7 +4864,7 @@ async def test_fit_correction_filter_joint_rejects_too_many_filters() -> None:
     target = {"points": [{"freq": 20, "spl": 75}, {"freq": 120, "spl": 75}], "band": [20, 120]}
     session = _make_fr_session([20.0, 120.0], [75.0, 75.0])
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_fit_correction_filter(
             session_id=1, target_curve=target,
             freq_range=[25.0, 100.0], num_filters=9,
@@ -4870,7 +4884,7 @@ async def test_call_tool_fit_correction_filter_joint_dispatch() -> None:
 
     target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}], "band": [20, 120]}
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         texts = await call_tool("fit_correction_filter", {
             "session_id": 1, "target_curve": target,
             "freq_range": [25.0, 100.0], "num_filters": 2,
@@ -4900,7 +4914,7 @@ async def test_fit_correction_filter_preserve_mean_balances_level() -> None:
     }
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         off = await _tool_fit_correction_filter(
             session_id=1, target_curve=target,
             freq_range=[25.0, 100.0], num_filters=3,
@@ -4946,7 +4960,7 @@ async def test_fit_correction_filter_doublet_penalty_discourages_opposing_pairs(
         return total
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         unpenalised = await _tool_fit_correction_filter(
             session_id=1, target_curve=target,
             freq_range=[30.0, 90.0], num_filters=3,
@@ -4985,7 +4999,7 @@ async def test_fit_correction_filter_exclude_geometry_drops_null_band() -> None:
     with patch("calibrate.storage.SessionStore") as MockStore, \
          patch("calibrate.mcp_server._get_geometry_band_ranges",
                return_value=[(62.5, 78.7)]):
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_fit_correction_filter(
             session_id=1, target_curve=target,
             freq_range=[40.0, 100.0], num_filters=2,
@@ -5024,7 +5038,7 @@ async def test_fit_correction_filter_auto_anchor_from_target_offsets() -> None:
     with patch("calibrate.storage.SessionStore") as MockStore, \
          patch("calibrate.mcp_server._tool_anchor_target", side_effect=fake_anchor), \
          patch("calibrate.mcp_server._get_geometry_band_ranges", return_value=[]):
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_fit_correction_filter(
             session_id=1,
             target_offsets=[
@@ -5042,7 +5056,7 @@ async def test_fit_correction_filter_requires_target_curve_or_offsets() -> None:
     """Must pass either target_curve or target_offsets."""
     session = _make_fr_session([20.0, 120.0], [75.0, 75.0])
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_fit_correction_filter(
             session_id=1, freq_range=[25.0, 100.0], num_filters=2,
         )
@@ -5066,7 +5080,7 @@ async def test_fit_correction_filter_max_q_boost_raises_boost_q() -> None:
     }
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         unconstrained = await _tool_fit_correction_filter(
             session_id=1, target_curve=target,
             freq_range=[30.0, 90.0], num_filters=2,
@@ -5119,7 +5133,7 @@ async def test_fit_correction_filter_baseline_filters_incremental() -> None:
     existing_filter = {"type": "peaking", "freq": 40.0, "gain_db": -6.0, "q": 3.0}
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         # Without baseline — optimiser sees both peaks, assigns filters to both.
         without_baseline = await _tool_fit_correction_filter(
             session_id=1, target_curve=target,
@@ -5167,7 +5181,7 @@ async def test_fit_correction_filter_preserve_mean_suppressed_when_max_boost_zer
     }
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_fit_correction_filter(
             session_id=1, target_curve=target,
             freq_range=[25.0, 100.0], num_filters=4,
@@ -5219,7 +5233,7 @@ async def test_fit_correction_filter_anchor_warning_when_anchor_diverges() -> No
          patch("calibrate.mcp_server._tool_anchor_target",
                side_effect=fake_anchor_high), \
          patch("calibrate.mcp_server._get_geometry_band_ranges", return_value=[]):
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_fit_correction_filter(
             session_id=1,
             target_offsets=[
@@ -5270,7 +5284,7 @@ async def test_fit_correction_filter_no_anchor_warning_when_anchor_close() -> No
          patch("calibrate.mcp_server._tool_anchor_target",
                side_effect=fake_anchor_close), \
          patch("calibrate.mcp_server._get_geometry_band_ranges", return_value=[]):
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_fit_correction_filter(
             session_id=1,
             target_offsets=[
@@ -5304,7 +5318,7 @@ async def test_predict_rms_basic() -> None:
     }
     # No filters → RMS should be ~5 dB
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_predict_rms(
             filters=[], session_id=1, target_curve=target,
         )
@@ -5327,7 +5341,7 @@ async def test_predict_rms_with_correction() -> None:
     # Broadband cut at 65 Hz — should reduce the 5 dB overshoot
     filters = [{"type": "peaking", "freq": 65.0, "gain_db": -5.0, "q": 0.5}]
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_predict_rms(
             filters=filters, session_id=1, target_curve=target,
         )
@@ -5348,7 +5362,7 @@ async def test_predict_rms_convergence() -> None:
         "band": [20, 120],
     }
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_predict_rms(
             filters=[], session_id=1, target_curve=target,
             convergence_threshold=1.0,
@@ -5362,7 +5376,7 @@ async def test_predict_rms_convergence() -> None:
 async def test_predict_rms_session_not_found() -> None:
     target = {"points": [{"freq": 20, "spl": 75}, {"freq": 120, "spl": 75}], "band": [20, 120]}
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = []
+        _wire_mock_store(MockStore, [])
         result = await _tool_predict_rms(
             filters=[], session_id=999, target_curve=target,
         )
@@ -5382,7 +5396,7 @@ async def test_predict_rms_returns_summary() -> None:
         "band": [20, 120],
     }
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_predict_rms(
             filters=[], session_id=1, target_curve=target,
         )
@@ -5418,7 +5432,7 @@ async def test_call_tool_per_filter_contribution_dispatch() -> None:
     spls = [75.0] * len(freqs)
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         texts = await call_tool("per_filter_contribution", {
             "filters": [{"type": "peaking", "freq": 50, "gain_db": -3, "q": 2}],
             "session_id": 1,
@@ -5451,7 +5465,7 @@ async def test_call_tool_sensitivity_analysis_dispatch() -> None:
     spls = [80.0] * len(freqs)
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         texts = await call_tool("sensitivity_analysis", {
             "filters": [{"type": "peaking", "freq": 65, "gain_db": -5, "q": 1}],
             "session_id": 1,
@@ -5473,7 +5487,7 @@ async def test_call_tool_fit_correction_filter_dispatch() -> None:
     spls = [80.0] * len(freqs)
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         texts = await call_tool("fit_correction_filter", {
             "session_id": 1,
             "target_curve": {
@@ -5494,7 +5508,7 @@ async def test_call_tool_predict_rms_dispatch() -> None:
     spls = [80.0] * len(freqs)
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         texts = await call_tool("predict_rms", {
             "session_id": 1,
             "filters": [{"type": "peaking", "freq": 65, "gain_db": -5, "q": 0.7}],
@@ -6204,7 +6218,7 @@ async def test_optimize_sub_alignment_two_subs_recovers_delay() -> None:
     sess_b = _make_session_with_synth_ir(2, ir_b, sr)
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [sess_a, sess_b]
+        _wire_mock_store(MockStore, [sess_a, sess_b])
         result = await _tool_optimize_sub_alignment(
             session_ids=[1, 2], min_hz=30.0, max_hz=150.0, max_delay_ms=20.0,
         )
@@ -6236,7 +6250,7 @@ async def test_optimize_sub_alignment_detects_polarity_flip() -> None:
     sess_b = _make_session_with_synth_ir(2, ir_b, sr)
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [sess_a, sess_b]
+        _wire_mock_store(MockStore, [sess_a, sess_b])
         result = await _tool_optimize_sub_alignment(
             session_ids=[1, 2], min_hz=30.0, max_hz=150.0, max_delay_ms=10.0,
         )
@@ -6266,7 +6280,7 @@ async def test_optimize_sub_alignment_three_subs() -> None:
     sessions = [_make_session_with_synth_ir(i + 1, ir, sr) for i, ir in enumerate([ir_a, ir_b, ir_c])]
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = sessions
+        _wire_mock_store(MockStore, sessions)
         result = await _tool_optimize_sub_alignment(
             session_ids=[1, 2, 3], min_hz=30.0, max_hz=150.0, max_delay_ms=20.0,
         )
@@ -6305,7 +6319,7 @@ async def test_optimize_sub_alignment_min_latency_form() -> None:
     ]
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = sessions
+        _wire_mock_store(MockStore, sessions)
         result = await _tool_optimize_sub_alignment(
             session_ids=[1, 2, 3], min_hz=30.0, max_hz=150.0, max_delay_ms=20.0,
         )
@@ -6324,7 +6338,7 @@ async def test_optimize_sub_alignment_min_latency_form() -> None:
 async def test_optimize_sub_alignment_missing_session() -> None:
     """Unknown session_id → error."""
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = []
+        _wire_mock_store(MockStore, [])
         result = await _tool_optimize_sub_alignment(session_ids=[99, 100])
     assert not result["ok"]
     assert "not found" in result["error"]
@@ -6349,7 +6363,7 @@ async def test_optimize_sub_alignment_priority_band_accepted() -> None:
     sess_a = _make_session_with_synth_ir(1, ir_a, sr)
     sess_b = _make_session_with_synth_ir(2, ir_b, sr)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [sess_a, sess_b]
+        _wire_mock_store(MockStore, [sess_a, sess_b])
         result = await _tool_optimize_sub_alignment(
             session_ids=[1, 2], min_hz=20.0, max_hz=120.0, max_delay_ms=20.0,
             priority_band=[20.0, 50.0],
@@ -6370,7 +6384,7 @@ async def test_optimize_sub_alignment_per_band_polarity_present() -> None:
     sess_a = _make_session_with_synth_ir(1, ir_a, sr)
     sess_b = _make_session_with_synth_ir(2, ir_b, sr)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [sess_a, sess_b]
+        _wire_mock_store(MockStore, [sess_a, sess_b])
         result = await _tool_optimize_sub_alignment(
             session_ids=[1, 2], min_hz=30.0, max_hz=120.0,
         )
@@ -6394,7 +6408,7 @@ async def test_sweep_inter_sub_delay_returns_recommendation() -> None:
     sess_a = _make_session_with_synth_ir(1, ir_a, sr)
     sess_b = _make_session_with_synth_ir(2, ir_b, sr)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [sess_a, sess_b]
+        _wire_mock_store(MockStore, [sess_a, sess_b])
         result = await _tool_sweep_inter_sub_delay(
             session_ids=[1, 2],
             base_delays_ms=[0.0, 2.0],  # sub_b is trailing
@@ -6602,7 +6616,7 @@ async def test_fit_shelf_recovers_known_shelf_parameters(mock_dsp) -> None:
     ]}
 
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [sess]
+        _wire_mock_store(MockStore, [sess])
         result = await _tool_fit_shelf_for_target(
             session_id=1, target_curve=target, min_hz=25.0, max_hz=120.0,
         )
@@ -6623,7 +6637,7 @@ async def test_fit_shelf_missing_target_errors(mock_dsp) -> None:
     from calibrate.mcp_server import _tool_fit_shelf_for_target
     sess = _make_fr_session_for_shelf([20.0, 50.0], [-10.0, -10.0], session_id=1)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [sess]
+        _wire_mock_store(MockStore, [sess])
         result = await _tool_fit_shelf_for_target(session_id=1, target_curve={})
     assert not result["ok"]
     assert "target_curve" in result["error"]
@@ -6633,7 +6647,7 @@ async def test_fit_shelf_missing_target_errors(mock_dsp) -> None:
 async def test_fit_shelf_session_not_found(mock_dsp) -> None:
     from calibrate.mcp_server import _tool_fit_shelf_for_target
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = []
+        _wire_mock_store(MockStore, [])
         result = await _tool_fit_shelf_for_target(
             session_id=99,
             target_curve={"points": [{"freq": 50, "spl": -10}]},
@@ -6655,7 +6669,7 @@ async def test_design_fir_surfaces_avr_max_delay() -> None:
     avr.MAX_SPEAKER_DELAY_MS = 65.0
     with patch("calibrate.storage.SessionStore") as MockStore, \
          patch("calibrate.mcp_server._avr", avr):
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_fir(
             session_id=1, num_taps=256, phase_mode="minimum",
         )
@@ -6678,7 +6692,7 @@ async def test_design_fir_warns_when_latency_exceeds_avr_budget() -> None:
     avr.MAX_SPEAKER_DELAY_MS = 5.0  # tight budget so 1024-tap linear blows past it
     with patch("calibrate.storage.SessionStore") as MockStore, \
          patch("calibrate.mcp_server._avr", avr):
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_fir(
             session_id=1, num_taps=1024, phase_mode="linear",
         )
@@ -6698,7 +6712,7 @@ async def test_design_fir_avr_fields_unknown_when_driver_lacks_attribute() -> No
     avr = MagicMock(spec=[])  # no attributes
     with patch("calibrate.storage.SessionStore") as MockStore, \
          patch("calibrate.mcp_server._avr", avr):
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_fir(
             session_id=1, num_taps=256, phase_mode="minimum",
         )
@@ -6740,7 +6754,7 @@ async def test_design_modal_fir_auto_classifies_when_intents_omitted() -> None:
     ]
     session = _make_modal_session(decay_modes)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_modal_fir(session_id=1, num_taps=2048)
     assert result["ok"], result
     treatments = {t["freq_hz"]: t["treatment"] for t in result["per_mode_treatments"]}
@@ -6761,7 +6775,7 @@ async def test_design_modal_fir_target_t60_changes_classification() -> None:
     ]
     session = _make_modal_session(decay_modes)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         # Strict target: 300 ms — 700 ms is 2.3× over → anti_pulse
         strict = await _tool_design_modal_fir(
             session_id=1, target_t60_ms=300.0, num_taps=2048,
@@ -6786,7 +6800,7 @@ async def test_design_modal_fir_uses_supplied_intents_verbatim() -> None:
     ]
     session = _make_modal_session(decay_modes)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_modal_fir(
             session_id=1, intents=intents, num_taps=1024,
         )
@@ -6809,7 +6823,7 @@ async def test_design_modal_fir_anti_pulse_uses_pre_ring_budget() -> None:
                 "treatment": "anti_pulse", "cancel_strength": 0.6}]
     session = _make_modal_session(decay_modes)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_modal_fir(
             session_id=1, intents=intents, num_taps=4096, max_pre_ring_ms=25.0,
         )
@@ -6843,7 +6857,7 @@ async def test_design_modal_fir_pre_ring_fits_full_gabor_envelope() -> None:
                 "treatment": "anti_pulse", "cancel_strength": 0.6, "bp_q": 3.0}]
     session = _make_modal_session(decay_modes)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_modal_fir(
             session_id=1, intents=intents, num_taps=24576, samplerate=48000,
             max_pre_ring_ms=25.0,
@@ -6873,7 +6887,7 @@ async def test_design_modal_fir_no_anti_pulse_means_zero_pre_ring() -> None:
                 "treatment": "min_phase"}]
     session = _make_modal_session(decay_modes)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_modal_fir(
             session_id=1, intents=intents, num_taps=1024,
         )
@@ -6889,7 +6903,7 @@ async def test_design_modal_fir_caches_coefficients_for_apply_fir() -> None:
     session = _make_modal_session(decay_modes, session_id=42)
     srv._fir_design_cache.pop(42, None)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_modal_fir(
             session_id=42, num_taps=1024, return_coefficients=False,
         )
@@ -6908,7 +6922,7 @@ async def test_design_modal_fir_missing_decay_modes_errors() -> None:
     session.start_fr = MagicMock()
     session.start_fr.impulse_response = None
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_modal_fir(session_id=1)
     assert not result["ok"]
     assert "decay_modes" in result["error"]
@@ -6950,7 +6964,7 @@ async def test_design_modal_fir_target_curve_adds_magnitude_correction() -> None
     intents = [{"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0,
                 "treatment": "anti_pulse", "cancel_strength": 0.4, "bp_q": 3.0}]
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         with_target = await _tool_design_modal_fir(
             session_id=1, intents=intents, target_curve=target_curve,
             num_taps=4096, max_pre_ring_ms=25.0, samplerate=8000,
@@ -7001,7 +7015,7 @@ async def test_design_modal_fir_iterative_reduction_fits_cap() -> None:
     }]
     session = _make_modal_session(decay_modes)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_modal_fir(
             session_id=1, intents=intents,
             num_taps=4096, max_pre_ring_ms=25.0, samplerate=8000,
@@ -7051,7 +7065,7 @@ async def test_design_modal_fir_demotes_to_linear_notch_when_unreachable() -> No
     # will exceed the cap in isolation → the search settles near 0.
     with patch("calibrate.storage.SessionStore") as MockStore, \
          patch("calibrate.graph.SVS_PB12_NSD_PROFILE") as MockProfile:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         MockProfile.modal_cancel_max_boost_db = -30.0
         result = await _tool_design_modal_fir(
             session_id=1, intents=intents,
@@ -7087,7 +7101,7 @@ async def test_design_modal_fir_scales_not_demotes_with_tight_cap() -> None:
     # (isolated peak at ~3-5% scale fits under -1 dB).
     with patch("calibrate.storage.SessionStore") as MockStore, \
          patch("calibrate.graph.SVS_PB12_NSD_PROFILE") as MockProfile:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         MockProfile.modal_cancel_max_boost_db = -1.0
         result = await _tool_design_modal_fir(
             session_id=1, intents=intents,
@@ -7111,7 +7125,7 @@ async def test_design_modal_fir_no_anti_pulse_unchanged() -> None:
                 "treatment": "min_phase"}]
     session = _make_modal_session(decay_modes)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         a = await _tool_design_modal_fir(
             session_id=1, intents=intents, num_taps=1024, samplerate=8000,
             return_coefficients=True,
@@ -7142,7 +7156,7 @@ async def test_design_modal_fir_compensation_notch_keeps_cancel_strength() -> No
     # notches while keeping the cut small enough that the mode is preserved.
     with patch("calibrate.storage.SessionStore") as MockStore, \
          patch("calibrate.graph.SVS_PB12_NSD_PROFILE") as MockProfile:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         MockProfile.modal_cancel_max_boost_db = 10.0
         result = await _tool_design_modal_fir(
             session_id=1, intents=intents,
@@ -7178,7 +7192,7 @@ async def test_design_modal_fir_compensation_notch_preserves_modal_cancellation(
     session = _make_modal_session(decay_modes)
     with patch("calibrate.storage.SessionStore") as MockStore, \
          patch("calibrate.graph.SVS_PB12_NSD_PROFILE") as MockProfile:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         MockProfile.modal_cancel_max_boost_db = 3.0
         with_notch = await _tool_design_modal_fir(
             session_id=1, intents=intents,
@@ -7223,7 +7237,7 @@ async def test_design_modal_fir_compensation_notch_default_false() -> None:
                 "treatment": "anti_pulse", "cancel_strength": 0.6, "bp_q": 1.5}]
     session = _make_modal_session(decay_modes)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         default = await _tool_design_modal_fir(
             session_id=1, intents=intents, num_taps=1024, samplerate=8000,
             return_coefficients=True,
@@ -7261,7 +7275,7 @@ async def test_design_modal_fir_auto_envelope_dense_modes() -> None:
     ]
     session = _make_modal_session(decay_modes)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_modal_fir(
             session_id=1, intents=intents, num_taps=4096, samplerate=8000,
         )
@@ -7282,7 +7296,7 @@ async def test_design_modal_fir_auto_envelope_sparse_modes() -> None:
                 "treatment": "anti_pulse", "cancel_strength": 0.4}]
     session = _make_modal_session(decay_modes)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_modal_fir(
             session_id=1, intents=intents, num_taps=4096, samplerate=8000,
         )
@@ -7311,7 +7325,7 @@ async def test_design_modal_fir_user_bp_q_not_overridden() -> None:
     ]
     session = _make_modal_session(decay_modes)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_modal_fir(
             session_id=1, intents=intents, num_taps=4096, samplerate=8000,
         )

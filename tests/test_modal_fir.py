@@ -68,6 +68,9 @@ async def test_modal_fir_anti_pulse_against_real_room_passes_safety() -> None:
 
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
+        MockStore.return_value.get_session.side_effect = (
+            lambda sid, _ss=[session]: next((s for s in _ss if s.id == sid), None)
+        )
         result = await _tool_design_modal_fir(
             session_id=fixture["session_id"],
             intents=intents,
@@ -131,6 +134,9 @@ async def test_modal_fir_dense_triplet_auto_envelope() -> None:
 
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
+        MockStore.return_value.get_session.side_effect = (
+            lambda sid, _ss=[session]: next((s for s in _ss if s.id == sid), None)
+        )
         result = await _tool_design_modal_fir(
             session_id=fixture["session_id"],
             intents=intents,
@@ -187,6 +193,9 @@ async def test_design_fir_anchor_deep_bass_priority_against_real_room() -> None:
 
     with patch("calibrate.storage.SessionStore") as MockStore:
         MockStore.return_value.list_sessions.return_value = [session]
+        MockStore.return_value.get_session.side_effect = (
+            lambda sid, _ss=[session]: next((s for s in _ss if s.id == sid), None)
+        )
         result = await _tool_design_fir(
             session_id=fixture["session_id"],
             target_curve=target,

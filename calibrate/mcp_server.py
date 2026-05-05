@@ -289,7 +289,7 @@ async def _tool_get_measurement_history(
     from .storage import SessionStore
     try:
         store = SessionStore()
-        sessions = store.list_sessions()[:limit]
+        sessions = store.list_sessions(limit=limit)
         result = []
         for s in sessions:
             fr = s.start_fr
@@ -420,7 +420,7 @@ async def _tool_get_fr_summary(
             sessions = [store.get_session(sid) for sid in session_ids]
             sessions = [s for s in sessions if s is not None]
         else:
-            sessions = store.list_sessions()[:limit]
+            sessions = store.list_sessions(limit=limit)
 
         result = []
         for s in sessions:
@@ -1361,9 +1361,8 @@ async def _tool_compare_sessions(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        sa = next((s for s in sessions if s.id == session_a), None)
-        sb = next((s for s in sessions if s.id == session_b), None)
+        sa = store.get_session(session_a)
+        sb = store.get_session(session_b)
         if sa is None:
             return _err(f"session {session_a} not found")
         if sb is None:
@@ -1434,8 +1433,7 @@ async def _tool_simulate_eq(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -1561,8 +1559,7 @@ async def _tool_per_filter_contribution(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -1706,8 +1703,7 @@ async def _tool_sensitivity_analysis(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -1865,8 +1861,7 @@ async def _tool_fit_correction_filter(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -2334,8 +2329,7 @@ async def _tool_predict_rms(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -2462,8 +2456,7 @@ async def _tool_optimize_q(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -2605,8 +2598,7 @@ async def _tool_analyze_phase(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -2762,9 +2754,8 @@ async def _tool_compare_sub_phase(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        sa = next((s for s in sessions if s.id == session_a), None)
-        sb = next((s for s in sessions if s.id == session_b), None)
+        sa = store.get_session(session_a)
+        sb = store.get_session(session_b)
         if sa is None:
             return _err(f"session {session_a} not found")
         if sb is None:
@@ -2967,11 +2958,9 @@ async def _tool_optimize_sub_alignment(
             return _err("optimize_sub_alignment: need at least 2 session_ids")
 
         store = SessionStore()
-        sessions = store.list_sessions()
-        by_id = {s.id: s for s in sessions}
         subs = []
         for sid in session_ids:
-            s = by_id.get(sid)
+            s = store.get_session(sid)
             if s is None:
                 return _err(f"session {sid} not found")
             if not s.impulse_response:
@@ -3307,11 +3296,9 @@ async def _tool_sweep_inter_sub_delay(
             return _err("sweep_inter_sub_delay: need at least 2 session_ids")
 
         store = SessionStore()
-        sessions = store.list_sessions()
-        by_id = {s.id: s for s in sessions}
         subs = []
         for sid in session_ids:
-            s = by_id.get(sid)
+            s = store.get_session(sid)
             if s is None:
                 return _err(f"session {sid} not found")
             if not s.impulse_response:
@@ -3497,8 +3484,7 @@ async def _tool_design_fir(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -4012,8 +3998,7 @@ async def _tool_design_modal_fir(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -4564,7 +4549,9 @@ async def _tool_apply_avr_fir(
     distances_override_m: dict[str, float] | None = None,
     target_curves: list[str] | None = None,
     samplerates_hz: list[int] | None = None,
-    inter_packet_delay_ms: float = 5.0,
+    inter_packet_delay_ms: float = 25.0,
+    commit_fin: bool = True,
+    abort_fin_on_nack: bool = True,
 ) -> dict:
     """Push cached AVR-format FIR coefficients to the receiver.
 
@@ -4648,6 +4635,8 @@ async def _tool_apply_avr_fir(
         "channel_filters": channel_filters,
         "distances_override_m": overrides or None,
         "inter_packet_delay_ms": float(inter_packet_delay_ms),
+        "commit_fin": bool(commit_fin),
+        "abort_fin_on_nack": bool(abort_fin_on_nack),
     }
     if tc_arg:
         push_kwargs["target_curves"] = tc_arg
@@ -5430,8 +5419,7 @@ async def _tool_fit_shelf_for_target(
             return _err("target_curve must be {'points': [{freq, spl}, ...]}")
 
         store = SessionStore()
-        sessions = store.list_sessions()
-        sess = next((s for s in sessions if s.id == session_id), None)
+        sess = store.get_session(session_id)
         if sess is None:
             return _err(f"session {session_id} not found")
         if not sess.start_fr or not sess.start_fr.frequencies:
@@ -6425,8 +6413,7 @@ async def _tool_design_corrective_fir(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
         if not session.start_fr or not session.start_fr.frequencies:
@@ -7169,8 +7156,7 @@ async def _tool_recommend_fir_phase(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        session = next((s for s in sessions if s.id == session_id), None)
+        session = store.get_session(session_id)
         if session is None:
             return _err(f"session {session_id} not found")
 
@@ -7343,9 +7329,8 @@ async def _tool_verify_fir_effect(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        pre = next((s for s in sessions if s.id == pre_session_id), None)
-        post = next((s for s in sessions if s.id == post_session_id), None)
+        pre = store.get_session(pre_session_id)
+        post = store.get_session(post_session_id)
         if pre is None:
             return _err(f"pre_session_id {pre_session_id} not found")
         if post is None:
@@ -7467,9 +7452,8 @@ async def _tool_verify_input_eq_effect(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        pre = next((s for s in sessions if s.id == pre_session_id), None)
-        post = next((s for s in sessions if s.id == post_session_id), None)
+        pre = store.get_session(pre_session_id)
+        post = store.get_session(post_session_id)
         if pre is None:
             return _err(f"pre_session_id {pre_session_id} not found")
         if post is None:
@@ -8190,14 +8174,13 @@ async def _tool_simulate_per_sub_fir(
         import numpy as np
 
         store = SessionStore()
-        all_sessions = store.list_sessions()
 
         # Validate + load each per-sub spec's session and FR.
         records: list[dict] = []
         sample_rate: int | None = None
         for spec in per_sub_specs:
             sid = int(spec["session_id"])
-            session = next((s for s in all_sessions if s.id == sid), None)
+            session = store.get_session(sid)
             if session is None:
                 return _err(f"session {sid} not found")
             fr = session.start_fr
@@ -8958,9 +8941,39 @@ _TOOLS: list[Tool] = [
                     "type": "number",
                     "description": (
                         "Pause between SET_COEFDT packets in ms. "
-                        "Helps less-buffered receivers keep up. Default 5."
+                        "Default 25 — verified on X3800H 2026-05-04 to "
+                        "drive coef_nack_count to 0 across 1-channel "
+                        "commits. The prior default of 5 ms produced "
+                        "high NACK rates (~30%) that aborted the Fin "
+                        "commit gate. Decrease only if profiling shows "
+                        "a less-aggressive pacing is sufficient."
                     ),
-                    "default": 5.0,
+                    "default": 25.0,
+                },
+                "commit_fin": {
+                    "type": "boolean",
+                    "description": (
+                        "When True (default), send the AudyFinFlg=Fin commit "
+                        "after FINZ_COEFS to persist coefficients to NVRAM. "
+                        "Set False for non-destructive verification — the "
+                        "AVR's persisted state is unchanged after EXIT_AUDMD. "
+                        "Use False to verify a multi-channel push end-to-end "
+                        "before risking the X3800H's documented Fin-commit-"
+                        "wipes-ChSetup failure mode."
+                    ),
+                    "default": True,
+                },
+                "abort_fin_on_nack": {
+                    "type": "boolean",
+                    "description": (
+                        "When True (default), the Fin commit is gated on "
+                        "zero NACKs during the SET_COEFDT stream. NACKs "
+                        "indicate a corrupted coefficient bank; committing "
+                        "on top of one wipes ChSetup on the X3800H. Set "
+                        "False only if you specifically want to ignore the "
+                        "gate (e.g. for protocol probing)."
+                    ),
+                    "default": True,
                 },
             },
             "required": ["host", "ady_path", "cache_key"],

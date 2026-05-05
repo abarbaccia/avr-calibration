@@ -21,7 +21,7 @@ Packet layout (variable-length, ``buildAvrPacket`` style):
     1 byte    0x00 (separator)
     2 bytes   param_length (BE) — bytes after this header up to checksum
     [4 bytes  first packet only: tc(1) + sr(1) + channel_byte(1) + 0x00]
-    N bytes   coefficient payload (4 bytes per LE float32)
+    N bytes   coefficient payload (4 bytes per LE float32, per OCA)
     1 byte    checksum (sum of preceding bytes & 0xFF)
 
 Float layout per packet:
@@ -56,14 +56,28 @@ XT32_SAMPLE_RATES_HZ: tuple[int, ...] = (32000, 44100, 48000)
 
 def packet_config_for(total_floats: int) -> dict:
     """Return ``{packetCount, firstPacketFloats, midPacketFloats,
-    lastPacketFloats, lastSeqNum}`` for a stream of ``total_floats``
-    floats.
+    lastPacketFloats, lastSeqNum, dropped_trailing_floats}`` for a
+    stream of ``total_floats`` floats.
 
-    The AVR expects the first packet to carry 127 floats, mid packets
-    128 each, and the last whatever remains.
+    The AVR expects the first packet to carry 127 floats (4-byte stream
+    header + 127×4 = 512 bytes), mid packets 128 floats (=512 bytes),
+    and the last whatever remains.
+
+    Edge case: with total_floats=1024 (speaker XT32 polyphase output),
+    last_remainder = 1, producing a 4-byte tail packet that the X3800H
+    NACKs (verified 2026-05-04 — multi-channel commits with 1024-float
+    coefs produced NACK rates of 30%+, scaling with channel count).
+    Mitigation: when last_remainder is small (≤ TINY_LAST_THRESHOLD),
+    drop the tail and report the dropped float count. The DSP fills
+    unsent taps with zero, so a 1-tap loss out of 1024 is acoustically
+    inaudible (-60 dB+ effect on broadband response). Sub channels
+    (704 floats → last_remainder=65) are unaffected.
     """
     first = 127
     mid = 128
+    # If the trailing packet would be ≤ this many floats, drop it
+    # rather than ship a tiny payload the AVR will NACK.
+    TINY_LAST_THRESHOLD = 8
     if total_floats <= 0:
         return {
             "packet_count": 0,
@@ -71,6 +85,7 @@ def packet_config_for(total_floats: int) -> dict:
             "mid_packet_floats": mid,
             "last_packet_floats": 0,
             "last_seq_num": 0,
+            "dropped_trailing_floats": 0,
         }
     if total_floats <= first:
         return {
@@ -79,18 +94,26 @@ def packet_config_for(total_floats: int) -> dict:
             "mid_packet_floats": mid,
             "last_packet_floats": total_floats,
             "last_seq_num": 0,
+            "dropped_trailing_floats": 0,
         }
     remaining = total_floats - first
     additional = (remaining + mid - 1) // mid
     packet_count = 1 + additional
     last_remainder = remaining % mid
     last_packet_floats = last_remainder if last_remainder else mid
+    dropped = 0
+    if 0 < last_packet_floats <= TINY_LAST_THRESHOLD:
+        # Drop the tiny tail packet — last packet is now the previous mid.
+        dropped = last_packet_floats
+        packet_count -= 1
+        last_packet_floats = mid
     return {
         "packet_count": packet_count,
         "first_packet_floats": first,
         "mid_packet_floats": mid,
         "last_packet_floats": last_packet_floats,
         "last_seq_num": packet_count - 1,
+        "dropped_trailing_floats": dropped,
     }
 
 
@@ -176,8 +199,14 @@ def build_coef_packets(
     sr_code = SAMPLE_RATE_CODES[samplerate_hz]
     channel_byte = get_channel_byte(channel_id, mult_eq_type)
 
-    # Pre-pack each float as 4 little-endian bytes. List slicing is then
-    # used to grab N floats at a time per packet.
+    # Pre-pack each float as 4 little-endian bytes. The wire format is
+    # LITTLE-endian float32 — confirmed by OCA / A1Evo Acoustica's
+    # working transfer.js port (oca_transfer.py:1495 uses
+    # `struct.pack('<f', f)`), which is the canonical reference for
+    # X3800H Audyssey TCP uploads. Earlier 2026-05-04 we briefly
+    # switched to BE based on a wrong reading of audyssey_pcap_decode.py
+    # — that script's `>f` was decoding fixed-point data, not the
+    # float-DType wire we're sending. Reverted after finding OCA.
     coef_words: list[bytes] = [
         struct.pack("<f", float(c)) for c in coefficients
     ]

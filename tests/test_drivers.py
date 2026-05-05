@@ -867,7 +867,7 @@ def _denon_sweep_config(pure_direct: bool = True, settle_ms: int = 5000):
     cfg.measurement = {
         "playback_route": "hdmi",
         "denon_sweep_input": "Videocore",
-        "denon_sweep_volume": -10.0,
+        "denon_sweep_volume": -20.0,
         "denon_settle_ms": settle_ms,
         "denon_pure_direct": pure_direct,
     }
@@ -926,6 +926,37 @@ def test_denon_sweep_from_config_returns_none_no_sweep_input():
     assert DenonSweepContext.from_config(cfg) is None
 
 
+def test_denon_sweep_volume_ceiling_protects_against_corrupt_audio_path() -> None:
+    """The MAX_SWEEP_VOLUME_DB cap is a hardware safety limit.
+
+    Pinned at -15 dB as of 2026-05-04 — a corrupted FIR push (SET_DISFIL
+    with empty FilData/DispData on X3800H) produced loud distorted output
+    through MultEQ at sweep_volume=0 dB, audible from another room. The
+    ceiling protects users + speakers from audio-path corruption modes
+    the safety validator can't see at the wire-protocol level.
+
+    This test pins the constant so it can't be silently raised. Any
+    intentional change to it should require a code review."""
+    assert DenonSweepContext.MAX_SWEEP_VOLUME_DB <= -15.0, (
+        f"sweep_volume ceiling raised to {DenonSweepContext.MAX_SWEEP_VOLUME_DB}; "
+        f"this is a safety regression — see 2026-05-04 incident notes."
+    )
+
+
+def test_denon_sweep_init_rejects_volume_above_ceiling() -> None:
+    """Constructing a DenonSweepContext with a sweep_volume above the
+    ceiling MUST raise. This is the wire that prevents calibrate.measure
+    from accidentally sending a hot signal to the speakers."""
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="sweep_volume must be"):
+        DenonSweepContext(host="x", sweep_input="AUX1", sweep_volume=0.0)
+    with _pytest.raises(ValueError, match="sweep_volume must be"):
+        DenonSweepContext(host="x", sweep_input="AUX1", sweep_volume=-10.0)
+    # -15 (the ceiling) is allowed.
+    DenonSweepContext(host="x", sweep_input="AUX1", sweep_volume=-15.0)
+    DenonSweepContext(host="x", sweep_input="AUX1", sweep_volume=-30.0)
+
+
 def _make_sweep_receiver(volume=-28.0, sound_mode="DTS SURROUND", power="ON"):
     """Build a denonavr mock receiver with all async methods needed by DenonSweepContext."""
     mock_mod, mock_receiver = _make_denonavr_mock(volume=volume)
@@ -949,7 +980,7 @@ async def test_denon_sweep_enter_sets_pure_direct():
         with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
             ctx = DenonSweepContext(
                 host="192.168.1.209", sweep_input="Videocore",
-                sweep_volume=-10.0, settle_ms=100, pure_direct=True,
+                sweep_volume=-20.0, settle_ms=100, pure_direct=True,
             )
             await ctx.__aenter__()
 
@@ -965,7 +996,7 @@ async def test_denon_sweep_enter_skips_pure_direct():
         with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
             ctx = DenonSweepContext(
                 host="192.168.1.209", sweep_input="Videocore",
-                sweep_volume=-10.0, settle_ms=100, pure_direct=False,
+                sweep_volume=-20.0, settle_ms=100, pure_direct=False,
             )
             await ctx.__aenter__()
 
@@ -981,7 +1012,7 @@ async def test_denon_sweep_exit_restores_sound_mode_when_pure_direct():
         with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
             ctx = DenonSweepContext(
                 host="192.168.1.209", sweep_input="Videocore",
-                sweep_volume=-10.0, settle_ms=100, pure_direct=True,
+                sweep_volume=-20.0, settle_ms=100, pure_direct=True,
             )
             await ctx.__aenter__()
             mock_receiver.soundmode.async_set_sound_mode.reset_mock()
@@ -1000,7 +1031,7 @@ async def test_denon_sweep_exit_skips_sound_mode_restore_when_not_pure_direct():
         with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
             ctx = DenonSweepContext(
                 host="192.168.1.209", sweep_input="Videocore",
-                sweep_volume=-10.0, settle_ms=100, pure_direct=False,
+                sweep_volume=-20.0, settle_ms=100, pure_direct=False,
             )
             await ctx.__aenter__()
             mock_receiver.soundmode.async_set_sound_mode.reset_mock()
@@ -2699,7 +2730,7 @@ def test_denon_sweep_sound_mode_override_validates_value():
     with pytest.raises(ValueError, match="sound_mode_override"):
         DenonSweepContext(
             host="192.168.1.209", sweep_input="Videocore",
-            sweep_volume=-10.0, sound_mode_override="JAZZ CLUB",
+            sweep_volume=-20.0, sound_mode_override="JAZZ CLUB",
         )
 
 
@@ -2707,7 +2738,7 @@ def test_denon_sweep_sound_mode_override_normalizes_case():
     """Lowercase value is normalized to uppercase canonical form."""
     ctx = DenonSweepContext(
         host="192.168.1.209", sweep_input="Videocore",
-        sweep_volume=-10.0, sound_mode_override="pure direct",
+        sweep_volume=-20.0, sound_mode_override="pure direct",
     )
     assert ctx._sound_mode_override == "PURE DIRECT"
 
@@ -2730,7 +2761,7 @@ async def test_denon_sweep_enter_uses_sound_mode_override():
             # override must take priority and force STEREO instead.
             ctx = DenonSweepContext(
                 host="192.168.1.209", sweep_input="Videocore",
-                sweep_volume=-10.0, settle_ms=100,
+                sweep_volume=-20.0, settle_ms=100,
                 pure_direct=False, sound_mode_override="STEREO",
             )
             await ctx.__aenter__()
@@ -2747,7 +2778,7 @@ async def test_denon_sweep_exit_restores_sound_mode_after_override():
         with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
             ctx = DenonSweepContext(
                 host="192.168.1.209", sweep_input="Videocore",
-                sweep_volume=-10.0, settle_ms=100,
+                sweep_volume=-20.0, settle_ms=100,
                 pure_direct=False, sound_mode_override="STEREO",
             )
             await ctx.__aenter__()

@@ -243,16 +243,33 @@ def test_design_correction_ir_sub_length() -> None:
     assert len(ir) == FILTER_CONFIGS["xt32Sub"]["input_length"]
 
 
-def test_design_correction_ir_peak_under_half() -> None:
-    """Designed IR is normalized so peak is at most 0.5."""
+def test_design_correction_ir_peak_under_one() -> None:
+    """Designed IR peak is capped at 0.95 (headroom against AVR clip)
+    and DC gain is approximately unity for a 0 dB target."""
     ir = design_correction_ir(
         target_freqs_hz=[20, 100, 1000, 10000, 20000],
         target_gain_db=[+6, +3, 0, -3, -6],
         is_sub=False,
     )
     arr = np.asarray(ir)
-    assert np.max(np.abs(arr)) <= 0.5 + 1e-9
+    assert np.max(np.abs(arr)) <= 0.95 + 1e-9
     assert np.all(np.isfinite(arr))
+
+
+def test_design_correction_ir_zero_target_yields_unity_dc_gain() -> None:
+    """A flat 0 dB target produces an IR with DC gain ≈ 1 — i.e. true
+    passthrough, not the -6 dB attenuation produced by a peak-normalised
+    IR. Verified against X3800H 2026-05-04: the prior 0.5 peak normalize
+    silenced channels through MultEQ even on 0 dB targets."""
+    ir = design_correction_ir(
+        target_freqs_hz=[20, 100, 1000, 10000, 20000],
+        target_gain_db=[0, 0, 0, 0, 0],
+        is_sub=False,
+    )
+    arr = np.asarray(ir)
+    dc_gain = float(np.sum(arr))
+    # Hann windowing trims a small fraction of the energy; allow ±5%.
+    assert 0.9 <= dc_gain <= 1.0, f"DC gain {dc_gain} should be ~1.0"
 
 
 def test_design_correction_ir_mismatched_lengths_raises() -> None:

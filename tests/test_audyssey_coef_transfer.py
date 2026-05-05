@@ -21,30 +21,39 @@ from calibrate.drivers.denon.audyssey_coef_transfer import (
 # ── packet_config_for math ──────────────────────────────────────────────
 
 
-def test_packet_config_speaker_1024_floats() -> None:
-    """1024 floats → 9 packets: 1×127 + 7×128 + 1×1."""
+def test_packet_config_speaker_1024_floats_drops_tiny_tail() -> None:
+    """1024 floats → 8 packets [127, 128×7] + 1 dropped trailing float.
+
+    The naive math would yield 9 packets [127, 128×7, 1] — but the
+    X3800H NACKs the 4-byte tail. packet_config_for drops trailing
+    payloads ≤ TINY_LAST_THRESHOLD (8 floats) and reports the count.
+    Verified against live AVR 2026-05-04: dropped-tail commit ACKs
+    cleanly where the tiny-tail variant produced 30%+ NACK rates.
+    """
     cfg = packet_config_for(1024)
-    assert cfg["packet_count"] == 9
+    assert cfg["packet_count"] == 8
     assert cfg["first_packet_floats"] == 127
     assert cfg["mid_packet_floats"] == 128
-    assert cfg["last_packet_floats"] == 1
-    assert cfg["last_seq_num"] == 8
-    # Sanity: floats sum to 1024.
+    assert cfg["last_packet_floats"] == 128
+    assert cfg["last_seq_num"] == 7
+    assert cfg["dropped_trailing_floats"] == 1
+    # 8 packets × payloads sum to 1023 (= 1024 - 1 dropped).
     total = (
         cfg["first_packet_floats"]
         + (cfg["packet_count"] - 2) * cfg["mid_packet_floats"]
         + cfg["last_packet_floats"]
     )
-    assert total == 1024
+    assert total == 1024 - cfg["dropped_trailing_floats"]
 
 
 def test_packet_config_sub_704_floats() -> None:
-    """704 floats → 6 packets: 1×127 + 4×128 + 1×65."""
+    """704 floats → 6 packets: 1×127 + 4×128 + 1×65 (no drop)."""
     cfg = packet_config_for(704)
     assert cfg["packet_count"] == 6
     assert cfg["first_packet_floats"] == 127
     assert cfg["last_packet_floats"] == 65
     assert cfg["last_seq_num"] == 5
+    assert cfg["dropped_trailing_floats"] == 0
     total = (
         cfg["first_packet_floats"]
         + (cfg["packet_count"] - 2) * cfg["mid_packet_floats"]
@@ -117,14 +126,16 @@ def test_build_packets_speaker_count_and_command_bytes() -> None:
         target_curve=TARGET_CURVE_FLAT,
         samplerate_hz=48000,
     )
-    assert len(pkts) == 9
+    # 8 packets, not 9 — packet_config_for drops the 4-byte tail packet
+    # that the X3800H NACKs.
+    assert len(pkts) == 8
     for i, pkt in enumerate(pkts):
         info = _parse_packet_header(pkt)
         assert info["marker_ok"]
         assert info["cmd"] == SET_COEFDT_BYTES
         assert info["separator_ok"]
         assert info["seq"] == i
-        assert info["last_seq"] == 8
+        assert info["last_seq"] == 7
         assert info["checksum_ok"]
 
 
@@ -170,8 +181,11 @@ def test_first_packet_header_for_sw1_at_44100() -> None:
 
 
 def test_coefficients_serialize_as_le_float32() -> None:
-    """Round-trip: pull coefficients out of a single-packet stream
-    and confirm they're LE float32."""
+    """Wire format is LITTLE-endian float32, per OCA's transfer.js
+    canonical reference (oca_transfer.py:1495 uses
+    `struct.pack('<f', f)`). The X3800H accepts LE; we briefly tried
+    BE on 2026-05-04 morning based on a wrong pcap_decode.py reading
+    and reverted after finding OCA."""
     coefs = [0.25, -0.5, 0.125]
     pkts = build_coef_packets(
         coefs,
@@ -189,6 +203,22 @@ def test_coefficients_serialize_as_le_float32() -> None:
         for i in range(len(coefs))
     ]
     np.testing.assert_allclose(decoded, coefs, atol=1e-7)
+
+
+def test_coefficient_wire_bytes_match_oca_format() -> None:
+    """Pin the exact wire bytes for a known float so the encoding can't
+    silently regress to big-endian. 0.25 in IEEE 754 LE = 0x0000803E."""
+    pkts = build_coef_packets(
+        [0.25],
+        channel_id="FL",
+        target_curve=TARGET_CURVE_FLAT,
+        samplerate_hz=48000,
+    )
+    info = _parse_packet_header(pkts[0])
+    coef_bytes = info["param_data"][4:]  # skip stream header
+    assert coef_bytes == bytes.fromhex("0000803E"), (
+        f"expected LE bytes 0000803E for 0.25, got {coef_bytes.hex().upper()}"
+    )
 
 
 def test_invalid_target_curve_raises() -> None:
@@ -225,10 +255,10 @@ def test_unknown_channel_raises() -> None:
 
 
 def test_all_streams_speaker_count() -> None:
-    """Speaker (1024 floats × 9 packets) × 2 curves × 3 rates = 54 packets."""
+    """Speaker (1024 floats → 8 packets after tiny-tail drop) × 2 curves × 3 rates = 48 packets."""
     coefs = [0.0] * 1024
     streams = all_streams_for_channel(coefs, channel_id="FL")
-    assert len(streams) == 2 * 3 * 9
+    assert len(streams) == 2 * 3 * 8
 
 
 def test_all_streams_sub_count() -> None:
@@ -240,11 +270,11 @@ def test_all_streams_sub_count() -> None:
 
 def test_all_streams_first_packet_per_stream_carries_header() -> None:
     """Within each stream, only the seq=0 packet gets the 4-byte header.
-    For 6 streams × 9 packets/stream the first packet of each stream is
-    at indices 0, 9, 18, 27, 36, 45."""
+    For 6 streams × 8 packets/stream the first packet of each stream is
+    at indices 0, 8, 16, 24, 32, 40."""
     coefs = [0.0] * 1024
     streams = all_streams_for_channel(coefs, channel_id="FL")
-    expected_first_indices = {0, 9, 18, 27, 36, 45}
+    expected_first_indices = {0, 8, 16, 24, 32, 40}
     for i, pkt in enumerate(streams):
         info = _parse_packet_header(pkt)
         if i in expected_first_indices:
