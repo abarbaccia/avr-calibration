@@ -204,6 +204,23 @@ CREATE TABLE IF NOT EXISTS active_dsp_state (
     data        TEXT NOT NULL
 );
 
+-- Append-only history of every prior version of each active_dsp_state key.
+-- Populated automatically by set_active_dsp before it overwrites a row.
+-- Lets us recover destructive operations (clear_fir, apply_eq replacing a
+-- known-good filter set, etc.) without manual snapshotting.
+CREATE TABLE IF NOT EXISTS active_dsp_state_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    key         TEXT    NOT NULL,
+    timestamp   TEXT    NOT NULL,  -- the prior row's timestamp
+    data        TEXT    NOT NULL,  -- the prior row's data (full)
+    archived_at TEXT    NOT NULL   -- when this archive entry was created
+);
+
+CREATE INDEX IF NOT EXISTS active_dsp_state_history_key
+    ON active_dsp_state_history(key);
+CREATE INDEX IF NOT EXISTS active_dsp_state_history_archived_at
+    ON active_dsp_state_history(archived_at);
+
 CREATE TABLE IF NOT EXISTS lessons (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at      TEXT    NOT NULL,
@@ -834,15 +851,95 @@ class SessionStore:
     # ── Active DSP state ────────────────────────────────────────────────────
 
     def set_active_dsp(self, key: str, data: dict) -> None:
-        """Upsert an active DSP state entry (e.g. 'output_eq_1', 'input_eq', 'delay_1')."""
+        """Upsert an active DSP state entry (e.g. 'output_eq_1', 'input_eq', 'delay_1').
+
+        Before overwriting, the prior row (if any) is archived into
+        ``active_dsp_state_history`` so destructive operations (clear_fir,
+        apply_eq replacing a known-good filter set, container restart
+        rehydration on top of an unintended state) are recoverable.
+        """
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
+            # Archive the existing row before overwriting. Cheap (one row
+            # copy per mutation) and bounded by how often DSP state changes.
+            prior = conn.execute(
+                "SELECT timestamp, data FROM active_dsp_state WHERE key=?",
+                (key,),
+            ).fetchone()
+            if prior is not None:
+                conn.execute(
+                    "INSERT INTO active_dsp_state_history"
+                    " (key, timestamp, data, archived_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (key, prior["timestamp"], prior["data"], now),
+                )
             conn.execute(
                 "INSERT INTO active_dsp_state (key, timestamp, data)"
                 " VALUES (?, ?, ?)"
                 " ON CONFLICT(key) DO UPDATE SET timestamp=excluded.timestamp, data=excluded.data",
                 (key, now, json.dumps(data)),
             )
+
+    def list_active_dsp_history(
+        self, key: str | None = None, limit: int = 50
+    ) -> list[dict]:
+        """List archived prior versions of active DSP state entries.
+
+        If ``key`` is provided, only entries for that key are returned;
+        otherwise all keys, newest-first up to ``limit`` rows.
+        """
+        with self._connect() as conn:
+            if key is not None:
+                rows = conn.execute(
+                    "SELECT id, key, timestamp, archived_at, length(data) AS data_len"
+                    " FROM active_dsp_state_history"
+                    " WHERE key=? ORDER BY archived_at DESC LIMIT ?",
+                    (key, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, key, timestamp, archived_at, length(data) AS data_len"
+                    " FROM active_dsp_state_history"
+                    " ORDER BY archived_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_active_dsp_history(self, history_id: int) -> dict | None:
+        """Fetch a single archived row by id (full data included)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, key, timestamp, data, archived_at"
+                " FROM active_dsp_state_history WHERE id=?",
+                (history_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        try:
+            d["data"] = json.loads(d["data"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return d
+
+    def restore_active_dsp_history(self, history_id: int) -> bool:
+        """Restore a prior version of an active_dsp_state key. The current
+        value is itself archived first (via set_active_dsp), so restore is
+        also reversible. Returns True if the history row was found and
+        restored, False otherwise.
+        """
+        entry = self.get_active_dsp_history(history_id)
+        if entry is None:
+            return False
+        data = entry["data"]
+        if isinstance(data, str):
+            # data wasn't valid JSON when fetched; pass through as-is.
+            try:
+                data = json.loads(data)
+            except (json.JSONDecodeError, TypeError):
+                return False
+        self.set_active_dsp(entry["key"], data)
+        return True
 
     def get_active_dsp(self) -> dict[str, dict]:
         """Return all active DSP state entries as {key: {timestamp, ...data}}."""

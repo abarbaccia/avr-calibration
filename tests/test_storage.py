@@ -1109,3 +1109,80 @@ class TestLessons:
         store.record_lesson(claim="mid", scope="room", confidence=0.6)
         out = store.get_relevant_lessons()
         assert [l["claim"] for l in out] == ["high", "mid", "low"]
+
+
+class TestActiveDspHistory:
+    """Auto-archival of active_dsp_state mutations.
+
+    The DSP shadow store is the single source of truth for what's running on
+    the AVR/CamillaDSP/miniDSP at any moment. Every set_active_dsp call
+    overwrites a per-key row, so without history a destructive op (clear_fir,
+    apply_eq replacing a known-good filter) would lose the prior value
+    forever. These tests pin the archive-before-overwrite behavior.
+    """
+
+    def test_history_empty_for_first_write(self, store):
+        store.set_active_dsp("k", {"v": 1})
+        assert store.list_active_dsp_history() == []
+
+    def test_history_records_prior_on_overwrite(self, store):
+        store.set_active_dsp("k", {"v": 1})
+        store.set_active_dsp("k", {"v": 2})
+        history = store.list_active_dsp_history(key="k")
+        assert len(history) == 1
+        # data_len reflects the prior {"v": 1} payload, not the new {"v": 2}.
+        assert history[0]["key"] == "k"
+
+    def test_history_full_payload_recoverable(self, store):
+        # Simulate a 24576-tap FIR being cleared — exactly the failure mode
+        # that prompted this feature.
+        store.set_active_dsp(
+            "processor:camilla:output:5:fir",
+            {"coefficients": [0.1] * 24576, "num_taps": 24576},
+        )
+        store.set_active_dsp(
+            "processor:camilla:output:5:fir",
+            {"coefficients": [], "num_taps": 0},
+        )
+        history = store.list_active_dsp_history()
+        assert len(history) == 1
+        full = store.get_active_dsp_history(history[0]["id"])
+        assert full["data"]["num_taps"] == 24576
+        assert len(full["data"]["coefficients"]) == 24576
+
+    def test_restore_brings_back_prior_value(self, store):
+        store.set_active_dsp("k", {"v": "good"})
+        store.set_active_dsp("k", {"v": "wiped"})
+        history_id = store.list_active_dsp_history(key="k")[0]["id"]
+        ok = store.restore_active_dsp_history(history_id)
+        assert ok is True
+        current = store.get_active_dsp()["k"]
+        assert current["v"] == "good"
+
+    def test_restore_is_reversible(self, store):
+        # Restoring should itself archive the current value, so a user can
+        # undo an undo.
+        store.set_active_dsp("k", {"v": "v1"})
+        store.set_active_dsp("k", {"v": "v2"})
+        first_history_id = store.list_active_dsp_history(key="k")[0]["id"]
+        store.restore_active_dsp_history(first_history_id)
+        history = store.list_active_dsp_history(key="k")
+        # Two history rows now: the v1→v2 archive, and the v2→v1 archive.
+        assert len(history) == 2
+
+    def test_list_history_returns_newest_first(self, store):
+        store.set_active_dsp("k", {"v": 1})
+        store.set_active_dsp("k", {"v": 2})
+        store.set_active_dsp("k", {"v": 3})
+        # Two prior versions archived (the v=1 and the v=2 rows).
+        history = store.list_active_dsp_history(key="k")
+        assert len(history) == 2
+        # Newest-first means the v=2 archive (created when v=3 overwrote it)
+        # comes before the v=1 archive (created when v=2 overwrote it).
+        assert history[0]["archived_at"] >= history[1]["archived_at"]
+
+    def test_get_history_returns_none_for_missing_id(self, store):
+        assert store.get_active_dsp_history(99999) is None
+
+    def test_restore_returns_false_for_missing_id(self, store):
+        assert store.restore_active_dsp_history(99999) is False
