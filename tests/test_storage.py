@@ -1186,3 +1186,132 @@ class TestActiveDspHistory:
 
     def test_restore_returns_false_for_missing_id(self, store):
         assert store.restore_active_dsp_history(99999) is False
+
+
+class TestDspSnapshots:
+    """Coarse-grained per-operation snapshots tagged with run scope.
+
+    These are the building block for "restore run 31 iter 2 to its
+    pre-apply state" — distinct from active_dsp_state_history (per-key
+    fine-grained) by capturing the FULL DSP shadow once per logical
+    operation. Tools call save_dsp_snapshot BEFORE they mutate so a
+    later restore lands on the pre-mutation state.
+    """
+
+    def test_snapshot_captures_full_dsp_state(self, store):
+        store.set_active_dsp("k1", {"v": "a"})
+        store.set_active_dsp("k2", {"v": "b"})
+        snap_id = store.save_dsp_snapshot(
+            operation="apply_eq",
+            operation_args={"target": "sub_left"},
+        )
+        snap = store.get_dsp_snapshot(snap_id)
+        assert snap["operation"] == "apply_eq"
+        assert snap["operation_args"] == {"target": "sub_left"}
+        # dsp_state_json deserialized to dict; both keys present.
+        assert "k1" in snap["dsp_state_json"]
+        assert "k2" in snap["dsp_state_json"]
+        assert snap["dsp_state_json"]["k1"]["v"] == "a"
+
+    def test_snapshot_records_run_scope_when_provided(self, store):
+        run_id = store.save_run("r", "harman", goal="g", hypothesis="h")
+        snap_id = store.save_dsp_snapshot(
+            operation="apply_avr_fir",
+            run_id=run_id,
+            iteration=2,
+        )
+        snap = store.get_dsp_snapshot(snap_id)
+        assert snap["run_id"] == run_id
+        assert snap["iteration"] == 2
+
+    def test_snapshot_works_without_run_scope(self, store):
+        # Ad-hoc tool calls outside a recipe still get a snapshot.
+        snap_id = store.save_dsp_snapshot(operation="set_master_gain")
+        snap = store.get_dsp_snapshot(snap_id)
+        assert snap["run_id"] is None
+        assert snap["iteration"] is None
+
+    def test_list_filters_by_run(self, store):
+        run_id = store.save_run("r", "harman", goal="g", hypothesis="h")
+        store.save_dsp_snapshot(operation="apply_eq")  # ad-hoc
+        store.save_dsp_snapshot(operation="apply_avr_fir", run_id=run_id)
+        store.save_dsp_snapshot(operation="set_delay", run_id=run_id)
+
+        in_run = store.list_dsp_snapshots(run_id=run_id)
+        assert len(in_run) == 2
+        assert all(s["run_id"] == run_id for s in in_run)
+        ad_hoc = store.list_dsp_snapshots(run_id=None)
+        assert len(ad_hoc) == 3  # no filter returns everything
+
+    def test_list_filters_by_operation(self, store):
+        store.save_dsp_snapshot(operation="apply_eq")
+        store.save_dsp_snapshot(operation="apply_eq")
+        store.save_dsp_snapshot(operation="clear_fir")
+        eq_only = store.list_dsp_snapshots(operation="apply_eq")
+        assert len(eq_only) == 2
+        assert all(s["operation"] == "apply_eq" for s in eq_only)
+
+    def test_list_returns_metadata_only(self, store):
+        # Don't load multi-MB FIR coefficients on every list call.
+        big = "x" * 100000
+        store.set_active_dsp("k", {"coefs": big})
+        snap_id = store.save_dsp_snapshot(operation="apply_avr_fir")
+        rows = store.list_dsp_snapshots()
+        assert "dsp_state_json" not in rows[0]
+        assert rows[0]["dsp_state_size"] > 100000
+
+    def test_list_orders_newest_first(self, store):
+        ids = [store.save_dsp_snapshot(operation=f"op{i}") for i in range(5)]
+        rows = store.list_dsp_snapshots()
+        listed_ids = [r["id"] for r in rows]
+        assert listed_ids == list(reversed(ids))
+
+    def test_get_returns_none_for_missing(self, store):
+        assert store.get_dsp_snapshot(99999) is None
+
+    def test_restore_brings_back_pre_op_state(self, store):
+        # User pushes a FIR they want to be able to undo.
+        store.set_active_dsp(
+            "processor:camilla:output:5:fir",
+            {"coefficients": [0.1] * 24576, "num_taps": 24576},
+        )
+        snap_id = store.save_dsp_snapshot(operation="pre clear_fir")
+        # Then a destructive op overwrites it.
+        store.set_active_dsp(
+            "processor:camilla:output:5:fir",
+            {"coefficients": [], "num_taps": 0},
+        )
+        # Restore puts the original back.
+        ok = store.restore_dsp_snapshot(snap_id)
+        assert ok is True
+        current = store.get_active_dsp()["processor:camilla:output:5:fir"]
+        assert current["num_taps"] == 24576
+        assert len(current["coefficients"]) == 24576
+
+    def test_restore_returns_false_for_missing_id(self, store):
+        assert store.restore_dsp_snapshot(99999) is False
+
+    def test_restore_is_itself_archived(self, store):
+        # Restoring writes via set_active_dsp, which archives the current
+        # value in active_dsp_state_history. So undo-of-restore is also
+        # available.
+        store.set_active_dsp("k", {"v": 1})
+        snap = store.save_dsp_snapshot(operation="capture v=1")
+        store.set_active_dsp("k", {"v": 2})
+        store.restore_dsp_snapshot(snap)
+        # Two history rows for k now: 1->2 and 2->1.
+        history = store.list_active_dsp_history(key="k")
+        assert len(history) == 2
+
+    def test_run_scope_thread_local_setter(self, store):
+        # Module-level scope so tools don't have to thread run_id through
+        # every signature. Set/get/clear roundtrip.
+        from calibrate.storage import (
+            set_current_run_scope, get_current_run_scope
+        )
+        assert get_current_run_scope() is None
+        set_current_run_scope(run_id=42, iteration=3)
+        scope = get_current_run_scope()
+        assert scope == {"run_id": 42, "iteration": 3}
+        set_current_run_scope(run_id=None)
+        assert get_current_run_scope() is None

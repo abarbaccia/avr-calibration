@@ -212,6 +212,37 @@ def _err(message: str) -> dict:
     return {"ok": False, "error": message}
 
 
+def _snapshot_before(operation: str, **operation_args: Any) -> int | None:
+    """Capture a pre-mutation DSP snapshot tagged with the active run scope.
+
+    Called at the head of every state-mutating MCP tool. The snapshot
+    holds the FULL active_dsp_state shadow at this moment, so a later
+    ``restore_dsp_snapshot(id)`` call returns the system to its pre-tool
+    state regardless of whether the tool succeeded, partially completed,
+    or was reverted.
+
+    Returns the snapshot id (or None if the snapshot itself failed —
+    snapshot failure must never block the actual operation).
+    """
+    try:
+        from .storage import (
+            SessionStore,
+            get_current_run_scope,
+        )
+        store = SessionStore()
+        scope = get_current_run_scope() or {}
+        return store.save_dsp_snapshot(
+            operation=operation,
+            operation_args=operation_args or None,
+            run_id=scope.get("run_id"),
+            iteration=scope.get("iteration"),
+        )
+    except Exception as exc:  # pragma: no cover — defensive
+        log.warning("dsp snapshot before %s failed (continuing): %s",
+                    operation, exc)
+        return None
+
+
 def _config() -> Config:
     """Load config per-call to support hot-reload without server restart."""
     return Config.load()
@@ -471,6 +502,8 @@ async def _tool_apply_eq(
     if target is not None and output_index is not None:
         return _err("apply_eq: pass either target or output_index, not both")
 
+    _snapshot_before("apply_eq", target=target, output_index=output_index,
+                     filter_count=len(filters or []))
     from .storage import dsp_output_key
     default_processor_name = _default_dsp_name() or "dsp"
 
@@ -587,6 +620,9 @@ async def _tool_apply_input_eq(
 
     Returns {ok: True} or {ok: False, error: "SafetyValidator: ..."} on rejection.
     """
+    _snapshot_before("apply_input_eq", target=target,
+                     filter_count=len(filters or []),
+                     has_target_curve=target_curve is not None)
     from .storage import dsp_input_key
 
     # Target path: bucket transducers by processor, call apply_input_eq on each
@@ -4367,6 +4403,11 @@ async def _tool_push_avr_speaker_layout(
     Signal-path-write rule applies — recipes/agents MUST get explicit user
     confirmation before calling with ``commit=True``.
     """
+    _snapshot_before("push_avr_speaker_layout", ady_path=ady_path,
+                     commit=commit,
+                     distance_overrides_m=distance_overrides_m,
+                     level_overrides_db=level_overrides_db,
+                     crossover_overrides_hz=crossover_overrides_hz)
     import json as _json
     if _avr is None:
         return _err("no AVR driver loaded")
@@ -4593,6 +4634,10 @@ async def _tool_apply_avr_fir(
     import json as _json
     from pathlib import Path
 
+    _snapshot_before("apply_avr_fir", host=host, cache_key=cache_key,
+                     channel_ids=channel_ids,
+                     distances_override_m=distances_override_m,
+                     commit_fin=commit_fin)
     from .drivers.denon.audyssey_filter_upload import (
         channels_in_ady, push_avr_filters,
     )
@@ -5558,6 +5603,8 @@ async def _tool_start_calibration(
             device_state=device_state if device_state.get("ok") else None,
             run_type="calibration",
         )
+        from .storage import set_current_run_scope
+        set_current_run_scope(run_id=run_id, iteration=None)
         return _ok(
             run_id=run_id,
             recipe_name=recipe_name,
@@ -5599,6 +5646,10 @@ async def _tool_save_calibration_run(
             device_state=device_state, run_type=run_type,
             goal=goal, hypothesis=hypothesis,
         )
+        # Tag any subsequent state-mutating MCP tool calls with this
+        # run_id so auto-snapshots are linked back to the run.
+        from .storage import set_current_run_scope
+        set_current_run_scope(run_id=run_id, iteration=None)
         return _ok(run_id=run_id)
     except Exception as exc:
         return _err(f"save_calibration_run failed: {exc}")
@@ -5635,6 +5686,9 @@ async def _tool_update_calibration_run(
             sessions=sessions,
             outcome=outcome,
         )
+        # Run is closed — auto-snapshot tags should stop tagging this run.
+        from .storage import set_current_run_scope
+        set_current_run_scope(run_id=None)
         return _ok(run_id=run_id, updated=True)
     except Exception as exc:
         return _err(f"update_calibration_run failed: {exc}")
@@ -5665,9 +5719,75 @@ async def _tool_save_calibration_iteration(
             safety_ok=safety_ok,
             safety_error=safety_error,
         )
+        # Update auto-snapshot tagging so subsequent state mutations
+        # carry the correct iteration number.
+        from .storage import set_current_run_scope
+        set_current_run_scope(run_id=run_id, iteration=iteration)
         return _ok(iteration_id=iter_id, run_id=run_id)
     except Exception as exc:
         return _err(f"save_calibration_iteration failed: {exc}")
+
+
+# ── DSP snapshot recovery (auto-archived by every state-mutating tool) ─────
+
+
+async def _tool_list_dsp_snapshots(
+    run_id: int | None = None,
+    operation: str | None = None,
+    limit: int = 50,
+) -> dict:
+    """List automatic DSP-state snapshots, newest-first."""
+    from .storage import SessionStore
+    try:
+        store = SessionStore()
+        rows = store.list_dsp_snapshots(
+            run_id=run_id, operation=operation, limit=limit,
+        )
+        return _ok(snapshots=rows, count=len(rows))
+    except Exception as exc:
+        return _err(f"list_dsp_snapshots failed: {exc}")
+
+
+async def _tool_get_dsp_snapshot(snapshot_id: int) -> dict:
+    """Fetch a single snapshot by id, including the full state dump."""
+    from .storage import SessionStore
+    try:
+        store = SessionStore()
+        snap = store.get_dsp_snapshot(snapshot_id)
+        if snap is None:
+            return _err(f"snapshot {snapshot_id} not found")
+        return _ok(snapshot=snap)
+    except Exception as exc:
+        return _err(f"get_dsp_snapshot failed: {exc}")
+
+
+async def _tool_restore_dsp_snapshot(snapshot_id: int) -> dict:
+    """Restore the DSP shadow to the state in this snapshot."""
+    from .storage import SessionStore
+    try:
+        store = SessionStore()
+        # Capture a fresh snapshot of the CURRENT state before restoring,
+        # so the restore itself is reversible at the snapshot level too.
+        snap_id = _snapshot_before(
+            "restore_dsp_snapshot", target_snapshot_id=snapshot_id,
+        )
+        ok = store.restore_dsp_snapshot(snapshot_id)
+        if not ok:
+            return _err(f"snapshot {snapshot_id} not found or invalid")
+        return _ok(
+            restored_snapshot_id=snapshot_id,
+            pre_restore_snapshot_id=snap_id,
+            note=(
+                "DSP shadow restored. AVR-side state (distances, MultEQ "
+                "flags) was captured for inspection but NOT pushed to the "
+                "AVR — call push_avr_speaker_layout separately if AVR "
+                "envelope restore is also needed. The pre-restore state "
+                "is itself snapshotted (id above) so this restore is "
+                "reversible."
+            ),
+        )
+    except Exception as exc:
+        return _err(f"restore_dsp_snapshot failed: {exc}")
 
 
 # ── Lessons system ──────────────────────────────────────────────────────────
@@ -6095,6 +6215,8 @@ async def _tool_set_delay(
     """
     if target is not None and output_index is not None:
         return _err("set_delay: pass either target or output_index, not both")
+    _snapshot_before("set_delay", target=target, output_index=output_index,
+                     delay_ms=delay_ms)
     from .storage import dsp_output_key
     try:
         if target is not None:
@@ -6136,6 +6258,8 @@ async def _tool_set_polarity(
     """Set polarity (inverted=True flips phase). See ``set_delay`` for targeting."""
     if target is not None and output_index is not None:
         return _err("set_polarity: pass either target or output_index, not both")
+    _snapshot_before("set_polarity", target=target, output_index=output_index,
+                     inverted=inverted)
     from .storage import dsp_output_key
     try:
         if target is not None:
@@ -6271,6 +6395,9 @@ async def _tool_apply_fir(
         return _err("apply_fir: pass either coefficients or design_session_id, not both")
     if coefficients is None and design_session_id is None:
         return _err("apply_fir: provide either coefficients or design_session_id")
+    _snapshot_before("apply_fir", output_index=output_index,
+                     design_session_id=design_session_id,
+                     coef_count=(len(coefficients) if coefficients else None))
 
     # Reject writes to outputs that aren't bound to a transducer in the
     # signal graph. This is a hard guard against off-by-one wiring
@@ -6500,6 +6627,7 @@ async def _tool_design_corrective_fir(
 
 async def _tool_clear_fir(output_index: int) -> dict:
     """Clear FIR coefficients and reset output to passthrough."""
+    _snapshot_before("clear_fir", output_index=output_index)
     try:
         graph = _config().signal_graph
         bound = {int(t.output_index): t.name for t in graph.transducers}
@@ -6556,6 +6684,8 @@ async def _tool_reset_dsp_defaults(
     without touching hardware.
     `preserve_eq=True`: keep EQ filters, only reset polarity/gain/delay/FIR.
     """
+    if not dry_run:
+        _snapshot_before("reset_dsp_defaults", preserve_eq=preserve_eq)
     from .storage import SessionStore, dsp_output_key
     try:
         cfg = _config()
@@ -6690,6 +6820,8 @@ async def _tool_set_output_gain(
     """Set gain for DSP output(s) in dB. See ``set_delay`` for targeting."""
     if target is not None and output_index is not None:
         return _err("set_output_gain: pass either target or output_index, not both")
+    _snapshot_before("set_output_gain", target=target,
+                     output_index=output_index, gain_db=gain_db)
     from .storage import dsp_output_key
     try:
         if target is not None:
@@ -6730,6 +6862,7 @@ async def _tool_set_master_gain(gain_db: float) -> dict:
     playback volume without touching per-output alignment gains.
     Always restore to 0.0 after sweeps are done.
     """
+    _snapshot_before("set_master_gain", gain_db=gain_db)
     try:
         await _dsp.set_master_gain(gain_db)  # type: ignore[union-attr]
         return _ok(gain_db=max(-127.0, min(0.0, gain_db)))
@@ -9373,6 +9506,74 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="list_dsp_snapshots",
+        description=(
+            "List automatic DSP-state snapshots, newest-first. Every "
+            "state-mutating tool (apply_avr_fir, apply_eq, apply_input_eq, "
+            "apply_fir, clear_fir, push_avr_speaker_layout, set_delay, "
+            "set_polarity, set_output_gain, set_master_gain, "
+            "reset_dsp_defaults) records a snapshot of the full DSP shadow "
+            "BEFORE running, so any of these can be undone via "
+            "restore_dsp_snapshot. Snapshots taken inside a save_calibration_run "
+            "/ update_calibration_run boundary are tagged with run_id + "
+            "iteration. Returns metadata only (size of the state blob, not "
+            "the blob itself). Call get_dsp_snapshot for the full payload."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "run_id": {
+                    "type": "integer",
+                    "description": "Filter to snapshots tagged with this run_id.",
+                },
+                "operation": {
+                    "type": "string",
+                    "description": "Filter to one operation (e.g. 'apply_avr_fir').",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 50,
+                    "description": "Max rows to return.",
+                },
+            },
+        },
+    ),
+    Tool(
+        name="get_dsp_snapshot",
+        description=(
+            "Fetch a single DSP snapshot by id, including the full "
+            "active_dsp_state dump (per-output FIR coefficients, EQ filters, "
+            "delays, polarities, gains for every processor)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "snapshot_id": {"type": "integer"},
+            },
+            "required": ["snapshot_id"],
+        },
+    ),
+    Tool(
+        name="restore_dsp_snapshot",
+        description=(
+            "Restore the DSP shadow to the state captured in this snapshot. "
+            "Each restored key goes through set_active_dsp, which itself "
+            "archives the current value in active_dsp_state_history — so "
+            "restore is reversible. Note: only restores the DSP shadow. "
+            "AVR-side state (distances, MultEQ flags) is captured for "
+            "inspection but applying it back to the AVR requires a separate "
+            "push_avr_speaker_layout call by the caller. REQUIRES EXPLICIT "
+            "USER CONFIRMATION before calling."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "snapshot_id": {"type": "integer"},
+            },
+            "required": ["snapshot_id"],
+        },
+    ),
+    Tool(
         name="record_lesson",
         description=(
             "Record a lesson learned from a calibration run. Call after "
@@ -11760,6 +11961,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             filters_applied=arguments.get("filters_applied", []),
             safety_ok=bool(arguments.get("safety_ok", True)),
             safety_error=arguments.get("safety_error", ""),
+        )
+    elif name == "list_dsp_snapshots":
+        result = await _tool_list_dsp_snapshots(
+            run_id=arguments.get("run_id"),
+            operation=arguments.get("operation"),
+            limit=int(arguments.get("limit", 50)),
+        )
+    elif name == "get_dsp_snapshot":
+        result = await _tool_get_dsp_snapshot(
+            snapshot_id=int(arguments["snapshot_id"]),
+        )
+    elif name == "restore_dsp_snapshot":
+        result = await _tool_restore_dsp_snapshot(
+            snapshot_id=int(arguments["snapshot_id"]),
         )
     elif name == "record_lesson":
         result = await _tool_record_lesson(

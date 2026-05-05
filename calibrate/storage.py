@@ -221,6 +221,38 @@ CREATE INDEX IF NOT EXISTS active_dsp_state_history_key
 CREATE INDEX IF NOT EXISTS active_dsp_state_history_archived_at
     ON active_dsp_state_history(archived_at);
 
+-- Coarse-grained per-operation snapshots of the full active_dsp_state.
+-- Captured BEFORE every state-mutating MCP tool runs (apply_avr_fir,
+-- apply_eq, apply_input_eq, apply_fir, clear_fir, push_avr_speaker_layout,
+-- set_*, etc.). Restoring a snapshot brings the DSP shadow back to the
+-- exact state it was in before the snapshot's named operation, regardless
+-- of whether the operation completed, half-completed, or was reverted by
+-- a later push.
+--
+-- Differs from active_dsp_state_history: that table is per-key fine-grained
+-- (one row per overwrite); this is per-operation coarse-grained (one row
+-- per mutating tool call, with the FULL state dump). Use this for "restore
+-- run 31 iter 2"; use the history table for "what was output 5's FIR
+-- before clear_fir wiped it on this specific timestamp."
+CREATE TABLE IF NOT EXISTS dsp_snapshots (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp           TEXT    NOT NULL,
+    operation           TEXT    NOT NULL,   -- "apply_avr_fir", "clear_fir", etc.
+    operation_args      TEXT,                -- JSON dict of relevant call args
+    run_id              INTEGER REFERENCES calibration_runs(id),
+    iteration           INTEGER,
+    dsp_state_json      TEXT    NOT NULL,    -- full snapshot of active_dsp_state
+    avr_envelope_json   TEXT,                -- AVR distances/levels/curves if relevant
+    notes               TEXT
+);
+
+CREATE INDEX IF NOT EXISTS dsp_snapshots_run_id
+    ON dsp_snapshots(run_id);
+CREATE INDEX IF NOT EXISTS dsp_snapshots_timestamp
+    ON dsp_snapshots(timestamp);
+CREATE INDEX IF NOT EXISTS dsp_snapshots_operation
+    ON dsp_snapshots(operation);
+
 CREATE TABLE IF NOT EXISTS lessons (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at      TEXT    NOT NULL,
@@ -272,6 +304,41 @@ def _decode_ir(blob: str) -> list[float]:
     raw = base64.b64decode(blob)
     n = len(raw) // _IR_BYTES
     return list(struct.unpack(f"<{n}f", raw[:n * _IR_BYTES]))
+
+
+# ── Run-scope plumbing for auto-snapshot ──────────────────────────────────────
+#
+# Mutating MCP tools call `save_dsp_snapshot` BEFORE they run. To tag the
+# snapshot with the active calibration run/iteration without threading them
+# through every tool's signature, we use a module-level scope that
+# `save_calibration_run` sets and `update_calibration_run` clears. Tools can
+# read it via ``get_current_run_scope()`` and pass into the snapshot call.
+#
+# Plain module globals (not threading.local) — this codebase is single-process
+# and the MCP server is single-worker (--workers 1). If that ever changes,
+# replace with contextvars.
+
+_current_run_scope: dict | None = None
+
+
+def set_current_run_scope(run_id: int | None, iteration: int | None = None) -> None:
+    """Set the active run + iteration tag for auto-snapshots.
+
+    Called by save_calibration_run (with iteration=None) and updated by
+    save_calibration_iteration (with the iteration number) so that any
+    state mutation between those checkpoints carries the right tags.
+    Pass run_id=None to clear (typically from update_calibration_run).
+    """
+    global _current_run_scope
+    if run_id is None:
+        _current_run_scope = None
+    else:
+        _current_run_scope = {"run_id": run_id, "iteration": iteration}
+
+
+def get_current_run_scope() -> dict | None:
+    """Return ``{"run_id": int, "iteration": int|None}`` or None if no run."""
+    return dict(_current_run_scope) if _current_run_scope else None
 
 
 @dataclass
@@ -939,6 +1006,135 @@ class SessionStore:
             except (json.JSONDecodeError, TypeError):
                 return False
         self.set_active_dsp(entry["key"], data)
+        return True
+
+    # ── Coarse-grained DSP snapshots ───────────────────────────────────────
+
+    def save_dsp_snapshot(
+        self,
+        operation: str,
+        operation_args: dict | None = None,
+        run_id: int | None = None,
+        iteration: int | None = None,
+        avr_envelope: dict | None = None,
+        notes: str | None = None,
+    ) -> int:
+        """Snapshot the full active_dsp_state under a labeled operation.
+
+        Designed to be called by every state-mutating MCP tool BEFORE it
+        runs its mutation, so that ``restore_dsp_snapshot(snapshot_id)``
+        returns the DSP shadow to its pre-operation state. Run-scope
+        tagging (``run_id`` / ``iteration``) is optional — ad-hoc pushes
+        outside a calibration run still get an audit trail.
+
+        Returns the snapshot id.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        dsp_state = self.snapshot_full_dsp_state()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO dsp_snapshots"
+                " (timestamp, operation, operation_args, run_id, iteration,"
+                "  dsp_state_json, avr_envelope_json, notes)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    now,
+                    operation,
+                    json.dumps(operation_args) if operation_args else None,
+                    run_id,
+                    iteration,
+                    dsp_state,
+                    json.dumps(avr_envelope) if avr_envelope else None,
+                    notes,
+                ),
+            )
+            return cur.lastrowid
+
+    def list_dsp_snapshots(
+        self,
+        run_id: int | None = None,
+        operation: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """List snapshots, newest-first. Filter by run_id and/or operation.
+
+        Returns metadata only — call ``get_dsp_snapshot(id)`` for the
+        full dsp_state_json blob (which can be many MB if FIRs are large).
+        """
+        sql = (
+            "SELECT id, timestamp, operation, operation_args, run_id,"
+            " iteration, length(dsp_state_json) AS dsp_state_size,"
+            " length(avr_envelope_json) AS avr_envelope_size, notes"
+            " FROM dsp_snapshots WHERE 1=1"
+        )
+        params: list = []
+        if run_id is not None:
+            sql += " AND run_id=?"
+            params.append(run_id)
+        if operation is not None:
+            sql += " AND operation=?"
+            params.append(operation)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            if d.get("operation_args"):
+                try:
+                    d["operation_args"] = json.loads(d["operation_args"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            out.append(d)
+        return out
+
+    def get_dsp_snapshot(self, snapshot_id: int) -> dict | None:
+        """Fetch a single snapshot by id, including the full state dump."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, timestamp, operation, operation_args, run_id,"
+                " iteration, dsp_state_json, avr_envelope_json, notes"
+                " FROM dsp_snapshots WHERE id=?",
+                (snapshot_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        for k in ("operation_args", "dsp_state_json", "avr_envelope_json"):
+            if d.get(k):
+                try:
+                    d[k] = json.loads(d[k])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        return d
+
+    def restore_dsp_snapshot(self, snapshot_id: int) -> bool:
+        """Restore the full DSP shadow to a snapshot's state.
+
+        Each restored key goes through ``set_active_dsp``, so
+        ``active_dsp_state_history`` archives the current value first —
+        the restore is itself reversible. Returns True on success, False
+        if the snapshot id doesn't exist.
+
+        Note: this only restores the DSP shadow. AVR-side state
+        (distances, per-channel trims, MultEQ flags) is captured in
+        ``avr_envelope_json`` for inspection but applying it back to the
+        AVR requires a separate ``push_avr_speaker_layout`` call by the
+        caller — the storage layer doesn't reach into hardware.
+        """
+        snap = self.get_dsp_snapshot(snapshot_id)
+        if snap is None:
+            return False
+        dsp_state = snap.get("dsp_state_json")
+        if not isinstance(dsp_state, dict):
+            return False
+        for key, value in dsp_state.items():
+            # `value` came from get_active_dsp() which adds a "timestamp"
+            # field; strip it before re-inserting since set_active_dsp
+            # writes its own timestamp.
+            v = {k: v for k, v in value.items() if k != "timestamp"}
+            self.set_active_dsp(key, v)
         return True
 
     def get_active_dsp(self) -> dict[str, dict]:
