@@ -58,6 +58,14 @@ cleanup() {
 
 trap cleanup TERM INT
 
+# ── Scarlett 18i20 PCM routing fix ────────────────────────────────────────────
+# Re-assert PCM 05–10 → "PCM N" so CamillaDSP's USB output reaches the line
+# outs (instead of the 18i20 falling back to Analogue passthrough).
+# Idempotent + silent skip when the Scarlett isn't present.
+if [ -x /fix-scarlett-routing.sh ]; then
+    /fix-scarlett-routing.sh || true
+fi
+
 # ── minidspd ──────────────────────────────────────────────────────────────────
 # Start the minidspd HTTP REST daemon so the web server can control the
 # miniDSP 2x4HD via localhost:5380.
