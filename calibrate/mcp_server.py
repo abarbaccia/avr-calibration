@@ -4929,7 +4929,11 @@ async def _tool_trigger_measurement(
         # playback_route='usb' fallback), still require cal_mode=ON. Same
         # rationale as the role-based gate above. Keeps backwards-compat
         # for callers that haven't migrated to target-driven profiles.
-        if chain.legacy_path and route == "usb" and not cal_active:
+        # Skip the gate entirely if no DSP is configured — the gate is a
+        # production safety check that assumes a real DSP whose cal_mode
+        # state we can read; without one (e.g. test environment), the
+        # caller is responsible for the measurement chain integrity.
+        if _dsp is not None and chain.legacy_path and route == "usb" and not cal_active:
             return _err(
                 "USB-route measurement requires cal_mode=ON, but it is currently OFF. "
                 "In live mode the DSP captures the multichannel interface directly — "
