@@ -4447,6 +4447,27 @@ async def _tool_push_avr_speaker_layout(
 _AVR_FIR_CACHE: dict[tuple[str, str], list[float]] = {}
 
 
+async def _tool_get_avr_audyssey_state() -> dict:
+    """Probe AVR Audyssey + sound-mode state for calibration recipes.
+
+    Thin wrapper around DenonDriver.audyssey_state_full(). Exposes the
+    derived ``calibration_ready`` flag + ``recommendations`` list so the
+    recipe driver can decide programmatically whether to proceed or stop
+    with a remediation message. Read-only — does not write any AVR state.
+    """
+    if _avr is None:
+        return _err("no AVR driver configured")
+    if not hasattr(_avr, "audyssey_state_full"):
+        return _err(
+            "AVR driver does not support audyssey_state_full (needs DenonDriver)"
+        )
+    try:
+        state = await _avr.audyssey_state_full()  # type: ignore[attr-defined]
+    except DriverError as exc:
+        return _err(f"AVR Audyssey probe failed: {exc}")
+    return {"ok": True, **state}
+
+
 async def _tool_design_avr_fir(
     channel_id: str,
     target_curve_db: list[dict],
@@ -8878,7 +8899,15 @@ _TOOLS: list[Tool] = [
             "HARD RULE: caller MUST NOT enter Manual Setup > Distances "
             "on the AVR after a successful push — that triggers firmware "
             "re-validation. Always backup the original .ady before calling "
-            "this tool. REQUIRES EXPLICIT USER CONFIRMATION."
+            "this tool. REQUIRES EXPLICIT USER CONFIRMATION. "
+            "GATING: pushed FIRs are bypassed when PSMULTEQ:OFF or when "
+            "the AVR sound mode is DIRECT/PURE DIRECT — both forcibly "
+            "disable the Audyssey processing chain that hosts these "
+            "filters. Verify PSMULTEQ:FLAT (or another active slot) and "
+            "a non-DIRECT sound mode (MULTI CH STEREO, DOLBY SURROUND, "
+            "STEREO) before assuming the push is audible. The slot is "
+            "still written by the push regardless — this is a runtime "
+            "engagement gate, not a write gate."
         ),
         inputSchema={
             "type": "object",
@@ -9628,6 +9657,24 @@ _TOOLS: list[Tool] = [
             "Returns a list of IP addresses. Timeout: 10 seconds. "
             "Use this during setup to auto-detect the AVR before calling "
             "set_config to save the host."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {},
+        },
+    ),
+    Tool(
+        name="get_avr_audyssey_state",
+        description=(
+            "Probe AVR Audyssey + sound-mode state for calibration recipes. "
+            "Returns power, sound_mode, multi_eq slot (FLAT/REFERENCE/BYP.LR/OFF), "
+            "dynamic_eq, dynamic_volume, audyssey_active flag, and a derived "
+            "calibration_ready flag with a recommendations list. "
+            "Use BEFORE measurement-bearing phases to verify the AVR is in a "
+            "state where measurements aren't contaminated by DYNEQ and pushed "
+            "FIRs aren't bypassed by sound mode (DIRECT/PURE DIRECT) or "
+            "PSMULTEQ:OFF. Replaces the 'walk to AVR menu and read' step in "
+            "the mains-calibration-v2 recipe."
         ),
         inputSchema={
             "type": "object",
@@ -11668,6 +11715,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             commit=bool(arguments.get("commit", False)),
             use_custom=bool(arguments.get("use_custom", False)),
         )
+    elif name == "get_avr_audyssey_state":
+        result = await _tool_get_avr_audyssey_state()
     elif name == "design_avr_fir":
         result = await _tool_design_avr_fir(
             channel_id=str(arguments["channel_id"]),

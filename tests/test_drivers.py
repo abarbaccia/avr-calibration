@@ -123,6 +123,121 @@ async def test_denon_set_volume_clamps_above_max() -> None:
     mock_receiver.async_set_volume.assert_called_once_with(18.0)
 
 
+def _make_denon_mock_with_audyssey(
+    sound_mode: str = "Multi Ch Stereo",
+    multi_eq: str = "Reference",
+    volume: float = -30.0,
+    power: str = "ON",
+):
+    """Mock factory that adds audyssey + soundmode + power surfaces."""
+    mock_mod, mock_receiver = _make_denonavr_mock(volume=volume)
+    mock_receiver.audyssey = MagicMock()
+    mock_receiver.audyssey.async_update = AsyncMock()
+    mock_receiver.audyssey.multi_eq = multi_eq
+    mock_receiver.soundmode = MagicMock()
+    mock_receiver.soundmode.sound_mode = sound_mode
+    mock_receiver.power = power
+    return mock_mod, mock_receiver
+
+
+@pytest.mark.asyncio
+async def test_audyssey_state_full_calibration_ready() -> None:
+    """All settings in calibration-ready posture → calibration_ready=True."""
+    mock_mod, _ = _make_denon_mock_with_audyssey(
+        sound_mode="Multi Ch Stereo", multi_eq="Flat", power="ON"
+    )
+    with patch.dict(sys.modules, {"denonavr": mock_mod}):
+        driver = DenonDriver(host="192.168.1.100")
+        async def _telnet_stub(self, commands, **_):
+            return {
+                "PSDYNEQ ?": "PSDYNEQ OFF",
+                "PSDYNVOL ?": "PSDYNVOL OFF",
+                "PSMULTEQ: ?": "PSMULTEQ:FLAT",
+                "PW?": "PWON",
+            }
+        with patch.object(DenonDriver, "telnet_query", _telnet_stub):
+            state = await driver.audyssey_state_full()
+    assert state["calibration_ready"] is True
+    assert state["recommendations"] == []
+    assert state["dynamic_eq"] == "OFF"
+    assert state["dynamic_volume"] == "OFF"
+    assert state["multi_eq"] == "FLAT"
+    assert state["power"] == "ON"
+
+
+@pytest.mark.asyncio
+async def test_audyssey_state_full_dyneq_on_blocks_cal() -> None:
+    """DYNEQ=ON → not calibration-ready; recommendation surfaced."""
+    mock_mod, _ = _make_denon_mock_with_audyssey(
+        sound_mode="Multi Ch Stereo", multi_eq="Flat", power="ON"
+    )
+    with patch.dict(sys.modules, {"denonavr": mock_mod}):
+        driver = DenonDriver(host="192.168.1.100")
+        async def _telnet_stub(self, commands, **_):
+            return {
+                "PSDYNEQ ?": "PSDYNEQ ON",
+                "PSDYNVOL ?": "PSDYNVOL OFF",
+                "PSMULTEQ: ?": "PSMULTEQ:FLAT",
+                "PW?": "PWON",
+            }
+        with patch.object(DenonDriver, "telnet_query", _telnet_stub):
+            state = await driver.audyssey_state_full()
+    assert state["calibration_ready"] is False
+    assert any("Dynamic EQ" in r for r in state["recommendations"])
+    assert state["dynamic_eq"] == "ON"
+
+
+@pytest.mark.asyncio
+async def test_audyssey_state_full_direct_mode_bypasses_firs() -> None:
+    """DIRECT sound mode bypasses Audyssey + pushed FIRs → not cal-ready."""
+    mock_mod, _ = _make_denon_mock_with_audyssey(
+        sound_mode="DIRECT", multi_eq="Flat", power="ON"
+    )
+    with patch.dict(sys.modules, {"denonavr": mock_mod}):
+        driver = DenonDriver(host="192.168.1.100")
+        async def _telnet_stub(self, commands, **_):
+            return {
+                "PSDYNEQ ?": "PSDYNEQ OFF",
+                "PSDYNVOL ?": "PSDYNVOL OFF",
+                "PSMULTEQ: ?": "PSMULTEQ:FLAT",
+                "PW?": "PWON",
+            }
+        with patch.object(DenonDriver, "telnet_query", _telnet_stub):
+            state = await driver.audyssey_state_full()
+    assert state["calibration_ready"] is False
+    assert any("Sound mode" in r and "bypass" in r.lower() for r in state["recommendations"])
+
+
+@pytest.mark.asyncio
+async def test_audyssey_state_full_multeq_off_blocks() -> None:
+    """PSMULTEQ:OFF disables our pushed FIRs → not cal-ready."""
+    mock_mod, _ = _make_denon_mock_with_audyssey(
+        sound_mode="Multi Ch Stereo", multi_eq="Flat", power="ON"
+    )
+    with patch.dict(sys.modules, {"denonavr": mock_mod}):
+        driver = DenonDriver(host="192.168.1.100")
+        async def _telnet_stub(self, commands, **_):
+            return {
+                "PSDYNEQ ?": "PSDYNEQ OFF",
+                "PSDYNVOL ?": "PSDYNVOL OFF",
+                "PSMULTEQ: ?": "PSMULTEQ:OFF",
+                "PW?": "PWON",
+            }
+        with patch.object(DenonDriver, "telnet_query", _telnet_stub):
+            state = await driver.audyssey_state_full()
+    assert state["calibration_ready"] is False
+    assert any("MultEQ" in r for r in state["recommendations"])
+    assert state["multi_eq"] == "OFF"
+
+
+@pytest.mark.asyncio
+async def test_audyssey_state_full_no_host_raises() -> None:
+    """No host configured → DriverError."""
+    driver = DenonDriver(host=None)
+    with pytest.raises(DriverError, match="no host"):
+        await driver.audyssey_state_full()
+
+
 @pytest.mark.asyncio
 async def test_denon_setup_and_close_are_noop() -> None:
     driver = DenonDriver(host=None)

@@ -160,35 +160,60 @@ is rejected, retry with a milder version.
   delay) from prior runs — `feedback_check_stale_dsp_state.md`. Anything
   not in this run's plan should be cleared or explicitly preserved.
 
-### 0.3 AVR menu state — set ON THE AVR before continuing
+### 0.3 AVR Audyssey state — calibration vs operating split
 
-The flags below live in the .ady envelope and on the AVR's settings
-state. We do NOT push them programmatically (no `flag_overrides` parameter
-on `push_avr_speaker_layout` yet). User must set these manually on the
-AVR before starting Phase 1.
+Calibration measurements and movie-watching want different Audyssey state.
+Don't conflate them.
 
-| Setting (Denon menu path) | Recipe default | Why |
-|---|---|---|
-| Audio → Audyssey → MultEQ | `Reference` | Cinema warmth (use `Flat` only for music monitoring) |
-| Audio → Audyssey → Dynamic EQ | `ON` | Fletcher-Munson at low volume — required for movie watching |
-| Audio → Audyssey → Dynamic Volume | `OFF` | Compresses dynamic range — leave off unless night-mode |
-| Audio → Audyssey → MultEQ | `ON` (not Off) | Engages our pushed FIRs |
+**During calibration (Phases 1–8.5)** — we want clean measurements free of
+volume-dependent loudness compensation:
 
-Verify from a Telnet probe: `PSDYNEQ ?` / `PSAUDY ?`. If a Fin commit
-during Phase 6 resets any of them (some firmware versions toggle MultEQ
-off after a coef push), re-set on the AVR remote/menu and document it
-in the iteration record. **Re-verify before Phase 9** — listening-test
-on a non-EQ system invalidates the gate.
+| Setting | Probe (Telnet) | Set value | Why |
+|---|---|---|---|
+| MultEQ slot | `PSMULTEQ:?` | `FLAT` | Active so our pushed FIRs are engaged. FLAT slot's stored target curve is unity, so our FIR is the only modification — predictable. |
+| Dynamic EQ | `PSDYNEQ ?` | `OFF` | DYNEQ applies volume-dependent FR shaping; sweeps would fight the curve. Never tune with DYNEQ on. |
+| Dynamic Volume | `PSDYNVOL ?` | `OFF` | Compresses dynamic range; not what we measure. |
+| Sound mode | `MS?` | NOT `DIRECT`, NOT `PURE DIRECT` | Both modes forcibly bypass Audyssey (and therefore our pushed FIRs). Use `MULTI CH STEREO`, `DOLBY SURROUND`, or `STEREO`. |
 
-### 0.4 HDMI route sanity gate
+**For movie watching (after Phase 11 cleanup)** the user can flip:
+`PSDYNEQ ON` for low-volume Fletcher-Munson; sound mode to whatever the
+content drives (Dolby Surround, DTS:X, etc).
 
-Mains pass-through this recipe must use `playback_route="hdmi"` with the
-HDMI plugin pinned to `default:CARD=vc4hdmi0` (not the `hdmi:` plugin —
-see `feedback_alsa_hdmi_plugin_downmixes.md`).
+**REFERENCE vs FLAT slot:** the AVR may not accept `PSMULTEQ:REFERENCE` if
+the committed `.ady` was last pushed without Reference curve data —
+`PSMULTEQ:?` will keep returning `FLAT` when you try to set Reference.
+Probe the available slots before assuming. **Recipe target is the FLAT slot
+exclusively** so our FIR is the entire correction; bake any cinema-style
+HF tilt into the designed FIR instead of relying on Audyssey's stored
+Reference curve overlay (which compounds with our FIR per the runtime
+multiplication audit in `project_avr_fir_decimation_broken.md`).
 
-1. Take a sanity sweep on FL via HDMI at the configured `master_gain_hdmi_db`.
+**Programmatic setup** (recommended): call `get_avr_audyssey_state()` to
+probe current values, then set via Telnet. We can NOT push these flags
+through `push_avr_speaker_layout` — they live outside the .ady envelope.
+
+After every Phase 6 Fin commit, re-verify (some firmware versions toggle
+MultEQ off after a coef push). **Re-verify before Phase 9** — listening
+test on a bypassed-Audyssey system invalidates the gate.
+
+### 0.4 Mains baseline route — target-driven
+
+Recipe Phase 1 baselines use `measure(target='FL')` etc. The target-driven
+resolver in `measurement_profiles.py` selects the HDMI route, the right
+sweep_channel for the position, and the appropriate sound_mode override.
+**Do NOT manually set `config.measurement.playback_route`** — that field
+is deprecated in favor of signal_graph + measurement_profiles. The
+resolver returns a `legacy_path=True` warning if it falls through to the
+old playback_route field; treat that as a config bug worth fixing.
+
+1. Take a sanity sweep on FL via `measure(target='FL', sound_mode='MULTI CH STEREO')`.
+   The sound_mode override keeps Audyssey active during the measurement
+   (per 0.3); without it the main role profile defaults to PURE DIRECT
+   which bypasses our FIRs.
 2. STOP if SNR < `measurement.min_snr_db` — see
    `project_2026-05-03_hdmi_mains_blocked.md` for diagnostics.
+3. STOP if `legacy_path=True` in the resolver result — fix the
+   target/profile config before continuing.
 
 ### 0.5 Save run + mute shakers
 - `save_calibration_run(recipe_name="mains-calibration-v2",
