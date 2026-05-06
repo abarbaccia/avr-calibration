@@ -28,6 +28,14 @@ if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
     echo "Certificate generated at ${CERT}"
 fi
 
+# ── Scarlett 18i20 PCM routing fix ────────────────────────────────────────────
+# Re-assert PCM 05–10 → "PCM N" so CamillaDSP's USB output reaches the line
+# outs (instead of the 18i20 falling back to Analogue passthrough).
+# Idempotent + silent skip when the Scarlett isn't present.
+if [ -x /fix-scarlett-routing.sh ]; then
+    /fix-scarlett-routing.sh || true
+fi
+
 # Start minidspd — HTTP REST daemon for miniDSP 2x4 HD
 # Bind to 0.0.0.0 so both FastAPI and MCP server can reach it within the container
 MINIDSPD_CONF=/tmp/minidspd.toml
