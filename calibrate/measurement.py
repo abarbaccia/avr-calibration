@@ -671,17 +671,20 @@ class MeasurementEngine:
                 except ImportError:
                     pass
 
+            # Resolve optional loopback device. Loopback gives a clean
+            # cross-correlation anchor (no room reflections) so sweep-start
             # Run blocking play_and_record() in a thread executor so the asyncio event
             # loop stays responsive during PortAudio I/O. Times out after 60s to prevent
             # a hung audio device from blocking the calibration loop indefinitely.
             loop = asyncio.get_running_loop()
             try:
-                sweep_1d, rec_1d = await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     loop.run_in_executor(
                         None, strategy.play_and_record, sweep, sample_rate, in_channel, out_channel
                     ),
                     timeout=_MEASUREMENT_TIMEOUT_S,
                 )
+                sweep_1d, rec_1d = result
             except asyncio.TimeoutError:
                 raise RuntimeError(
                     f"Measurement timed out after {_MEASUREMENT_TIMEOUT_S:.0f}s — "
@@ -693,6 +696,7 @@ class MeasurementEngine:
         # its noise-floor check — the first 500ms must be silence. It also returns
         # the sample index where the sweep actually begins in the recording, derived
         # from an FFT cross-correlation against the reference sweep.
+        #
         _warnings, sweep_start_sample = self.validate_recording(
             np, sweep_1d, rec_1d, sample_rate, min_snr_db=min_snr,
         )

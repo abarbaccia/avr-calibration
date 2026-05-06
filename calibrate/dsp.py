@@ -10,6 +10,7 @@ Supported filter types:
   - ``low_shelf``  — low-frequency shelving filter
   - ``high_shelf`` — high-frequency shelving filter
   - ``hpf``        — high-pass filter (Butterworth, variable order)
+  - ``allpass``    — unity-magnitude phase-only filter (RBJ APF)
 
 Usage::
 
@@ -36,7 +37,7 @@ from scipy import signal as _signal
 
 # ── Types ──────────────────────────────────────────────────────────────────────
 
-FilterType = Literal["peaking", "low_shelf", "high_shelf", "hpf"]
+FilterType = Literal["peaking", "low_shelf", "high_shelf", "hpf", "allpass"]
 
 BiquadCoeffs = dict[str, float]
 """Biquad coefficients in minidspd form: {b0, b1, b2, a1, a2}."""
@@ -92,10 +93,12 @@ def freq_gain_q_to_biquad(
         return _high_shelf(freq, gain_db, q, sample_rate)
     elif filter_type == "hpf":
         return _hpf(freq, sample_rate, order=hpf_order)
+    elif filter_type == "allpass":
+        return _allpass(freq, q, sample_rate)
     else:
         raise ValueError(
             f"Unsupported filter type: {filter_type!r}. "
-            f"Must be one of: peaking, low_shelf, high_shelf, hpf"
+            f"Must be one of: peaking, low_shelf, high_shelf, hpf, allpass"
         )
 
 
@@ -198,6 +201,26 @@ def _high_shelf(freq: float, gain_db: float, q: float, sample_rate: int) -> Biqu
     a0 = (A + 1.0) - (A - 1.0) * cos_w0 + 2.0 * sqrt_A * alpha
     a1 = 2.0 * ((A - 1.0) - (A + 1.0) * cos_w0)
     a2 = (A + 1.0) - (A - 1.0) * cos_w0 - 2.0 * sqrt_A * alpha
+    return _normalise(b0, b1, b2, a0, a1, a2)
+
+
+def _allpass(freq: float, q: float, sample_rate: int) -> BiquadCoeffs:
+    """All-pass filter — Audio EQ Cookbook APF.
+
+    Unity magnitude at all frequencies; phase wraps from 0 at low f
+    through -180 at f0 to -360 (= 0) at high f. Useful for frequency-
+    specific phase manipulation (e.g., aligning two subs at one mode
+    without affecting the magnitude response).
+    """
+    w0, alpha = _omega_and_alpha(freq, q, sample_rate)
+    cos_w0 = math.cos(w0)
+
+    b0 = 1.0 - alpha
+    b1 = -2.0 * cos_w0
+    b2 = 1.0 + alpha
+    a0 = 1.0 + alpha
+    a1 = -2.0 * cos_w0
+    a2 = 1.0 - alpha
     return _normalise(b0, b1, b2, a0, a1, a2)
 
 

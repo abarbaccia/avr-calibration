@@ -148,13 +148,12 @@ minidsp:
 #   #   profile: Balanced        # Fast | Balanced | Accurate
 #   input_channels: 2          # logical inputs seen by the cal_matrix mixer
 #   output_channels: 10
-#   # Direct-capture path (no ffmpeg bridge): CamillaDSP opens the multichannel
-#   # USB DAC capture stream and a pre-cal_matrix mixer fans the chosen physical
-#   # channel out to every logical input. Omit capture_channels / lfe_input_channel
-#   # to use the legacy 2ch Loopback path.
+#   # CamillaDSP is the sole owner of the audio hardware (no external bridge
+#   # process). It opens the multichannel USB DAC capture stream directly and a
+#   # pre-cal_matrix mixer fans the chosen physical channel out to every
+#   # logical input.
 #   capture_channels: 20       # physical channels on the capture device (e.g. 18i20)
 #   lfe_input_channel: 2       # 0-indexed physical channel carrying the LFE feed
-#   bridge_service: "denon-sub-bridge.service"   # only set on the legacy bridge path
 #   capture:
 #     type: Alsa
 #     device: "plughw:USB,0"   # plughw:USB,0 for direct multichannel capture

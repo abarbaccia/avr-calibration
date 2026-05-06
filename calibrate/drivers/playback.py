@@ -208,6 +208,7 @@ class HDMIPlayback:
             device=in_dev, samplerate=sample_rate,
             channels=1, dtype="float32", callback=_rec_callback,
         )
+
         try:
             out_stream = sd.OutputStream(
                 device=out_dev, samplerate=sample_rate,

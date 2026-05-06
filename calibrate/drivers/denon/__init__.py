@@ -329,6 +329,111 @@ class DenonDriver(AVRDriver):
             "reason": reason,
         }
 
+    async def audyssey_state_full(self) -> dict:
+        """Full Audyssey + sound-mode state for calibration recipes.
+
+        Extends ``audyssey_status`` with Telnet probes for the per-feature
+        Audyssey toggles that don't surface through the denonavr HTTP API:
+        Dynamic EQ, Dynamic Volume, MultEQ slot, and EQ-Set Reference vs
+        Flat. Also returns a derived ``calibration_ready`` flag and a list
+        of recommended actions if the state isn't ready.
+
+        Calibration-ready means all of:
+          - power == ON
+          - sound_mode is NOT 'PURE DIRECT' or 'DIRECT' (both bypass
+            Audyssey + our pushed FIRs)
+          - multi_eq slot is one of {'FLAT', 'REFERENCE', 'BYP.LR'} (i.e.
+            NOT 'OFF' — OFF disables our pushed FIRs entirely)
+          - dynamic_eq is OFF (DYNEQ contaminates measurements with
+            volume-dependent loudness compensation)
+          - dynamic_volume is OFF (compresses dynamic range)
+
+        For movie-watching state (post-cal), DYNEQ may be ON; this method
+        returns ``calibration_ready`` rather than asserting either way so
+        the caller can interpret per-context.
+        """
+        if not self._host:
+            raise DriverError("no host configured")
+
+        base = await self.audyssey_status()
+
+        # Telnet-probe the toggles that aren't on the HTTP API surface.
+        replies = {}
+        try:
+            replies = await self.telnet_query(
+                ["PSDYNEQ ?", "PSDYNVOL ?", "PSMULTEQ: ?", "PW?"]
+            )
+        except DriverError as exc:
+            log.warning("Telnet probe of Audyssey toggles failed: %s", exc)
+
+        def _parse_reply(prefix: str) -> str | None:
+            for line in replies.values():
+                if line.startswith(prefix):
+                    return line[len(prefix):].strip().upper()
+            return None
+
+        dynamic_eq = _parse_reply("PSDYNEQ ")
+        dynamic_volume = _parse_reply("PSDYNVOL ")
+        # PSMULTEQ replies as "PSMULTEQ:VALUE" (colon, no space).
+        multi_eq_telnet = _parse_reply("PSMULTEQ:")
+        power = _parse_reply("PW")
+
+        # Cross-check Telnet vs HTTP for multi_eq; prefer Telnet (more
+        # current — HTTP is sometimes cached at session start).
+        multi_eq = multi_eq_telnet if multi_eq_telnet else (
+            base.get("multi_eq") or "UNKNOWN"
+        )
+
+        recommendations: list[str] = []
+        cal_ready = True
+
+        if power != "ON":
+            cal_ready = False
+            recommendations.append(
+                f"Power: {power!r} — power on the AVR before calibration"
+            )
+
+        sound_mode_upper = (base.get("sound_mode") or "").upper()
+        if sound_mode_upper in ("PURE DIRECT", "DIRECT"):
+            cal_ready = False
+            recommendations.append(
+                f"Sound mode: {sound_mode_upper!r} bypasses Audyssey + pushed FIRs — "
+                "switch to MULTI CH STEREO, DOLBY SURROUND, or STEREO"
+            )
+
+        if multi_eq == "OFF":
+            cal_ready = False
+            recommendations.append(
+                "MultEQ: OFF disables Audyssey filter slot — set PSMULTEQ:FLAT "
+                "(via Telnet) before pushing FIRs"
+            )
+
+        if dynamic_eq == "ON":
+            cal_ready = False
+            recommendations.append(
+                "Dynamic EQ: ON contaminates calibration measurements with "
+                "volume-dependent loudness compensation. Set PSDYNEQ OFF for "
+                "calibration; user can re-enable post-cal for movie watching"
+            )
+
+        if dynamic_volume == "ON":
+            cal_ready = False
+            recommendations.append(
+                "Dynamic Volume: ON compresses dynamic range — set PSDYNVOL OFF"
+            )
+
+        return {
+            "power": power,
+            "sound_mode": base.get("sound_mode"),
+            "multi_eq": multi_eq,
+            "dynamic_eq": dynamic_eq,
+            "dynamic_volume": dynamic_volume,
+            "audyssey_active": base.get("active"),
+            "audyssey_active_reason": base.get("reason"),
+            "calibration_ready": cal_ready,
+            "recommendations": recommendations,
+        }
+
     async def discover(self) -> list[str]:
         """SSDP scan for Denon/Marantz AVRs on the local network."""
         try:

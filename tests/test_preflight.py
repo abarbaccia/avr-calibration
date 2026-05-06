@@ -316,11 +316,10 @@ class TestRunAll:
             patch.object(checker, "check_output_routing_safety", return_value=CheckResult("Output routing", True, "not applicable")),
             patch.object(checker, "check_audio_stack_clean", return_value=CheckResult("Audio stack", True, "no PipeWire holders")),
             patch.object(checker, "check_dsp_persisted_state", return_value=CheckResult("DSP persisted state", True, "all defaults")),
-            patch.object(checker, "check_capture_path_consistency", return_value=CheckResult("Capture path", True, "not applicable")),
         ):
             results = await checker.run_all()
         assert all(r.passed for r in results)
-        assert len(results) == 9
+        assert len(results) == 8
 
     async def test_unhandled_exception_becomes_failed_result(self, config):
         checker = PreflightChecker(config)
@@ -348,14 +347,13 @@ class TestRunAll:
             patch.object(checker, "check_output_routing_safety", side_effect=RuntimeError("err")),
             patch.object(checker, "check_audio_stack_clean", side_effect=RuntimeError("err")),
             patch.object(checker, "check_dsp_persisted_state", side_effect=RuntimeError("err")),
-            patch.object(checker, "check_capture_path_consistency", side_effect=RuntimeError("err")),
         ):
             results = await checker.run_all()
         # DSP label now comes from the configured driver — "miniDSP 2x4 HD" for
         # dsp_driver: minidsp (the test fixture default).
         assert [r.name for r in results] == [
             "Config", "Microphone", "miniDSP 2x4 HD", "Denon AVR", "Signal Path",
-            "Output routing", "Audio stack", "DSP persisted state", "Capture path",
+            "Output routing", "Audio stack", "DSP persisted state",
         ]
 
     async def test_result_names_camilladsp_label(self, config):
@@ -859,9 +857,8 @@ class TestOutputRoutingSafety:
 class TestCamillaDSPPipelineStateInPreflight:
     """check_minidsp warns (but passes) when CamillaDSP pipeline is Inactive.
 
-    The priming step in _BridgeSweepContext.__enter__ (Bug 2 fix) will restart
-    the pipeline before measurement, so an Inactive state at preflight time is
-    non-fatal — just informational.
+    Pipeline restarts itself before measurement when needed, so an Inactive
+    state at preflight time is non-fatal — just informational.
     """
 
     def _camilladsp_config(self) -> "Config":
@@ -1010,97 +1007,3 @@ class TestDspPersistedState:
         assert "skipped" in result.detail.lower()
 
 
-# ── check_capture_path_consistency ───────────────────────────────────────────
-
-
-class TestCapturePathConsistency:
-    """Reject configs where direct USB capture and the bridge would compete."""
-
-    def _camilla_config(self, **overrides):
-        from calibrate.config import Config
-        cam = {
-            "host": "127.0.0.1",
-            "port": 1234,
-            "samplerate": 48000,
-            "chunksize": 1024,
-            "input_channels": 2,
-            "output_channels": 10,
-            **overrides,
-        }
-        return Config({
-            "dsp_driver": "camilladsp",
-            "denon": {"host": "192.168.1.100"},
-            "mic": {"name": "UMIK"},
-            "camilladsp": cam,
-        })
-
-    async def test_skip_when_dsp_driver_is_minidsp(self, config) -> None:
-        """The check is camilladsp-only; minidsp installs see a passing skip."""
-        checker = PreflightChecker(config)
-        result = await checker.check_capture_path_consistency()
-        assert result.passed
-        assert "skipped" in result.detail.lower()
-
-    async def test_skip_when_no_explicit_capture_device(self) -> None:
-        """No `capture` block → defaults apply, no contention possible to detect."""
-        cfg = self._camilla_config()
-        checker = PreflightChecker(cfg)
-        result = await checker.check_capture_path_consistency()
-        assert result.passed
-        assert "default" in result.detail.lower()
-
-    async def test_loopback_capture_with_bridge_passes(self) -> None:
-        """Legacy path: hw:Loopback,1,0 + denon-sub-bridge.service → pass."""
-        cfg = self._camilla_config(
-            capture={"type": "Alsa", "device": "hw:Loopback,1,0", "channels": 2, "format": "S32LE"},
-            bridge_service="denon-sub-bridge.service",
-        )
-        checker = PreflightChecker(cfg)
-        with (
-            patch.object(checker, "_systemctl_is_enabled", return_value=True),
-            patch.object(checker, "_systemctl_is_active", return_value=True),
-        ):
-            result = await checker.check_capture_path_consistency()
-        assert result.passed
-        assert "loopback" in result.detail.lower()
-
-    async def test_loopback_capture_without_bridge_fails(self) -> None:
-        """Loopback capture but no bridge_service → silence, fail loudly."""
-        cfg = self._camilla_config(
-            capture={"type": "Alsa", "device": "hw:Loopback,1,0", "channels": 2, "format": "S32LE"},
-        )
-        checker = PreflightChecker(cfg)
-        result = await checker.check_capture_path_consistency()
-        assert not result.passed
-        assert "no bridge_service" in result.detail.lower() or "silence" in (result.error or "").lower()
-
-    async def test_direct_capture_with_bridge_running_fails(self) -> None:
-        """Direct USB capture + bridge running = race condition → reject."""
-        cfg = self._camilla_config(
-            capture={"type": "Alsa", "device": "plughw:USB,0", "channels": 20, "format": "S32LE"},
-            bridge_service="denon-sub-bridge.service",
-        )
-        checker = PreflightChecker(cfg)
-        with (
-            patch.object(checker, "_systemctl_is_enabled", return_value=True),
-            patch.object(checker, "_systemctl_is_active", return_value=True),
-        ):
-            result = await checker.check_capture_path_consistency()
-        assert not result.passed
-        assert "race" in (result.error or "").lower() or "cannot both" in (result.error or "").lower()
-        assert "denon-sub-bridge.service" in (result.error or "")
-
-    async def test_direct_capture_with_bridge_inactive_passes(self) -> None:
-        """Direct USB capture with bridge disabled & inactive → pass."""
-        cfg = self._camilla_config(
-            capture={"type": "Alsa", "device": "plughw:USB,0", "channels": 20, "format": "S32LE"},
-            bridge_service="denon-sub-bridge.service",
-        )
-        checker = PreflightChecker(cfg)
-        with (
-            patch.object(checker, "_systemctl_is_enabled", return_value=False),
-            patch.object(checker, "_systemctl_is_active", return_value=False),
-        ):
-            result = await checker.check_capture_path_consistency()
-        assert result.passed
-        assert "direct" in result.detail.lower()
