@@ -161,132 +161,24 @@ class _CamillaWSClient:
         return inner.get("value")
 
 
-class _BridgeSweepContext:
-    """Async context manager that stops the Denon-sub bridge around a sweep.
+class _NoOpSweepContext:
+    """Trivial async context manager for USB-route sweeps.
 
-    On ``__enter__``:
-      1. Stops ``bridge_service`` via ``systemctl stop`` (if configured), so
-         the loopback write side (``hw:Loopback,0,0``) is free.
-      2. Primes the loopback by opening ``hw:Loopback,0,0`` via sounddevice,
-         writing ~0.5 s of silence, triggering a CamillaDSP config push so
-         the daemon opens its capture device, sleeping 300 ms, then closing
-         the stream. The upcoming sweep then takes over the device cleanly.
-
-    On ``__exit__``: starts the bridge service again (if configured).
-
-    If ``bridge_service`` is ``None``, the stop/start calls are skipped but
-    the loopback primer still runs (CamillaDSP may still need it when started
-    cold without a bridge holding the device open).
+    CamillaDSP is the sole owner of the audio hardware (no userland bridge).
+    Capture is direct from the multichannel USB DAC, so there is no loopback
+    write side to prime and no bridge service to stop. Sweep setup/teardown
+    is therefore a no-op at this layer.
     """
 
-    def __init__(
-        self,
-        driver: "CamillaDSPDriver",
-        bridge_service: str | None,
-        playback_device: str,
-        needs_loopback_prime: bool = True,
-    ) -> None:
-        self._driver = driver
-        self._bridge_service = bridge_service
-        self._playback_device = playback_device
-        self._needs_loopback_prime = needs_loopback_prime
+    def __init__(self) -> None:
         self.active = False
 
-    async def enter(self) -> "_BridgeSweepContext":
-        if self._bridge_service:
-            log.info("sweep_context: stopping bridge service %s", self._bridge_service)
-            await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: subprocess.run(
-                    ["systemctl", "stop", self._bridge_service],
-                    check=False, capture_output=True,
-                ),
-            )
-
-        if self._needs_loopback_prime:
-            await self._prime_loopback()
-        else:
-            log.info("sweep_context: direct-capture path, skipping loopback prime")
+    async def __aenter__(self) -> "_NoOpSweepContext":
         self.active = True
         return self
 
-    async def exit(self) -> None:
-        if self._bridge_service:
-            log.info("sweep_context: starting bridge service %s", self._bridge_service)
-            await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: subprocess.run(
-                    ["systemctl", "start", self._bridge_service],
-                    check=False, capture_output=True,
-                ),
-            )
-        self.active = False
-
-    async def __aenter__(self) -> "_BridgeSweepContext":
-        return await self.enter()
-
     async def __aexit__(self, *_) -> None:
-        await self.exit()
-
-    async def _prime_loopback(self) -> None:
-        """Open the loopback write side briefly so CamillaDSP can open the read side.
-
-        CamillaDSP gets EINVAL on ``snd_pcm_hw_params_set_format`` when it tries
-        to open ``hw:Loopback,1,0`` (the capture/read side) if nothing has yet
-        opened the write side (``hw:Loopback,0,0``). Writing a short burst of
-        silence establishes the format negotiation; CamillaDSP can then open its
-        capture device successfully when we push a config reload.
-        """
-        try:
-            import sounddevice as sd
-            import numpy as np
-
-            devices = sd.query_devices()
-            dev_idx: int | None = None
-            for i, d in enumerate(devices):
-                if (
-                    self._playback_device
-                    and self._playback_device.lower() in str(d.get("name", "")).lower()
-                    and d.get("max_output_channels", 0) > 0
-                ):
-                    dev_idx = i
-                    break
-
-            if dev_idx is None:
-                log.warning(
-                    "sweep_context: loopback device %r not found — skipping primer; "
-                    "CamillaDSP may fail to start",
-                    self._playback_device,
-                )
-                return
-
-            log.info("sweep_context: priming loopback via device index %d", dev_idx)
-            silence = np.zeros((int(48000 * 0.5), 2), dtype="int32")
-            stream = sd.OutputStream(
-                device=dev_idx,
-                samplerate=48000,
-                channels=2,
-                dtype="int32",
-            )
-            stream.start()
-            stream.write(silence)
-
-            # Trigger a CamillaDSP config push so the daemon opens its capture
-            # device while the loopback write side is held open.
-            try:
-                async with self._driver._lock:
-                    await self._driver._push_config_locked()
-            except Exception as exc:
-                log.warning("sweep_context: config push during primer failed: %s", exc)
-
-            await asyncio.sleep(0.3)
-            stream.stop()
-            stream.close()
-            log.info("sweep_context: loopback primer complete")
-        except ImportError:
-            log.warning("sweep_context: sounddevice not available — skipping loopback primer")
-        except Exception as exc:
-            log.warning("sweep_context: loopback primer failed: %s", exc)
+        self.active = False
 
 
 class CamillaDSPDriver(DSPDriver):
@@ -663,6 +555,13 @@ class CamillaDSPDriver(DSPDriver):
             return {
                 "type": "Biquad",
                 "parameters": {"type": "Notch", "freq": spec.freq, "q": spec.q},
+            }
+        if t in {"allpass", "ap", "apf"}:
+            # Unity-magnitude phase-only filter. CamillaDSP "Allpass" takes
+            # only freq + q; gain_db is meaningless and ignored.
+            return {
+                "type": "Biquad",
+                "parameters": {"type": "Allpass", "freq": spec.freq, "q": spec.q},
             }
         # 4th-order Butterworth HPF/LPF → BiquadCombo (single filter, two sections).
         if t in {"hpf", "highpass"}:
@@ -1215,10 +1114,8 @@ class CamillaDSPDriver(DSPDriver):
     def sweep_context(self, config):
         """Return an async context manager that prepares CamillaDSP for a sweep.
 
-        USB route: returns a ``_BridgeSweepContext`` that stops the
-        ``bridge_service`` (if configured) so the loopback write side is free,
-        primes the ALSA loopback so CamillaDSP can open its capture device, and
-        restores the bridge on exit.
+        USB route: no-op — CamillaDSP captures directly from the USB DAC, no
+        bridge or loopback priming required.
 
         HDMI route: returns a ``DSPHDMISweepContext`` for master-gain management.
         """
@@ -1226,18 +1123,7 @@ class CamillaDSPDriver(DSPDriver):
         route = config.measurement.get("playback_route", "usb")
         if route == "hdmi":
             return DSPHDMISweepContext(self, config)
-        # USB route: wrap bridge stop/start + loopback primer.
-        bridge_service = config.camilladsp.get("bridge_service")
-        playback_device = config.measurement.get("playback_device", "")
-        # Loopback prime is only meaningful when CamillaDSP captures from the
-        # ALSA Loopback device — it wakes the loopback's read side. With direct
-        # USB capture (Focusrite et al.), the prime opens an unrelated device
-        # and is skipped.
-        capture_dev = str(self._capture_device.get("device", ""))
-        needs_prime = capture_dev.startswith("hw:Loopback")
-        return _BridgeSweepContext(
-            self, bridge_service, playback_device, needs_loopback_prime=needs_prime,
-        )
+        return _NoOpSweepContext()
 
     async def pipeline_state(self) -> str:
         """Return the CamillaDSP pipeline state string.

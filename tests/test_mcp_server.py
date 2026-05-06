@@ -443,6 +443,86 @@ async def test_apply_eq_generic_exception_returns_error(mock_dsp, valid_filters)
     assert "apply_eq error" in result["error"]
 
 
+# ── allpass filter ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_apply_eq_allpass_accepts_filter(mock_dsp) -> None:
+    """apply_eq accepts an allpass filter spec (HPF still required)."""
+    filters = [
+        {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
+        {"freq": 23.0, "gain_db": 0.0, "q": 1.5, "type": "allpass"},
+    ]
+    result = await _tool_apply_eq(filters)
+    assert result["ok"], result
+    mock_dsp.apply_eq.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_evaluate_transfer_function_allpass_unity_magnitude() -> None:
+    """An allpass filter contributes 0 dB at every query frequency."""
+    filters = [{"freq": 50.0, "gain_db": 0.0, "q": 1.0, "type": "allpass"}]
+    query_freqs = [20.0, 30.0, 50.0, 80.0, 120.0, 200.0]
+    result = await _tool_evaluate_transfer_function(filters, query_freqs)
+    assert result["ok"], result
+    for entry in result["results"]:
+        assert abs(entry["total_db"]) < 0.1, (
+            f"allpass should be unity magnitude, got {entry['total_db']} dB at "
+            f"{entry['freq_hz']} Hz"
+        )
+
+
+def test_allpass_phase_at_f0_is_minus_180() -> None:
+    """Allpass biquad phase response crosses -180° at f0 (within ±5°)."""
+    import cmath
+    import math
+
+    from calibrate.dsp import freq_gain_q_to_biquad
+
+    f0 = 50.0
+    sample_rate = 96_000
+    bq = freq_gain_q_to_biquad(
+        freq=f0, gain_db=0.0, q=1.0, filter_type="allpass",
+        sample_rate=sample_rate,
+    )
+    z = cmath.exp(1j * 2.0 * math.pi * f0 / sample_rate)
+    zi = 1.0 / z
+    num = bq["b0"] + bq["b1"] * zi + bq["b2"] * zi * zi
+    den = 1.0 + bq["a1"] * zi + bq["a2"] * zi * zi
+    h = num / den
+    # Magnitude should be ~1
+    assert abs(abs(h) - 1.0) < 1e-6, f"allpass not unity: |H|={abs(h)}"
+    phase_deg = math.degrees(cmath.phase(h))
+    # Phase should be close to -180° (or equivalently +180°)
+    assert abs(abs(phase_deg) - 180.0) < 5.0, (
+        f"allpass phase at f0 should be ±180°, got {phase_deg:.2f}°"
+    )
+
+
+def test_allpass_cascade_unity_magnitude_across_band() -> None:
+    """Cascaded identical allpass filters preserve unity magnitude across band."""
+    import cmath
+    import math
+
+    from calibrate.dsp import freq_gain_q_to_biquad
+
+    sample_rate = 96_000
+    bq = freq_gain_q_to_biquad(
+        freq=40.0, gain_db=0.0, q=1.5, filter_type="allpass",
+        sample_rate=sample_rate,
+    )
+    for f in [15.0, 25.0, 40.0, 80.0, 200.0]:
+        z = cmath.exp(1j * 2.0 * math.pi * f / sample_rate)
+        zi = 1.0 / z
+        num = bq["b0"] + bq["b1"] * zi + bq["b2"] * zi * zi
+        den = 1.0 + bq["a1"] * zi + bq["a2"] * zi * zi
+        # |H|² (cascade of two identical allpasses) is still 1
+        mag_squared = abs(num / den) ** 2
+        mag_db = 10.0 * math.log10(mag_squared)
+        assert abs(mag_db) < 0.1, (
+            f"allpass cascade not unity at {f} Hz: {mag_db:.4f} dB"
+        )
+
+
 # ── avr_set_volume / set_denon_volume ──────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -551,6 +631,78 @@ async def test_trigger_measurement_success() -> None:
     assert result["ok"]
     assert result["session_id"] == 7
     mock_engine.measure.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_trigger_measurement_usb_route_requires_cal_mode() -> None:
+    """USB-route sweep with cal_mode OFF must hard-fail with a clear error
+    pointing to set_cal_mode. Regression for 2026-05-06 incident where
+    measurements silently captured noise floor for ~2 hours of MSO experiments.
+    """
+    mock_sd = MagicMock()
+    mock_sd.query_devices.return_value = [
+        {"name": "UMIK-1", "max_input_channels": 1, "max_output_channels": 0},
+    ]
+
+    mock_dsp_obj = MagicMock()
+    mock_dsp_obj.cal_mode_active = False
+    mock_dsp_obj.cal_playback_device = None
+
+    # Force USB route so the cal_mode precondition is exercised; default test
+    # config uses HDMI which would skip the check.
+    mock_cfg = MagicMock()
+    mock_cfg.measurement = {"playback_route": "usb"}
+    mock_cfg.mic = {"name": "UMIK"}
+
+    with (
+        patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        patch("calibrate.mcp_server._dsp", mock_dsp_obj),
+        patch("calibrate.mcp_server._config", return_value=mock_cfg),
+    ):
+        result = await _tool_trigger_measurement(sweep_volume_db=-31.0)
+
+    assert result["ok"] is False
+    err = result["error"].lower()
+    assert "cal_mode" in err or "cal mode" in err
+    assert "set_cal_mode" in err  # error must point user to the fix
+
+
+@pytest.mark.asyncio
+async def test_trigger_measurement_target_subs_requires_cal_mode_via_profile() -> None:
+    """target='subs' resolves via measurement_profiles to role='sub' which
+    requires cal_mode. Refuses with helpful error pointing to set_cal_mode.
+    Regression for 2026-05-06: 6+ hours of mains-via-HDMI captures because
+    target=subs silently routed via legacy playback_route='hdmi'."""
+    mock_sd = MagicMock()
+    mock_sd.query_devices.return_value = [
+        {"name": "UMIK-1", "max_input_channels": 1, "max_output_channels": 0},
+    ]
+
+    mock_dsp_obj = MagicMock()
+    mock_dsp_obj.cal_mode_active = False  # cal_mode OFF — bug condition
+    mock_dsp_obj.cal_playback_device = None
+
+    mock_cfg = MagicMock()
+    # Note: even with playback_route='hdmi' as the legacy default, the
+    # role-based resolver should refuse target='subs' because role=sub
+    # requires cal_mode regardless of legacy config.
+    mock_cfg.measurement = {"playback_route": "hdmi"}
+    mock_cfg.mic = {"name": "UMIK"}
+    mock_cfg.signal_graph = None  # no graph → resolver uses role aliases ('subs' → 'sub')
+    mock_cfg._data = {}
+
+    with (
+        patch.dict(sys.modules, {"sounddevice": mock_sd}),
+        patch("calibrate.mcp_server._dsp", mock_dsp_obj),
+        patch("calibrate.mcp_server._config", return_value=mock_cfg),
+    ):
+        result = await _tool_trigger_measurement(target="subs", sweep_volume_db=-31.0)
+
+    assert result["ok"] is False
+    err = result["error"].lower()
+    assert "cal_mode" in err or "cal mode" in err
+    assert "set_cal_mode" in err  # error must point user to the fix
+    assert "sub" in err or "target" in err  # mentions role/target context
 
 
 @pytest.mark.asyncio
@@ -3881,6 +4033,35 @@ def test_classify_fixability_tiers() -> None:
     # old fixed 5 ms threshold, but the new scaled threshold classifies it as fixable.
     cls, fx = _classify_fixability(20.0, 5.0)
     assert cls == "fixable" and fx is True
+
+
+def test_classify_fixability_magnitude_check_rejects_geometry_for_peaks() -> None:
+    """A measured PEAK above reference cannot be a cancellation null —
+    don't classify as geometry regardless of phase response.
+
+    Previously this was the over-flagging bug: every modal peak with
+    dispersive room phase response (excess GD ≥ ½ wavelength) was lumped
+    into 'geometry / unfixable', burying real EQ-fixable resonances.
+    """
+    from calibrate.mcp_server import _classify_fixability
+
+    # 93 Hz, excess GD 30 ms (well above the 25 ms / ½λ geometry threshold).
+    # WITHOUT magnitude context: legacy "geometry" classification.
+    cls, fx = _classify_fixability(93.0, 30.0)
+    assert cls == "geometry" and fx is False
+
+    # Same band with magnitude context: measured +14 dB, reference 0 dB.
+    # +14 above reference → real peak, never geometry. Demoted to partial.
+    cls, fx = _classify_fixability(93.0, 30.0, measured_spl_db=14.0, reference_spl_db=0.0)
+    assert cls == "partial" and fx is True
+
+    # A real null (measured well below reference) keeps the geometry tag.
+    cls, fx = _classify_fixability(93.0, 30.0, measured_spl_db=-15.0, reference_spl_db=0.0)
+    assert cls == "geometry" and fx is False
+
+    # Magnitude near reference — band is neither peak nor null. Geometry stands.
+    cls, fx = _classify_fixability(93.0, 30.0, measured_spl_db=1.5, reference_spl_db=0.0)
+    assert cls == "geometry" and fx is False
 
 
 @pytest.mark.asyncio

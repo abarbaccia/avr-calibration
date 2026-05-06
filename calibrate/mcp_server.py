@@ -1466,6 +1466,9 @@ async def _tool_simulate_eq(
                     # response here would double-apply the attenuation, causing
                     # predicted bass levels to be far too low.
                     pass
+                elif ftype == "allpass":
+                    # Unity magnitude — phase-only filter contributes 0 dB.
+                    pass
                 elif ftype in ("low_shelf", "high_shelf"):
                     total_correction += _biquad_response(f, ftype, fc, gain, q)
             predicted_fr.append({
@@ -1516,6 +1519,8 @@ async def _tool_evaluate_transfer_function(
                 q = float(filt.get("q", 1.0))
                 if ftype == "hpf":
                     contribution = 0.0  # HPF already in measurement
+                elif ftype == "allpass":
+                    contribution = 0.0  # Unity magnitude (phase-only)
                 elif ftype in ("peaking", "low_shelf", "high_shelf"):
                     contribution = _biquad_response(freq, ftype, fc, gain, q)
                 else:
@@ -1591,6 +1596,8 @@ async def _tool_per_filter_contribution(
                 q = float(filt.get("q", 1.0))
                 if ftype == "hpf":
                     c = 0.0
+                elif ftype == "allpass":
+                    c = 0.0  # Unity magnitude (phase-only)
                 elif ftype in ("peaking", "low_shelf", "high_shelf"):
                     c = _biquad_response(qf, ftype, fc, gain, q)
                 else:
@@ -2540,29 +2547,34 @@ async def _get_geometry_band_ranges(
     return out
 
 
-def _classify_fixability(freq_hz: float, excess_gd_ms: float) -> tuple[str, bool]:
+def _classify_fixability(
+    freq_hz: float,
+    excess_gd_ms: float,
+    measured_spl_db: float | None = None,
+    reference_spl_db: float | None = None,
+) -> tuple[str, bool]:
     """Classify a band as fixable / partial / geometry from excess group delay.
 
-    The old fixed 5 ms threshold flagged essentially every room measurement
-    as "not fixable" because modal ringing at sub frequencies comfortably
-    exceeds 5 ms of excess group delay even when the underlying response is
-    minimum-phase-correctable. Scale instead with the period of the band:
+    Scales thresholds with the period of the band:
 
-      fixable   — excess GD < max(10 ms, ¼ wavelength).
-                  PEQ handles the peak cleanly.
-      partial   — excess GD < max(25 ms, ½ wavelength).
-                  Modal ringing is significant; FIR shortens decay better than
-                  PEQ, but PEQ still reduces the peak.
-      geometry  — excess GD ≥ ½ wavelength, i.e. near-π phase offset.
-                  Likely cancellation at the mic; repositioning (sub placement,
-                  listening position, polarity/delay between subs) beats EQ.
+      fixable   — excess GD < max(10 ms, ¼ wavelength). PEQ handles cleanly.
+      partial   — excess GD < max(25 ms, ½ wavelength). FIR shortens decay
+                  better than PEQ but PEQ still reduces the peak.
+      geometry  — excess GD ≥ ½ wavelength (near-π phase offset). Cancellation
+                  at the mic; repositioning beats EQ.
 
-    The 10 ms / 25 ms floors protect against over-classifying mid/upper-bass
-    bands where a short wavelength makes the raw wavelength thresholds
-    unrealistically tight.
+    Magnitude sanity check: a true geometry null produces a measured SPL
+    BELOW the local reference (a dip). A modal peak produces SPL ABOVE
+    reference. If we have magnitude context and the band's measured SPL
+    exceeds the reference by ≥ 2 dB, the band is a resonance — NOT a
+    cancellation — so we never classify it as geometry regardless of phase.
 
-    Returns (classification, fixable_bool) where fixable is True for both
-    "fixable" and "partial" — both respond to some combination of PEQ + FIR.
+    measured_spl_db: the band's measured SPL.
+    reference_spl_db: a baseline to compare against (e.g. the broadband median
+        SPL across the analyzed band, or the target curve's value at this
+        frequency). Without it the magnitude check is skipped (legacy path).
+
+    Returns (classification, fixable_bool).
     """
     period_ms = 1000.0 / max(freq_hz, 1e-6)
     fixable_threshold = max(10.0, 0.25 * period_ms)
@@ -2572,6 +2584,15 @@ def _classify_fixability(freq_hz: float, excess_gd_ms: float) -> tuple[str, bool
         return "fixable", True
     if excess_gd_ms < geometry_threshold:
         return "partial", True
+
+    # Magnitude sanity check: a peak above reference cannot be a null.
+    if (
+        measured_spl_db is not None
+        and reference_spl_db is not None
+        and measured_spl_db > reference_spl_db + 2.0
+    ):
+        return "partial", True
+
     return "geometry", False
 
 
@@ -2659,6 +2680,10 @@ async def _tool_analyze_phase(
                 min_len = min(len(meas_gd_ms), len(mp_gd_ms))
                 excess_gd_ms = meas_gd_ms[:min_len] - mp_gd_ms[:min_len]
 
+        # Reference for magnitude sanity check in fixability classifier:
+        # median across the analyzed band — bands above this are peaks.
+        ref_spl_db = float(np.median(spl_band)) if len(spl_band) > 0 else None
+
         # Downsample to 1/3-octave bands
         bands = []
         for centre in _THIRD_OCTAVE_CENTRES:
@@ -2693,7 +2718,9 @@ async def _tool_analyze_phase(
                     if len(excess_vals) > 0:
                         avg_excess = float(np.mean(np.abs(excess_vals)))
                         entry["excess_group_delay_ms"] = round(avg_excess, 1)
-                        classification, fixable = _classify_fixability(centre, avg_excess)
+                        classification, fixable = _classify_fixability(
+                            centre, avg_excess, avg_spl, ref_spl_db,
+                        )
                         entry["classification"] = classification
                         entry["fixable"] = fixable
                     else:
@@ -4848,18 +4875,73 @@ async def _tool_trigger_measurement(
 
     try:
         from .measurement import MeasurementEngine, compute_session_metadata
+        from .measurement_profiles import (
+            resolve_measurement_chain,
+            chain_requires_cal_mode,
+            chain_forbids_cal_mode,
+        )
         from .storage import SessionStore
 
         cfg = _config()
+
+        # Target-driven chain resolution. The signal_graph + measurement_profiles
+        # in config.yaml are authoritative — `target` (or sweep_channel) implies
+        # route, cal_mode requirements, sound_mode, sweep_channel, freq range.
+        # Hardware-agnostic; recipes never set route manually.
+        # See feedback_validate_chain_matches_target.md and
+        # docs/measurement-chain.md (task #57) for the design.
+        chain = resolve_measurement_chain(target, sweep_channel, cfg)
+        route = chain.route
+        if chain.legacy_path:
+            log.warning(
+                "trigger_measurement: target=%r resolved via legacy "
+                "measurement.playback_route=%r — no measurement_profile matched. "
+                "This path is deprecated; add a measurement_profile or set "
+                "target to a transducer/group/role name.",
+                target, route,
+            )
+
+        # Cal-mode precondition: derived from chain spec (per role profile).
+        # Sub measurements require cal_mode ON; mains measurements require it
+        # OFF. Without these gates, sweeps silently go to the wrong device.
+        # Documented failure modes 2026-05-06: ~6 hours measuring mains via
+        # HDMI when target was 'subs' (route=hdmi default + cal_mode toggle
+        # decoupled from route).
+        cal_active = bool(getattr(_dsp, "cal_mode_active", False))
+        if chain_requires_cal_mode(chain) and not cal_active:
+            return _err(
+                f"target={target!r} (role={chain.role!r}) requires cal_mode=ON. "
+                "The DSP must capture from the snd-aloop loopback so the Pi sweep "
+                "reaches the transducers. Currently cal_mode is OFF — sweeps would "
+                "be silently misrouted. Call set_cal_mode(enabled=True) first, "
+                "then run measurement, then set_cal_mode(enabled=False) (or "
+                "restore_listening_mode) when done."
+            )
+        if chain_forbids_cal_mode(chain) and cal_active:
+            return _err(
+                f"target={target!r} (role={chain.role!r}) requires cal_mode=OFF "
+                "(HDMI route through AVR). Currently cal_mode is ON — the AVR "
+                "path is bypassed and sweeps go via snd-aloop. Call "
+                "set_cal_mode(enabled=False) first, then run measurement."
+            )
+
+        # Legacy precondition: when no profile matched and route=usb (legacy
+        # playback_route='usb' fallback), still require cal_mode=ON. Same
+        # rationale as the role-based gate above. Keeps backwards-compat
+        # for callers that haven't migrated to target-driven profiles.
+        if chain.legacy_path and route == "usb" and not cal_active:
+            return _err(
+                "USB-route measurement requires cal_mode=ON, but it is currently OFF. "
+                "In live mode the DSP captures the multichannel interface directly — "
+                "the Pi sweep plays into snd-aloop and never reaches the subs, "
+                "producing noise-floor captures. Call set_cal_mode(enabled=True) "
+                "before the measurement, then set_cal_mode(enabled=False) (or "
+                "restore_listening_mode) when done. "
+                "Better: pass target='subs' to use the target-driven chain "
+                "resolver (recommended, handles cal_mode automatically per profile)."
+            )
+
         engine = MeasurementEngine(cfg)
-        # Auto-route: a per-channel sweep_channel only makes sense on HDMI.
-        # Honor config only when the caller has not implied HDMI by passing
-        # sweep_channel — eliminates the silent-fallback foot-gun where a
-        # mains sweep routed via USB and produced garbage.
-        if sweep_channel is not None:
-            route = "hdmi"
-        else:
-            route = cfg.measurement.get("playback_route", "usb")
 
         # Resolve sweep range from explicit args / target / config defaults.
         resolved_min, resolved_max, sweep_range_source = _resolve_sweep_range(
@@ -4876,13 +4958,10 @@ async def _tool_trigger_measurement(
                     f"Valid values: {list(_HDMI_CHANNEL_MAP.keys())}"
                 )
 
-        # When the DSP driver is in cal mode, route the sweep into its loopback
-        # capture device so the sweep enters CamillaDSP via snd-aloop. Bypasses
-        # the AVR — Audyssey/MultEQ filters cannot color the cal stimulus.
-        # Cal-mode loopback only makes sense for the USB/CamillaDSP path. For
-        # an HDMI sweep we must IGNORE cal_playback_device — otherwise an HDMI
+        # cal_active was checked above as a precondition; here we just route
+        # the sweep into the cal_playback device when active and not HDMI.
+        # An HDMI sweep must IGNORE cal_playback_device — otherwise an HDMI
         # mains sweep silently goes into snd-aloop instead of the AVR/HDMI.
-        cal_active = bool(getattr(_dsp, "cal_mode_active", False))
         if cal_active and route != "hdmi":
             cal_playback = getattr(_dsp, "cal_playback_device", None)
         else:
@@ -7731,6 +7810,11 @@ def _compute_phase_bands_for_session(
             n = min(len(meas_gd_ms), len(mp_gd_ms))
             excess_gd_ms = meas_gd_ms[:n] - mp_gd_ms[:n]
 
+    # Reference for magnitude sanity check: median SPL across the analyzed band.
+    # Bands measuring above this are peaks (not nulls) and shouldn't be flagged
+    # as geometry/cancellation regardless of their phase response.
+    ref_spl_db = float(np.median(spl_band)) if len(spl_band) > 0 else None
+
     bands: list[dict] = []
     for centre in _THIRD_OCTAVE_CENTRES:
         if centre < min_hz or centre > max_hz:
@@ -7756,7 +7840,9 @@ def _compute_phase_bands_for_session(
                 if len(excess_vals) > 0:
                     avg_excess = float(np.mean(np.abs(excess_vals)))
                     entry["excess_group_delay_ms"] = round(avg_excess, 1)
-                    classification, fixable = _classify_fixability(centre, avg_excess)
+                    classification, fixable = _classify_fixability(
+                        centre, avg_excess, avg_spl, ref_spl_db,
+                    )
                     entry["classification"] = classification
                     entry["fixable"] = fixable
                 else:
@@ -8480,7 +8566,9 @@ _TOOLS: list[Tool] = [
             "PEQ reduces modal peak amplitude but leaves the ringing time unchanged; FIR "
             "both flattens magnitude AND shortens T60 decay. Check `eq_capabilities.fir_capable` "
             "in get_config. Use apply_eq for: (a) the mandatory infrasonic HPF, (b) per-sub "
-            "safety limiting, (c) fallback when the hardware is FIR-incapable (miniDSP 2x4 HD)."
+            "safety limiting, (c) fallback when the hardware is FIR-incapable (miniDSP 2x4 HD), "
+            "(d) allpass filters for phase-only correction (e.g., aligning two subs at a single "
+            "frequency without affecting magnitude). Allpass: gain_db is ignored."
         ),
         inputSchema={
             "type": "object",
@@ -8496,7 +8584,7 @@ _TOOLS: list[Tool] = [
                             "q": {"type": "number", "description": "Quality factor (ignored for hpf)"},
                             "type": {
                                 "type": "string",
-                                "enum": ["peaking", "low_shelf", "high_shelf", "hpf"],
+                                "enum": ["peaking", "low_shelf", "high_shelf", "hpf", "allpass"],
                             },
                         },
                         "required": ["freq", "gain_db", "q", "type"],
@@ -8556,7 +8644,9 @@ _TOOLS: list[Tool] = [
             "specific sub that excites them. Pair with fit_shelf_for_target to auto-derive "
             "the shelf parameters for a given target curve. "
             "Each filter: {freq: Hz, gain_db: dB, q: float, type: 'peaking'|"
-            "'low_shelf'|'high_shelf'|'hpf'}. A mandatory 18Hz HPF must always be included."
+            "'low_shelf'|'high_shelf'|'hpf'|'allpass'}. A mandatory 18Hz HPF must always be included. "
+            "Allpass is unity-magnitude (gain_db is ignored) and is for phase-only correction "
+            "(e.g., aligning two subs at one frequency)."
         ),
         inputSchema={
             "type": "object",
@@ -8572,7 +8662,7 @@ _TOOLS: list[Tool] = [
                             "q": {"type": "number", "description": "Quality factor (ignored for hpf)"},
                             "type": {
                                 "type": "string",
-                                "enum": ["peaking", "low_shelf", "high_shelf", "hpf"],
+                                "enum": ["peaking", "low_shelf", "high_shelf", "hpf", "allpass"],
                             },
                         },
                         "required": ["freq", "gain_db", "q", "type"],
@@ -10627,7 +10717,8 @@ _TOOLS: list[Tool] = [
             "Predict FR after applying proposed PEQ filters to a measurement. "
             "Pure simulation — no hardware writes. Design filters yourself, then call this "
             "to see the predicted result. Iterate in simulation before applying to hardware. "
-            "Returns compact predicted FR string and per-point original/predicted/correction values."
+            "Returns compact predicted FR string and per-point original/predicted/correction values. "
+            "Allpass filters contribute 0 dB to predicted magnitude (phase-only)."
         ),
         inputSchema={
             "type": "object",
@@ -10645,7 +10736,7 @@ _TOOLS: list[Tool] = [
                             "freq": {"type": "number"},
                             "gain_db": {"type": "number"},
                             "q": {"type": "number"},
-                            "type": {"type": "string", "enum": ["peaking", "low_shelf", "high_shelf", "hpf"]},
+                            "type": {"type": "string", "enum": ["peaking", "low_shelf", "high_shelf", "hpf", "allpass"]},
                         },
                         "required": ["freq", "gain_db", "q", "type"],
                     },
@@ -11290,7 +11381,7 @@ _TOOLS: list[Tool] = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "type": {"type": "string", "enum": ["peaking", "low_shelf", "high_shelf", "hpf"]},
+                            "type": {"type": "string", "enum": ["peaking", "low_shelf", "high_shelf", "hpf", "allpass"]},
                             "freq": {"type": "number"},
                             "gain_db": {"type": "number"},
                             "q": {"type": "number"},

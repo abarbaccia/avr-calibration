@@ -72,7 +72,7 @@ THIRD_OCTAVE_CENTRES_HZ: list[float] = [
 
 # ── Data types ─────────────────────────────────────────────────────────────────
 
-FilterType = Literal["peaking", "low_shelf", "high_shelf", "hpf", "lpf", "notch"]
+FilterType = Literal["peaking", "low_shelf", "high_shelf", "hpf", "lpf", "notch", "allpass"]
 
 
 @dataclass
@@ -173,7 +173,9 @@ def _filter_magnitude_db(f: FilterSpec, freq_hz: float) -> float:
 
     from .dsp import freq_gain_q_to_biquad
 
-    if f.type in ("hpf", "lpf", "notch"):
+    if f.type in ("hpf", "lpf", "notch", "allpass"):
+        # Allpass has unity magnitude by construction; treat as 0 dB
+        # for the per-band magnitude check (it cannot contribute boost).
         return 0.0
 
     coeffs = freq_gain_q_to_biquad(
@@ -293,7 +295,7 @@ class SafetyValidator:
         """Reject any boost below the profile's min boost frequency."""
         floor = self._profile.min_boost_freq_hz
         for f in filters:
-            if f.type == "hpf":
+            if f.type in ("hpf", "allpass"):
                 continue
             if _is_boost(f) and f.freq < floor:
                 return ValidationResult.failed(
@@ -314,7 +316,7 @@ class SafetyValidator:
         """
         threshold = self._profile.freq_dependent_boost_threshold_hz
         for f in filters:
-            if f.type == "hpf":
+            if f.type in ("hpf", "allpass"):
                 continue
             limit = (
                 self._profile.max_boost_per_band_db
@@ -337,7 +339,7 @@ class SafetyValidator:
         ceiling = self._profile.max_cumulative_boost_db
         cumulative: dict[float, float] = {}
         for f in filters:
-            if f.type == "hpf" or not _is_boost(f):
+            if f.type in ("hpf", "allpass") or not _is_boost(f):
                 continue
             centre = _third_octave_for_freq(f.freq)
             cumulative[centre] = cumulative.get(centre, 0.0) + f.gain_db

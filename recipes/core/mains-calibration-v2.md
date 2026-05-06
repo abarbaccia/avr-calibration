@@ -151,6 +151,20 @@ is rejected, retry with a milder version.
   YES (FRO, CEN, SUA at minimum; SBK if 7.x). After ANY Fin commit during
   this recipe, re-issue `SSSPCCEN YES` / `SSSPCSUA YES` (the commit resets
   them — see `feedback_avr_layout_push_does_not_engage_sspc.md`).
+- **TODO — atmos visibility confirmation**. Telnet `SSSPC ?` does NOT
+  enumerate height/ceiling channels (TFL/TFR/TRL/TRR), so we can't verify
+  programmatically that atmos is engaged. After every layout push, ASK
+  the user to confirm on the AVR menu (`Setup → Speakers → Speaker
+  Configuration`) that all expected height channels are listed. If
+  missing, the issue is almost always `Setup → Speakers → Amp Assign`
+  reverting from a `.4` (atmos) layout to plain `5.1ch` / `7.1ch` — the
+  .ady envelope's `enAmpAssignType` doesn't change Amp Assign mode, only
+  the speaker-config payload, so the user must set Amp Assign manually
+  on the AVR menu to re-engage the atmos preamp outs. Future
+  improvement: probe + report the active Amp Assign via Telnet
+  (commands like `SSAMSP ?` returned blank on X3800H; needs further
+  RE) and either include it in `check_system` or pass it through
+  `push_avr_speaker_layout`.
 
 ### 0.2 Backup + stale-state check
 - Verify a recent `.ady` is on disk (will be Phase 6's layout-push baseline
@@ -781,6 +795,15 @@ peak to correct or *what* parameter value to apply are solver-shaped
 and don't belong in an LLM-first recipe.
 
 ### Capabilities not yet wired
+
+- **Atmos sweep_channel support in `measure`** — current `sweep_channel`
+  arg accepts FL/FR/C/LFE/SL/SR/SBL/SBR (HDMI channels 1-8). Atmos
+  channels (TFL/TFR/TRL/TRR = HDMI ch 7+ in 5.1.4 layouts) aren't
+  supported, so v2 Phase 1 cannot solo-sweep atmos for baseline. For
+  iter1 those channels just get passthrough FIRs in Phase 6. Future
+  improvement: extend the measure tool's HDMI channel map to cover
+  TFL/TFR/TML/TMR/TRL/TRR + the higher channels.
+
 
 - **No `average_sessions` MCP tool** — multi-position averaging is
   approximated in Phase 1 by a single head-shift session used as a
