@@ -501,7 +501,7 @@ def playback_for_route(
     route: str,
     *,
     hdmi_alsa_device: str | None = None,
-    hdmi_channels: int = 8,
+    hdmi_channels: int = 6,
 ) -> PlaybackStrategy:
     """Factory: return the right playback strategy for the configured route.
 
