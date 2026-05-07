@@ -4785,14 +4785,22 @@ def _resolve_sweep_range(
     return resolved_min, resolved_max, " + ".join(source_parts)
 
 
-# HDMI multi-channel PCM channel layout as interpreted by the Denon X3800H.
-# Verified empirically: ch3=LFE (sweep to muted subs → no signal at mic),
-# ch4=C. Order: FL, FR, LFE, C, RL, RR, SBL, SBR.
+# HDMI multi-channel PCM channel layout — Microsoft-style 5.1.
+# Verified empirically 2026-05-07 against Denon X3800H + Pi 5 vc4-hdmi:
+#   PCM ch 1 = FL    PCM ch 2 = FR    PCM ch 3 = LFE
+#   PCM ch 4 = FC    PCM ch 5 = RL    PCM ch 6 = RR
+# This matches the vc4-hdmi driver's chmap-fixed table entries that
+# include FC: ALL of them place LFE at index 3 and FC at index 4.
+# The AVR honors the HDMI Audio InfoFrame chmap. Without explicit
+# --chmap override, the driver picks `FL,FR,LFE,NA,RC,NA` for AVRs
+# whose EDID advertises back-center, leaving FC unmappable. The
+# playback driver passes --chmap=FL,FR,LFE,FC,RL,RR explicitly to
+# force the FC-aware chmap. See project_hdmi_multichannel_kernel_blocked.md.
 _HDMI_CHANNEL_MAP: dict[str, int] = {
     "FL": 1, "L": 1, "front_left": 1,
     "FR": 2, "R": 2, "front_right": 2,
     "LFE": 3, "sub": 3, "subs": 3,
-    "C": 4, "center": 4, "centre": 4,
+    "C": 4, "center": 4, "centre": 4, "FC": 4,
     "SL": 5, "surround_left": 5, "LS": 5, "RL": 5,
     "SR": 6, "surround_right": 6, "RS": 6, "RR": 6,
     "SBL": 7, "surround_back_left": 7,
