@@ -417,12 +417,29 @@ class HDMIAplayPlayback:
             callback=_rec_callback,
         )
 
+        # Force the chmap that has FC at index 4. Without this, the
+        # vc4-hdmi driver picks `FL,FR,LFE,NA,RC,NA` for AVRs whose EDID
+        # advertises back-center — that maps PCM ch 4 to NA, so any
+        # Center sweep goes nowhere (AVR drops it or routes by fallback
+        # to sub). With --chmap=FL,FR,LFE,FC,RL,RR explicit, ch 4 = FC,
+        # ch 5 = RL, ch 6 = RR — all reachable. Verified 2026-05-07
+        # against amixer numid=2 reading values 3,4,8,7,5,6,0,0.
+        chmap_for_channels = {
+            2: "FL,FR",
+            4: "FL,FR,LFE,FC",
+            6: "FL,FR,LFE,FC,RL,RR",
+        }
+        chmap_arg = chmap_for_channels.get(n_channels)
         aplay_cmd = [
             "aplay",
             "-D", self.alsa_device,
             "-c", str(n_channels),
             "-r", str(sample_rate),
             "-f", "S16_LE",
+        ]
+        if chmap_arg is not None:
+            aplay_cmd.extend(["--chmap", chmap_arg])
+        aplay_cmd += [
             "-t", "raw",
             "-q",  # quiet — don't pollute MCP logs with progress chatter
             "-",
