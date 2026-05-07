@@ -514,11 +514,91 @@ class HDMIAplayPlayback:
         return sweep_1d, rec_1d
 
 
+class LoopbackRefPlayback:
+    """Decorator strategy: wrap any base PlaybackStrategy and capture a
+    parallel electrical reference channel during sweep playback.
+
+    The reference is an ALSA capture device (snd-aloop or a Scarlett
+    input) that taps the audio chain downstream of the AVR (or
+    downstream of CamillaDSP for sub measurements). Cross-correlating
+    the recorded mic vs the recorded reference (instead of vs the
+    analytical sweep template) isolates pure acoustic delay from
+    upstream processing latency — AVR FIR pre-ring, CamillaDSP
+    buffering, USB jitter. Sub-millisecond timing accuracy.
+
+    Per project_loopback_alignment_rig.md, this is task #50's deliverable.
+
+    Status: SKELETON — interface stable, ref capture not yet wired. The
+    base strategy still runs as before; this class adds the capture
+    plumbing once the ALSA / CamillaDSP YAML for the ref path is built.
+    Production use requires:
+      Phase 1a (sub):  CamillaDSP YAML adds a 2nd playback to
+                       hw:Loopback,1,X carrying a copy of the sub-bus
+                       signal; ref_device = "hw:Loopback,1,X" capture.
+      Phase 1b (HDMI): asound.conf `multi` plugin fans aplay output to
+                       both vc4hdmi0 AND hw:Loopback,1,X; same ref capture.
+      Phase 2 (per-speaker): AVR pre-out → Scarlett input N; ref_device
+                       = "hw:USB,0" with channel index N, captured in
+                       parallel during sweep.
+
+    Returns ``(sweep_1d, mic_1d, ref_1d)`` triple. Callers that don't
+    care about ref bypass via ``measure(loopback_ref=False)`` and use
+    the base strategy's 2-tuple shape.
+    """
+
+    def __init__(
+        self,
+        base: PlaybackStrategy,
+        ref_device: str,
+        ref_channels: int = 1,
+        ref_channel_index: int = 1,  # 1-based
+    ) -> None:
+        if ref_channels < 1:
+            raise ValueError(f"ref_channels must be >= 1, got {ref_channels}")
+        if not (1 <= ref_channel_index <= ref_channels):
+            raise ValueError(
+                f"ref_channel_index ({ref_channel_index}) must be in "
+                f"[1, {ref_channels}]"
+            )
+        self.base = base
+        self.ref_device = ref_device
+        self.ref_channels = int(ref_channels)
+        self.ref_channel_index = int(ref_channel_index)
+
+    def play_and_record(self, sweep, sample_rate, in_channel, out_channel):
+        """Run base playback + capture loopback ref in parallel.
+
+        Implementation TODO: open a third sd.InputStream on
+        ``self.ref_device`` synchronized with the base strategy's mic
+        InputStream. For HDMIAplayPlayback the ref stream lifecycle is
+        the same as the existing UMIK stream — start before aplay,
+        stop after aplay returns. For USBPlayback similar pairing.
+
+        Until wired, delegates to base and returns zeros for ref so the
+        signature is stable and callers can detect "ref not present"
+        via all-zero check or len comparison.
+        """
+        sweep_1d, mic_1d = self.base.play_and_record(
+            sweep, sample_rate, in_channel, out_channel,
+        )
+        import numpy as np
+        ref_1d = np.zeros_like(mic_1d)
+        log.warning(
+            "LoopbackRefPlayback: ref capture not yet wired (ref_device=%s) "
+            "— returning zeros. See project_loopback_alignment_rig.md.",
+            self.ref_device,
+        )
+        return sweep_1d, mic_1d, ref_1d
+
+
 def playback_for_route(
     route: str,
     *,
     hdmi_alsa_device: str | None = None,
     hdmi_channels: int = 6,
+    loopback_ref_device: str | None = None,
+    loopback_ref_channels: int = 1,
+    loopback_ref_channel_index: int = 1,
 ) -> PlaybackStrategy:
     """Factory: return the right playback strategy for the configured route.
 
@@ -528,11 +608,29 @@ def playback_for_route(
         enumeration inside containers).
       - ``hdmi_alsa_device`` None → legacy PortAudio-based ``HDMIPlayback``,
         kept for back-compat with callers that don't yet plumb a device.
+
+    Loopback ref:
+      - ``loopback_ref_device`` set (e.g. ``"hw:Loopback,1,0"`` or
+        ``"hw:USB,0"``) → wraps the base strategy in
+        ``LoopbackRefPlayback`` to capture an electrical reference
+        channel alongside the mic. Returns 3-tuples (sweep, mic, ref)
+        instead of 2-tuples. See project_loopback_alignment_rig.md.
     """
     if route == "hdmi":
         if hdmi_alsa_device:
-            return HDMIAplayPlayback(
+            base: PlaybackStrategy = HDMIAplayPlayback(
                 alsa_device=hdmi_alsa_device, channels=hdmi_channels,
             )
-        return HDMIPlayback()
-    return USBPlayback()
+        else:
+            base = HDMIPlayback()
+    else:
+        base = USBPlayback()
+
+    if loopback_ref_device is not None:
+        return LoopbackRefPlayback(
+            base=base,
+            ref_device=loopback_ref_device,
+            ref_channels=loopback_ref_channels,
+            ref_channel_index=loopback_ref_channel_index,
+        )
+    return base
