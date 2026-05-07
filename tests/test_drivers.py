@@ -2673,3 +2673,111 @@ async def test_denon_sweep_exit_restores_sound_mode_after_override():
 
     # On exit, the saved DTS SURROUND must be restored.
     mock_receiver.soundmode.async_set_sound_mode.assert_any_call("DTS SURROUND")
+
+
+# ── LoopbackRefPlayback (task #50 skeleton) ─────────────────────────────────────
+
+
+def test_loopback_ref_playback_construction() -> None:
+    """LoopbackRefPlayback wraps a base strategy and stores ref params."""
+    from calibrate.drivers.playback import LoopbackRefPlayback, USBPlayback
+
+    base = USBPlayback()
+    wrapper = LoopbackRefPlayback(
+        base=base, ref_device="hw:Loopback,1,0",
+        ref_channels=2, ref_channel_index=1,
+    )
+    assert wrapper.base is base
+    assert wrapper.ref_device == "hw:Loopback,1,0"
+    assert wrapper.ref_channels == 2
+    assert wrapper.ref_channel_index == 1
+
+
+def test_loopback_ref_playback_validates_channel_index() -> None:
+    """ref_channel_index out of [1, ref_channels] raises."""
+    from calibrate.drivers.playback import LoopbackRefPlayback, USBPlayback
+
+    base = USBPlayback()
+    with pytest.raises(ValueError, match="ref_channel_index"):
+        LoopbackRefPlayback(
+            base=base, ref_device="hw:dummy",
+            ref_channels=2, ref_channel_index=3,  # out of range
+        )
+    with pytest.raises(ValueError, match="ref_channel_index"):
+        LoopbackRefPlayback(
+            base=base, ref_device="hw:dummy",
+            ref_channels=2, ref_channel_index=0,  # 0-based bug guard
+        )
+
+
+def test_loopback_ref_playback_validates_channel_count() -> None:
+    """ref_channels < 1 raises."""
+    from calibrate.drivers.playback import LoopbackRefPlayback, USBPlayback
+
+    base = USBPlayback()
+    with pytest.raises(ValueError, match="ref_channels"):
+        LoopbackRefPlayback(
+            base=base, ref_device="hw:dummy",
+            ref_channels=0, ref_channel_index=1,
+        )
+
+
+def test_playback_for_route_no_ref_returns_base() -> None:
+    """Without loopback_ref_device, factory returns the base strategy unchanged."""
+    from calibrate.drivers.playback import (
+        USBPlayback, HDMIAplayPlayback, LoopbackRefPlayback, playback_for_route,
+    )
+
+    p_usb = playback_for_route("usb")
+    assert isinstance(p_usb, USBPlayback)
+    assert not isinstance(p_usb, LoopbackRefPlayback)
+
+    p_hdmi = playback_for_route(
+        "hdmi", hdmi_alsa_device="default:CARD=vc4hdmi0", hdmi_channels=6,
+    )
+    assert isinstance(p_hdmi, HDMIAplayPlayback)
+    assert not isinstance(p_hdmi, LoopbackRefPlayback)
+
+
+def test_playback_for_route_with_ref_wraps_in_loopback() -> None:
+    """With loopback_ref_device set, factory wraps base in LoopbackRefPlayback."""
+    from calibrate.drivers.playback import (
+        LoopbackRefPlayback, USBPlayback, playback_for_route,
+    )
+
+    p = playback_for_route(
+        "usb",
+        loopback_ref_device="hw:Loopback,1,0",
+        loopback_ref_channels=2, loopback_ref_channel_index=1,
+    )
+    assert isinstance(p, LoopbackRefPlayback)
+    assert isinstance(p.base, USBPlayback)
+    assert p.ref_device == "hw:Loopback,1,0"
+
+
+def test_loopback_ref_playback_returns_three_tuple() -> None:
+    """play_and_record returns (sweep, mic, ref) triple even when ref is stubbed."""
+    from unittest.mock import MagicMock
+    from calibrate.drivers.playback import LoopbackRefPlayback
+    import numpy as np
+
+    # Mock base strategy that returns a known 2-tuple.
+    fake_sweep = np.array([0.1, 0.2, 0.3])
+    fake_mic = np.array([0.0, 0.5, 0.0])
+    base = MagicMock()
+    base.play_and_record.return_value = (fake_sweep, fake_mic)
+
+    sweep_obj = MagicMock()
+    sweep_obj.timeSignal = MagicMock()
+
+    wrapper = LoopbackRefPlayback(
+        base=base, ref_device="hw:Loopback,1,0",
+    )
+    result = wrapper.play_and_record(sweep_obj, 48000, 1, 1)
+    assert len(result) == 3, f"expected 3-tuple, got {len(result)}"
+    sweep_1d, mic_1d, ref_1d = result
+    np.testing.assert_array_equal(sweep_1d, fake_sweep)
+    np.testing.assert_array_equal(mic_1d, fake_mic)
+    # Ref is stubbed as zeros until full capture wiring lands.
+    assert len(ref_1d) == len(fake_mic)
+    assert (ref_1d == 0).all(), "stub should return all-zero ref"
