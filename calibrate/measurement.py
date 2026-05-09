@@ -848,27 +848,67 @@ class MeasurementEngine:
         # Plain C = IFFT(conj(X)·Y) is useless: a log sweep has most of its
         # energy at low frequencies, so the cross-correlation is dominated
         # by a broad low-frequency hump that peaks at lag 0 regardless of
-        # actual travel time. We bandlimit to the sub's operating range
-        # (30–150 Hz) and peak on the Hilbert envelope within a physical
-        # travel-time window (≥1 ms, ≤20 ms → 0.3–6.9 m path).
+        # actual travel time. Bandlimit the correlation to the sweep's
+        # actual frequency range and peak on the Hilbert envelope within
+        # a physical travel-time window.
+        #
+        # Bandpass selection (2026-05-08 fix): previously hardcoded 30-150 Hz
+        # (sub band). For mains sweeps (100-5000 Hz), most direct sound
+        # energy is ABOVE 150 Hz — the old bandpass filtered the signal
+        # to noise, causing argmax to lock onto ALSA stream-startup
+        # transients at lag ≈ 0. Now: use a band intersecting the sweep
+        # range and the audible direct-sound band (~80-2000 Hz upper
+        # limit gives broadband content while excluding HF reflections).
+        bp_lo = max(30.0, float(freq_min) * 1.2)
+        bp_hi = min(2000.0, float(freq_max) * 0.8, sample_rate * 0.4)
+        if bp_hi <= bp_lo + 50.0:
+            bp_lo = max(30.0, float(freq_min))
+            bp_hi = min(sample_rate * 0.4, float(freq_max))
         C_full = np.fft.irfft(np.conj(X) * Y, n=n)
         try:
             from scipy.signal import butter, sosfiltfilt, hilbert
-            sos = butter(4, [30.0, 150.0], btype="band", fs=sample_rate, output="sos")
+            sos = butter(4, [bp_lo, bp_hi], btype="band", fs=sample_rate, output="sos")
             C_bp = sosfiltfilt(sos, C_full)
             envelope = np.abs(hilbert(C_bp))
         except Exception as _xexc:  # scipy missing or filter edge case
             envelope = np.abs(C_full)
             log.warning("xcorr bandpass/hilbert unavailable (%s); using raw |C|", _xexc)
-        # After fixed-strip in measure(), the IR is anchored at (PRE_DELAY_S −
-        # SWEEP_SAFETY_S) relative to play start, so the direct arrival sits at
-        # (~100 ms pre-sweep silence residue) + ALSA-start-jitter + sub→mic
-        # travel. Search the whole first 200 ms to catch it even with jitter.
-        lo_idx = max(1, int(0.001 * sample_rate))
+        # Floor at 3 ms (≈1 m acoustic) — skip ALSA stream-startup transients
+        # that consistently produce a spurious argmax peak at lag ≈ 0.
+        lo_idx = max(1, int(0.003 * sample_rate))
         hi_idx = min(n, int(0.200 * sample_rate))
         if hi_idx <= lo_idx:
             hi_idx = min(n, lo_idx + 1)
-        rel_idx = int(np.argmax(envelope[lo_idx:hi_idx]))
+        # ── First-arrival onset detection (2026-05-08 fix) ─────────────
+        # Replaces argmax (which locks on the LARGEST envelope peak — often
+        # a strong reflection or AVR processing artifact) with first-arrival
+        # detection: find the first sample where envelope rises above a
+        # threshold proportional to the global peak. Direct sound is the
+        # FIRST significant arrival; reflections/processing artifacts
+        # come later. argmax IR analysis was producing absurd inter-channel
+        # delta times (5 to 150 ms range across mains) because it picked
+        # a different feature on each channel. Onset detection picks the
+        # consistent first-arrival point.
+        env_window = envelope[lo_idx:hi_idx]
+        if len(env_window) > 0 and float(np.max(env_window)) > 0.0:
+            global_peak = float(np.max(env_window))
+            threshold = 0.10 * global_peak  # 10% of peak — catches onset edge
+            above = env_window > threshold
+            # First sample at or above threshold = direct-sound onset
+            if np.any(above):
+                rel_idx = int(np.argmax(above))
+                # Refine: find the local maximum within ±2 ms of onset for
+                # sub-sample-stable peak time (envelope plateau makes argmax
+                # noisy; local max near the onset is more stable than the
+                # threshold-crossing sample itself).
+                refine_lo = max(0, rel_idx - int(0.002 * sample_rate))
+                refine_hi = min(len(env_window), rel_idx + int(0.002 * sample_rate))
+                rel_idx = refine_lo + int(np.argmax(env_window[refine_lo:refine_hi]))
+            else:
+                # Fallback: no signal above threshold — use argmax (legacy)
+                rel_idx = int(np.argmax(env_window))
+        else:
+            rel_idx = 0
         xcorr_peak_idx = lo_idx + rel_idx
         xcorr_peak_ms = round(xcorr_peak_idx / sample_rate * 1000.0, 3)
         xcorr_peak_sign = 1 if C_full[xcorr_peak_idx] >= 0.0 else -1

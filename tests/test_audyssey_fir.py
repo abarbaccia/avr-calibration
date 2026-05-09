@@ -20,6 +20,7 @@ from calibrate.audyssey_fir import (
     decompose_filter,
     design_correction_ir,
     design_passthrough_ir,
+    smooth_target_curve,
     filter_config_for,
     generate_window,
     get_channel_byte,
@@ -303,3 +304,53 @@ def test_design_correction_ir_sub_pipes_through_convert_xt32() -> None:
     avr_taps = convert_xt32(ir)
     assert len(avr_taps) == 704
     assert all(np.isfinite(avr_taps))
+
+
+# ── Sub-floor target smoothing (A1Evo-style mitigation) ───────────────
+
+
+def test_smooth_target_curve_passes_above_floor_through_unchanged() -> None:
+    """Targets above the floor frequency should not be modified."""
+    freqs = [200.0, 500.0, 1000.0, 5000.0]
+    gains = [+3.0, -2.0, 0.0, +1.5]
+    out_freqs, out_gains = smooth_target_curve(
+        freqs, gains, floor_hz=200.0, octaves=1.0,
+    )
+    assert out_freqs == freqs
+    for a, b in zip(gains, out_gains):
+        assert a == pytest.approx(b)
+
+
+def test_smooth_target_curve_smooths_narrow_notch_below_floor() -> None:
+    """A single-point -12 dB notch at 70 Hz should get spread out to a
+    much shallower, broader feature after octave-smoothing."""
+    freqs = [20, 50, 60, 70, 80, 100, 200, 1000, 20000]
+    gains = [0,  0,  0, -12,  0,  0,    0,    0,    0]
+    _, smoothed = smooth_target_curve(
+        freqs, gains, floor_hz=200.0, octaves=1.0,
+    )
+    # Index 3 is the 70 Hz point. Original was -12 dB; after octave smoothing
+    # it should be much shallower (the surrounding 0 dB samples drag it up).
+    assert smoothed[3] > -6.0, f"70 Hz still too deep after smoothing: {smoothed[3]}"
+    assert smoothed[3] < 0.0, f"70 Hz lost the cut entirely: {smoothed[3]}"
+    # Above the floor (200, 1000, 20000 Hz) the values are untouched.
+    assert smoothed[6] == pytest.approx(0.0)
+    assert smoothed[7] == pytest.approx(0.0)
+
+
+def test_smooth_target_curve_disabled_when_floor_zero() -> None:
+    freqs = [20, 70, 200, 20000]
+    gains = [0, -12, 0, 0]
+    _, smoothed = smooth_target_curve(freqs, gains, floor_hz=0.0)
+    # With floor=0, nothing is below it, so no smoothing.
+    for a, b in zip(gains, smoothed):
+        assert a == pytest.approx(b)
+
+
+def test_smooth_target_curve_empty_inputs() -> None:
+    assert smooth_target_curve([], []) == ([], [])
+
+
+def test_smooth_target_curve_mismatched_lengths_raises() -> None:
+    with pytest.raises(ValueError, match="same length"):
+        smooth_target_curve([20.0, 100.0], [0.0])

@@ -173,12 +173,18 @@ class _NoOpSweepContext:
     def __init__(self) -> None:
         self.active = False
 
-    async def __aenter__(self) -> "_NoOpSweepContext":
+    async def enter(self) -> "_NoOpSweepContext":
         self.active = True
         return self
 
-    async def __aexit__(self, *_) -> None:
+    async def exit(self) -> None:
         self.active = False
+
+    async def __aenter__(self) -> "_NoOpSweepContext":
+        return await self.enter()
+
+    async def __aexit__(self, *_) -> None:
+        await self.exit()
 
 
 class CamillaDSPDriver(DSPDriver):
