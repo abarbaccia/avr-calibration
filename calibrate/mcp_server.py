@@ -3934,6 +3934,7 @@ async def _tool_design_modal_fir(
     anchor: dict | None = None,
     compensation_notch: bool = False,
     gabor_n_cycles: int = 3,
+    auto_samplerate: bool = True,
 ) -> dict:
     """Design a modal-aware mixed-phase FIR with explicit per-mode treatment.
 
@@ -4218,9 +4219,24 @@ async def _tool_design_modal_fir(
         except Exception:
             modal_cap_db = 14.0
 
+        # Auto-detect live DSP sample rate so coefficients land at the rate
+        # CamillaDSP runs at. Designing at 48 kHz when DSP processes at 96 kHz
+        # halves every modal frequency in the FIR (47 Hz → 23.5 Hz). Caller
+        # can opt out via auto_samplerate=False if they really need a specific
+        # design rate (e.g. offline analysis).
+        effective_samplerate = int(samplerate)
+        effective_num_taps = int(num_taps)
+        if auto_samplerate and _dsp is not None:
+            live_rate = int(getattr(_dsp.capabilities, "fir_sample_rate_hz", 0) or 0)
+            if live_rate and live_rate != effective_samplerate:
+                # Scale num_taps proportionally so the time-domain span (in ms)
+                # stays the same — required for modal cancellation correctness.
+                effective_num_taps = int(round(num_taps * live_rate / samplerate))
+                effective_samplerate = live_rate
+
         designer = ModalAwareFIRDesigner(
-            sample_rate=int(samplerate),
-            n_taps=int(num_taps),
+            sample_rate=effective_samplerate,
+            n_taps=effective_num_taps,
             max_pre_ring_ms=float(max_pre_ring_ms),
         )
         coeffs, summary = designer.design(
@@ -4500,6 +4516,8 @@ async def _tool_design_avr_fir(
     target_curve_db: list[dict],
     cache_key: str,
     samplerate_hz: float = 48000.0,
+    auto_smooth_below_hz: float = 200.0,
+    smooth_octaves: float = 1.0,
 ) -> dict:
     """Design + polyphase-decimate an AVR-format FIR for one channel.
 
@@ -4537,6 +4555,7 @@ async def _tool_design_avr_fir(
     """
     from .audyssey_fir import (
         convert_xt32, design_correction_ir, get_channel_byte, is_sub_channel,
+        smooth_target_curve,
     )
 
     if not target_curve_db:
@@ -4561,10 +4580,23 @@ async def _tool_design_avr_fir(
     gains = [gains[i] for i in order]
 
     is_sub = is_sub_channel(channel_id)
+    # Pre-smooth low-frequency target features. The polyphase decimation in
+    # convert_xt32 heavily attenuates narrow notches below ~200 Hz (a -6 dB
+    # cut at 70 Hz lands as ~-2 dB). A1EvoAcoustica handles this by refusing
+    # to design narrow features below 200 Hz at all and pre-smoothing
+    # everything to 1/1-octave; we mirror that behaviour. Above 200 Hz the
+    # polyphase format has full resolution (verified empirically: -6 dB at
+    # 117 Hz lands as -6.6 dB).
+    smoothed_freqs, smoothed_gains = smooth_target_curve(
+        freqs, gains,
+        samplerate_hz=float(samplerate_hz),
+        octaves=float(smooth_octaves),
+        floor_hz=float(auto_smooth_below_hz),
+    )
     try:
         ir = design_correction_ir(
-            target_freqs_hz=freqs,
-            target_gain_db=gains,
+            target_freqs_hz=smoothed_freqs,
+            target_gain_db=smoothed_gains,
             is_sub=is_sub,
             samplerate_hz=float(samplerate_hz),
         )
@@ -4575,15 +4607,33 @@ async def _tool_design_avr_fir(
     _AVR_FIR_CACHE[(str(cache_key), channel_id)] = coefs
     import numpy as np
     arr = np.asarray(coefs)
+
+    # Report what was smoothed so the caller can see how the request was
+    # interpreted. Each entry: requested target vs the value actually used
+    # for design after sub-floor smoothing.
+    smoothing_report = []
+    for f, requested, used in zip(freqs, gains, smoothed_gains):
+        if abs(requested - used) > 0.01:
+            smoothing_report.append({
+                "freq_hz": f,
+                "requested_db": requested,
+                "after_smoothing_db": used,
+            })
+
     return _ok(
         channel_id=channel_id,
         cache_key=str(cache_key),
         fir_taps=len(coefs),
         peak_amplitude=float(np.max(np.abs(arr))) if len(arr) else 0.0,
         is_sub=is_sub,
+        auto_smooth_below_hz=float(auto_smooth_below_hz),
+        smooth_octaves=float(smooth_octaves),
+        smoothing_changes=smoothing_report,
         message=(
             f"Designed {len(coefs)}-tap AVR FIR for {channel_id} "
             f"({'sub' if is_sub else 'speaker'} chain). "
+            f"Targets below {auto_smooth_below_hz:.0f} Hz pre-smoothed to "
+            f"{smooth_octaves:.1f}-oct. "
             f"Cached as ({cache_key!r}, {channel_id!r})."
         ),
     )
@@ -8983,6 +9033,34 @@ _TOOLS: list[Tool] = [
                     ),
                     "default": 48000,
                 },
+                "auto_smooth_below_hz": {
+                    "type": "number",
+                    "description": (
+                        "Frequency floor below which target curve points "
+                        "are smoothed (1/1-octave by default) before the "
+                        "IR is designed. The polyphase decimation in the "
+                        "AVR's FIR format heavily attenuates narrow "
+                        "features below ~200 Hz — empirically a -6 dB cut "
+                        "at 70 Hz lands as ~-2 dB. A1EvoAcoustica handles "
+                        "this by not EQ-ing below 200 Hz at all; we "
+                        "auto-smooth the target so the polyphase loss is "
+                        "absorbed predictably. Set to 0 to disable. "
+                        "Default 200."
+                    ),
+                    "default": 200,
+                },
+                "smooth_octaves": {
+                    "type": "number",
+                    "description": (
+                        "Width of the moving-average smoother applied "
+                        "below auto_smooth_below_hz. 1.0 = full-octave "
+                        "(matches A1Evo's REW match-target setting). "
+                        "Wider = smoother, narrower = preserves more of "
+                        "the requested shape but risks polyphase loss. "
+                        "Default 1.0."
+                    ),
+                    "default": 1.0,
+                },
             },
             "required": ["channel_id", "target_curve_db", "cache_key"],
         },
@@ -11826,6 +11904,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             target_curve_db=list(arguments["target_curve_db"]),
             cache_key=str(arguments["cache_key"]),
             samplerate_hz=float(arguments.get("samplerate_hz", 48000.0)),
+            auto_smooth_below_hz=float(arguments.get("auto_smooth_below_hz", 200.0)),
+            smooth_octaves=float(arguments.get("smooth_octaves", 1.0)),
         )
     elif name == "apply_avr_fir":
         result = await _tool_apply_avr_fir(

@@ -567,6 +567,76 @@ def design_correction_ir(
     return ir.tolist()
 
 
+def smooth_target_curve(
+    target_freqs_hz: Sequence[float],
+    target_gain_db: Sequence[float],
+    *,
+    samplerate_hz: float = 48000.0,
+    octaves: float = 1.0,
+    floor_hz: float = 200.0,
+) -> tuple[list[float], list[float]]:
+    """Smooth a target EQ curve below ``floor_hz`` with an ``octaves``-wide
+    log-frequency moving average.
+
+    Why: the AVR's polyphase decomposition (``convert_xt32``) heavily
+    smooths narrow features in the lower bands. Empirically a -6 dB notch
+    at 70 Hz designed naively lands as ~-2 dB on hardware; A1EvoAcoustica
+    sidesteps this by pre-smoothing targets to 1/1-octave and refusing to
+    EQ below 200 Hz with REW's match-target. We do the same: anything
+    below ``floor_hz`` gets octave-smoothed so narrow notches the AVR
+    can't reproduce never enter the design.
+
+    Above ``floor_hz`` the polyphase format has full resolution (verified
+    empirically: -6 dB at 117 Hz lands as -6.6 dB, ~100% delivery), so
+    that band is left untouched.
+
+    Returns (freqs_hz, gains_db) — same shape as the inputs.
+    """
+    if len(target_freqs_hz) != len(target_gain_db):
+        raise ValueError("target_freqs_hz and target_gain_db must be same length")
+    if len(target_freqs_hz) == 0:
+        return [], []
+
+    freqs = np.asarray(target_freqs_hz, dtype=np.float64)
+    gains = np.asarray(target_gain_db, dtype=np.float64)
+    # Sort by frequency.
+    order = np.argsort(freqs)
+    freqs = freqs[order]
+    gains = gains[order]
+
+    # If everything is above the floor, nothing to smooth.
+    if not np.any(freqs < floor_hz):
+        return freqs.tolist(), gains.tolist()
+
+    # Build a dense log-frequency grid covering the user's range, do the
+    # smoothing there, then resample back to the user's freqs.
+    lo = max(float(freqs[0]), 1.0)
+    hi = max(float(freqs[-1]), lo * 1.001)
+    dense_log = np.linspace(np.log10(lo), np.log10(hi), 1024)
+    dense = 10.0 ** dense_log
+    dense_gain = np.interp(np.log10(dense), np.log10(freqs), gains)
+
+    # Octave-wide moving average (in log-frequency space).
+    half_oct = octaves / 2.0
+    smoothed = dense_gain.copy()
+    for i, f in enumerate(dense):
+        if f >= floor_hz:
+            continue  # leave above-floor alone
+        f_lo = f / (2.0 ** half_oct)
+        f_hi = f * (2.0 ** half_oct)
+        mask = (dense >= f_lo) & (dense <= f_hi)
+        smoothed[i] = float(dense_gain[mask].mean())
+
+    # Resample back to user frequencies. Above floor, return original; below,
+    # return the smoothed values.
+    out_gains = np.where(
+        freqs < floor_hz,
+        np.interp(np.log10(freqs), dense_log, smoothed),
+        gains,
+    )
+    return freqs.tolist(), out_gains.tolist()
+
+
 def design_passthrough_ir(*, is_sub: bool) -> list[float]:
     """Build a zero-gain passthrough impulse response of the AVR-expected
     length (16,321 speaker / 16,055 sub).
