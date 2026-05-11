@@ -173,6 +173,217 @@ def parse_umik_cal_curve(cal_path: str) -> list[tuple[float, float]]:
     return sorted(points, key=lambda p: p[0])
 
 
+def design_weighting_filter(weighting: str, sample_rate: int):
+    """Return (b, a) biquad-cascade coefficients for IEC 61672 weighting.
+
+    Args:
+        weighting: 'A', 'C', or 'Z' (case-insensitive). 'Z' returns identity.
+        sample_rate: target audio sample rate in Hz.
+
+    Returns:
+        (b, a) for `scipy.signal.lfilter`.
+
+    A-weighting: rolls off bass + extreme HF, models ear at quiet levels.
+    C-weighting: ~flat 30 Hz - 10 kHz with mild rolloff at extremes, models
+        ear at loud levels — used for cinema reference (Dolby/THX 75 dB target).
+    Z-weighting: no weighting (linear).
+    """
+    import numpy as np
+    from scipy.signal import bilinear
+
+    w = weighting.upper()
+    if w == "Z":
+        return np.array([1.0]), np.array([1.0])
+
+    pi = np.pi
+    if w == "C":
+        # C-weighting (IEC 61672): poles at ±f1 (×2) and ±f4 (×2).
+        f1 = 20.598997
+        f4 = 12194.217
+        # Analog transfer: H(s) = K · s² / [(s + 2πf1)² · (s + 2πf4)²]
+        # We use the gain that makes |H(jω)| = 1 at 1 kHz (the standard).
+        nums = np.array([(2 * pi * f4) ** 2, 0.0, 0.0])
+        dens = np.poly([
+            -2 * pi * f1, -2 * pi * f1,
+            -2 * pi * f4, -2 * pi * f4,
+        ])
+    elif w == "A":
+        # A-weighting: poles at ±f1 (×2), ±f2, ±f3, ±f4 (×2).
+        f1 = 20.598997
+        f2 = 107.65265
+        f3 = 737.86223
+        f4 = 12194.217
+        nums = np.array([(2 * pi * f4) ** 2, 0.0, 0.0, 0.0, 0.0])
+        dens = np.poly([
+            -2 * pi * f1, -2 * pi * f1,
+            -2 * pi * f2,
+            -2 * pi * f3,
+            -2 * pi * f4, -2 * pi * f4,
+        ])
+    else:
+        raise ValueError(f"weighting must be 'A', 'C', or 'Z', got {weighting!r}")
+
+    # Bilinear transform to digital. scipy.signal.bilinear handles the prewarp.
+    b, a = bilinear(nums, dens, fs=float(sample_rate))
+    # Normalize so |H(j2π·1000)| = 1 (= 0 dB at 1 kHz, per the standards).
+    from scipy.signal import freqz
+    _, h_at_ref = freqz(b, a, worN=[1000.0], fs=float(sample_rate))
+    gain_at_ref = np.abs(h_at_ref[0])
+    if gain_at_ref > 0:
+        b = b / gain_at_ref
+    return b, a
+
+
+def measure_pink_spl(
+    *,
+    duration_s: float = 10.0,
+    level_dbfs: float = -20.0,
+    sample_rate: int = 48000,
+    weighting: str = "C",
+    play_buffer: "np.ndarray | None" = None,
+    output_channel: int = 0,
+    n_output_channels: int = 6,
+    mic_device_index: int | None = None,
+    hdmi_device_index: int | None = None,
+    umik_cal_path: str | None = None,
+    integration_time_s: float = 1.0,
+) -> dict:
+    """Play pink noise on one channel, record from UMIK, return absolute SPL.
+
+    Generates ``duration_s`` of pink noise at ``level_dbfs`` (RMS), plays on
+    the chosen output channel via HDMI, captures from the UMIK, and computes:
+
+      - time-averaged dB SPL with the requested weighting (default C, cinema)
+      - peak SPL
+      - per-block time series of SPL values (``integration_time_s`` blocks)
+
+    Returns dict with: ``spl_db``, ``spl_peak_db``, ``per_block_db``,
+    ``weighting``, ``level_dbfs``, ``recording_peak_dbfs``, ``calibrated``.
+
+    UMIK calibration: if ``umik_cal_path`` is provided AND the file's header
+    parses cleanly, the dBFS→dB SPL offset is applied. Otherwise the result
+    is reported as relative dBFS (``calibrated`` field will be False).
+    """
+    import numpy as np
+    from scipy.signal import lfilter
+
+    rng = np.random.default_rng(42)
+    n_samples = int(duration_s * sample_rate)
+
+    if play_buffer is None:
+        # Pink noise via Voss-McCartney would be lower-overhead, but spectral
+        # accuracy from FFT-shaping is more important for SPL measurement.
+        white = rng.normal(size=n_samples).astype(np.float32)
+        # Shape spectrum to 1/f (pink): multiply FFT by 1/sqrt(f).
+        spec = np.fft.rfft(white)
+        freqs = np.fft.rfftfreq(n_samples, 1.0 / sample_rate)
+        freqs[0] = freqs[1]  # avoid div-by-zero at DC
+        spec = spec / np.sqrt(freqs)
+        pink = np.fft.irfft(spec, n=n_samples).astype(np.float32)
+        # Normalise to target RMS = level_dbfs.
+        target_rms = 10.0 ** (level_dbfs / 20.0)
+        actual_rms = float(np.sqrt(np.mean(pink ** 2)))
+        if actual_rms > 0:
+            pink = pink * (target_rms / actual_rms)
+        # Hard-clip to ±1.0 (rare for pink at -20 dBFS, but pathological
+        # peaks happen at long durations).
+        pink = np.clip(pink, -1.0, 1.0)
+        # Build multichannel buffer with pink on the chosen channel only.
+        # MultichannelPlayback expects int16 for HDMI (sounddevice quirk).
+        buf_f32 = np.zeros((n_samples, n_output_channels), dtype=np.float32)
+        buf_f32[:, output_channel] = pink
+        buf = (buf_f32 * 32767.0).astype(np.int16)
+    else:
+        buf = play_buffer
+
+    # Play + record using the same MultichannelPlayback path as
+    # play_and_measure_fft.
+    from .drivers.playback import MultichannelPlayback
+    import sounddevice as sd
+
+    devices = sd.query_devices()
+    if mic_device_index is None:
+        mic_device_index = _find_umik_device(devices)
+    if mic_device_index is None:
+        raise RuntimeError("UMIK not found")
+    if hdmi_device_index is None:
+        cands = [
+            (i, d) for i, d in enumerate(devices)
+            if d["max_output_channels"] > 0 and "hdmi" in d["name"].lower()
+        ]
+        cands.sort(key=lambda x: (x[1]["name"].lower() != "hdmi", len(x[1]["name"])))
+        if cands:
+            hdmi_device_index = cands[0][0]
+    if hdmi_device_index is None:
+        raise RuntimeError("No HDMI output device found")
+
+    player = MultichannelPlayback()
+    recording, n_rec = player.play_and_record(
+        buf, sample_rate, mic_device_index, hdmi_device_index,
+    )
+    if len(recording) == 0:
+        raise RuntimeError("Recording is empty — no audio captured")
+
+    rec = np.asarray(recording, dtype=np.float64)
+    # Apply weighting filter to the time-domain recording.
+    b, a = design_weighting_filter(weighting, sample_rate)
+    weighted = lfilter(b, a, rec) if len(b) > 1 else rec
+
+    # Trim head + tail to skip start-up transients (typical SPL meter "slow"
+    # is 1 s exponential; we approximate with hard 1-s window blocks after
+    # trimming the first 0.5 s).
+    skip = int(0.5 * sample_rate)
+    if skip < len(weighted):
+        weighted = weighted[skip:]
+
+    block_size = int(integration_time_s * sample_rate)
+    if block_size <= 0 or len(weighted) < block_size:
+        block_size = len(weighted)
+    n_blocks = max(1, len(weighted) // block_size)
+    per_block_rms = []
+    for i in range(n_blocks):
+        chunk = weighted[i * block_size : (i + 1) * block_size]
+        rms = float(np.sqrt(np.mean(chunk ** 2)))
+        per_block_rms.append(rms)
+    overall_rms = float(np.sqrt(np.mean(weighted ** 2)))
+
+    # Convert dBFS → dB SPL via UMIK calibration if available.
+    offset = 0.0
+    calibrated = False
+    if umik_cal_path:
+        try:
+            offset = parse_umik_sensitivity(umik_cal_path)
+            calibrated = True
+        except (FileNotFoundError, ValueError):
+            offset = 0.0
+            calibrated = False
+
+    def to_spl(rms: float) -> float:
+        if rms <= 0:
+            return -200.0
+        dbfs = 20.0 * np.log10(rms)
+        return float(dbfs + offset)
+
+    overall_spl = to_spl(overall_rms)
+    per_block_spl = [to_spl(r) for r in per_block_rms]
+    peak_abs = float(np.max(np.abs(weighted)))
+    peak_spl = (
+        20.0 * np.log10(peak_abs) + offset if peak_abs > 0 else -200.0
+    )
+
+    return {
+        "spl_db": round(overall_spl, 2),
+        "spl_peak_db": round(peak_spl, 2),
+        "per_block_db": [round(v, 2) for v in per_block_spl],
+        "n_blocks": n_blocks,
+        "weighting": weighting.upper(),
+        "level_dbfs": level_dbfs,
+        "duration_s": duration_s,
+        "calibrated": calibrated,
+        "umik_offset_db": round(offset, 2) if calibrated else None,
+    }
+
+
 def apply_mic_correction(
     frequencies: list[float],
     spl: list[float],

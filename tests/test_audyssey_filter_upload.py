@@ -97,7 +97,7 @@ def test_build_envelope_includes_core_fields(
     keys = [k for k, _ in build_set_dat_envelope(minimal_ady, minimal_avr_status)]
     for required in (
         "AmpAssign", "AssignBin", "SpConfig", "Distance", "ChLevel",
-        "Crossover", "AudyFinFlg", "AudyDynEq", "AudyEqRef", "AudyMultEQ",
+        "Crossover", "AudyFinFlg", "AudyDynEq", "AudyEqRef", "AudyMultEq",
         "SWSetup",
     ):
         assert required in keys, f"missing required field {required!r}"
@@ -110,24 +110,26 @@ def test_audyfinflg_defaults_to_notfin(
     assert ordered["AudyFinFlg"] == "NotFin"
 
 
-def test_audymulteq_uses_capital_q(
+def test_audymulteq_uses_lowercase_q(
     minimal_ady: dict, minimal_avr_status: dict
 ) -> None:
-    """The field name has a capital Q at the end. Lowercase q is a NACK."""
+    """The field name is lowercase q (`AudyMultEq`). Capital Q is silently
+    dropped by the X3800H parser and collapses SSSPC on Fin commit —
+    verified 2026-05-10 on a 5.1.4 layout."""
     ordered = dict(build_set_dat_envelope(minimal_ady, minimal_avr_status))
-    assert "AudyMultEQ" in ordered
-    assert "AudyMultEq" not in ordered
+    assert "AudyMultEq" in ordered
+    assert "AudyMultEQ" not in ordered
 
 
 def test_calibration_settings_use_correct_types(
     minimal_ady: dict, minimal_avr_status: dict
 ) -> None:
-    """AudyDynEq/AudyDynVol/AudyMultEQ/AudyLfc are bools, AudyEqRef is int.
+    """AudyDynEq/AudyDynVol/AudyMultEq/AudyLfc are bools, AudyEqRef is int.
     Wrong types trigger a NACK."""
     ordered = dict(build_set_dat_envelope(minimal_ady, minimal_avr_status))
     assert isinstance(ordered["AudyDynEq"], bool)
     assert isinstance(ordered["AudyDynVol"], bool)
-    assert isinstance(ordered["AudyMultEQ"], bool)
+    assert isinstance(ordered["AudyMultEq"], bool)
     assert isinstance(ordered["AudyLfc"], bool)
     assert isinstance(ordered["AudyEqRef"], int) and not isinstance(ordered["AudyEqRef"], bool)
     assert isinstance(ordered["AudyLfcLev"], int) and not isinstance(ordered["AudyLfcLev"], bool)
@@ -144,11 +146,13 @@ def test_distance_override_replaces_ady_value(
         )
     )
     distance_arrays = ordered["Distance"]
-    # 3 measurement positions per minimal_ady fixture
+    # Per A1Evo: one single-key dict per detected channel (FL, FR, SW1)
     assert len(distance_arrays) == 3
-    for pos in distance_arrays:
-        assert pos["SW1"] == 2000  # 20.0 m × 100 cm/m
-        assert pos["FL"] == 405    # untouched (.ady customDistance × 100)
+    merged = {k: v for d in distance_arrays for k, v in d.items()}
+    assert merged["SW1"] == 2000  # 20.0 m × 100 cm/m
+    assert merged["FL"] == 405    # untouched (.ady customDistance × 100)
+    for d in distance_arrays:
+        assert len(d) == 1, f"expected single-key dict, got {d}"
 
 
 def test_distance_override_only_affects_named_channels(
@@ -161,9 +165,9 @@ def test_distance_override_only_affects_named_channels(
             distances_override_m={"FL": 10.0},
         )
     )
-    pos = ordered["Distance"][0]
-    assert pos["FL"] == 1000
-    assert pos["FR"] == 420  # unaffected
+    merged = {k: v for d in ordered["Distance"] for k, v in d.items()}
+    assert merged["FL"] == 1000
+    assert merged["FR"] == 420  # unaffected
 
 
 def test_subwoofer_crossover_set_to_F_string(
@@ -171,9 +175,9 @@ def test_subwoofer_crossover_set_to_F_string(
 ) -> None:
     """Speaker type "E" (subwoofer) gets crossover "F" (full-range)."""
     ordered = dict(build_set_dat_envelope(minimal_ady, minimal_avr_status))
-    crossover_arr = ordered["Crossover"][0]
-    assert crossover_arr["SW1"] == "F"
-    assert crossover_arr["FL"] == 80
+    merged = {k: v for d in ordered["Crossover"] for k, v in d.items()}
+    assert merged["SW1"] == "F"
+    assert merged["FL"] == 80
 
 
 def test_channel_level_uses_dbx10_int(
@@ -181,9 +185,9 @@ def test_channel_level_uses_dbx10_int(
 ) -> None:
     """AVR encodes ChLevel as integer dB × 10."""
     ordered = dict(build_set_dat_envelope(minimal_ady, minimal_avr_status))
-    chlevel = ordered["ChLevel"][0]
-    assert chlevel["FL"] == -15   # -1.5 dB × 10
-    assert chlevel["SW1"] == 20   # +2.0 dB × 10
+    merged = {k: v for d in ordered["ChLevel"] for k, v in d.items()}
+    assert merged["FL"] == -15   # -1.5 dB × 10
+    assert merged["SW1"] == 20   # +2.0 dB × 10
 
 
 def test_calibration_settings_override(
@@ -216,7 +220,7 @@ def test_default_calibration_settings_match_oca_reference() -> None:
         "AudyEqRef": 0,
         "AudyDynVol": False,
         "AudyDynSet": "L",
-        "AudyMultEQ": True,
+        "AudyMultEq": True,
         "AudyEqSet": "Flat",
         "AudyLfc": False,
         "AudyLfcLev": 3,
