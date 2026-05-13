@@ -115,7 +115,8 @@ VOLUME ["/data"]
 COPY recipes/ /app/recipes/
 COPY deploy/entrypoint.sh /entrypoint.sh
 COPY deploy/entrypoint-with-mcp.sh /entrypoint-with-mcp.sh
-RUN chmod +x /entrypoint.sh /entrypoint-with-mcp.sh
+COPY deploy/fix-scarlett-routing.sh /fix-scarlett-routing.sh
+RUN chmod +x /entrypoint.sh /entrypoint-with-mcp.sh /fix-scarlett-routing.sh
 
 # Starts minidspd + uvicorn over plain HTTP (browser is read-only dashboard).
 CMD ["/entrypoint.sh"]

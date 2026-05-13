@@ -4515,7 +4515,7 @@ async def test_design_fir_min_phase_magnitude_matches_target() -> None:
         # that triggered the original bug. Skip 65536 in CI for speed.
         for num_taps in (4_096, 8_192):
             with patch("calibrate.storage.SessionStore") as MockStore:
-                MockStore.return_value.list_sessions.return_value = [session]
+                _wire_mock_store(MockStore, [session])
                 result = await _tool_design_fir(
                     session_id=1,
                     num_taps=num_taps,
