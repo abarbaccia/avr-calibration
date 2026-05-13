@@ -28,12 +28,19 @@ Crucial behaviours discovered while reverse-engineering this protocol:
      AVR NACKs the entire write.
 
   2. Field types matter — the AVR rejects mistyped fields silently. Booleans
-     stay booleans; integers stay integers; the `AudyMultEQ` field name has
-     a capital `Q` at the end (`AudyMultEQ`, not `AudyMultEq`).
+     stay booleans; integers stay integers; the `AudyMultEq` field name is
+     lowercase `q` (NOT `AudyMultEQ` — the capital-Q form is silently dropped
+     by the X3800H parser, which on Fin commit re-derives MultEQ state and
+     collapses unmentioned channels in SSSPC).
 
-  3. Field order: AmpAssign, AssignBin, SpConfig, Distance, ChLevel,
+  3. Per-channel arrays (SpConfig, Distance, ChLevel, Crossover) are LISTS
+     OF SINGLE-KEY DICTS — one dict per channel: [{FL:"S"},{C:"S"},...].
+     The X3800H rejects (silently mis-parses) the per-position multi-key
+     shape and collapses the layout to 2.1 on Fin commit.
+
+  4. Field order: AmpAssign, AssignBin, SpConfig, Distance, ChLevel,
      Crossover, AudyFinFlg, AudyDynEq, AudyEqRef, AudyDynVol, AudyDynSet,
-     AudyMultEQ, AudyEqSet, AudyLfc, AudyLfcLev, SWSetup.
+     AudyMultEq, AudyEqSet, AudyLfc, AudyLfcLev, SWSetup.
 
   4. The AudyFinFlg=Fin commit at the end IS required — without it the
      firmware re-validates Distance on EXIT_AUDMD and snaps it back to
@@ -105,7 +112,7 @@ DEFAULT_CALIBRATION_SETTINGS: dict[str, object] = {
     "AudyEqRef": 0,
     "AudyDynVol": False,
     "AudyDynSet": "L",
-    "AudyMultEQ": True,   # NOTE the capital Q
+    "AudyMultEq": True,
     "AudyEqSet": "Flat",
     "AudyLfc": False,
     "AudyLfcLev": 3,
@@ -124,7 +131,7 @@ SETDAT_PARAM_ORDER: tuple[str, ...] = (
     "AudyEqRef",
     "AudyDynVol",
     "AudyDynSet",
-    "AudyMultEQ",
+    "AudyMultEq",
     "AudyEqSet",
     "AudyLfc",
     "AudyLfcLev",
@@ -209,70 +216,74 @@ def build_set_dat_envelope(
     if not detected:
         raise ValueError(".ady has no detectedChannels — cannot build envelope")
 
-    overrides = dict(distances_override_m or {})
+    dist_ov = dict(distances_override_m or {})
 
-    # n_pos = max length of any channel's responseData dict
-    n_pos = 1
+    # Per A1Evo convention (and the X3800H's parser): the four per-channel
+    # arrays are LISTS OF SINGLE-KEY DICTS — one dict per detected channel.
+    # The X3800H silently mis-parses the per-position multi-key-dict shape
+    # and re-derives SSSPC from COEFDT data alone, collapsing channels not
+    # included in the COEFDT stream to NO. Verified 2026-05-10: pushing
+    # this envelope with all 10 channels in the multi-key-dict shape still
+    # collapsed 5.1.4 → 2.1. The single-key-dict shape matches
+    # build_full_envelope_payload (audyssey_tcp.py) which preserves layout.
+    spconfig: list[dict] = []
+    distance: list[dict] = []
+    chlevel: list[dict] = []
+    crossover: list[dict] = []
     for c in detected:
-        rd = c.get("responseData")
-        if isinstance(rd, dict) and rd:
-            n_pos = max(n_pos, len(rd))
+        cid = c.get("commandId")
+        if not cid:
+            continue
+        sp = c.get("customSpeakerType") or ""
+        if not sp or sp == "?":
+            sp = "E" if cid.startswith("SW") else "S"
 
-    # Per-channel maps. Distance can be overridden; the rest come from .ady.
-    sp_config: dict[str, str] = {}
-    distance_cm: dict[str, int] = {}
-    ch_level_dbx10: dict[str, int] = {}
-    crossover: dict[str, object] = {}
-    for c in detected:
-        cid = c["commandId"]
-        sp_config[cid] = c.get("customSpeakerType", "S")
+        m = float(dist_ov.get(cid, c.get("customDistance", 0.0) or 0.0))
+        trim_db = float(c.get("trimAdjustment", 0.0) or 0.0)
 
-        m = float(overrides.get(cid, c.get("customDistance", 0.0)))
-        distance_cm[cid] = round(m * 100)
-
-        trim_db = float(c.get("trimAdjustment", 0.0))
-        ch_level_dbx10[cid] = int(trim_db * 10)
-
-        speaker_type = sp_config[cid]
-        # Subwoofer ("E") and Large ("L") get "F" crossover; everything else
-        # uses customCrossover (Hz integer). Match A1Evo's convention.
-        if speaker_type in ("E", "L"):
-            crossover[cid] = "F"
+        if sp in ("E", "L"):
+            xover: int | str = "F"
         else:
-            xover = c.get("customCrossover", 80)
-            crossover[cid] = int(xover) if not isinstance(xover, str) else xover
+            xv = c.get("customCrossover", 80)
+            xover = int(xv) if not isinstance(xv, str) else xv
 
-    sw_setup = avr_status.get("SWSetup")
-    if isinstance(sw_setup, dict) and sw_setup.get("SWNum") is not None:
-        try:
-            sw_num = int(sw_setup["SWNum"])
-        except (TypeError, ValueError):
-            sw_num = 0
-        sw_setup_value = (
-            {"SWNum": sw_num, "SWMode": "Standard", "SWLayout": "N/A"}
-            if sw_num > 0
-            else None
-        )
-    else:
-        sw_setup_value = None
+        spconfig.append({cid: sp})
+        distance.append({cid: round(m * 100)})
+        chlevel.append({cid: int(round(trim_db * 10))})
+        crossover.append({cid: xover})
+
+    # AmpAssign / AssignBin: prefer .ady values (canonical) over AVR-status
+    # readback which can be stale during a Fin commit. Derive enum from .ady.
+    enmp_to_ampassign = {0: "Normal", 1: "BiAmp", 2: "SBack", 3: "Front", 4: "Surr"}
+    amp_assign = (
+        enmp_to_ampassign.get(int(ady.get("enAmpAssignType", 0) or 0), "Normal")
+        if ady.get("enAmpAssignType") is not None
+        else avr_status.get("AmpAssign")
+    )
+    assign_bin = ady.get("ampAssignInfo") or avr_status.get("AssignBin") or ""
+
+    # SWSetup: the X3800H needs the static A1Evo shape during the FIR
+    # upload Fin — using the avr_status readback dropped PSSWL/SWMode
+    # state on 2026-05-10. Match build_full_envelope_payload defaults.
+    sw_setup_value = {"SWNum": 1, "SWMode": "N/A", "SWLayout": "N/A"}
 
     settings = dict(DEFAULT_CALIBRATION_SETTINGS)
     if calibration_settings:
         settings.update(calibration_settings)
 
     values: dict[str, object | None] = {
-        "AmpAssign": avr_status.get("AmpAssign"),
-        "AssignBin": avr_status.get("AssignBin") or ady.get("ampAssignInfo"),
-        "SpConfig": [dict(sp_config) for _ in range(n_pos)] if sp_config else None,
-        "Distance": [dict(distance_cm) for _ in range(n_pos)] if distance_cm else None,
-        "ChLevel": [dict(ch_level_dbx10) for _ in range(n_pos)] if ch_level_dbx10 else None,
-        "Crossover": [dict(crossover) for _ in range(n_pos)] if crossover else None,
+        "AmpAssign": amp_assign,
+        "AssignBin": assign_bin,
+        "SpConfig": spconfig if spconfig else None,
+        "Distance": distance if distance else None,
+        "ChLevel": chlevel if chlevel else None,
+        "Crossover": crossover if crossover else None,
         "AudyFinFlg": settings["AudyFinFlg"],
         "AudyDynEq": settings["AudyDynEq"],
         "AudyEqRef": settings["AudyEqRef"],
         "AudyDynVol": settings["AudyDynVol"],
         "AudyDynSet": settings["AudyDynSet"],
-        "AudyMultEQ": settings["AudyMultEQ"],
+        "AudyMultEq": settings["AudyMultEq"],
         "AudyEqSet": settings["AudyEqSet"],
         "AudyLfc": settings["AudyLfc"],
         "AudyLfcLev": settings["AudyLfcLev"],

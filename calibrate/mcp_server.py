@@ -4650,6 +4650,7 @@ async def _tool_apply_avr_fir(
     inter_packet_delay_ms: float = 25.0,
     commit_fin: bool = True,
     abort_fin_on_nack: bool = True,
+    allow_partial: bool = False,
 ) -> dict:
     """Push cached AVR-format FIR coefficients to the receiver.
 
@@ -4706,6 +4707,26 @@ async def _tool_apply_avr_fir(
 
     available = channels_in_ady(ady)
     selected = list(channel_ids) if channel_ids else list(available)
+
+    # Coverage gate: refuse to push a SUBSET of the .ady's detected channels
+    # unless the caller explicitly opts in via allow_partial=True. Channels
+    # left untouched keep whatever stale FIR is in flash, which under
+    # MultEQ:FLAT can silently attenuate the bus (verified 2026-05-09: pushing
+    # FL/FR/C/SLA/SRA but skipping SW1 left SW1's stored MultEQ FIR cutting
+    # the LFE → sub-pre-out path to noise floor). Default to refuse so a
+    # partial push surfaces explicitly.
+    not_pushed = [c for c in available if c not in selected]
+    if not_pushed and not allow_partial:
+        return _err(
+            f"partial push refused — channel_ids={selected!r} but the .ady "
+            f"detected {available!r}; the un-selected channels {not_pushed!r} "
+            f"keep stale FIRs that may attenuate or distort their output "
+            f"under MultEQ:FLAT/REFERENCE. Either design+push a passthrough "
+            f"FIR for every detected channel, OR pass allow_partial=True if "
+            f"you have intentionally pre-pushed the others under the same "
+            f"AVR power cycle and they are known good."
+        )
+
     missing_in_cache: list[str] = []
     channel_filters: dict[str, list[float]] = {}
     for cid in selected:
@@ -5221,6 +5242,51 @@ async def _tool_play_and_measure_fft(
     except Exception as exc:
         log.exception("play_and_measure_fft failed")
         return _err(f"play_and_measure_fft error: {exc}")
+
+
+async def _tool_measure_spl_pink(
+    channel: int,
+    duration_s: float = 10.0,
+    level_dbfs: float = -20.0,
+    weighting: str = "C",
+    n_output_channels: int = 6,
+    integration_time_s: float = 1.0,
+) -> dict:
+    """Pink-noise-based absolute SPL measurement on one HDMI channel.
+
+    Plays -level_dbfs (default -20 dBFS) pink noise for ``duration_s`` on
+    the chosen HDMI channel, captures from UMIK, applies UMIK calibration
+    + IEC 61672 weighting, returns dB SPL.
+
+    Use case: cinema reference level audit. Set AVR to MV0, then call
+    measure_spl_pink for each main; target is 75 dB C-slow per main /
+    85 dB C-slow on LFE bus per Dolby/THX.
+    """
+    try:
+        from .measurement import measure_pink_spl
+
+        cfg = _config()
+        sample_rate = int(cfg.measurement.get("sample_rate", 48000))
+        cal_path = cfg._data.get("mic", {}).get("cal_file")
+
+        # Run the blocking play+capture in an executor.
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: measure_pink_spl(
+                duration_s=duration_s,
+                level_dbfs=level_dbfs,
+                sample_rate=sample_rate,
+                weighting=weighting,
+                output_channel=channel,
+                n_output_channels=n_output_channels,
+                umik_cal_path=cal_path,
+                integration_time_s=integration_time_s,
+            ),
+        )
+        return _ok(channel=channel, **result)
+    except Exception as exc:
+        log.exception("measure_spl_pink failed")
+        return _err(f"measure_spl_pink error: {exc}")
 
 
 async def _tool_assign_headroom_tones(
@@ -9184,6 +9250,22 @@ _TOOLS: list[Tool] = [
                     ),
                     "default": True,
                 },
+                "allow_partial": {
+                    "type": "boolean",
+                    "description": (
+                        "Coverage gate. When False (default), refuses to "
+                        "push if `channel_ids` is a subset of the .ady's "
+                        "detected channels. Verified 2026-05-09: pushing "
+                        "FL/FR/C/SLA/SRA but skipping SW1 left SW1's stored "
+                        "MultEQ FIR silently attenuating the LFE → sub-pre-"
+                        "out path to noise floor under MultEQ:FLAT. Default "
+                        "behaviour now: design+push a passthrough FIR for "
+                        "EVERY detected channel. Set True only when you "
+                        "have intentionally pushed the others under the "
+                        "same AVR power cycle and trust their stored state."
+                    ),
+                    "default": False,
+                },
             },
             "required": ["host", "ady_path", "cache_key"],
         },
@@ -11791,6 +11873,72 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="measure_spl_pink",
+        description=(
+            "Play -20 dBFS pink noise on one HDMI channel, capture from UMIK, "
+            "return absolute dB SPL with optional weighting (C / A / Z). "
+            "Used for cinema reference level audit (target: 75 dB C-slow on "
+            "each main, 85 dB C-slow on the LFE bus, source = -20 dBFS pink, "
+            "AVR at MV0). UMIK calibration (.cal sensitivity offset) is "
+            "applied automatically when config.mic.cal_file is set. "
+            "Returns spl_db (overall), spl_peak_db, per_block_db (1-s blocks "
+            "= SPL-meter slow integration), n_blocks, weighting, calibrated, "
+            "umik_offset_db. SET AVR VOLUME TO REFERENCE (MV0) BEFORE CALLING."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "channel": {
+                    "type": "integer",
+                    "description": (
+                        "HDMI channel index (0-based; 0=FL, 1=FR, 2=LFE, "
+                        "3=FC, 4=RL, 5=RR for the standard 5.1 chmap)."
+                    ),
+                },
+                "duration_s": {
+                    "type": "number",
+                    "description": "Pink noise duration (default 10s).",
+                    "default": 10.0,
+                },
+                "level_dbfs": {
+                    "type": "number",
+                    "description": (
+                        "Pink noise RMS level in dBFS. Cinema spec is "
+                        "-20 dBFS (default)."
+                    ),
+                    "default": -20.0,
+                },
+                "weighting": {
+                    "type": "string",
+                    "enum": ["C", "A", "Z"],
+                    "description": (
+                        "Frequency weighting. C = cinema (default), "
+                        "A = OSHA-style noise, Z = unweighted."
+                    ),
+                    "default": "C",
+                },
+                "n_output_channels": {
+                    "type": "integer",
+                    "description": (
+                        "HDMI output channel count. Default 6 for 5.1 PCM. "
+                        "Use 8 for 7.1, 2 for stereo."
+                    ),
+                    "default": 6,
+                },
+                "integration_time_s": {
+                    "type": "number",
+                    "description": (
+                        "Time-averaging window per block (default 1.0 s = "
+                        "SPL meter 'slow'). Smaller windows = more time "
+                        "resolution, less averaging."
+                    ),
+                    "default": 1.0,
+                },
+            },
+            "required": ["channel"],
+        },
+    ),
+    Tool(
         name="assign_headroom_tones",
         description=(
             "Assign non-overlapping multitone clusters to speakers for headroom testing. "
@@ -11917,6 +12065,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             target_curves=arguments.get("target_curves"),
             samplerates_hz=arguments.get("samplerates_hz"),
             inter_packet_delay_ms=float(arguments.get("inter_packet_delay_ms", 5.0)),
+            commit_fin=bool(arguments.get("commit_fin", True)),
+            abort_fin_on_nack=bool(arguments.get("abort_fin_on_nack", True)),
+            allow_partial=bool(arguments.get("allow_partial", False)),
         )
     elif name in ("measure", "trigger_measurement"):
         result = await _tool_trigger_measurement(
@@ -12334,6 +12485,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             duration_s=float(arguments.get("duration_s", 2.0)),
             amplitude=float(arguments.get("amplitude", 0.5)),
             fft_size=int(arguments.get("fft_size", 8192)),
+        )
+    elif name == "measure_spl_pink":
+        result = await _tool_measure_spl_pink(
+            channel=int(arguments["channel"]),
+            duration_s=float(arguments.get("duration_s", 10.0)),
+            level_dbfs=float(arguments.get("level_dbfs", -20.0)),
+            weighting=str(arguments.get("weighting", "C")),
+            n_output_channels=int(arguments.get("n_output_channels", 6)),
+            integration_time_s=float(arguments.get("integration_time_s", 1.0)),
         )
     elif name == "assign_headroom_tones":
         result = await _tool_assign_headroom_tones(

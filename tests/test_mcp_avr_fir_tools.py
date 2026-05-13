@@ -202,6 +202,7 @@ async def test_apply_avr_fir_unknown_channel_returns_error(
         ady_path=str(small_ady_file),
         cache_key="k",
         channel_ids=["FL", "BOGUS"],
+        allow_partial=True,
     )
     assert not res["ok"]
     assert "not in .ady" in res["error"]
@@ -246,10 +247,32 @@ async def test_apply_avr_fir_calls_push_with_resolved_filters(
 
 
 @pytest.mark.asyncio
-async def test_apply_avr_fir_subset_channels(
+async def test_apply_avr_fir_subset_refused_by_default(
     small_ady_file: Path,
 ) -> None:
-    """Caller can restrict the upload to a subset of channels."""
+    """A subset push leaves un-selected channels with stale FIRs that can
+    silently attenuate under MultEQ:FLAT/REFERENCE. Default-refuse so the
+    caller has to opt in explicitly."""
+    _AVR_FIR_CACHE[("k", "FL")] = [0.0] * 1024
+    _AVR_FIR_CACHE[("k", "SW1")] = [0.0] * 704
+
+    res = await _tool_apply_avr_fir(
+        host="192.0.2.1",
+        ady_path=str(small_ady_file),
+        cache_key="k",
+        channel_ids=["FL"],
+    )
+    assert not res["ok"]
+    assert "partial push refused" in res["error"]
+    assert "allow_partial=True" in res["error"]
+
+
+@pytest.mark.asyncio
+async def test_apply_avr_fir_subset_channels_with_allow_partial(
+    small_ady_file: Path,
+) -> None:
+    """Caller can restrict the upload to a subset of channels by passing
+    allow_partial=True, intentionally bypassing the safety gate."""
     _AVR_FIR_CACHE[("k", "FL")] = [0.0] * 1024
     _AVR_FIR_CACHE[("k", "SW1")] = [0.0] * 704
 
@@ -262,6 +285,7 @@ async def test_apply_avr_fir_subset_channels(
             ady_path=str(small_ady_file),
             cache_key="k",
             channel_ids=["FL"],
+            allow_partial=True,
         )
     assert res["ok"]
     assert res["channels_uploaded"] == ["FL"]
