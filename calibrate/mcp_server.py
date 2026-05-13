@@ -3520,7 +3520,6 @@ async def _tool_design_fir(
             return _err(f"session {session_id} has no frequency response data")
 
         import numpy as np
-        from scipy.signal import minimum_phase, firwin
 
         # Query the active driver for FIR limits; fall back to miniDSP constants
         # when no DSP is attached (e.g. unit tests exercising the math only).
@@ -3670,6 +3669,76 @@ async def _tool_design_fir(
         # Interpolate correction to FIR frequency grid
         fir_correction = np.interp(fir_freqs, freqs_measured, correction_linear, left=1.0, right=1.0)
 
+        # Min-phase from a magnitude spectrum via cepstral construction.
+        #
+        # Why we don't use scipy.signal.minimum_phase here: that function
+        # expects a SYMMETRIC linear-phase FIR (peak at the centre of the
+        # buffer) and uses ``half=True`` by default which returns
+        # sqrt(|H|) at half the length — neither of which is what a
+        # correction filter needs. It also requires
+        # n_fft >> len(h) to avoid cepstral aliasing; passing
+        # n_fft = len(h) (as the previous implementation did) made the
+        # cepstrum alias completely. At small num_taps the result was
+        # noisy but non-trivial; at num_taps ≥ 8192 the aliasing collapsed
+        # the output to a unit delta — so design_fir / apply_fir silently
+        # returned passthrough coefficients with NO frequency-domain
+        # correction. Two days of "calibrated" sub runs in production
+        # were unity passthroughs because of this.
+        #
+        # The cepstral construction below works directly from the desired
+        # magnitude response on a heavily oversampled FFT grid, which is
+        # the correct way to design a min-phase FIR from a magnitude
+        # specification.
+        def _min_phase_from_magnitude(
+            mag_rfft: np.ndarray, taps: int,
+        ) -> np.ndarray:
+            """Build a length-``taps`` min-phase FIR with the given magnitude.
+
+            ``mag_rfft`` is the desired non-negative magnitude on the
+            ``rfftfreq(n_grid, 1/fs)`` grid where ``n_grid`` is the full
+            FFT size implied by ``len(mag_rfft) = n_grid//2 + 1``. To
+            avoid time-aliasing of the cepstrum we oversample so that
+            ``n_grid >= 8 * taps``. The cepstrum-window construction is
+            standard (Oppenheim & Schafer, 3e §13.5).
+            """
+            # Original full FFT size implied by the rfft grid.
+            n_grid = (len(mag_rfft) - 1) * 2
+            # Oversample (in frequency) so the cepstrum is well-resolved.
+            min_grid = max(8 * taps, n_grid, 4096)
+            # Round up to a power of two for FFT speed.
+            n_os = 1 << (min_grid - 1).bit_length()
+            # Resample magnitude onto the oversampled rfft grid by linear
+            # interpolation in frequency. Using np.interp keeps the
+            # behaviour rate-agnostic and matches what the caller passed.
+            f_in = np.fft.rfftfreq(n_grid, d=1.0 / fir_fs)
+            f_out = np.fft.rfftfreq(n_os, d=1.0 / fir_fs)
+            mag_os = np.interp(f_out, f_in, mag_rfft, left=mag_rfft[0], right=mag_rfft[-1])
+            # Stabilise the log: clip the magnitude floor so log doesn't
+            # explode in stop-bands. The floor is set well below any real
+            # correction range (≈ -260 dB).
+            mag_floor = max(1e-13, float(np.max(mag_os)) * 1e-13)
+            mag_os = np.maximum(mag_os, mag_floor)
+            # Mirror to the full FFT (real, even-symmetric magnitude).
+            log_mag_full = np.empty(n_os, dtype=np.float64)
+            log_mag_full[: len(mag_os)] = np.log(mag_os)
+            # Mirror bins (1..n_os/2-1) to (n_os-1..n_os/2+1).
+            log_mag_full[len(mag_os):] = log_mag_full[1 : n_os - len(mag_os) + 1][::-1]
+            # Real cepstrum.
+            cepstrum = np.fft.ifft(log_mag_full).real
+            # Homomorphic window: keep zero & positive-time, double aliased
+            # negative-time copies (Oppenheim & Schafer eq 13.42b).
+            window = np.zeros(n_os)
+            window[0] = 1.0
+            half = n_os // 2
+            window[1:half] = 2.0
+            window[half] = 1.0  # n_os is even by construction
+            cepstrum *= window
+            # Back to spectrum, exponentiate, inverse FFT to time domain.
+            log_H_min = np.fft.fft(cepstrum)
+            h_min_full = np.fft.ifft(np.exp(log_H_min)).real
+            # First ``taps`` samples are the causal min-phase impulse.
+            return h_min_full[:taps].copy()
+
         # Design FIR via inverse FFT
         if phase_mode == "linear":
             # Linear phase: symmetric FIR, corrects both magnitude and phase
@@ -3681,17 +3750,18 @@ async def _tool_design_fir(
             fir_td *= window
             pre_ringing_ms = round((num_taps / 2) / fir_fs * 1000, 2)
         elif phase_mode == "minimum":
-            # Minimum phase: no pre-ringing, magnitude-only correction
-            H = fir_correction
-            fir_td = np.fft.irfft(H, n=n_fft)
-            # Convert to minimum phase
+            # Minimum phase: no pre-ringing, magnitude-only correction.
+            # Build directly from the desired magnitude spectrum so the
+            # cepstrum is well-conditioned at any tap count.
             try:
-                fir_td_mp = minimum_phase(fir_td[:num_taps * 2], method="homomorphic", n_fft=n_fft)
-                fir_td = fir_td_mp[:num_taps]
+                fir_td = _min_phase_from_magnitude(fir_correction, num_taps)
             except Exception:
-                # Fallback: truncate + window to reduce spectral leakage
-                log.warning("minimum_phase() failed, falling back to windowed truncation")
-                fir_td = fir_td[:num_taps] * np.hanning(num_taps)
+                log.warning(
+                    "min-phase cepstral build failed, falling back to windowed truncation"
+                )
+                H = fir_correction
+                fir_td_full = np.fft.irfft(H, n=n_fft)
+                fir_td = fir_td_full[:num_taps] * np.hanning(num_taps)
             pre_ringing_ms = 0.0
         else:  # mixed — proper homomorphic decomposition with bounded pre-ringing
             # Mixed-phase via the Kirkeby-style construction:
@@ -3707,14 +3777,18 @@ async def _tool_design_fir(
             H = fir_correction
             fir_td_full = np.fft.irfft(H, n=n_fft)
 
-            # Min-phase core — same path as phase_mode="minimum"
+            # Min-phase core — same path as phase_mode="minimum".
+            # Use the cepstral builder (works at any tap count) rather
+            # than scipy.signal.minimum_phase which silently collapsed
+            # to a unit delta at large num_taps because n_fft = len(h)
+            # caused complete cepstral aliasing.
             try:
-                fir_min = minimum_phase(
-                    fir_td_full[:num_taps * 2], method="homomorphic", n_fft=n_fft,
-                )
-                fir_min = fir_min[:num_taps]
+                fir_min = _min_phase_from_magnitude(fir_correction, num_taps)
             except Exception:
-                log.warning("minimum_phase() failed in mixed-phase; falling back to min-phase only")
+                log.warning(
+                    "min-phase cepstral build failed in mixed-phase; "
+                    "falling back to min-phase only"
+                )
                 fir_td = fir_td_full[:num_taps] * np.hanning(num_taps)
                 pre_ringing_ms = 0.0
                 # jump to post-mixed normalise/output path
