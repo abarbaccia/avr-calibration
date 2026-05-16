@@ -1,8 +1,14 @@
 # CODA — Calibration Orchestrator & Digital Acoustician
 
-A PhD acoustic engineer in your listening room — powered by an LLM, fed by a digital twin of your hardware and room, guided by AV community recipes and best practices.
+**A live-in acoustician for your home theater.** CODA hands the keys of your AVR, DSP, and measurement mic to an LLM that actually knows what it's doing — and lets you collaborate with it in plain English.
+
+Tell it "calibrate the subs for movies", "the bass sounds muddy at loud volumes", or "what are the biggest problems in my room?" — and it runs the sweeps, reads the frequency response, decides what's a fixable room mode vs an un-fixable cancellation null, designs PEQ and FIR filters inside hardware-safe limits, applies them, re-measures, and tells you what to do with your hands: move a sub eighteen inches toward the corner, add a bass trap on the back wall, stop here because no filter can fix this. It's the difference between a one-shot auto-cal and a calibration partner that builds an understanding of *your* specific room over time.
+
+**Why this exists.** Auto-cal (Audyssey, Dirac, ARC) gives you one answer and walks away. Manual REW + miniDSP gives you full control but assumes you already know what to do with it. CODA fills the gap: full measurement rigor, full DSP control, and a reasoning layer — what to fix, what to leave alone, what to recommend physically — driven by an LLM reading community recipes and accumulating knowledge across every session.
 
 It's not a batch process — it's a conversation with something that understands your room.
+
+## Example conversation
 
 > **help me calibrate the room**
 >
@@ -26,7 +32,7 @@ It's not a batch process — it's a conversation with something that understands
 >
 > Yes, but move sub 2 first — eighteen inches toward the corner fills the 65 Hz null for free. That's 80% of the benefit. Sub crawl takes 10 minutes. Third sub conversation after.
 
-## Five layers
+## How it works (five layers)
 
 ```
  ════════════ PHILOSOPHY ════════════

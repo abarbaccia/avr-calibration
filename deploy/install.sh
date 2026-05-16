@@ -177,7 +177,64 @@ if [ -f "$UPDATE_TIMER" ]; then
     echo "  Next run: $(systemctl show avr-calibration-update.timer --property=NextElapseUSecRealtime --value 2>/dev/null || echo 'unknown')"
 fi
 
-# ── 7. Done ───────────────────────────────────────────────────────────────
+# ── 7. Audio stack (audio-mode + watchdog + pikaraoke bridge) ─────────────
+#
+# Installs the host-side audio orchestration: mode switcher (listening/cal/
+# karaoke), the CamillaDSP watchdog, and the pikaraoke idle bridge. These
+# run on the Pi (not in a container) because they manage host services
+# (camilladsp.service, the pikaraoke Docker container) and need privileges.
+
+echo ""
+echo "--- Installing audio-stack scripts and services ---"
+
+# Root python needs websockets for the watchdog probe + audio-mode probe.
+# Without it the watchdog falls into a thrash loop restarting CamillaDSP
+# every ~20s. Use --break-system-packages on Debian 12+ (system pip is
+# externally-managed). Skip if already installed.
+if ! sudo python3 -c 'import websockets' 2>/dev/null; then
+    echo "Installing python3-websockets for root (watchdog/audio-mode probes)"
+    sudo pip3 install --break-system-packages websockets >/dev/null
+fi
+
+for f in audio-mode denon-watch.sh camilladsp-watchdog.sh; do
+    if [ -f "$SCRIPT_DIR/$f" ]; then
+        sudo install -m 0755 "$SCRIPT_DIR/$f" "/usr/local/sbin/$f"
+        echo "Installed: /usr/local/sbin/$f"
+    fi
+done
+
+# audio-mode.conf — only install if absent (don't clobber user edits).
+if [ -f "$SCRIPT_DIR/audio-mode.conf" ] && [ ! -f /etc/audio-mode.conf ]; then
+    sudo install -m 0644 "$SCRIPT_DIR/audio-mode.conf" /etc/audio-mode.conf
+    echo "Installed: /etc/audio-mode.conf  (edit to set KARAOKE_TRIGGER_INPUT)"
+fi
+
+for svc in camilladsp-watchdog.service denon-watch.service; do
+    if [ -f "$SCRIPT_DIR/$svc" ]; then
+        sudo cp "$SCRIPT_DIR/$svc" "/etc/systemd/system/$svc"
+        echo "Installed: /etc/systemd/system/$svc"
+    fi
+done
+
+# Retire the old dmix keepalive if it's still present from a previous install.
+if systemctl list-unit-files scarlett-keepalive.service >/dev/null 2>&1; then
+    sudo systemctl disable --now scarlett-keepalive.service 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/scarlett-keepalive.service
+fi
+
+sudo systemctl daemon-reload
+for svc in camilladsp-watchdog.service denon-watch.service; do
+    if [ -f "/etc/systemd/system/$svc" ]; then
+        sudo systemctl enable --now "$svc"
+    fi
+done
+
+# Land in listening mode (sets /run/audio-mode so the watchdog behaves).
+if [ -x /usr/local/sbin/audio-mode ]; then
+    sudo /usr/local/sbin/audio-mode set listening || true
+fi
+
+# ── 8. Done ───────────────────────────────────────────────────────────────
 
 echo ""
 echo "=== Setup complete ==="

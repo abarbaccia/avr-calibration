@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# CamillaDSP + avr-calibration liveness watchdog.
+#
+# Self-heals CamillaDSP when its audio thread dies but the process stays
+# alive (systemd reports "active" but no PCM flows — the failure mode that
+# silenced the subs for two days on 2026-05-13). Also drives the Pi 5's
+# onboard ACT/PWR LEDs as a glanceable health indicator and writes a
+# status JSON for any future dashboard.
+#
+# LED states (audio-mode driven, health overlay):
+#   listening : ACT solid green, PWR off
+#   cal       : ACT heartbeat green (slow blink) — calibration in progress
+#   karaoke   : ACT off, PWR solid red
+#   camilladsp stalled : ACT off, PWR fast-blink red  (overrides mode, except karaoke)
+#   avr-calibration container down : ACT heartbeat, PWR on (overlays listening only)
+#
+# Run as root via camilladsp-watchdog.service.
+
+set -u
+
+POLL_INTERVAL_S="${POLL_INTERVAL_S:-15}"
+CAMILLADSP_WS="${CAMILLADSP_WS:-ws://127.0.0.1:1234}"
+AVR_HEALTH_URL="${AVR_HEALTH_URL:-http://127.0.0.1:8000/health}"
+STATUS_FILE="${STATUS_FILE:-/run/avr-status.json}"
+LED_ACT="/sys/class/leds/ACT"
+LED_PWR="/sys/class/leds/PWR"
+STALL_RESTART_THRESHOLD="${STALL_RESTART_THRESHOLD:-2}"
+
+stall_count=0
+
+log() { echo "[watchdog] $*" >&2; }
+
+set_led() {
+    local led="$1" trigger="$2" brightness="$3"
+    [ -d "$led" ] || return 0
+    echo "$trigger"    > "$led/trigger"    2>/dev/null || true
+    echo "$brightness" > "$led/brightness" 2>/dev/null || true
+}
+
+set_led_state() {
+    case "$1" in
+        listening)
+            set_led "$LED_ACT" default-on 1
+            set_led "$LED_PWR" none 0
+            ;;
+        cal)
+            set_led "$LED_ACT" heartbeat 1
+            set_led "$LED_PWR" none 0
+            ;;
+        karaoke)
+            set_led "$LED_ACT" none 0
+            set_led "$LED_PWR" default-on 1
+            ;;
+        avr_down)
+            # Overlays listening: ACT heartbeats, PWR stays off.
+            set_led "$LED_ACT" heartbeat 1
+            set_led "$LED_PWR" none 0
+            ;;
+        camilla_stalled)
+            # Hard failure indicator: both off + PWR fast-blink.
+            set_led "$LED_ACT" none 0
+            set_led "$LED_PWR" timer 1
+            # Fast blink: 150 ms on / 150 ms off
+            echo 150 > "$LED_PWR/delay_on"  2>/dev/null || true
+            echo 150 > "$LED_PWR/delay_off" 2>/dev/null || true
+            ;;
+    esac
+}
+
+probe_camilladsp() {
+    # Returns 0 if CamillaDSP responds with state=Running, 1 otherwise.
+    # Uses python3 + websockets (already a CamillaDSP-stack dependency).
+    python3 - "$CAMILLADSP_WS" <<'PY' 2>/dev/null
+import asyncio, json, sys
+try:
+    import websockets
+except ImportError:
+    sys.exit(2)
+
+async def go(url):
+    try:
+        async with websockets.connect(url, open_timeout=3, close_timeout=2) as ws:
+            await ws.send('"GetState"')
+            resp = await asyncio.wait_for(ws.recv(), timeout=3)
+            data = json.loads(resp)
+            state = data.get("GetState", {}).get("value")
+            # Healthy states: Running (audio flowing), Starting (waiting for capture
+            # to deliver data — normal when LFE is silent), Paused (intentional).
+            # Failure states: Stalled, Inactive, anything unknown.
+            sys.exit(0 if state in ("Running", "Starting", "Paused") else 1)
+    except Exception:
+        sys.exit(1)
+
+asyncio.run(go(sys.argv[1]))
+PY
+}
+
+probe_avr_calibration() {
+    curl --silent --fail --max-time 3 "$AVR_HEALTH_URL" >/dev/null 2>&1
+}
+
+write_status() {
+    local camilla="$1" avr="$2" led="$3"
+    cat > "$STATUS_FILE" <<EOF
+{
+  "ts": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "camilladsp": "$camilla",
+  "avr_calibration": "$avr",
+  "led_state": "$led",
+  "stall_count": $stall_count
+}
+EOF
+}
+
+log "starting (poll=${POLL_INTERVAL_S}s, stall-restart=${STALL_RESTART_THRESHOLD})"
+
+while true; do
+    # audio-mode awareness: during karaoke, CamillaDSP is intentionally stopped.
+    # Skip the probe + self-heal path so the watchdog does not fight the mode switch.
+    if [ -r /run/audio-mode ] && [ "$(cat /run/audio-mode 2>/dev/null)" = "karaoke" ]; then
+        camilla="karaoke"
+        stall_count=0
+    elif probe_camilladsp; then
+        camilla="running"
+        stall_count=0
+    else
+        camilla="stalled"
+        stall_count=$((stall_count + 1))
+        log "CamillaDSP not Running (consecutive: $stall_count)"
+        if [ "$stall_count" -ge "$STALL_RESTART_THRESHOLD" ]; then
+            log "restarting camilladsp.service after $stall_count consecutive stalls"
+            systemctl restart camilladsp || log "systemctl restart failed"
+            # Give it a moment before next probe; don't reset stall_count here,
+            # the next successful probe will. If restart didn't help, we stay red.
+            sleep 5
+        fi
+    fi
+
+    if probe_avr_calibration; then
+        avr="up"
+    else
+        avr="down"
+    fi
+
+    audio_mode="unknown"
+    [ -r /run/audio-mode ] && audio_mode="$(cat /run/audio-mode 2>/dev/null)"
+
+    if [ "$camilla" = "stalled" ]; then
+        led_state="camilla_stalled"
+    elif [ "$audio_mode" = "karaoke" ]; then
+        led_state="karaoke"
+    elif [ "$audio_mode" = "cal" ]; then
+        led_state="cal"
+    elif [ "$avr" = "down" ]; then
+        led_state="avr_down"
+    else
+        led_state="listening"
+    fi
+
+    set_led_state "$led_state"
+    write_status "$camilla" "$avr" "$led_state"
+
+    sleep "$POLL_INTERVAL_S"
+done

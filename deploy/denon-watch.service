@@ -1,0 +1,14 @@
+[Unit]
+Description=Denon AVR state watcher — flips audio-mode based on AVR input
+After=network-online.target audio-mode.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/denon-watch.sh
+Restart=always
+RestartSec=15
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=CamillaDSP + avr-calibration liveness watchdog (LED + self-heal)
+After=camilladsp.service avr-calibration.service
+Wants=camilladsp.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/camilladsp-watchdog.sh
+Restart=always
+RestartSec=10
+# Needs root to write /sys/class/leds/*/trigger and to systemctl restart camilladsp.
+User=root
+
+[Install]
+WantedBy=multi-user.target

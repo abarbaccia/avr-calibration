@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# audio-mode — switch the Pi audio stack between listening / cal / karaoke.
+#
+# Modes:
+#   listening : CamillaDSP runs, pikaraoke container stopped, internal cal_mode=OFF.
+#               Normal home-theater operation. AVR sub pre-out → Scarlett input 3 →
+#               CamillaDSP → Scarlett output → subs.
+#   cal       : CamillaDSP runs, pikaraoke container stopped, internal cal_mode=ON.
+#               Calibration capture routing: snd-aloop → CamillaDSP, bypassing AVR.
+#               (Cal-mode capture flip is delegated to avr-calibration via HTTP.)
+#   karaoke   : CamillaDSP stopped, pikaraoke container running. pikaraoke owns
+#               the Scarlett directly — no dmix, no buzz.
+#
+# State file: /run/audio-mode (single token: listening|cal|karaoke).
+# Read by camilladsp-watchdog.sh so it does NOT self-heal CamillaDSP during karaoke.
+
+set -u
+
+STATE_FILE="${STATE_FILE:-/run/audio-mode}"
+CAMILLA_SVC="${CAMILLA_SVC:-camilladsp.service}"
+PIKARAOKE_CONTAINER="${PIKARAOKE_CONTAINER:-pikaraoke}"
+CAL_API_URL="${CAL_API_URL:-http://127.0.0.1:8000/api/cal-mode}"
+
+usage() {
+    cat <<EOF
+usage: audio-mode <command>
+
+commands:
+  get                       Print current mode (listening|cal|karaoke|unknown).
+  set <listening|cal|karaoke>
+                            Transition to the named mode.
+
+state file: $STATE_FILE
+EOF
+}
+
+log() { echo "[audio-mode] $*" >&2; }
+
+# Bass-shaker output is on Scarlett 18i20 Line 08 (per output_slots index 7,
+# label "Bass Shakers (via NX3000) — Line 08"). Mute it whenever the shaker
+# shouldn't be felt: during calibration (acoustic-only target) and during
+# karaoke. Unmute for listening.
+SHAKER_MUTE_CTL="${SHAKER_MUTE_CTL:-Line 08 Mute}"
+SHAKER_CARD="${SHAKER_CARD:-USB}"
+
+set_shaker_mute() {
+    local state="$1"   # on=muted, off=unmuted
+    amixer -c "$SHAKER_CARD" sset "$SHAKER_MUTE_CTL" "$state" >/dev/null 2>&1 \
+        && log "shaker mute → $state" \
+        || log "WARNING: failed to set shaker mute=$state (Scarlett missing?)"
+}
+
+current_mode() {
+    if [ -r "$STATE_FILE" ]; then
+        cat "$STATE_FILE"
+    else
+        echo "unknown"
+    fi
+}
+
+write_state() {
+    local mode="$1"
+    echo "$mode" > "$STATE_FILE"
+}
+
+ensure_camilladsp_up() {
+    if ! systemctl is-active --quiet "$CAMILLA_SVC"; then
+        log "starting $CAMILLA_SVC"
+        systemctl start "$CAMILLA_SVC"
+        # Wait until websocket reports Running (or give up after ~15s).
+        for _ in $(seq 1 15); do
+            if probe_camilla_running; then return 0; fi
+            sleep 1
+        done
+        log "WARNING: $CAMILLA_SVC did not reach Running within 15s"
+        return 1
+    fi
+    return 0
+}
+
+ensure_camilladsp_down() {
+    if systemctl is-active --quiet "$CAMILLA_SVC"; then
+        log "stopping $CAMILLA_SVC"
+        systemctl stop "$CAMILLA_SVC"
+    fi
+}
+
+ensure_pikaraoke_up() {
+    if ! docker ps --format '{{.Names}}' | grep -qx "$PIKARAOKE_CONTAINER"; then
+        log "starting $PIKARAOKE_CONTAINER container"
+        docker start "$PIKARAOKE_CONTAINER" >/dev/null
+    fi
+}
+
+ensure_pikaraoke_down() {
+    if docker ps --format '{{.Names}}' | grep -qx "$PIKARAOKE_CONTAINER"; then
+        log "stopping $PIKARAOKE_CONTAINER container"
+        docker stop "$PIKARAOKE_CONTAINER" >/dev/null
+    fi
+}
+
+probe_camilla_running() {
+    python3 - <<'PY' 2>/dev/null
+import asyncio, json, sys
+try:
+    import websockets
+except ImportError:
+    sys.exit(2)
+async def go():
+    try:
+        async with websockets.connect("ws://127.0.0.1:1234", open_timeout=2, close_timeout=1) as ws:
+            await ws.send('"GetState"')
+            r = json.loads(await asyncio.wait_for(ws.recv(), timeout=2))
+            sys.exit(0 if r.get("GetState", {}).get("value") == "Running" else 1)
+    except Exception:
+        sys.exit(1)
+asyncio.run(go())
+PY
+}
+
+# Note: cal-mode capture flip (analog input vs snd-aloop) is intentionally NOT
+# performed here. MCP server and web server hold separate driver instances in
+# separate processes; mutating cal_mode from a third party desyncs them. The
+# /avr:calibrate recipes flip cal_mode via the MCP tool as their first step,
+# which is the single coordination point. audio-mode just owns the gross
+# Scarlett-ownership question (listening vs karaoke); cal/listening differ
+# only in what the recipe asks CamillaDSP to do once it's running.
+
+cmd_set() {
+    local target="$1"
+    case "$target" in
+        listening)
+            ensure_pikaraoke_down
+            ensure_camilladsp_up || true
+            set_shaker_mute off                   # shaker unmuted in listening
+            write_state listening
+            log "→ listening  (subs + shakers unmuted)"
+            ;;
+        cal)
+            ensure_pikaraoke_down
+            ensure_camilladsp_up || true
+            set_shaker_mute on                    # shaker muted during calibration
+            write_state cal
+            log "→ cal  (shaker muted; recipes flip CamillaDSP cal capture via MCP)"
+            ;;
+        karaoke)
+            ensure_camilladsp_down
+            ensure_pikaraoke_up
+            set_shaker_mute on                    # shaker muted during karaoke
+            write_state karaoke
+            log "→ karaoke  (shaker muted)"
+            ;;
+        *)
+            echo "unknown mode: $target" >&2
+            usage
+            exit 2
+            ;;
+    esac
+}
+
+case "${1:-}" in
+    get)            current_mode ;;
+    set)            shift; cmd_set "${1:-}" ;;
+    ""|-h|--help)   usage ;;
+    *)              usage; exit 2 ;;
+esac
