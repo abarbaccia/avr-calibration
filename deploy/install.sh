@@ -209,6 +209,19 @@ if [ -f "$SCRIPT_DIR/audio-mode.conf" ] && [ ! -f /etc/audio-mode.conf ]; then
     echo "Installed: /etc/audio-mode.conf  (edit to set KARAOKE_TRIGGER_INPUT)"
 fi
 
+# ALSA configs — asound.conf defines karaoke_out plug (stereo → Scarlett PCM 1/2,
+# fed into Scarlett HW Mix A/B which sum mic preamps 1/2 + PCM 1/2 → Line 1/2).
+# Per-user asoundrc sets pi user's ALSA default to karaoke_out so Chromium kiosk
+# audio flows there during karaoke mode.
+if [ -f "$SCRIPT_DIR/asound.conf" ]; then
+    sudo install -m 0644 "$SCRIPT_DIR/asound.conf" /etc/asound.conf
+    echo "Installed: /etc/asound.conf"
+fi
+if [ -f "$SCRIPT_DIR/home-pi.asoundrc" ] && [ -d /home/pi ]; then
+    sudo install -m 0644 -o pi -g pi "$SCRIPT_DIR/home-pi.asoundrc" /home/pi/.asoundrc
+    echo "Installed: /home/pi/.asoundrc"
+fi
+
 for svc in camilladsp-watchdog.service denon-watch.service; do
     if [ -f "$SCRIPT_DIR/$svc" ]; then
         sudo cp "$SCRIPT_DIR/$svc" "/etc/systemd/system/$svc"

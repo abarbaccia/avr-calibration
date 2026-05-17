@@ -50,6 +50,34 @@ set_shaker_mute() {
         || log "WARNING: failed to set shaker mute=$state (Scarlett missing?)"
 }
 
+# Chromium kiosk lifecycle. The kiosk is the audio-playback head for karaoke
+# (Chromium writes to ALSA "default" → karaoke_out plug → Scarlett PCM 1/2 →
+# Mix A/B → Line 1/2 → Denon). Two operations:
+#
+#   kill_kiosk     stop chromium so it releases Scarlett (used before starting
+#                  CamillaDSP — otherwise CamillaDSP can't grab hw:USB,0,0)
+#   relaunch_kiosk kill + re-launch (returns kiosk to splash with fresh ALSA state)
+#
+# In listening + cal modes the kiosk runs but cannot grab Scarlett (CamillaDSP
+# holds it exclusively). Chromium audio attempts fail silently — desired.
+KIOSK_RELAUNCH="${KIOSK_RELAUNCH:-/home/pi/.config/labwc/relaunch-kiosk.sh}"
+kill_kiosk() {
+    pkill -f 'chromium.*chromium-kiosk' 2>/dev/null
+    # wait briefly for the audio device to be released
+    for _ in 1 2 3 4 5; do
+        sudo fuser /dev/snd/pcmC3D0p 2>/dev/null | grep -q . || break
+        sleep 0.3
+    done
+}
+relaunch_kiosk() {
+    if [ -x "$KIOSK_RELAUNCH" ]; then
+        sudo -u pi -H \
+            env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 \
+            "$KIOSK_RELAUNCH" >/dev/null 2>&1 &
+        log "chromium kiosk relaunch scheduled"
+    fi
+}
+
 current_mode() {
     if [ -r "$STATE_FILE" ]; then
         cat "$STATE_FILE"
@@ -130,25 +158,30 @@ cmd_set() {
     local target="$1"
     case "$target" in
         listening)
+            kill_kiosk                            # free Scarlett before camilladsp grabs it
             ensure_pikaraoke_down
             ensure_camilladsp_up || true
             set_shaker_mute off                   # shaker unmuted in listening
             write_state listening
+            relaunch_kiosk                        # kiosk back up; can't grab Scarlett (camilla has it) — fine
             log "→ listening  (subs + shakers unmuted)"
             ;;
         cal)
+            kill_kiosk                            # free Scarlett before camilladsp grabs it
             ensure_pikaraoke_down
             ensure_camilladsp_up || true
             set_shaker_mute on                    # shaker muted during calibration
             write_state cal
+            relaunch_kiosk
             log "→ cal  (shaker muted; recipes flip CamillaDSP cal capture via MCP)"
             ;;
         karaoke)
-            ensure_camilladsp_down
+            ensure_camilladsp_down                # release Scarlett for Chromium
             ensure_pikaraoke_up
             set_shaker_mute on                    # shaker muted during karaoke
             write_state karaoke
-            log "→ karaoke  (shaker muted)"
+            relaunch_kiosk                        # Chromium re-opens PCM 1/2 via karaoke_out
+            log "→ karaoke  (shaker muted; kiosk audio → Scarlett PCM 1/2 → Line 1/2)"
             ;;
         *)
             echo "unknown mode: $target" >&2

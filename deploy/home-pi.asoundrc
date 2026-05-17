@@ -1,0 +1,12 @@
+# Pi-user ALSA default = karaoke_out (stereo → Scarlett PCM 1/2).
+# Chromium kiosk uses this for karaoke audio playback. In listening mode
+# CamillaDSP holds the hardware exclusively, so this open() fails — Chromium
+# stays silent until audio-mode set karaoke releases the device.
+pcm.!default {
+    type plug
+    slave.pcm "karaoke_out"
+}
+ctl.!default {
+    type hw
+    card USB
+}
