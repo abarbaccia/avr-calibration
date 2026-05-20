@@ -470,6 +470,11 @@ class DenonSweepContext:
     sweep input/volume, waits for settle. On exit: restores saved state
     (best-effort, exceptions caught).
 
+    Sound mode is intentionally NOT managed here — the orchestrator sets
+    the AVR sound mode before calling measure (via set_avr_mode). The sweep
+    context only touches input and volume so it doesn't undo the operator's
+    deliberate mode choice.
+
     Volume safety: sweep_volume must be <= MAX_SWEEP_VOLUME_DB.
 
     Default lowered to -15 dB after 2026-05-04 incident: a corrupted FIR
@@ -488,29 +493,12 @@ class DenonSweepContext:
 
     MAX_SWEEP_VOLUME_DB: float = -15.0  # protective ceiling (was 0)
 
-    VALID_SOUND_MODES: tuple[str, ...] = (
-        "PURE DIRECT",
-        "DIRECT",
-        "STEREO",
-        "MULTI CH STEREO",
-        "DOLBY SURROUND",
-    )
-    """Per-call ``sound_mode_override`` whitelist.
-
-    - PURE DIRECT      — raw mains response, no Audyssey, no bass mgmt.
-    - DIRECT           — bass mgmt active, Audyssey off (sub-mains integration check).
-    - STEREO           — Audyssey ACTIVE (verify mains corrections).
-    - MULTI CH STEREO  — Audyssey ACTIVE, all speakers play.
-    - DOLBY SURROUND   — Audyssey ACTIVE, surround upmix.
-    """
-
     @classmethod
     def from_config(
         cls,
         config,
         manage_volume: bool = True,
         sweep_volume_override: float | None = None,
-        sound_mode_override: str | None = None,
     ) -> "DenonSweepContext | None":
         """Build from a Config object, or return None if HDMI sweep not configured.
 
@@ -519,9 +507,6 @@ class DenonSweepContext:
                 Useful when the caller manages volume itself (e.g. calibrate_level).
             sweep_volume_override: If set, use this volume instead of the config value.
                 Useful for mains measurements which need a higher level than subs.
-            sound_mode_override: If set, force this exact sound mode on enter
-                and restore on exit. Overrides ``denon_pure_direct`` config.
-                Must be one of ``VALID_SOUND_MODES``.
         """
         route = config.measurement.get("playback_route", "usb")
         if route != "hdmi":
@@ -541,8 +526,6 @@ class DenonSweepContext:
             sweep_volume=volume,
             settle_ms=config.measurement.get("denon_settle_ms", 5000),
             manage_volume=manage_volume,
-            pure_direct=bool(config.measurement.get("denon_pure_direct", True)),
-            sound_mode_override=sound_mode_override,
         )
 
     def __init__(
@@ -552,32 +535,19 @@ class DenonSweepContext:
         sweep_volume: float = -10.0,
         settle_ms: int = 5000,
         manage_volume: bool = True,
-        pure_direct: bool = True,
-        sound_mode_override: str | None = None,
     ) -> None:
         if manage_volume and sweep_volume > self.MAX_SWEEP_VOLUME_DB:
             raise ValueError(
                 f"sweep_volume must be <= {self.MAX_SWEEP_VOLUME_DB} dB, got {sweep_volume}"
             )
-        if sound_mode_override is not None:
-            normalized = sound_mode_override.strip().upper()
-            if normalized not in self.VALID_SOUND_MODES:
-                raise ValueError(
-                    f"sound_mode_override must be one of {self.VALID_SOUND_MODES}, "
-                    f"got {sound_mode_override!r}"
-                )
-            sound_mode_override = normalized
         self._host = host
         self._sweep_input = sweep_input
         self._sweep_volume = sweep_volume
         self._settle_ms = settle_ms
         self._manage_volume = manage_volume
-        self._pure_direct = pure_direct
-        self._sound_mode_override = sound_mode_override
         self._receiver = None
         self._saved_input: str | None = None
         self._saved_volume: float | None = None
-        self._saved_sound_mode: str | None = None
 
     async def __aenter__(self) -> "DenonSweepContext":
         self._receiver = await _connect_receiver(self._host)
@@ -609,41 +579,15 @@ class DenonSweepContext:
         self._saved_input = self._receiver.input_func
         self._saved_volume = self._receiver.volume
 
-        # Save sound mode so we can restore it on exit.
-        try:
-            self._saved_sound_mode = self._receiver.soundmode.sound_mode
-            log.info("Denon sweep: saved sound mode: %s", self._saved_sound_mode)
-        except Exception as exc:
-            log.warning("Could not read sound mode: %s", exc)
-
-        # sound_mode_override takes priority over pure_direct: when set, force
-        # exactly that mode and restore on exit regardless of pure_direct.
-        target_sound_mode: str | None
-        if self._sound_mode_override is not None:
-            target_sound_mode = self._sound_mode_override
-        elif self._pure_direct:
-            target_sound_mode = "PURE DIRECT"
-        else:
-            target_sound_mode = None
-
         log.info(
-            "Denon sweep: switching to input=%s %ssound_mode=%s (was %s / %s / %s)",
+            "Denon sweep: switching to input=%s%s (was input=%s volume=%s)",
             self._sweep_input,
-            f"volume={self._sweep_volume:.1f} dB " if self._manage_volume else "",
-            target_sound_mode if target_sound_mode is not None else "(unchanged)",
-            self._saved_input, self._saved_volume, self._saved_sound_mode,
+            f" volume={self._sweep_volume:.1f} dB" if self._manage_volume else "",
+            self._saved_input, self._saved_volume,
         )
         await self._receiver.async_set_input_func(self._sweep_input)
         if self._manage_volume:
             await self._receiver.async_set_volume(self._sweep_volume)
-
-        if target_sound_mode is not None:
-            try:
-                await self._receiver.soundmode.async_set_sound_mode(target_sound_mode)
-            except Exception as exc:
-                log.warning("Could not set sound mode %s: %s", target_sound_mode, exc)
-        else:
-            log.info("Denon sweep: keeping current sound mode: %s", self._saved_sound_mode)
 
         await asyncio.sleep(self._settle_ms / 1000.0)
         return self
@@ -653,18 +597,9 @@ class DenonSweepContext:
             return
         try:
             log.info(
-                "Denon sweep: restoring input=%s volume=%s sound_mode=%s",
-                self._saved_input, self._saved_volume, self._saved_sound_mode,
+                "Denon sweep: restoring input=%s volume=%s",
+                self._saved_input, self._saved_volume,
             )
-            # Restore sound mode if we changed it (override OR pure_direct=True).
-            changed_sound_mode = (
-                self._sound_mode_override is not None or self._pure_direct
-            )
-            if changed_sound_mode and self._saved_sound_mode is not None:
-                await asyncio.wait_for(
-                    self._receiver.soundmode.async_set_sound_mode(self._saved_sound_mode),
-                    timeout=5.0,
-                )
             if self._saved_input is not None:
                 await asyncio.wait_for(
                     self._receiver.async_set_input_func(self._saved_input),

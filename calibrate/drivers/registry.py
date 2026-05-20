@@ -197,14 +197,6 @@ def _make_camilladsp(config: Config, proc) -> CamillaDSPDriver:
         kwargs["resampler"] = dict(cam["resampler"])
     if cam.get("queuelimit") is not None:
         kwargs["queuelimit"] = int(cam["queuelimit"])
-    if cam.get("cal_capture") is not None:
-        kwargs["cal_capture_device"] = dict(cam["cal_capture"])
-    if cam.get("cal_capture_channels") is not None:
-        kwargs["cal_capture_channels"] = int(cam["cal_capture_channels"])
-    if cam.get("cal_lfe_input_channel") is not None:
-        kwargs["cal_lfe_input_channel"] = int(cam["cal_lfe_input_channel"])
-    if cam.get("cal_playback_device") is not None:
-        kwargs["cal_playback_device"] = str(cam["cal_playback_device"])
     return CamillaDSPDriver(**kwargs)
 
 

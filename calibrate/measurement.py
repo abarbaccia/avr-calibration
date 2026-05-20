@@ -650,7 +650,6 @@ class MeasurementEngine:
     async def measure(
         self,
         input_device_name: str | None = None,
-        playback_device_override: str | None = None,
         freq_min: int | None = None,
         freq_max: int | None = None,
         out_channel_override: int | None = None,
@@ -742,17 +741,12 @@ class MeasurementEngine:
             _traceback.walk_stack = _orig_walk_stack
 
         # Strategy selection.
-        #   - cal-mode override → legacy PortAudio HDMI/USB strategy with the
-        #     loopback device handed in via playback_device_override.
-        #   - "hdmi" without cal-mode → direct-ALSA aplay subprocess (PortAudio
-        #     inside the container can't see vc4hdmi0; aplay can).
-        #   - "usb" → unchanged (PortAudio sees miniDSP fine).
+        #   - "hdmi" → direct-ALSA aplay subprocess (PortAudio inside the
+        #     container can't see vc4hdmi0; aplay can).
+        #   - "usb" → PortAudio (sees the Focusrite fine).
         from .drivers.playback import playback_for_route
 
-        use_aplay_hdmi = (
-            route == "hdmi"
-            and not playback_device_override  # cal-mode keeps PortAudio path
-        )
+        use_aplay_hdmi = route == "hdmi"
         if use_aplay_hdmi:
             # Use default:CARD=vc4hdmi0, NOT the hdmi: plugin — the hdmi:
             # ALSA plugin silently downmixes multichannel PCM to stereo
@@ -821,40 +815,7 @@ class MeasurementEngine:
                 pass
 
             # Select output device based on route — prefer explicit index, fall back to name search
-            # Cal-mode override takes priority over the configured route — when
-            # a DSP driver is in cal mode, the sweep must be written into the
-            # driver's loopback regardless of whether the configured route is
-            # USB or HDMI. Without this the HDMI route would happily send the
-            # sweep to the AVR while the caller assumed it was bypassing.
-            override_handled = False
-            if playback_device_override:
-                try:
-                    import sounddevice as sd
-                    devices = sd.query_devices()
-                    idx, dev = _resolve_alsa_device_in_portaudio(
-                        playback_device_override, devices, want_output=True,
-                    )
-                    if idx is not None:
-                        in_idx = int(sd.default.device[0])
-                        sd.default.device = (in_idx, idx)
-                        log.info(
-                            "Output device (cal-mode override %r): %s (index %d)",
-                            playback_device_override, dev["name"], idx,
-                        )
-                        override_handled = True
-                    else:
-                        raise RuntimeError(
-                            f"cal-mode playback override {playback_device_override!r} "
-                            f"did not resolve to any PortAudio output device. "
-                            f"Available outputs: "
-                            f"{[(i, d['name']) for i, d in enumerate(devices) if d.get('max_output_channels', 0) > 0]}"
-                        )
-                except ImportError:
-                    pass
-
-            if override_handled:
-                pass  # device already set above
-            elif route == "hdmi":
+            if route == "hdmi":
                 try:
                     import sounddevice as sd
                     devices = sd.query_devices()
