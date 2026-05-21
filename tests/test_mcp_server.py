@@ -7017,7 +7017,7 @@ async def test_skip_freqs_hz_demotes_classified_anti_pulse() -> None:
     ]
     session = _make_modal_session(decay_modes)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_modal_fir(
             session_id=1, num_taps=2048, skip_freqs_hz=[70.3],
         )
@@ -7036,7 +7036,7 @@ async def test_skip_freqs_hz_demotes_min_phase() -> None:
     ]
     session = _make_modal_session(decay_modes)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_modal_fir(
             session_id=1, num_taps=2048, skip_freqs_hz=[47.0],
         )
@@ -7052,7 +7052,7 @@ async def test_skip_freqs_hz_tolerance_within_5pct() -> None:
     ]
     session = _make_modal_session(decay_modes)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_modal_fir(
             session_id=1, num_taps=2048, skip_freqs_hz=[23.0],
         )
@@ -7068,7 +7068,7 @@ async def test_skip_freqs_hz_tolerance_outside_5pct() -> None:
     ]
     session = _make_modal_session(decay_modes)
     with patch("calibrate.storage.SessionStore") as MockStore:
-        MockStore.return_value.list_sessions.return_value = [session]
+        _wire_mock_store(MockStore, [session])
         result = await _tool_design_modal_fir(
             session_id=1, num_taps=2048, skip_freqs_hz=[23.0],
         )
