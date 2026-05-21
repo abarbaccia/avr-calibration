@@ -30,3 +30,4 @@ build/
 *.db
 *.sqlite3
 .claude/worktrees/
+.aider*

@@ -50,6 +50,7 @@ log = logging.getLogger(__name__)
 
 
 _WS_TIMEOUT_S: float = 5.0
+_WS_TIMEOUT_LARGE_S: float = 30.0  # SetConfig with large FIR payloads (~500 KB YAML)
 
 
 # ── Defaults for the CamillaDSP audio devices ────────────────────────────────
@@ -70,18 +71,6 @@ _DEFAULT_PLAYBACK_DEVICE: dict[str, Any] = {
     "channels": 10,
     "format": "S32_LE",
 }
-
-# Cal-mode capture: ALSA loopback (snd-aloop). Sweep player writes to
-# hw:Loopback,0,0; CamillaDSP captures from hw:Loopback,1,0. This bypasses
-# the AVR entirely so Audyssey/MultEQ filters cannot color the cal stimulus.
-# The cal-mode capture is always 2-channel mono-fan-out (lfe_input_channel=0).
-_DEFAULT_CAL_CAPTURE_DEVICE: dict[str, Any] = {
-    "type": "Alsa",
-    "device": "hw:Loopback,1,0",
-    "channels": 2,
-    "format": "S32_LE",
-}
-_DEFAULT_CAL_PLAYBACK_LOOPBACK: str = "hw:Loopback,0,0"
 
 
 class _CamillaWSClient:
@@ -123,21 +112,51 @@ class _CamillaWSClient:
     async def call(self, command: str, value: Any = None) -> Any:
         """Send one command, await its response, return the unwrapped value.
 
+        On a stale connection (server closed socket without notification) the
+        first send raises immediately.  We clear the handle and reconnect once
+        before giving up so callers never see a "transport error" from a
+        connection that simply idled out.
+
         Raises DriverError on transport failure, unexpected response shape, or
         a non-Ok result from the daemon.
         """
         if self._ws is None:
             raise DriverError("CamillaDSP websocket is not connected")
 
+        # SetConfig / SetConfigJson carry large YAML/JSON payloads (can exceed
+        # 500 KB when 4096-tap FIRs are embedded inline).  Use a longer timeout
+        # so the send + server reload don't race against a 5-second wall clock.
+        timeout = (
+            _WS_TIMEOUT_LARGE_S
+            if command in {"SetConfig", "SetConfigJson"}
+            else self._timeout
+        )
+
         request: Any = command if value is None else {command: value}
         payload = json.dumps(request)
-        try:
-            await asyncio.wait_for(self._ws.send(payload), timeout=self._timeout)
-            raw = await asyncio.wait_for(self._ws.recv(), timeout=self._timeout)
-        except asyncio.TimeoutError as exc:
-            raise DriverError(f"CamillaDSP {command} timed out") from exc
-        except Exception as exc:
-            raise DriverError(f"CamillaDSP {command} transport error: {exc}") from exc
+        for attempt in range(2):
+            try:
+                await asyncio.wait_for(self._ws.send(payload), timeout=timeout)
+                raw = await asyncio.wait_for(self._ws.recv(), timeout=timeout)
+                break
+            except asyncio.TimeoutError as exc:
+                raise DriverError(f"CamillaDSP {command} timed out") from exc
+            except Exception as exc:
+                if attempt == 0:
+                    # Connection likely dropped (idle timeout, buffer underrun
+                    # recovery, etc.).  Discard the stale handle and reconnect.
+                    log.warning(
+                        "CamillaDSP %s transport error (%s) — reconnecting", command, exc
+                    )
+                    self._ws = None
+                    try:
+                        await self.connect()
+                    except DriverError as reconnect_exc:
+                        raise DriverError(
+                            f"CamillaDSP {command} transport error and reconnect failed: {reconnect_exc}"
+                        ) from reconnect_exc
+                else:
+                    raise DriverError(f"CamillaDSP {command} transport error: {exc}") from exc
 
         try:
             data = json.loads(raw)
@@ -212,10 +231,6 @@ class CamillaDSPDriver(DSPDriver):
         lfe_input_channel: int | None = None,
         capture_samplerate: int | None = None,
         resampler: dict | None = None,
-        cal_capture_device: dict | None = None,
-        cal_capture_channels: int | None = None,
-        cal_lfe_input_channel: int | None = None,
-        cal_playback_device: str | None = None,
         routed_outputs: list[int] | None = None,
         queuelimit: int | None = None,
     ) -> None:
@@ -233,9 +248,9 @@ class CamillaDSPDriver(DSPDriver):
         self._input_channels = input_channels
         # capture_channels is the PHYSICAL channel count opened on the ALSA
         # capture device. input_channels is the LOGICAL count seen by the
-        # cal_matrix mixer and routing/PEQ code. They differ when CamillaDSP
-        # captures a multichannel device directly (e.g. Focusrite 18i20, 20ch)
-        # and only a single physical channel carries the signal of interest.
+        # lfe_source + output_router mixers. They differ when CamillaDSP
+        # captures a multichannel device (e.g. Focusrite 18i20) and only a
+        # single physical channel carries the LFE signal.
         self._capture_channels = int(capture_channels) if capture_channels else input_channels
         self._lfe_input_channel = int(lfe_input_channel) if lfe_input_channel is not None else None
         if self._capture_channels != self._input_channels and self._lfe_input_channel is None:
@@ -273,24 +288,6 @@ class CamillaDSPDriver(DSPDriver):
         self._capture_device["channels"] = self._capture_channels
         self._playback_device["channels"] = output_channels
 
-        # Cal-mode capture state — preserved alongside the live config so we can
-        # swap atomically via set_cal_mode() without losing the live settings.
-        # Live config is what's currently in _capture_device / _capture_channels /
-        # _lfe_input_channel above. Cal config defaults to the snd-aloop loopback.
-        self._live_capture_device = dict(self._capture_device)
-        self._live_capture_channels = self._capture_channels
-        self._live_lfe_input_channel = self._lfe_input_channel
-        self._cal_capture_device = (
-            dict(cal_capture_device) if cal_capture_device else dict(_DEFAULT_CAL_CAPTURE_DEVICE)
-        )
-        self._cal_capture_channels = int(cal_capture_channels) if cal_capture_channels else 2
-        self._cal_lfe_input_channel = (
-            int(cal_lfe_input_channel) if cal_lfe_input_channel is not None else 0
-        )
-        self._cal_capture_device["channels"] = self._cal_capture_channels
-        self._cal_playback_device = cal_playback_device or _DEFAULT_CAL_PLAYBACK_LOOPBACK
-        self._cal_mode_active: bool = False
-
         self._lock = asyncio.Lock()
         self._max_peq_slots = max_peq_slots
         self._client = _CamillaWSClient(host, port)
@@ -313,6 +310,7 @@ class CamillaDSPDriver(DSPDriver):
         # Shadow state — each mutation rebuilds the pipeline from this.
         self._output_eq: dict[int, list[dict]] = {}   # output_index → filter specs
         self._input_eq: dict[int, list[dict]] = {}    # input_index → filter specs
+        self._input_gain: dict[int, float] = {}       # input_index → gain_db (flat make-up gain pre-mixer)
         self._output_gain: dict[int, float] = {}
         self._output_delay: dict[int, float] = {}
         self._output_polarity: dict[int, bool] = {}
@@ -438,7 +436,7 @@ class CamillaDSPDriver(DSPDriver):
         matches the shadow.
         """
         return bool(
-            self._output_eq or self._input_eq
+            self._output_eq or self._input_eq or self._input_gain
             or self._output_gain or self._output_delay
             or self._output_polarity or self._output_muted
             or any(v for v in self._fir_state.values())
@@ -498,6 +496,11 @@ class CamillaDSPDriver(DSPDriver):
                         for inp in range(self._input_channels):
                             self._input_eq[inp] = list(filters)
                             self._eq_state[("input", inp, 0)] = list(filters)
+                elif parsed["kind"] == "input" and parsed["field"] == "gain":
+                    inp = parsed.get("input_index")
+                    if inp is None:
+                        continue
+                    self._input_gain[int(inp)] = float(data["gain_db"])
             except (KeyError, ValueError, TypeError) as exc:
                 log.warning("rehydrate_from_active_state: skipping key=%s: %s", key, exc)
 
@@ -593,6 +596,20 @@ class CamillaDSPDriver(DSPDriver):
     def _build_filters(self) -> dict[str, dict]:
         filters: dict[str, dict] = {}
 
+        # Per-input flat gain (pre-PEQ, pre-mixer). Make-up gain for upstream
+        # attenuation lives here so per-output gains stay alignment-only.
+        for inp_idx, gain in self._input_gain.items():
+            if gain == 0.0:
+                continue
+            filters[f"cal_in{inp_idx}_gain"] = {
+                "type": "Gain",
+                "parameters": {
+                    "gain": float(gain),
+                    "inverted": False,
+                    "mute": False,
+                },
+            }
+
         # Per-input PEQ
         for inp_idx, specs_raw in self._input_eq.items():
             specs = self._parse_filter_specs(specs_raw)
@@ -642,24 +659,14 @@ class CamillaDSPDriver(DSPDriver):
 
         return filters
 
-    def _needs_capture_mixer(self) -> bool:
-        """True when the physical capture stream needs reshaping into logical inputs.
-
-        Today the only reshape is fan-out: one physical channel (the LFE feed
-        from the AVR's sub pre-out) replicated to every logical input so the
-        downstream cal_matrix sees a 2-channel mono signal. When physical and
-        logical counts match (the legacy Loopback path), no reshape is needed.
-        """
-        return self._capture_channels != self._input_channels
-
     def _build_capture_mixer(self) -> dict | None:
-        """Build the pre-cal_matrix mixer that reshapes physical → logical inputs.
+        """Build the lfe_source mixer that fans the LFE physical channel to logical inputs.
 
-        Returns ``None`` when no reshape is needed (capture_channels == input_channels).
-        Otherwise emits a mixer named ``cal_capture`` with one source per logical
-        input, all reading from ``lfe_input_channel`` of the capture stream.
+        Returns ``None`` when capture_channels == input_channels (no reshape needed).
+        Otherwise picks lfe_input_channel from the physical capture stream and fans
+        it out to all logical input channels.
         """
-        if not self._needs_capture_mixer():
+        if self._capture_channels == self._input_channels:
             return None
         assert self._lfe_input_channel is not None
         mapping: list[dict] = []
@@ -711,14 +718,14 @@ class CamillaDSPDriver(DSPDriver):
                     })
             mapping.append({"dest": out_idx, "sources": sources})
         mixers: dict = {
-            "cal_matrix": {
+            "output_router": {
                 "channels": {"in": self._input_channels, "out": self._output_channels},
                 "mapping": mapping,
             }
         }
         capture_mixer = self._build_capture_mixer()
         if capture_mixer is not None:
-            mixers["cal_capture"] = capture_mixer
+            mixers["lfe_source"] = capture_mixer
         return mixers
 
     def _build_pipeline(self) -> list[dict]:
@@ -730,12 +737,19 @@ class CamillaDSPDriver(DSPDriver):
         """
         steps: list[dict] = []
 
-        # Capture mixer (when present) reshapes physical capture channels into
-        # logical inputs before any per-input processing runs. Subsequent steps
-        # see exactly self._input_channels channels, identical to the legacy
-        # Loopback path.
-        if self._needs_capture_mixer():
-            steps.append({"type": "Mixer", "name": "cal_capture"})
+        # lfe_source mixer fans the single LFE physical channel to all logical inputs.
+        if self._capture_channels != self._input_channels:
+            steps.append({"type": "Mixer", "name": "lfe_source"})
+
+        # Input-side flat gain (pre-PEQ, per input channel).
+        for inp_idx in range(self._input_channels):
+            if self._input_gain.get(inp_idx, 0.0) == 0.0:
+                continue
+            steps.append({
+                "type": "Filter",
+                "channels": [inp_idx],
+                "names": [f"cal_in{inp_idx}_gain"],
+            })
 
         # Input-side PEQ, per input channel (pre-mixer).
         for inp_idx in range(self._input_channels):
@@ -745,8 +759,8 @@ class CamillaDSPDriver(DSPDriver):
             names = [f"cal_in{inp_idx}_peq_{i}" for i in range(len(specs))]
             steps.append({"type": "Filter", "channels": [inp_idx], "names": names})
 
-        # Mixer step — always present so the router sees the channel count change.
-        steps.append({"type": "Mixer", "name": "cal_matrix"})
+        # Routing mixer — always present so the router sees the channel count change.
+        steps.append({"type": "Mixer", "name": "output_router"})
 
         # Per-output processing. FIR first (if set), then PEQ, then delay, then
         # gain/polarity/mute as a single Gain block.
@@ -794,25 +808,12 @@ class CamillaDSPDriver(DSPDriver):
 
     # ── Cal-mode capture (loopback) ───────────────────────────────────────────
 
-    @property
-    def cal_mode_active(self) -> bool:
-        return self._cal_mode_active
-
-    @property
-    def cal_playback_device(self) -> str:
-        """ALSA device measure() should write the sweep to in cal mode."""
-        return self._cal_playback_device
-
     async def _sync_fir_state_from_active_locked(self) -> None:
         """Pull Conv FIR coefficients from the running CamillaDSP config into shadow state.
 
-        Caller must hold ``self._lock``. Used before a full pipeline rebuild
-        (e.g. ``set_cal_mode``) to preserve FIR coefficients that were applied
-        outside this driver — for example, an external script that called
-        ``SetConfigJson`` directly to avoid the round-trip token cost of
-        passing 4096-tap arrays through the MCP layer. Without this sync, the
-        rebuild would silently revert those filters to whatever shadow state
-        last knew about (often the initial linear-phase coefficients).
+        Caller must hold ``self._lock``. Preserves FIR coefficients applied
+        outside this driver (e.g. via SetConfigJson directly) so a subsequent
+        pipeline rebuild doesn't revert them to shadow state.
 
         Only Conv filters named ``cal_out{N}_fir`` are synced — those are the
         per-output FIR slots this driver owns. Other Conv filters are ignored.
@@ -847,48 +848,6 @@ class CamillaDSPDriver(DSPDriver):
             if not isinstance(values, list) or not values:
                 continue
             self._fir_state[idx] = [float(c) for c in values]
-
-    async def set_cal_mode(self, enabled: bool) -> None:
-        """Swap CamillaDSP capture between live and calibration sources.
-
-        Live: captures from the AVR/Focusrite analog input (normal listening).
-        Cal:  captures from the snd-aloop loopback so a sweep player can write
-              directly into CamillaDSP, bypassing the AVR. The AVR's Audyssey/
-              MultEQ filters and sub-trim cannot color the cal stimulus on this
-              path — what enters the FIR/PEQ chain is exactly what the sweep
-              generator produced.
-
-        Idempotent. Pushes a fresh config to CamillaDSP on transition. FIR
-        coefficients on the running daemon are synced into shadow state before
-        the push so externally-applied filters survive the toggle.
-        """
-        if enabled == self._cal_mode_active:
-            return
-        async with self._lock:
-            await self._sync_fir_state_from_active_locked()
-            if enabled:
-                # Snapshot live config before swapping, in case the caller
-                # mutated capture state through other paths since construction.
-                self._live_capture_device = dict(self._capture_device)
-                self._live_capture_channels = self._capture_channels
-                self._live_lfe_input_channel = self._lfe_input_channel
-                self._capture_device = dict(self._cal_capture_device)
-                self._capture_channels = self._cal_capture_channels
-                self._lfe_input_channel = self._cal_lfe_input_channel
-            else:
-                self._capture_device = dict(self._live_capture_device)
-                self._capture_channels = self._live_capture_channels
-                self._lfe_input_channel = self._live_lfe_input_channel
-            self._capture_device["channels"] = self._capture_channels
-            self._cal_mode_active = enabled
-            log.info(
-                "set_cal_mode: enabled=%s capture=%s channels=%d lfe_ch=%s",
-                enabled,
-                self._capture_device.get("device"),
-                self._capture_channels,
-                self._lfe_input_channel,
-            )
-            await self._push_config_locked()
 
     # ── EQ ────────────────────────────────────────────────────────────────────
 
@@ -1080,6 +1039,25 @@ class CamillaDSPDriver(DSPDriver):
                     self._output_gain.pop(output_index, None)
                 else:
                     self._output_gain[output_index] = prev
+                raise
+
+    async def set_input_gain(self, input_index: int, gain_db: float) -> None:
+        """Set flat gain (dB) on a DSP input channel, pre-PEQ and pre-mixer.
+
+        Make-up gain for upstream attenuation (e.g. a turned-down Scarlett
+        analog-in trim). Lives in its own layer so per-output gains stay
+        alignment-only and input PEQ stays target-curve-only.
+        """
+        async with self._lock:
+            prev = self._input_gain.get(input_index)
+            self._input_gain[int(input_index)] = float(gain_db)
+            try:
+                await self._push_config_locked()
+            except DriverError:
+                if prev is None:
+                    self._input_gain.pop(input_index, None)
+                else:
+                    self._input_gain[input_index] = prev
                 raise
 
     async def set_output_delay(self, output_index: int, delay_ms: float) -> None:

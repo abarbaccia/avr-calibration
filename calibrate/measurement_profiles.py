@@ -1,8 +1,8 @@
 """Target-driven measurement chain resolution.
 
 Maps a measurement *target* (a transducer name, group name, or role) to a
-fully-resolved chain spec: route (usb/hdmi), cal_mode requirements, sound_mode,
-sweep_channel, sweep volume, frequency range, validation checks.
+fully-resolved chain spec: route (usb/hdmi), sound_mode, sweep_channel,
+sweep volume, frequency range, validation checks.
 
 The signal_graph + measurement_profiles in config.yaml are authoritative.
 Hardware specifics live in config; the resolver code is hardware-agnostic.
@@ -35,23 +35,18 @@ log = logging.getLogger(__name__)
 # means the resolver falls back to legacy ``measurement.playback_route``.
 DEFAULT_MEASUREMENT_PROFILES: dict[str, dict] = {
     "sub": {
-        "route": "usb",
-        "cal_mode": {
-            "enabled": "required",
-            "capture_device": "hw:Loopback,1,0",
-            "playback_device": "hw:Loopback,0,0",
-            "channels": 2,
-        },
-        "sound_mode": None,
-        "sweep_channel": None,
+        # Pi → HDMI → Denon (DIRECT, bass mgmt on) → sub pre-out → Scarlett in 3
+        # → CamillaDSP → subs. DIRECT keeps bass management active without MultEQ.
+        "route": "hdmi",
+        "sound_mode": "DIRECT",
+        "sweep_channel": "LFE",
         "sweep_freq_min_hz": 15,
         "sweep_freq_max_hz": 200,
     },
     "main": {
-        # Pure mains via PURE DIRECT: Pi → HDMI → AVR → speaker outs. The
-        # DSP/Focusrite chain is not involved, so cal_mode is irrelevant.
+        # Pure mains via PURE DIRECT: Pi → HDMI → AVR → speaker outs.
+        # The DSP/Focusrite chain is not involved.
         "route": "hdmi",
-        "cal_mode": None,
         "sound_mode": "PURE DIRECT",
         "sweep_channel": "from_position",
         "sweep_freq_min_hz": 60,
@@ -59,7 +54,6 @@ DEFAULT_MEASUREMENT_PROFILES: dict[str, dict] = {
     },
     "atmos": {
         "route": "hdmi",
-        "cal_mode": None,
         "sound_mode": "DOLBY SURROUND",
         "sweep_channel": "from_position",
         "sweep_freq_min_hz": 80,
@@ -67,33 +61,26 @@ DEFAULT_MEASUREMENT_PROFILES: dict[str, dict] = {
     },
     "surround": {
         "route": "hdmi",
-        "cal_mode": None,
         "sound_mode": "DIRECT",
         "sweep_channel": "from_position",
         "sweep_freq_min_hz": 80,
         "sweep_freq_max_hz": 20000,
     },
     "lfe_pre": {
-        # Mains-bass-mgmt path through AVR: Pi → HDMI → AVR → AVR sub-pre-out
-        # → Focusrite IN3 → CamillaDSP → Focusrite OUT 5/6 → subs. This chain
-        # GOES THROUGH the DSP, so the DSP must be in live mode (capturing
-        # Focusrite directly, not snd-aloop). Hence cal_mode is forbidden.
+        # Pi → HDMI → Denon (DIRECT) → sub pre-out → Scarlett in 3 → CamillaDSP → subs.
+        # Identical path to "sub"; kept as a named alias for explicit LFE-channel sweeps.
         "route": "hdmi",
-        "cal_mode": {"enabled": "forbidden"},
         "sound_mode": "DIRECT",
         "sweep_channel": "LFE",
         "sweep_freq_min_hz": 15,
         "sweep_freq_max_hz": 200,
     },
     "shaker": {
-        # Tactile transducers; same chain as subs (Pi → cal-mode → DSP → shaker)
-        "route": "usb",
-        "cal_mode": {
-            "enabled": "required",
-            "capture_device": "hw:Loopback,1,0",
-            "playback_device": "hw:Loopback,0,0",
-            "channels": 2,
-        },
+        # Same chain as subs: Pi → HDMI → Denon → sub pre-out → Scarlett in 3
+        # → CamillaDSP → shaker output.
+        "route": "hdmi",
+        "sound_mode": "DIRECT",
+        "sweep_channel": "LFE",
         "sweep_freq_min_hz": 8,
         "sweep_freq_max_hz": 80,
     },
@@ -113,22 +100,13 @@ class ChainSpec:
     lfe_pre, shaker, or None when resolution fell back to legacy)."""
 
     route: str
-    """Sweep injection path: 'usb' (Pi → snd-aloop → DSP) or 'hdmi'
-    (Pi → AVR HDMI → mains/bass-mgmt). Fully determines the upstream chain."""
-
-    cal_mode: dict | None
-    """Cal-mode (input-side loopback) configuration. ``None`` means no
-    cal-mode interaction (e.g., HDMI route). When set:
-      ``enabled: required|forbidden|optional``,
-      ``capture_device``: ALSA capture device the DSP should switch to,
-      ``playback_device``: ALSA playback device measure() writes to,
-      ``channels``: number of channels in the loopback subdevice,
-      ``samplerate``: optional samplerate override."""
+    """Sweep injection path: 'usb' or 'hdmi' (Pi → AVR HDMI → bass-mgmt).
+    Fully determines the upstream chain."""
 
     sound_mode: str | None
     """AVR sound mode for the sweep: 'PURE DIRECT', 'DIRECT',
     'MULTI CH STEREO', 'DOLBY SURROUND', etc. ``None`` means don't touch
-    the AVR (cal-mode/USB route)."""
+    the AVR sound mode."""
 
     sweep_channel: str | int | None
     """HDMI channel for the sweep. String 'from_position' = derive from
@@ -152,11 +130,6 @@ class ChainSpec:
     """Ordered list of validation checks the engine must pass before the
     sweep runs. Each entry: ``{check: <name>, ...check-specific args}``.
     Empty list = no validation gate (legacy behaviour)."""
-
-    reference_loopback: dict | None = None
-    """Optional output-side loopback (electrical IR-alignment anchor).
-    ``None`` = mic-only IR alignment. When set: ``device``, ``pick_channel``,
-    ``enabled: when_available|required|disabled``."""
 
     legacy_path: bool = False
     """True when resolver fell back to legacy ``measurement.playback_route``
@@ -209,7 +182,6 @@ def resolve_measurement_chain(
     return ChainSpec(
         role=None,
         route=legacy_route,
-        cal_mode=None,
         sound_mode=None,
         sweep_channel=None,
         sweep_freq_min_hz=config.measurement.get("freq_min"),
@@ -339,7 +311,6 @@ def _profile_to_chain(
     return ChainSpec(
         role=role,
         route=prof.get("route", "usb"),
-        cal_mode=prof.get("cal_mode"),
         sound_mode=prof.get("sound_mode"),
         sweep_channel=sweep_channel_override or prof.get("sweep_channel"),
         sweep_freq_min_hz=prof.get("sweep_freq_min_hz"),
@@ -347,19 +318,6 @@ def _profile_to_chain(
         master_gain_db=prof.get("master_gain_db"),
         sweep_volume_db=prof.get("sweep_volume_db"),
         pre_sweep_validation=prof.get("pre_sweep_validation") or [],
-        reference_loopback=prof.get("reference_loopback"),
     )
 
 
-def chain_requires_cal_mode(chain: ChainSpec) -> bool:
-    """True if the chain spec requires cal_mode to be active before the sweep."""
-    if not chain.cal_mode:
-        return False
-    return chain.cal_mode.get("enabled") == "required"
-
-
-def chain_forbids_cal_mode(chain: ChainSpec) -> bool:
-    """True if the chain spec requires cal_mode to be OFF before the sweep."""
-    if not chain.cal_mode:
-        return False
-    return chain.cal_mode.get("enabled") == "forbidden"

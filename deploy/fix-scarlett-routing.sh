@@ -78,4 +78,30 @@ for ch in $CHANNELS; do
 done
 
 echo "[fix-scarlett-routing] Done — ${OK} ok, ${FAIL} failed." >&2
+
+# Karaoke summing matrix: Mix A → Line 1 (Denon L), Mix B → Line 2 (Denon R).
+# Each Mix bus sums Mic 1 (Mixer In 01) + Mic 2 (Mixer In 02) + Pi karaoke L/R
+# (Mixer In 03 = PCM 1, Mixer In 04 = PCM 2). Slot 25's source enum is forced
+# to Off (was sticking on "Analogue 9", dumping unwanted signal into karaoke
+# output and surfacing as the input-3 buzz reported 2026-05-18).
+#
+# Mix A: 01,02,03 hot (160 = 0 dB); 04 + 05..25 muted (0 = -80 dB)
+# Mix B: 01,02,04 hot; 03 + 05..25 muted
+echo "[fix-scarlett-routing] Asserting Mix A/B karaoke summing matrix..." >&2
+# Mixer Input 25 source -> Off  (numid=103 on Scarlett 18i20 3rd Gen driver)
+amixer -c USB cset numid=103 0 >/dev/null 2>&1 || true
+for slot in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do
+    case "$slot" in
+        01|02|03) a_val=160 ;;
+        *)        a_val=0   ;;
+    esac
+    case "$slot" in
+        01|02|04) b_val=160 ;;
+        *)        b_val=0   ;;
+    esac
+    amixer -c USB sset "Mix A Input $slot" "$a_val" >/dev/null 2>&1 || true
+    amixer -c USB sset "Mix B Input $slot" "$b_val" >/dev/null 2>&1 || true
+done
+echo "[fix-scarlett-routing] Mix A/B asserted." >&2
+
 exit 0

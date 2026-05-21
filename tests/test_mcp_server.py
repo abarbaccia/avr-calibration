@@ -634,78 +634,6 @@ async def test_trigger_measurement_success() -> None:
 
 
 @pytest.mark.asyncio
-async def test_trigger_measurement_usb_route_requires_cal_mode() -> None:
-    """USB-route sweep with cal_mode OFF must hard-fail with a clear error
-    pointing to set_cal_mode. Regression for 2026-05-06 incident where
-    measurements silently captured noise floor for ~2 hours of MSO experiments.
-    """
-    mock_sd = MagicMock()
-    mock_sd.query_devices.return_value = [
-        {"name": "UMIK-1", "max_input_channels": 1, "max_output_channels": 0},
-    ]
-
-    mock_dsp_obj = MagicMock()
-    mock_dsp_obj.cal_mode_active = False
-    mock_dsp_obj.cal_playback_device = None
-
-    # Force USB route so the cal_mode precondition is exercised; default test
-    # config uses HDMI which would skip the check.
-    mock_cfg = MagicMock()
-    mock_cfg.measurement = {"playback_route": "usb"}
-    mock_cfg.mic = {"name": "UMIK"}
-
-    with (
-        patch.dict(sys.modules, {"sounddevice": mock_sd}),
-        patch("calibrate.mcp_server._dsp", mock_dsp_obj),
-        patch("calibrate.mcp_server._config", return_value=mock_cfg),
-    ):
-        result = await _tool_trigger_measurement(sweep_volume_db=-31.0)
-
-    assert result["ok"] is False
-    err = result["error"].lower()
-    assert "cal_mode" in err or "cal mode" in err
-    assert "set_cal_mode" in err  # error must point user to the fix
-
-
-@pytest.mark.asyncio
-async def test_trigger_measurement_target_subs_requires_cal_mode_via_profile() -> None:
-    """target='subs' resolves via measurement_profiles to role='sub' which
-    requires cal_mode. Refuses with helpful error pointing to set_cal_mode.
-    Regression for 2026-05-06: 6+ hours of mains-via-HDMI captures because
-    target=subs silently routed via legacy playback_route='hdmi'."""
-    mock_sd = MagicMock()
-    mock_sd.query_devices.return_value = [
-        {"name": "UMIK-1", "max_input_channels": 1, "max_output_channels": 0},
-    ]
-
-    mock_dsp_obj = MagicMock()
-    mock_dsp_obj.cal_mode_active = False  # cal_mode OFF — bug condition
-    mock_dsp_obj.cal_playback_device = None
-
-    mock_cfg = MagicMock()
-    # Note: even with playback_route='hdmi' as the legacy default, the
-    # role-based resolver should refuse target='subs' because role=sub
-    # requires cal_mode regardless of legacy config.
-    mock_cfg.measurement = {"playback_route": "hdmi"}
-    mock_cfg.mic = {"name": "UMIK"}
-    mock_cfg.signal_graph = None  # no graph → resolver uses role aliases ('subs' → 'sub')
-    mock_cfg._data = {}
-
-    with (
-        patch.dict(sys.modules, {"sounddevice": mock_sd}),
-        patch("calibrate.mcp_server._dsp", mock_dsp_obj),
-        patch("calibrate.mcp_server._config", return_value=mock_cfg),
-    ):
-        result = await _tool_trigger_measurement(target="subs", sweep_volume_db=-31.0)
-
-    assert result["ok"] is False
-    err = result["error"].lower()
-    assert "cal_mode" in err or "cal mode" in err
-    assert "set_cal_mode" in err  # error must point user to the fix
-    assert "sub" in err or "target" in err  # mentions role/target context
-
-
-@pytest.mark.asyncio
 async def test_trigger_measurement_engine_error() -> None:
     """engine.measure() raises → error returned."""
     mock_sd = MagicMock()
@@ -6240,13 +6168,8 @@ async def test_trigger_measurement_sweep_channel_forces_hdmi_route() -> None:
 
 
 @pytest.mark.asyncio
-async def test_trigger_measurement_hdmi_ignores_cal_mode_loopback() -> None:
-    """HDMI sweep must NOT inherit cal_mode_active loopback override.
-
-    Foot-gun regression: when a sub-cal session leaves cal_mode_active=True
-    on the DSP driver, a subsequent mains sweep (sweep_channel=FL) was
-    silently routed to hw:Loopback,0,0 instead of the AVR/HDMI path.
-    """
+async def test_trigger_measurement_hdmi_sweep_channel_routes_correctly() -> None:
+    """HDMI sweep with sweep_channel=FL goes through DenonSweepContext with route=hdmi."""
     from calibrate.config import Config, DEFAULT_CONFIG
 
     mock_sd = MagicMock()
@@ -6263,16 +6186,11 @@ async def test_trigger_measurement_hdmi_ignores_cal_mode_loopback() -> None:
     mock_ctx_instance.__aenter__ = AsyncMock(return_value=mock_ctx_instance)
     mock_ctx_instance.__aexit__ = AsyncMock(return_value=False)
 
-    # DSP driver in cal mode with a loopback override device set.
-    mock_dsp = MagicMock()
-    mock_dsp.cal_mode_active = True
-    mock_dsp.cal_playback_device = "hw:Loopback,0,0"
-
     cfg_data = {k: (dict(v) if isinstance(v, dict) else v)
                 for k, v in DEFAULT_CONFIG.items()}
     cfg_data["measurement"] = {
         **cfg_data["measurement"],
-        "playback_route": "usb",
+        "playback_route": "hdmi",
         "denon_sweep_input": "AUX1",
     }
     cfg_data["denon"] = {**cfg_data.get("denon", {}), "host": "192.168.1.209"}
@@ -6284,7 +6202,6 @@ async def test_trigger_measurement_hdmi_ignores_cal_mode_loopback() -> None:
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
         patch.object(sut, "_drivers", None),
-        patch.object(sut, "_dsp", mock_dsp),
         patch.object(sut, "_config", return_value=Config(cfg_data)),
     ):
         MockCtx.from_config.return_value = mock_ctx_instance
@@ -6292,15 +6209,12 @@ async def test_trigger_measurement_hdmi_ignores_cal_mode_loopback() -> None:
 
     assert result["ok"], result
     measure_kwargs = mock_engine.measure.await_args.kwargs
-    # Critical: cal_playback_device must be DROPPED on HDMI route — otherwise
-    # the sweep plays into snd-aloop instead of HDMI.
-    assert measure_kwargs["playback_device_override"] is None
     assert measure_kwargs["route"] == "hdmi"
 
 
 @pytest.mark.asyncio
-async def test_trigger_measurement_sound_mode_passed_to_denon_context() -> None:
-    """sound_mode arg is plumbed to DenonSweepContext.from_config."""
+async def test_trigger_measurement_does_not_pass_sound_mode_to_denon_context() -> None:
+    """measure() no longer touches AVR sound mode — that's set_avr_mode's job."""
     from calibrate.config import Config, DEFAULT_CONFIG
 
     mock_sd = MagicMock()
@@ -6327,17 +6241,15 @@ async def test_trigger_measurement_sound_mode_passed_to_denon_context() -> None:
         patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
-        # Force the legacy path: sound_mode is one of the conditions that
-        # bypasses the graph composer so the override actually applies.
         patch.object(sut, "_drivers", None),
         patch.object(sut, "_config", return_value=Config(hdmi_cfg)),
     ):
         MockCtx.from_config.return_value = mock_ctx_instance
-        result = await sut._tool_trigger_measurement(sound_mode="PURE DIRECT")
+        result = await sut._tool_trigger_measurement()
 
     assert result["ok"], result
     call_kwargs = MockCtx.from_config.call_args.kwargs
-    assert call_kwargs.get("sound_mode_override") == "PURE DIRECT"
+    assert "sound_mode_override" not in call_kwargs
 
 
 @pytest.mark.asyncio

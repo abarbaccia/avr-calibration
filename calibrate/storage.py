@@ -50,6 +50,11 @@ def dsp_input_key(processor: str, field: str = "eq") -> str:
     return f"processor:{processor}:input:{field}"
 
 
+def dsp_input_channel_key(processor: str, input_index: int, field: str) -> str:
+    """Canonical key for a per-input-channel DSP state entry (e.g. input gain)."""
+    return f"processor:{processor}:input:{input_index}:{field}"
+
+
 def parse_dsp_key(key: str) -> dict | None:
     """Parse a namespaced or legacy DSP key into components.
 
@@ -80,6 +85,16 @@ def parse_dsp_key(key: str) -> dict | None:
                 "kind": "input",
                 "field": parts[3],
             }
+        if len(parts) == 5 and parts[2] == "input":
+            try:
+                return {
+                    "processor": parts[1],
+                    "kind": "input",
+                    "input_index": int(parts[3]),
+                    "field": parts[4],
+                }
+            except ValueError:
+                return None
         return None
 
     # Legacy shapes — processor is unknown at this layer; callers map via the

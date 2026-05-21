@@ -976,7 +976,7 @@ async def test_reapply_volatile_output_state_holds_lock():
 from calibrate.drivers.denon import DenonSweepContext
 
 
-def _denon_sweep_config(pure_direct: bool = True, settle_ms: int = 5000):
+def _denon_sweep_config(settle_ms: int = 5000):
     """Build a minimal Config mock for DenonSweepContext.from_config()."""
     cfg = MagicMock()
     cfg.measurement = {
@@ -984,7 +984,6 @@ def _denon_sweep_config(pure_direct: bool = True, settle_ms: int = 5000):
         "denon_sweep_input": "Videocore",
         "denon_sweep_volume": -20.0,
         "denon_settle_ms": settle_ms,
-        "denon_pure_direct": pure_direct,
     }
     cfg.denon = {"host": "192.168.1.209"}
     return cfg
@@ -1002,21 +1001,6 @@ def test_denon_sweep_from_config_returns_context_for_hdmi():
     cfg = _denon_sweep_config()
     ctx = DenonSweepContext.from_config(cfg)
     assert isinstance(ctx, DenonSweepContext)
-
-
-def test_denon_sweep_from_config_pure_direct_default_true():
-    """from_config() defaults to pure_direct=True."""
-    cfg = _denon_sweep_config()
-    del cfg.measurement["denon_pure_direct"]  # not in config → default
-    ctx = DenonSweepContext.from_config(cfg)
-    assert ctx._pure_direct is True
-
-
-def test_denon_sweep_from_config_pure_direct_false():
-    """from_config() respects denon_pure_direct=False."""
-    cfg = _denon_sweep_config(pure_direct=False)
-    ctx = DenonSweepContext.from_config(cfg)
-    assert ctx._pure_direct is False
 
 
 def test_denon_sweep_from_config_settle_ms_default():
@@ -1087,70 +1071,35 @@ def _make_sweep_receiver(volume=-28.0, sound_mode="DTS SURROUND", power="ON"):
 
 
 @pytest.mark.asyncio
-async def test_denon_sweep_enter_sets_pure_direct():
-    """With pure_direct=True, __aenter__ calls async_set_sound_mode(PURE DIRECT)."""
+async def test_denon_sweep_enter_does_not_touch_sound_mode():
+    """__aenter__ switches input+volume but never touches the AVR sound mode."""
     mock_mod, mock_receiver = _make_sweep_receiver()
 
     with patch.dict(sys.modules, {"denonavr": mock_mod}):
         with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
             ctx = DenonSweepContext(
                 host="192.168.1.209", sweep_input="Videocore",
-                sweep_volume=-20.0, settle_ms=100, pure_direct=True,
+                sweep_volume=-20.0, settle_ms=100,
             )
             await ctx.__aenter__()
 
-    mock_receiver.soundmode.async_set_sound_mode.assert_called_once_with("PURE DIRECT")
-
-
-@pytest.mark.asyncio
-async def test_denon_sweep_enter_skips_pure_direct():
-    """With pure_direct=False, __aenter__ does NOT call async_set_sound_mode."""
-    mock_mod, mock_receiver = _make_sweep_receiver()
-
-    with patch.dict(sys.modules, {"denonavr": mock_mod}):
-        with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
-            ctx = DenonSweepContext(
-                host="192.168.1.209", sweep_input="Videocore",
-                sweep_volume=-20.0, settle_ms=100, pure_direct=False,
-            )
-            await ctx.__aenter__()
-
+    mock_receiver.async_set_input_func.assert_called_once_with("Videocore")
     mock_receiver.soundmode.async_set_sound_mode.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_denon_sweep_exit_restores_sound_mode_when_pure_direct():
-    """With pure_direct=True, __aexit__ restores the saved sound mode."""
+async def test_denon_sweep_exit_does_not_touch_sound_mode():
+    """__aexit__ restores input+volume but never touches the AVR sound mode."""
     mock_mod, mock_receiver = _make_sweep_receiver()
 
     with patch.dict(sys.modules, {"denonavr": mock_mod}):
         with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
             ctx = DenonSweepContext(
                 host="192.168.1.209", sweep_input="Videocore",
-                sweep_volume=-20.0, settle_ms=100, pure_direct=True,
+                sweep_volume=-20.0, settle_ms=100,
             )
             await ctx.__aenter__()
             mock_receiver.soundmode.async_set_sound_mode.reset_mock()
-
-            await ctx.__aexit__(None, None, None)
-
-    mock_receiver.soundmode.async_set_sound_mode.assert_called_once_with("DTS SURROUND")
-
-
-@pytest.mark.asyncio
-async def test_denon_sweep_exit_skips_sound_mode_restore_when_not_pure_direct():
-    """With pure_direct=False, __aexit__ does NOT restore sound mode."""
-    mock_mod, mock_receiver = _make_sweep_receiver()
-
-    with patch.dict(sys.modules, {"denonavr": mock_mod}):
-        with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
-            ctx = DenonSweepContext(
-                host="192.168.1.209", sweep_input="Videocore",
-                sweep_volume=-20.0, settle_ms=100, pure_direct=False,
-            )
-            await ctx.__aenter__()
-            mock_receiver.soundmode.async_set_sound_mode.reset_mock()
-
             await ctx.__aexit__(None, None, None)
 
     mock_receiver.soundmode.async_set_sound_mode.assert_not_called()
@@ -1468,144 +1417,6 @@ async def test_camilladsp_setup_closes_ws_on_probe_failure() -> None:
     driver._client.close.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-async def test_camilladsp_set_cal_mode_swaps_capture_device_and_pushes() -> None:
-    """set_cal_mode(True) swaps capture to the loopback and pushes a fresh config.
-
-    Live capture (e.g. Focusrite analog input fed by AVR LFE pre-out) is preserved
-    so a subsequent set_cal_mode(False) restores it without losing channel-count
-    or lfe-input mappings.
-    """
-    driver = CamillaDSPDriver(
-        capture_device={
-            "type": "Alsa", "device": "plughw:USB,0", "channels": 20, "format": "S32_LE",
-        },
-        capture_channels=20,
-        input_channels=2,
-        lfe_input_channel=2,
-    )
-    driver._client.call = AsyncMock(return_value=None)
-
-    assert driver.cal_mode_active is False
-    assert driver._capture_device["device"] == "plughw:USB,0"
-
-    await driver.set_cal_mode(True)
-    assert driver.cal_mode_active is True
-    assert driver._capture_device["device"] == "hw:Loopback,1,0"
-    assert driver._capture_channels == 2
-    assert driver._lfe_input_channel == 0
-    pushed = [c.args[0] for c in driver._client.call.await_args_list if c.args[0] == "SetConfig"]
-    assert len(pushed) == 1
-
-    await driver.set_cal_mode(False)
-    assert driver.cal_mode_active is False
-    assert driver._capture_device["device"] == "plughw:USB,0"
-    assert driver._capture_channels == 20
-    assert driver._lfe_input_channel == 2
-
-
-@pytest.mark.asyncio
-async def test_camilladsp_set_cal_mode_idempotent() -> None:
-    """Calling set_cal_mode with the current state is a no-op (no SetConfig push)."""
-    driver = CamillaDSPDriver()
-    driver._client.call = AsyncMock(return_value=None)
-
-    await driver.set_cal_mode(False)  # already in live mode
-    assert driver._client.call.await_count == 0
-
-    await driver.set_cal_mode(True)
-    push_count_after_enable = driver._client.call.await_count
-    await driver.set_cal_mode(True)  # already in cal mode
-    assert driver._client.call.await_count == push_count_after_enable
-
-
-@pytest.mark.asyncio
-async def test_camilladsp_set_cal_mode_preserves_externally_applied_fir() -> None:
-    """FIR coefficients on the running daemon survive a cal_mode toggle.
-
-    Regression: an external script that called SetConfigJson directly to write
-    Conv FIR coefficients (e.g. to dodge the token cost of passing 4096-tap
-    arrays through MCP) used to lose those coefficients on the next cal_mode
-    transition — the driver rebuilt the pipeline from its shadow state, which
-    didn't know about the externally-applied filter. set_cal_mode now syncs
-    Conv ``cal_out{N}_fir`` filters from GetConfigJson into shadow state
-    before pushing, so the rebuild faithfully re-emits them.
-    """
-    import json as _json
-
-    driver = CamillaDSPDriver(output_channels=8)
-    external_fir = [0.1, -0.2, 0.3, -0.4, 0.5]
-    daemon_cfg = {
-        "devices": {},
-        "filters": {
-            "cal_out5_fir": {
-                "type": "Conv",
-                "parameters": {"type": "Values", "values": external_fir},
-            },
-            "some_other_filter": {
-                "type": "Biquad",
-                "parameters": {"type": "Peaking", "freq": 60, "gain": -3, "q": 1.0},
-            },
-        },
-    }
-
-    async def call_mock(command, value=None):
-        if command == "GetConfigJson":
-            return _json.dumps(daemon_cfg)
-        return None
-
-    driver._client.call = AsyncMock(side_effect=call_mock)
-
-    assert driver._fir_state.get(5) is None  # shadow state empty
-    await driver.set_cal_mode(True)
-    assert driver._fir_state[5] == external_fir  # synced from daemon
-    # Non-FIR filters and unrelated names are ignored — only cal_out{N}_fir
-    # Conv slots are pulled into shadow state.
-    assert 60 not in driver._fir_state
-
-
-@pytest.mark.asyncio
-async def test_camilladsp_set_cal_mode_tolerates_getconfigjson_failure() -> None:
-    """If GetConfigJson fails or returns junk, set_cal_mode still completes.
-
-    Defensive: a daemon hiccup during sync must not block the capture swap.
-    Shadow state is left untouched in that case.
-    """
-    driver = CamillaDSPDriver()
-    driver._fir_state[5] = [0.9, 0.1]  # pre-existing shadow state
-
-    async def call_mock(command, value=None):
-        if command == "GetConfigJson":
-            raise DriverError("simulated transport failure")
-        return None
-
-    driver._client.call = AsyncMock(side_effect=call_mock)
-
-    await driver.set_cal_mode(True)
-    assert driver.cal_mode_active is True
-    assert driver._fir_state[5] == [0.9, 0.1]  # untouched
-
-
-def test_camilladsp_cal_playback_device_default_is_loopback_write_side() -> None:
-    """The cal-mode playback device is the snd-aloop write side by default."""
-    driver = CamillaDSPDriver()
-    assert driver.cal_playback_device == "hw:Loopback,0,0"
-
-
-def test_camilladsp_cal_capture_overrides_via_constructor() -> None:
-    """Custom cal-mode capture/playback can be supplied (e.g. different loopback names)."""
-    driver = CamillaDSPDriver(
-        cal_capture_device={
-            "type": "Alsa", "device": "hw:CalLoop,1,0", "channels": 4, "format": "S32_LE",
-        },
-        cal_capture_channels=4,
-        cal_lfe_input_channel=1,
-        cal_playback_device="hw:CalLoop,0,0",
-    )
-    assert driver._cal_capture_device["device"] == "hw:CalLoop,1,0"
-    assert driver._cal_capture_channels == 4
-    assert driver._cal_lfe_input_channel == 1
-    assert driver.cal_playback_device == "hw:CalLoop,0,0"
 
 
 @pytest.mark.asyncio
@@ -2013,7 +1824,7 @@ async def test_camilladsp_set_routing_builds_mixer_mapping() -> None:
         1: {0: False, 1: False, 2: False, 3: False},
     })
     cfg = _last_pushed_config(call)
-    mapping = cfg["mixers"]["cal_matrix"]["mapping"]
+    mapping = cfg["mixers"]["output_router"]["mapping"]
     by_dest = {m["dest"]: m["sources"] for m in mapping}
     # outs 0/1 have exactly one source (input 0); outs 2/3 have none.
     assert len(by_dest[0]) == 1 and by_dest[0][0]["channel"] == 0
@@ -2293,7 +2104,7 @@ async def test_camilladsp_mute_flips_source_mute_flag() -> None:
     await driver.set_routing({0: {0: True, 1: True}, 1: {}})
     await driver.mute_outputs([1])
 
-    mixer = driver._build_mixer()["cal_matrix"]
+    mixer = driver._build_mixer()["output_router"]
     mapping = {entry["dest"]: entry["sources"] for entry in mixer["mapping"]}
     # Output 0 unaffected — source still present and unmuted.
     assert len(mapping[0]) == 1
@@ -2313,10 +2124,10 @@ async def test_camilladsp_unmute_clears_source_mute_flag() -> None:
 
     await driver.set_routing({0: {0: True, 1: True}, 1: {}})
     await driver.mute_outputs([1])
-    assert driver._build_mixer()["cal_matrix"]["mapping"][1]["sources"][0]["mute"] is True
+    assert driver._build_mixer()["output_router"]["mapping"][1]["sources"][0]["mute"] is True
 
     await driver.unmute_outputs([1])
-    mapping = driver._build_mixer()["cal_matrix"]["mapping"]
+    mapping = driver._build_mixer()["output_router"]["mapping"]
     assert len(mapping[1]["sources"]) == 1
     assert mapping[1]["sources"][0]["channel"] == 0
     assert mapping[1]["sources"][0]["mute"] is False
@@ -2336,7 +2147,7 @@ async def test_camilladsp_mute_does_not_mutate_routing() -> None:
     await driver.set_routing({0: {0: True, 1: True}, 1: {2: True}})
 
     def routing_pairs() -> set[tuple[int, int]]:
-        mapping = driver._build_mixer()["cal_matrix"]["mapping"]
+        mapping = driver._build_mixer()["output_router"]["mapping"]
         return {
             (src["channel"], entry["dest"])
             for entry in mapping
@@ -2370,7 +2181,7 @@ async def test_camilladsp_rehydrate_restores_mute_state() -> None:
     assert driver._output_muted.get(1) is True
     # The source for output 1 stays in the mixer (routing inspectable) but
     # carries mute: true so the per-output chain receives silence.
-    mapping = driver._build_mixer()["cal_matrix"]["mapping"]
+    mapping = driver._build_mixer()["output_router"]["mapping"]
     assert len(mapping[1]["sources"]) == 1
     assert mapping[1]["sources"][0]["mute"] is True
 
@@ -2419,7 +2230,7 @@ class TestCamillaDSPPipelineState:
 
 class TestCamillaDSPDirectCapture:
     """Tests for capture_channels / lfe_input_channel — direct multichannel capture
-    without the ffmpeg bridge. The pre-cal_matrix capture_mixer fans out one
+    without the ffmpeg bridge. The pre-output_router capture_mixer fans out one
     physical channel to every logical input."""
 
     def test_default_capture_channels_match_input_channels(self) -> None:
@@ -2427,7 +2238,6 @@ class TestCamillaDSPDirectCapture:
         driver = CamillaDSPDriver(input_channels=2)
         assert driver._capture_channels == 2
         assert driver._lfe_input_channel is None
-        assert not driver._needs_capture_mixer()
         assert driver._build_capture_mixer() is None
 
     def test_capture_channels_without_lfe_channel_raises(self) -> None:
@@ -2470,34 +2280,34 @@ class TestCamillaDSPDirectCapture:
             assert src["inverted"] is False
 
     def test_pipeline_includes_capture_mixer_step_first(self) -> None:
-        """When physical != logical, cal_capture is the first pipeline step."""
+        """When physical != logical, lfe_source is the first pipeline step."""
         driver = CamillaDSPDriver(
             input_channels=2, output_channels=4,
             capture_channels=20, lfe_input_channel=2,
         )
         pipeline = driver._build_pipeline()
-        assert pipeline[0] == {"type": "Mixer", "name": "cal_capture"}
-        # cal_matrix still present, after any input PEQ.
-        assert {"type": "Mixer", "name": "cal_matrix"} in pipeline
+        assert pipeline[0] == {"type": "Mixer", "name": "lfe_source"}
+        # output_router still present, after any input PEQ.
+        assert {"type": "Mixer", "name": "output_router"} in pipeline
 
     def test_pipeline_omits_capture_mixer_on_legacy_path(self) -> None:
         """Legacy 2:2 Loopback path emits no capture_mixer step."""
         driver = CamillaDSPDriver(input_channels=2, output_channels=4)
         pipeline = driver._build_pipeline()
-        assert {"type": "Mixer", "name": "cal_capture"} not in pipeline
-        # cal_matrix is still the routing mixer.
+        assert {"type": "Mixer", "name": "lfe_source"} not in pipeline
+        # output_router is still the routing mixer.
         names = [s.get("name") for s in pipeline if s.get("type") == "Mixer"]
-        assert names == ["cal_matrix"]
+        assert names == ["output_router"]
 
     def test_full_config_contains_both_mixers_on_direct_path(self) -> None:
-        """_build_config emits cal_capture alongside cal_matrix when needed."""
+        """_build_config emits lfe_source alongside output_router when needed."""
         driver = CamillaDSPDriver(
             input_channels=2, output_channels=4,
             capture_channels=20, lfe_input_channel=2,
         )
         cfg = driver._build_config()
-        assert "cal_capture" in cfg["mixers"]
-        assert "cal_matrix" in cfg["mixers"]
+        assert "lfe_source" in cfg["mixers"]
+        assert "output_router" in cfg["mixers"]
         assert cfg["devices"]["capture"]["channels"] == 20
 
     def test_registry_passes_through_new_keys(self) -> None:
@@ -2608,71 +2418,6 @@ class TestCamillaDSPMultirate:
         assert driver._resampler == {"type": "AsyncSinc", "profile": "Balanced"}
 
 
-# ── DenonSweepContext.sound_mode_override ─────────────────────────────────────
-
-
-def test_denon_sweep_sound_mode_override_validates_value():
-    """sound_mode_override rejects values outside VALID_SOUND_MODES."""
-    with pytest.raises(ValueError, match="sound_mode_override"):
-        DenonSweepContext(
-            host="192.168.1.209", sweep_input="Videocore",
-            sweep_volume=-20.0, sound_mode_override="JAZZ CLUB",
-        )
-
-
-def test_denon_sweep_sound_mode_override_normalizes_case():
-    """Lowercase value is normalized to uppercase canonical form."""
-    ctx = DenonSweepContext(
-        host="192.168.1.209", sweep_input="Videocore",
-        sweep_volume=-20.0, sound_mode_override="pure direct",
-    )
-    assert ctx._sound_mode_override == "PURE DIRECT"
-
-
-def test_denon_sweep_from_config_passes_sound_mode_override():
-    """from_config() forwards sound_mode_override to the constructor."""
-    cfg = _denon_sweep_config()
-    ctx = DenonSweepContext.from_config(cfg, sound_mode_override="DIRECT")
-    assert ctx._sound_mode_override == "DIRECT"
-
-
-@pytest.mark.asyncio
-async def test_denon_sweep_enter_uses_sound_mode_override():
-    """sound_mode_override forces that exact mode regardless of pure_direct."""
-    mock_mod, mock_receiver = _make_sweep_receiver()
-
-    with patch.dict(sys.modules, {"denonavr": mock_mod}):
-        with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
-            # pure_direct=False would normally skip sound-mode setting; the
-            # override must take priority and force STEREO instead.
-            ctx = DenonSweepContext(
-                host="192.168.1.209", sweep_input="Videocore",
-                sweep_volume=-20.0, settle_ms=100,
-                pure_direct=False, sound_mode_override="STEREO",
-            )
-            await ctx.__aenter__()
-
-    mock_receiver.soundmode.async_set_sound_mode.assert_called_once_with("STEREO")
-
-
-@pytest.mark.asyncio
-async def test_denon_sweep_exit_restores_sound_mode_after_override():
-    """Exit restores the saved sound mode when override was applied."""
-    mock_mod, mock_receiver = _make_sweep_receiver(sound_mode="DTS SURROUND")
-
-    with patch.dict(sys.modules, {"denonavr": mock_mod}):
-        with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
-            ctx = DenonSweepContext(
-                host="192.168.1.209", sweep_input="Videocore",
-                sweep_volume=-20.0, settle_ms=100,
-                pure_direct=False, sound_mode_override="STEREO",
-            )
-            await ctx.__aenter__()
-            mock_receiver.soundmode.async_set_sound_mode.reset_mock()
-            await ctx.__aexit__(None, None, None)
-
-    # On exit, the saved DTS SURROUND must be restored.
-    mock_receiver.soundmode.async_set_sound_mode.assert_any_call("DTS SURROUND")
 
 
 # ── LoopbackRefPlayback (task #50 skeleton) ─────────────────────────────────────

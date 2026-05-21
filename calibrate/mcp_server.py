@@ -4667,17 +4667,42 @@ async def _tool_design_avr_fir(
     is_sub}``.
     """
     from .audyssey_fir import (
-        convert_xt32, design_correction_ir, get_channel_byte, is_sub_channel,
-        smooth_target_curve,
+        convert_xt32, design_correction_ir, design_passthrough_ir,
+        get_channel_byte, is_sub_channel, smooth_target_curve,
     )
 
-    if not target_curve_db:
-        return _err("target_curve_db is empty")
     try:
         # Validate the channel exists before doing the IR FFT.
         get_channel_byte(channel_id, "XT32")
     except ValueError as exc:
         return _err(str(exc))
+
+    import numpy as np
+    is_sub = is_sub_channel(channel_id)
+
+    # Empty target_curve_db → true passthrough (center-tap delta, DC gain ≈ 1.0).
+    # This is the correct way to restore a channel to flat EQ without the
+    # -0.45 dB peak-limiter artifact that the flat-0dB correction path produces.
+    if not target_curve_db:
+        ir = design_passthrough_ir(is_sub=is_sub)
+        coefs = convert_xt32(ir)
+        _AVR_FIR_CACHE[(str(cache_key), channel_id)] = coefs
+        arr = np.asarray(coefs)
+        return _ok(
+            channel_id=channel_id,
+            cache_key=str(cache_key),
+            fir_taps=len(coefs),
+            peak_amplitude=float(np.max(np.abs(arr))) if len(arr) else 0.0,
+            is_sub=is_sub,
+            auto_smooth_below_hz=float(auto_smooth_below_hz),
+            smooth_octaves=float(smooth_octaves),
+            smoothing_changes=[],
+            message=(
+                f"Designed {len(coefs)}-tap passthrough AVR FIR for {channel_id} "
+                f"({'sub' if is_sub else 'speaker'} chain). "
+                f"Cached as ({cache_key!r}, {channel_id!r})."
+            ),
+        )
 
     freqs: list[float] = []
     gains: list[float] = []
@@ -4692,7 +4717,6 @@ async def _tool_design_avr_fir(
     freqs = [freqs[i] for i in order]
     gains = [gains[i] for i in order]
 
-    is_sub = is_sub_channel(channel_id)
     # Pre-smooth low-frequency target features. The polyphase decimation in
     # convert_xt32 heavily attenuates narrow notches below ~200 Hz (a -6 dB
     # cut at 70 Hz lands as ~-2 dB). A1EvoAcoustica handles this by refusing
@@ -4718,7 +4742,6 @@ async def _tool_design_avr_fir(
         return _err(f"FIR design failed: {exc}")
 
     _AVR_FIR_CACHE[(str(cache_key), channel_id)] = coefs
-    import numpy as np
     arr = np.asarray(coefs)
 
     # Report what was smoothed so the caller can see how the request was
@@ -5001,7 +5024,6 @@ async def _tool_trigger_measurement(
     freq_max: int | None = None,
     sweep_channel: str | None = None,
     sweep_volume_db: float | None = None,
-    sound_mode: str | None = None,
 ) -> dict:
     """Trigger a measurement via UMIK-1 + PyTTa.
 
@@ -5034,16 +5056,6 @@ async def _tool_trigger_measurement(
         measurement only. Mains typically need -10 to -15 dB; the default
         sub calibration volume (-31.1 dB) is too quiet for mains at MLP.
         Does not persist to config.
-      - ``sound_mode``: per-call AVR sound mode override. Trade-offs:
-          * "PURE DIRECT" — raw mains response, no Audyssey, no bass mgmt.
-            Use for distance/level cal of mains alone.
-          * "DIRECT" — bass mgmt active, Audyssey off. Use to verify
-            sub-mains integration without Audyssey on top.
-          * "STEREO" / "MULTI CH STEREO" / "DOLBY SURROUND" — Audyssey
-            ACTIVE. Use to verify how the corrections actually sound.
-        If None, uses the existing config-driven behavior
-        (``denon_pure_direct`` flag).
-
     Auto-routing: when ``sweep_channel`` is provided the route is forced
     to "hdmi" regardless of ``measurement.playback_route`` config — a
     per-channel mains sweep is a no-op on the USB sub path, so the prior
@@ -5067,21 +5079,15 @@ async def _tool_trigger_measurement(
 
     try:
         from .measurement import MeasurementEngine, compute_session_metadata
-        from .measurement_profiles import (
-            resolve_measurement_chain,
-            chain_requires_cal_mode,
-            chain_forbids_cal_mode,
-        )
+        from .measurement_profiles import resolve_measurement_chain
         from .storage import SessionStore
 
         cfg = _config()
 
         # Target-driven chain resolution. The signal_graph + measurement_profiles
         # in config.yaml are authoritative — `target` (or sweep_channel) implies
-        # route, cal_mode requirements, sound_mode, sweep_channel, freq range.
+        # route, sound_mode, sweep_channel, and freq range.
         # Hardware-agnostic; recipes never set route manually.
-        # See feedback_validate_chain_matches_target.md and
-        # docs/measurement-chain.md (task #57) for the design.
         chain = resolve_measurement_chain(target, sweep_channel, cfg)
         route = chain.route
         if chain.legacy_path:
@@ -5091,50 +5097,6 @@ async def _tool_trigger_measurement(
                 "This path is deprecated; add a measurement_profile or set "
                 "target to a transducer/group/role name.",
                 target, route,
-            )
-
-        # Cal-mode precondition: derived from chain spec (per role profile).
-        # Sub measurements require cal_mode ON; mains measurements require it
-        # OFF. Without these gates, sweeps silently go to the wrong device.
-        # Documented failure modes 2026-05-06: ~6 hours measuring mains via
-        # HDMI when target was 'subs' (route=hdmi default + cal_mode toggle
-        # decoupled from route).
-        cal_active = bool(getattr(_dsp, "cal_mode_active", False))
-        if chain_requires_cal_mode(chain) and not cal_active:
-            return _err(
-                f"target={target!r} (role={chain.role!r}) requires cal_mode=ON. "
-                "The DSP must capture from the snd-aloop loopback so the Pi sweep "
-                "reaches the transducers. Currently cal_mode is OFF — sweeps would "
-                "be silently misrouted. Call set_cal_mode(enabled=True) first, "
-                "then run measurement, then set_cal_mode(enabled=False) (or "
-                "restore_listening_mode) when done."
-            )
-        if chain_forbids_cal_mode(chain) and cal_active:
-            return _err(
-                f"target={target!r} (role={chain.role!r}) requires cal_mode=OFF "
-                "(HDMI route through AVR). Currently cal_mode is ON — the AVR "
-                "path is bypassed and sweeps go via snd-aloop. Call "
-                "set_cal_mode(enabled=False) first, then run measurement."
-            )
-
-        # Legacy precondition: when no profile matched and route=usb (legacy
-        # playback_route='usb' fallback), still require cal_mode=ON. Same
-        # rationale as the role-based gate above. Keeps backwards-compat
-        # for callers that haven't migrated to target-driven profiles.
-        # Skip the gate entirely if no DSP is configured — the gate is a
-        # production safety check that assumes a real DSP whose cal_mode
-        # state we can read; without one (e.g. test environment), the
-        # caller is responsible for the measurement chain integrity.
-        if _dsp is not None and chain.legacy_path and route == "usb" and not cal_active:
-            return _err(
-                "USB-route measurement requires cal_mode=ON, but it is currently OFF. "
-                "In live mode the DSP captures the multichannel interface directly — "
-                "the Pi sweep plays into snd-aloop and never reaches the subs, "
-                "producing noise-floor captures. Call set_cal_mode(enabled=True) "
-                "before the measurement, then set_cal_mode(enabled=False) (or "
-                "restore_listening_mode) when done. "
-                "Better: pass target='subs' to use the target-driven chain "
-                "resolver (recommended, handles cal_mode automatically per profile)."
             )
 
         engine = MeasurementEngine(cfg)
@@ -5154,15 +5116,6 @@ async def _tool_trigger_measurement(
                     f"Valid values: {list(_HDMI_CHANNEL_MAP.keys())}"
                 )
 
-        # cal_active was checked above as a precondition; here we just route
-        # the sweep into the cal_playback device when active and not HDMI.
-        # An HDMI sweep must IGNORE cal_playback_device — otherwise an HDMI
-        # mains sweep silently goes into snd-aloop instead of the AVR/HDMI.
-        if cal_active and route != "hdmi":
-            cal_playback = getattr(_dsp, "cal_playback_device", None)
-        else:
-            cal_playback = None
-
         # Graph composes the right stack: HDMI route → AVR neutralisation
         # (DenonSweepContext) + DSP HDMI-mode context (source=Analog +
         # master_gain_hdmi_db). USB route → DSP USB sweep context only.
@@ -5175,31 +5128,29 @@ async def _tool_trigger_measurement(
             and _drivers is not None
             and resolved_out_channel is None
             and sweep_volume_db is None
-            and sound_mode is None
         ):
             # Standard sub/combined sweep: let the graph compose all processor
             # contexts (Denon + CamillaDSP). Mains sweeps bypass this path
             # because CamillaDSP's sweep context is not part of the mains chain.
             async with graph.sweep_context_for_route(route, targets, cfg, _drivers):
                 fr = await engine.measure(
-                    playback_device_override=cal_playback,
                     freq_min=resolved_min,
                     freq_max=resolved_max,
                     route=route,
                 )
         elif route == "hdmi":
-            # Legacy path used when the driver registry isn't populated (older
-            # test setups that patch `_dsp` directly without the lifespan).
-            # Behaves exactly as before the graph refactor.
+            # Per-channel mains sweep (resolved_out_channel set) or legacy path.
+            # Pass route_override so this works when config.playback_route="usb"
+            # (sub-calibration setups where HDMI sweeps are triggered via
+            # sweep_channel= but the base config doesn't set playback_route=hdmi).
             denon_ctx = DenonSweepContext.from_config(
                 cfg,
                 sweep_volume_override=sweep_volume_db,
-                sound_mode_override=sound_mode,
+                route_override=route,
             )
             if denon_ctx:
                 async with denon_ctx:
                     fr = await engine.measure(
-                        playback_device_override=cal_playback,
                         freq_min=resolved_min,
                         freq_max=resolved_max,
                         out_channel_override=resolved_out_channel,
@@ -5207,20 +5158,14 @@ async def _tool_trigger_measurement(
                     )
             else:
                 fr = await engine.measure(
-                    playback_device_override=cal_playback,
                     freq_min=resolved_min,
                     freq_max=resolved_max,
                     out_channel_override=resolved_out_channel,
                     route=route,
                 )
         else:
-            # USB mode keeps the persistent-session pattern so repeat
-            # measurements don't thrash the DSP source switch. The persistent
-            # session is equivalent to entering the DSP's sweep context once
-            # and holding it open across measurements.
             await _ensure_sweep_session()
             fr = await engine.measure(
-                playback_device_override=cal_playback,
                 route=route,
             )
 
@@ -6318,6 +6263,40 @@ async def _tool_discover_avr() -> dict:
         return _err(f"discovery error: {exc}")
 
 
+async def _tool_set_avr_mode(sound_mode: str) -> dict:
+    """Set the AVR sound mode persistently (does not restore on sweep exit).
+
+    The orchestrator calls this before running sweeps. The sweep context
+    no longer flips the AVR mode, so whatever mode is set here persists
+    through all subsequent measurements until changed again.
+    """
+    # Mapping from friendly names to the denonavr-settable mode keys.
+    # denonavr uses "DOLBY DIGITAL" as the key for the Dolby Surround family;
+    # "DOLBY SURROUND" only appears as an auto-detected sub-mode string.
+    _MODE_MAP = {
+        "PURE DIRECT": "PURE DIRECT",
+        "DIRECT": "DIRECT",
+        "STEREO": "STEREO",
+        "MULTI CH STEREO": "MCH STEREO",
+        "DOLBY SURROUND": "DOLBY DIGITAL",
+    }
+    normalized = sound_mode.strip().upper()
+    if normalized not in _MODE_MAP:
+        return _err(f"set_avr_mode: sound_mode must be one of {list(_MODE_MAP)}, got {sound_mode!r}")
+    api_mode = _MODE_MAP[normalized]
+    try:
+        cfg = _config()
+        host = cfg.denon.get("host")
+        if not host:
+            return _err("set_avr_mode: no denon.host in config")
+        from .drivers.denon import _connect_receiver
+        receiver = await _connect_receiver(host)
+        await receiver.soundmode.async_set_sound_mode(api_mode)
+        return _ok(sound_mode=normalized, api_mode=api_mode)
+    except Exception as exc:
+        return _err(f"set_avr_mode error: {exc}")
+
+
 async def _tool_mute_output(
     output_indices: list[int] | None = None,
     target: str | None = None,
@@ -7064,6 +7043,31 @@ async def _tool_set_output_gain(
         return _err(f"set_output_gain error: {exc}")
 
 
+async def _tool_set_input_gain(input_index: int, gain_db: float) -> dict:
+    """Set flat gain (dB) on a DSP input channel, pre-PEQ and pre-mixer.
+
+    Make-up gain for upstream attenuation (e.g. a Scarlett analog-in trimmed
+    down for buzz mitigation). Sits in its own pipeline layer so per-output
+    gains stay alignment-only and input PEQ stays target-curve-only.
+    """
+    if _dsp is None:
+        return _err("DSP driver not loaded")
+    if not hasattr(_dsp, "set_input_gain"):
+        return _err("active DSP driver does not support input gain")
+    try:
+        await _dsp.set_input_gain(int(input_index), float(gain_db))
+        from .storage import dsp_input_channel_key
+        _persist_dsp_state(
+            dsp_input_channel_key(_default_dsp_name() or "dsp", int(input_index), "gain"),
+            {"gain_db": float(gain_db)},
+        )
+        return _ok(input_index=int(input_index), gain_db=float(gain_db))
+    except DriverError as exc:
+        return _err(str(exc))
+    except Exception as exc:
+        return _err(f"set_input_gain error: {exc}")
+
+
 async def _tool_set_master_gain(gain_db: float) -> dict:
     """Set the miniDSP master output gain (-127 to 0 dB).
 
@@ -7078,33 +7082,6 @@ async def _tool_set_master_gain(gain_db: float) -> dict:
         return _err(str(exc))
     except Exception as exc:
         return _err(f"set_master_gain error: {exc}")
-
-
-async def _tool_set_cal_mode(enabled: bool) -> dict:
-    """Switch CamillaDSP capture between live and calibration sources.
-
-    enabled=True: capture from snd-aloop loopback (hw:Loopback,1,0). The sweep
-                  player writes to hw:Loopback,0,0 → CamillaDSP processes (FIR,
-                  PEQ, gain, delay) → Focusrite outputs → subs. AVR is bypassed
-                  so Audyssey/MultEQ filters cannot color the cal stimulus.
-    enabled=False: restore live capture (e.g. Focusrite analog input fed by AVR
-                   LFE pre-out) for normal listening.
-
-    No-op if already in the requested mode. Always pair an enable with a
-    disable when the calibration finishes — leaving cal mode active will
-    silence the system for movies/music.
-    """
-    try:
-        if not hasattr(_dsp, "set_cal_mode"):
-            return _err("set_cal_mode: active DSP driver does not support cal-mode capture")
-        await _dsp.set_cal_mode(bool(enabled))  # type: ignore[union-attr]
-        active = getattr(_dsp, "cal_mode_active", None)
-        playback = getattr(_dsp, "cal_playback_device", None)
-        return _ok(cal_mode_active=bool(active), cal_playback_device=playback)
-    except DriverError as exc:
-        return _err(str(exc))
-    except Exception as exc:
-        return _err(f"set_cal_mode error: {exc}")
 
 
 async def _tool_configure_matrix(active_input: int | None = None) -> dict:
@@ -9475,23 +9452,6 @@ _TOOLS: list[Tool] = [
                         "calibrated for subs)."
                     ),
                 },
-                "sound_mode": {
-                    "type": "string",
-                    "enum": [
-                        "PURE DIRECT",
-                        "DIRECT",
-                        "STEREO",
-                        "MULTI CH STEREO",
-                        "DOLBY SURROUND",
-                    ],
-                    "description": (
-                        "Per-call AVR sound mode override (HDMI route only). "
-                        "PURE DIRECT = raw mains, no Audyssey, no bass mgmt; "
-                        "DIRECT = bass mgmt active, Audyssey off; "
-                        "STEREO/MULTI CH STEREO/DOLBY SURROUND = Audyssey ACTIVE. "
-                        "Default: config denon_pure_direct flag."
-                    ),
-                },
             },
         },
     ),
@@ -10039,6 +9999,33 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="set_avr_mode",
+        description=(
+            "Set the AVR sound mode persistently. Use this before running sweeps "
+            "to put the AVR in the right mode. The sweep context no longer touches "
+            "sound mode — whatever you set here stays until you change it again. "
+            "Modes: PURE DIRECT (no Audyssey, no bass mgmt), DIRECT (bass mgmt on, "
+            "Audyssey off), STEREO, MULTI CH STEREO, DOLBY SURROUND (Audyssey active)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "sound_mode": {
+                    "type": "string",
+                    "enum": [
+                        "PURE DIRECT",
+                        "DIRECT",
+                        "STEREO",
+                        "MULTI CH STEREO",
+                        "DOLBY SURROUND",
+                    ],
+                    "description": "AVR sound mode to apply.",
+                },
+            },
+            "required": ["sound_mode"],
+        },
+    ),
+    Tool(
         name="get_avr_audyssey_state",
         description=(
             "Probe AVR Audyssey + sound-mode state for calibration recipes. "
@@ -10381,30 +10368,6 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
-        name="set_cal_mode",
-        description=(
-            "Switch CamillaDSP capture between live and calibration sources. "
-            "Cal mode (enabled=true) routes capture from snd-aloop loopback so a "
-            "sweep player can inject directly into CamillaDSP, bypassing the AVR — "
-            "Audyssey/MultEQ filters cannot color the cal stimulus on this path. "
-            "Live mode (enabled=false) restores capture from the AVR/Focusrite line "
-            "for normal listening. Always pair enable→disable around a calibration "
-            "session; leaving cal mode on silences the system for movies/music. "
-            "Returns the active mode and the loopback playback device measure() "
-            "writes to in cal mode."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "enabled": {
-                    "type": "boolean",
-                    "description": "True to enter cal mode (loopback capture); False to return to live capture.",
-                },
-            },
-            "required": ["enabled"],
-        },
-    ),
-    Tool(
         name="set_master_gain",
         description=(
             "Set the miniDSP master output gain in dB. Range: -127 to 0 dB. "
@@ -10421,6 +10384,32 @@ _TOOLS: list[Tool] = [
                 },
             },
             "required": ["gain_db"],
+        },
+    ),
+    Tool(
+        name="set_input_gain",
+        description=(
+            "Set flat gain (dB) on a DSP input channel, pre-PEQ and pre-mixer. "
+            "Use for make-up gain when an upstream stage is attenuated (e.g. a "
+            "Scarlett analog-in trimmed down to mitigate hum/buzz). Sits in its "
+            "own layer so per-output gains stay alignment-only and input PEQ "
+            "stays target-curve-only. Watch downstream clipping — combined "
+            "(input_gain + input_eq peaks + output_gain) must keep peaks below "
+            "0 dBFS at the DAC."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "input_index": {
+                    "type": "integer",
+                    "description": "DSP input channel index (0-based).",
+                },
+                "gain_db": {
+                    "type": "number",
+                    "description": "Gain in dB (positive = boost, negative = cut).",
+                },
+            },
+            "required": ["input_index", "gain_db"],
         },
     ),
     Tool(
@@ -12208,7 +12197,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             freq_max=(int(arguments["freq_max"]) if arguments.get("freq_max") is not None else None),
             sweep_channel=arguments.get("sweep_channel"),
             sweep_volume_db=(float(arguments["sweep_volume_db"]) if arguments.get("sweep_volume_db") is not None else None),
-            sound_mode=arguments.get("sound_mode"),
         )
     elif name == "calibrate_level":
         result = await _tool_calibrate_level(
@@ -12322,6 +12310,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_set_config(arguments["updates"])
     elif name == "discover_avr":
         result = await _tool_discover_avr()
+    elif name == "set_avr_mode":
+        result = await _tool_set_avr_mode(str(arguments["sound_mode"]))
     elif name == "mute_output":
         result = await _tool_mute_output(
             output_indices=arguments.get("output_indices"),
@@ -12378,10 +12368,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             dry_run=bool(arguments.get("dry_run", False)),
             preserve_eq=bool(arguments.get("preserve_eq", False)),
         )
-    elif name == "set_cal_mode":
-        result = await _tool_set_cal_mode(enabled=bool(arguments["enabled"]))
     elif name == "set_master_gain":
         result = await _tool_set_master_gain(gain_db=float(arguments["gain_db"]))
+    elif name == "set_input_gain":
+        result = await _tool_set_input_gain(
+            input_index=int(arguments["input_index"]),
+            gain_db=float(arguments["gain_db"]),
+        )
     elif name == "set_output_gain":
         result = await _tool_set_output_gain(
             gain_db=float(arguments["gain_db"]),
