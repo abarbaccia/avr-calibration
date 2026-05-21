@@ -4628,17 +4628,42 @@ async def _tool_design_avr_fir(
     is_sub}``.
     """
     from .audyssey_fir import (
-        convert_xt32, design_correction_ir, get_channel_byte, is_sub_channel,
-        smooth_target_curve,
+        convert_xt32, design_correction_ir, design_passthrough_ir,
+        get_channel_byte, is_sub_channel, smooth_target_curve,
     )
 
-    if not target_curve_db:
-        return _err("target_curve_db is empty")
     try:
         # Validate the channel exists before doing the IR FFT.
         get_channel_byte(channel_id, "XT32")
     except ValueError as exc:
         return _err(str(exc))
+
+    import numpy as np
+    is_sub = is_sub_channel(channel_id)
+
+    # Empty target_curve_db → true passthrough (center-tap delta, DC gain ≈ 1.0).
+    # This is the correct way to restore a channel to flat EQ without the
+    # -0.45 dB peak-limiter artifact that the flat-0dB correction path produces.
+    if not target_curve_db:
+        ir = design_passthrough_ir(is_sub=is_sub)
+        coefs = convert_xt32(ir)
+        _AVR_FIR_CACHE[(str(cache_key), channel_id)] = coefs
+        arr = np.asarray(coefs)
+        return _ok(
+            channel_id=channel_id,
+            cache_key=str(cache_key),
+            fir_taps=len(coefs),
+            peak_amplitude=float(np.max(np.abs(arr))) if len(arr) else 0.0,
+            is_sub=is_sub,
+            auto_smooth_below_hz=float(auto_smooth_below_hz),
+            smooth_octaves=float(smooth_octaves),
+            smoothing_changes=[],
+            message=(
+                f"Designed {len(coefs)}-tap passthrough AVR FIR for {channel_id} "
+                f"({'sub' if is_sub else 'speaker'} chain). "
+                f"Cached as ({cache_key!r}, {channel_id!r})."
+            ),
+        )
 
     freqs: list[float] = []
     gains: list[float] = []
@@ -4653,7 +4678,6 @@ async def _tool_design_avr_fir(
     freqs = [freqs[i] for i in order]
     gains = [gains[i] for i in order]
 
-    is_sub = is_sub_channel(channel_id)
     # Pre-smooth low-frequency target features. The polyphase decimation in
     # convert_xt32 heavily attenuates narrow notches below ~200 Hz (a -6 dB
     # cut at 70 Hz lands as ~-2 dB). A1EvoAcoustica handles this by refusing
@@ -4679,7 +4703,6 @@ async def _tool_design_avr_fir(
         return _err(f"FIR design failed: {exc}")
 
     _AVR_FIR_CACHE[(str(cache_key), channel_id)] = coefs
-    import numpy as np
     arr = np.asarray(coefs)
 
     # Report what was smoothed so the caller can see how the request was
@@ -5077,12 +5100,14 @@ async def _tool_trigger_measurement(
                     route=route,
                 )
         elif route == "hdmi":
-            # Legacy path used when the driver registry isn't populated (older
-            # test setups that patch `_dsp` directly without the lifespan).
-            # Behaves exactly as before the graph refactor.
+            # Per-channel mains sweep (resolved_out_channel set) or legacy path.
+            # Pass route_override so this works when config.playback_route="usb"
+            # (sub-calibration setups where HDMI sweeps are triggered via
+            # sweep_channel= but the base config doesn't set playback_route=hdmi).
             denon_ctx = DenonSweepContext.from_config(
                 cfg,
                 sweep_volume_override=sweep_volume_db,
+                route_override=route,
             )
             if denon_ctx:
                 async with denon_ctx:

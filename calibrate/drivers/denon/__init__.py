@@ -499,6 +499,7 @@ class DenonSweepContext:
         config,
         manage_volume: bool = True,
         sweep_volume_override: float | None = None,
+        route_override: str | None = None,
     ) -> "DenonSweepContext | None":
         """Build from a Config object, or return None if HDMI sweep not configured.
 
@@ -507,8 +508,11 @@ class DenonSweepContext:
                 Useful when the caller manages volume itself (e.g. calibrate_level).
             sweep_volume_override: If set, use this volume instead of the config value.
                 Useful for mains measurements which need a higher level than subs.
+            route_override: If set, use this route instead of config.playback_route.
+                Pass the ChainSpec-resolved route so per-channel HDMI sweeps work even
+                when config.playback_route is "usb" (e.g. sub-calibration setup).
         """
-        route = config.measurement.get("playback_route", "usb")
+        route = route_override or config.measurement.get("playback_route", "usb")
         if route != "hdmi":
             return None
         host = config.denon.get("host")

@@ -86,14 +86,35 @@ async def test_design_avr_fir_unknown_channel_returns_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_design_avr_fir_empty_curve_returns_error() -> None:
+async def test_design_avr_fir_empty_curve_designs_passthrough_speaker() -> None:
     res = await _tool_design_avr_fir(
         channel_id="FL",
         target_curve_db=[],
-        cache_key="x",
+        cache_key="pt",
     )
-    assert not res["ok"]
-    assert "empty" in res["error"]
+    assert res["ok"], res.get("error")
+    assert res["fir_taps"] == 1024
+    assert res["is_sub"] is False
+    assert "passthrough" in res["message"].lower()
+    coefs = _AVR_FIR_CACHE[("pt", "FL")]
+    import numpy as np
+    # DC gain (sum of coefs) must be near unity — not the 0.95 peak-limited value.
+    assert abs(sum(coefs) - 1.0) < 0.02, f"DC gain {sum(coefs):.4f} too far from 1.0"
+
+
+@pytest.mark.asyncio
+async def test_design_avr_fir_empty_curve_designs_passthrough_sub() -> None:
+    res = await _tool_design_avr_fir(
+        channel_id="SW1",
+        target_curve_db=[],
+        cache_key="pt-sub",
+    )
+    assert res["ok"], res.get("error")
+    assert res["fir_taps"] == 704
+    assert res["is_sub"] is True
+    coefs = _AVR_FIR_CACHE[("pt-sub", "SW1")]
+    import numpy as np
+    assert abs(sum(coefs) - 1.0) < 0.02, f"DC gain {sum(coefs):.4f} too far from 1.0"
 
 
 @pytest.mark.asyncio
