@@ -16,6 +16,7 @@ Tools:
   get_fr_summary         — 1/3-octave downsampled FR (compact, for analysis)
   apply_eq               — SafetyValidator → biquad conversion → DSP write
   set_volume             — AVR volume control
+  set_avr_input          — switch AVR input source persistently (no auto-restore)
   measure                — trigger sweep measurement via UMIK + PyTTa
   mute_output            — mute DSP outputs (gain → -127 dB)
   unmute_output          — unmute DSP outputs (gain → 0 dB)
@@ -6297,6 +6298,35 @@ async def _tool_set_avr_mode(sound_mode: str) -> dict:
         return _err(f"set_avr_mode error: {exc}")
 
 
+async def _tool_set_avr_input(input_name: str) -> dict:
+    """Switch the AVR input source persistently.
+
+    Unlike the sweep context (which auto-restores on exit), this persists
+    until explicitly changed. Use it to switch between calibration, media
+    player, and karaoke sources without running a sweep.
+    """
+    try:
+        cfg = _config()
+        host = cfg.denon.get("host")
+        if not host:
+            return _err("set_avr_input: no denon.host in config")
+        from .drivers.denon import _connect_receiver
+        receiver = await _connect_receiver(host)
+        import asyncio as _asyncio
+        await _asyncio.wait_for(
+            receiver.async_set_input_func(input_name), timeout=5.0
+        )
+        await _asyncio.wait_for(receiver.async_update(), timeout=5.0)
+        confirmed = receiver.input_func
+        if confirmed != input_name:
+            return _err(
+                f"set_avr_input: requested {input_name!r} but AVR reports {confirmed!r}"
+            )
+        return _ok(input=confirmed)
+    except Exception as exc:
+        return _err(f"set_avr_input error: {exc}")
+
+
 async def _tool_mute_output(
     output_indices: list[int] | None = None,
     target: str | None = None,
@@ -10026,6 +10056,31 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="set_avr_input",
+        description=(
+            "Switch the AVR input source persistently (does not auto-restore). "
+            "Use this to select between calibration, media player, and karaoke "
+            "sources. The change persists until explicitly changed again — unlike "
+            "the sweep context which restores the previous input on exit. "
+            "Returns {ok: true, input: '<name>'} on success or "
+            "{ok: false, error: '...'} on failure."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "input_name": {
+                    "type": "string",
+                    "description": (
+                        "AVR input to select, e.g. 'CAL', 'SHIELD', 'KARAOKE', "
+                        "'Bluetooth'. Names are case-sensitive and must match the "
+                        "AVR's input_func_list."
+                    ),
+                },
+            },
+            "required": ["input_name"],
+        },
+    ),
+    Tool(
         name="get_avr_audyssey_state",
         description=(
             "Probe AVR Audyssey + sound-mode state for calibration recipes. "
@@ -12312,6 +12367,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_discover_avr()
     elif name == "set_avr_mode":
         result = await _tool_set_avr_mode(str(arguments["sound_mode"]))
+    elif name == "set_avr_input":
+        result = await _tool_set_avr_input(str(arguments["input_name"]))
     elif name == "mute_output":
         result = await _tool_mute_output(
             output_indices=arguments.get("output_indices"),
