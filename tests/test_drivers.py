@@ -1071,9 +1071,10 @@ def _make_sweep_receiver(volume=-28.0, sound_mode="DTS SURROUND", power="ON"):
 
 
 @pytest.mark.asyncio
-async def test_denon_sweep_enter_does_not_touch_sound_mode():
-    """__aenter__ switches input+volume but never touches the AVR sound mode."""
+async def test_denon_sweep_enter_does_not_switch_input():
+    """__aenter__ does NOT switch input — it checks and proceeds if correct."""
     mock_mod, mock_receiver = _make_sweep_receiver()
+    mock_receiver.input_func = "Videocore"  # already on the right input
 
     with patch.dict(sys.modules, {"denonavr": mock_mod}):
         with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
@@ -1083,14 +1084,34 @@ async def test_denon_sweep_enter_does_not_touch_sound_mode():
             )
             await ctx.__aenter__()
 
-    mock_receiver.async_set_input_func.assert_called_once_with("Videocore")
+    mock_receiver.async_set_input_func.assert_not_called()
     mock_receiver.soundmode.async_set_sound_mode.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_denon_sweep_exit_does_not_touch_sound_mode():
-    """__aexit__ restores input+volume but never touches the AVR sound mode."""
+async def test_denon_sweep_enter_raises_on_wrong_input():
+    """__aenter__ raises DriverError if AVR is on the wrong input."""
+    from calibrate.drivers.denon import DriverError
     mock_mod, mock_receiver = _make_sweep_receiver()
+    mock_receiver.input_func = "SHIELD"  # wrong input
+
+    with patch.dict(sys.modules, {"denonavr": mock_mod}):
+        with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
+            ctx = DenonSweepContext(
+                host="192.168.1.209", sweep_input="CAL",
+                sweep_volume=-20.0, settle_ms=100,
+            )
+            with pytest.raises(DriverError, match="AVR is on input 'SHIELD', expected 'CAL'"):
+                await ctx.__aenter__()
+
+    mock_receiver.async_set_input_func.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_denon_sweep_exit_does_not_restore_input():
+    """__aexit__ restores volume but never restores or touches the AVR input."""
+    mock_mod, mock_receiver = _make_sweep_receiver()
+    mock_receiver.input_func = "Videocore"
 
     with patch.dict(sys.modules, {"denonavr": mock_mod}):
         with patch("calibrate.drivers.denon.asyncio.sleep", new_callable=AsyncMock):
@@ -1099,9 +1120,11 @@ async def test_denon_sweep_exit_does_not_touch_sound_mode():
                 sweep_volume=-20.0, settle_ms=100,
             )
             await ctx.__aenter__()
+            mock_receiver.async_set_input_func.reset_mock()
             mock_receiver.soundmode.async_set_sound_mode.reset_mock()
             await ctx.__aexit__(None, None, None)
 
+    mock_receiver.async_set_input_func.assert_not_called()
     mock_receiver.soundmode.async_set_sound_mode.assert_not_called()
 
 

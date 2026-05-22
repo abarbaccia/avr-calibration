@@ -279,6 +279,44 @@ class DenonDriver(AVRDriver):
         await receiver.async_update()
         return receiver.volume  # type: ignore[no-any-return]
 
+    async def set_input(self, input_name: str) -> str:
+        """Switch the AVR input source. Persists until explicitly changed.
+
+        Unlike DenonSweepContext, this does NOT auto-restore on exit — the
+        caller is responsible for switching back if needed.
+
+        Args:
+            input_name: Input source name as recognised by denonavr, e.g.
+                'CAL', 'SHIELD', 'KARAOKE', 'Bluetooth', 'AUX1'. Names are
+                case-sensitive; the AVR's input_func_list (populated by
+                _connect_receiver) defines the valid set.
+
+        Returns:
+            The confirmed input_func string read back from the receiver.
+
+        Raises:
+            DriverError: no host configured, connection failure, or the
+                confirmed input doesn't match the requested name after setting.
+        """
+        if not self._host:
+            raise DriverError("no host configured")
+        receiver = await _connect_receiver(self._host)
+        try:
+            await asyncio.wait_for(
+                receiver.async_set_input_func(input_name), timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            raise DriverError(f"timeout setting input to {input_name!r}")
+        except Exception as exc:
+            raise DriverError(f"set_input failed: {exc}") from exc
+        await asyncio.wait_for(receiver.async_update(), timeout=5.0)
+        confirmed = receiver.input_func
+        if confirmed != input_name:
+            raise DriverError(
+                f"set_input: requested {input_name!r} but AVR reports {confirmed!r}"
+            )
+        return confirmed  # type: ignore[return-value]
+
     async def audyssey_status(self) -> dict:
         """Report whether Audyssey distance compensation is currently active.
 
@@ -550,7 +588,6 @@ class DenonSweepContext:
         self._settle_ms = settle_ms
         self._manage_volume = manage_volume
         self._receiver = None
-        self._saved_input: str | None = None
         self._saved_volume: float | None = None
 
     async def __aenter__(self) -> "DenonSweepContext":
@@ -580,16 +617,24 @@ class DenonSweepContext:
                     "Turn the AVR on manually and retry."
                 )
 
-        self._saved_input = self._receiver.input_func
         self._saved_volume = self._receiver.volume
+        current_input = self._receiver.input_func
+
+        # Check input precondition — never auto-switch. The orchestrator owns
+        # input selection. If the AVR is on the wrong input, raise so the
+        # caller can fix it explicitly.
+        if current_input != self._sweep_input:
+            raise DriverError(
+                f"AVR is on input {current_input!r}, expected {self._sweep_input!r}. "
+                f"Switch to {self._sweep_input!r} before measuring."
+            )
 
         log.info(
-            "Denon sweep: switching to input=%s%s (was input=%s volume=%s)",
+            "Denon sweep: input=%s confirmed%s volume=%s",
             self._sweep_input,
-            f" volume={self._sweep_volume:.1f} dB" if self._manage_volume else "",
-            self._saved_input, self._saved_volume,
+            f", setting volume={self._sweep_volume:.1f} dB" if self._manage_volume else "",
+            self._saved_volume,
         )
-        await self._receiver.async_set_input_func(self._sweep_input)
         if self._manage_volume:
             await self._receiver.async_set_volume(self._sweep_volume)
 
@@ -600,20 +645,12 @@ class DenonSweepContext:
         if self._receiver is None:
             return
         try:
-            log.info(
-                "Denon sweep: restoring input=%s volume=%s",
-                self._saved_input, self._saved_volume,
-            )
-            if self._saved_input is not None:
-                await asyncio.wait_for(
-                    self._receiver.async_set_input_func(self._saved_input),
-                    timeout=5.0,
-                )
             if self._manage_volume and self._saved_volume is not None:
+                log.info("Denon sweep: restoring volume=%s", self._saved_volume)
                 await asyncio.wait_for(
                     self._receiver.async_set_volume(self._saved_volume),
                     timeout=5.0,
                 )
         except Exception as exc:
-            log.warning("Failed to restore Denon state: %s", exc)
+            log.warning("Failed to restore Denon volume: %s", exc)
         self._receiver = None
