@@ -973,7 +973,9 @@ class MeasurementEngine:
         avr_processing_ms: Optional[float] = None
         if ref_1d is not None and not np.all(ref_1d == 0):
             loopback_xcorr_peak_ms = _xcorr_delay_ms(np, ref_1d, rec_for_deconv, sample_rate)
-            avr_processing_ms = _xcorr_delay_ms(np, sweep_for_deconv, ref_1d, sample_rate)
+            # Use unpadded sweep_1d: sweep_for_deconv includes pre_pad_samples offset
+            # that would inflate avr_processing_ms by ~pre_delay_s seconds.
+            avr_processing_ms = _xcorr_delay_ms(np, sweep_1d, ref_1d, sample_rate)
             log.info(
                 "loopback: avr_processing=%.3f ms  loopback_xcorr=%.3f ms  "
                 "sum=%.3f ms  xcorr_peak=%.3f ms  delta=%.3f ms",
