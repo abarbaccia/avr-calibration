@@ -4,7 +4,15 @@ Coverage diagram:
   FrequencyResponse
   ├── [TESTED] to_json / from_json round-trip
   ├── [TESTED] peak_spl returns maximum SPL value
-  └── [TESTED] freq_at_peak returns corresponding frequency
+  ├── [TESTED] freq_at_peak returns corresponding frequency
+  ├── [TESTED] loopback_xcorr_peak_ms / avr_processing_ms round-trip
+  └── [TESTED] backward compat when loopback fields absent
+
+  _xcorr_delay_ms
+  ├── [TESTED] recovers known delay within 1.5 ms
+  ├── [TESTED] returns None when reference is silent
+  ├── [TESTED] returns None when delayed is silent
+  └── [TESTED] result lies within search window
 
   MeasurementEngine.measure()
   ├── [TESTED] happy path — returns FrequencyResponse with correct fields
@@ -37,7 +45,7 @@ from click.testing import CliRunner
 
 from calibrate.cli import cli
 from calibrate.config import Config
-from calibrate.measurement import FrequencyResponse, MeasurementEngine, MeasurementQualityError, compute_session_metadata, detect_ir_onset
+from calibrate.measurement import FrequencyResponse, MeasurementEngine, MeasurementQualityError, compute_session_metadata, detect_ir_onset, _xcorr_delay_ms
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -237,8 +245,7 @@ class TestMeasure:
         ) as mock_factory:
             await engine.measure(route="hdmi")
         # playback_for_route is called with the explicit route, not cfg's "usb".
-        # Note: when route=="hdmi" without cal-mode override, measure() takes
-        # the direct-aplay branch; either way the route arg drives the choice.
+        # playback_for_route is called with the explicit route arg.
         called_route = mock_factory.call_args[0][0]
         assert called_route == "hdmi"
 
@@ -661,12 +668,10 @@ class TestComputeSessionMetadata:
 class TestResolveAlsaDeviceInPortAudio:
     """ALSA hw: names don't substring-match PortAudio device names directly.
 
-    Regression: cal-mode used to lookup ``hw:Loopback,0,0`` against PortAudio
-    names like ``"Loopback: PCM (hw:2,0)"`` — literal substring match fails,
-    cal-mode silently fell back to system default device, sweep went to AVR
-    instead of into CamillaDSP, every cal-mode measurement produced bogus data.
-    These tests pin the new resolver that maps ALSA card names → PortAudio
-    matches via /proc/asound/cards.
+    Regression: ``hw:Loopback,0,0`` vs PortAudio ``"Loopback: PCM (hw:2,0)"``
+    — literal substring match fails and silently falls back to system default.
+    These tests pin the resolver that maps ALSA card names → PortAudio matches
+    via /proc/asound/cards.
     """
 
     def _devices(self):
@@ -1371,3 +1376,94 @@ class TestDetectIrOnsetWithFirPreDelay:
         result = detect_ir_onset(ir, sr)
         # No pre-delay arg (defaults to 0); 1 ms skip + onset at 5 ms.
         assert 4.0 < result["peak_time_ms"] < 6.0
+
+
+# ── _xcorr_delay_ms ───────────────────────────────────────────────────────────
+
+class TestXcorrDelayMs:
+    """_xcorr_delay_ms returns the lag (in ms) of `delayed` behind `reference`."""
+
+    def _make_delayed(self, sr, delay_ms, length_s=0.3):
+        import numpy as np
+        n = int(length_s * sr)
+        delay_s = delay_ms / 1000.0
+        delay_samples = int(delay_s * sr)
+        rng = np.random.default_rng(42)
+        sig = rng.standard_normal(n) * 0.1
+        # Impulse at ~20 ms so it lands after the 3 ms skip floor
+        impulse_at = int(0.020 * sr)
+        sig[impulse_at] = 1.0
+        ref = np.zeros(n)
+        ref[impulse_at] = 1.0
+        delayed = np.zeros(n)
+        if impulse_at + delay_samples < n:
+            delayed[impulse_at + delay_samples] = 1.0
+        return ref, delayed
+
+    def test_known_delay_recovered(self):
+        import numpy as np
+        sr = 48000
+        ref, delayed = self._make_delayed(sr, delay_ms=15.0)
+        result = _xcorr_delay_ms(np, ref, delayed, sr, lo_ms=3.0, hi_ms=200.0)
+        assert result is not None
+        assert abs(result - 15.0) < 1.5  # within 1.5 ms
+
+    def test_zero_reference_returns_none(self):
+        import numpy as np
+        sr = 48000
+        ref = np.zeros(4800)
+        delayed = np.ones(4800) * 0.1
+        assert _xcorr_delay_ms(np, ref, delayed, sr) is None
+
+    def test_zero_delayed_returns_none(self):
+        import numpy as np
+        sr = 48000
+        ref = np.ones(4800) * 0.1
+        delayed = np.zeros(4800)
+        assert _xcorr_delay_ms(np, ref, delayed, sr) is None
+
+    def test_result_within_search_window(self):
+        import numpy as np
+        sr = 48000
+        ref, delayed = self._make_delayed(sr, delay_ms=50.0)
+        result = _xcorr_delay_ms(np, ref, delayed, sr, lo_ms=3.0, hi_ms=200.0)
+        assert result is not None
+        assert 3.0 <= result <= 200.0
+
+
+# ── FrequencyResponse loopback fields ─────────────────────────────────────────
+
+class TestFrequencyResponseLoopbackFields:
+    def _base_fr(self, **kwargs):
+        return FrequencyResponse(
+            frequencies=[20.0, 40.0, 80.0],
+            spl=[-20.0, -15.0, -12.0],
+            sample_rate=48000,
+            sweep_duration=3.0,
+            timestamp="2026-01-01T00:00:00+00:00",
+            **kwargs,
+        )
+
+    def test_defaults_to_none(self):
+        fr = self._base_fr()
+        assert fr.loopback_xcorr_peak_ms is None
+        assert fr.avr_processing_ms is None
+
+    def test_round_trip_with_loopback_fields(self):
+        fr = self._base_fr(loopback_xcorr_peak_ms=42.5, avr_processing_ms=18.3)
+        rt = FrequencyResponse.from_json(fr.to_json())
+        assert rt.loopback_xcorr_peak_ms == 42.5
+        assert rt.avr_processing_ms == 18.3
+
+    def test_backward_compat_missing_loopback_fields(self):
+        import json
+        data = {
+            "frequencies": [20.0],
+            "spl": [-20.0],
+            "sample_rate": 48000,
+            "sweep_duration": 3.0,
+            "timestamp": "2026-01-01T00:00:00+00:00",
+        }
+        fr = FrequencyResponse.from_json(json.dumps(data))
+        assert fr.loopback_xcorr_peak_ms is None
+        assert fr.avr_processing_ms is None
