@@ -62,13 +62,9 @@ times — no calculation, no static offsets.
 Build the diagram from `config`:
 
 - Pi → HDMI → AVR → speakers → room → mic → Pi (mains)
-- Pi → HDMI → AVR → Focusrite → subs → room → mic → Pi (subs, **NOT** via
-  cal_mode loopback for this recipe — subs go through the AVR path so peak
-  times are referenced to the same trigger as mains)
+- Pi → HDMI → AVR → sub-pre-out → Focusrite → CamillaDSP → subs → room → mic → Pi (subs)
 
-If `config.measurement.playback_route` is not `"hdmi"`, the recipe MUST switch
-it (or refuse, with a clear message). Sub-only `cal_mode` loopback is wrong for
-this recipe — distances would be unreferenced.
+Both paths share the same HDMI trigger so peak times are referenced to each other.
 
 ## Pre-flight
 
