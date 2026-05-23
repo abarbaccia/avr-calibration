@@ -76,6 +76,8 @@ class FrequencyResponse:
     recording_rms_dbfs: Optional[float] = None  # RMS of raw recording (sweep portion)
     coherence: Optional[list[float]] = None  # 0-1 per frequency, measurement reliability
     xcorr_peak_ms: Optional[float] = None  # cross-correlation peak time (propagation delay)
+    loopback_xcorr_peak_ms: Optional[float] = None  # xcorr(ref, mic): CamillaDSP latency + acoustic travel
+    avr_processing_ms: Optional[float] = None       # xcorr(sweep, ref): AVR processing delay
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
@@ -90,6 +92,8 @@ class FrequencyResponse:
         data.setdefault("recording_rms_dbfs", None)  # backward compat
         data.setdefault("coherence", None)  # backward compat
         data.setdefault("xcorr_peak_ms", None)  # backward compat
+        data.setdefault("loopback_xcorr_peak_ms", None)  # backward compat
+        data.setdefault("avr_processing_ms", None)  # backward compat
         return cls(**data)
 
     @property
@@ -747,6 +751,10 @@ class MeasurementEngine:
         from .drivers.playback import playback_for_route
 
         use_aplay_hdmi = route == "hdmi"
+        loopback_ref_device: str | None = cfg.get("loopback_ref_device")
+        loopback_ref_channels: int = int(cfg.get("loopback_ref_channels", 1))
+        loopback_ref_channel_index: int = int(cfg.get("loopback_ref_channel_index", 1))
+
         if use_aplay_hdmi:
             # Use default:CARD=vc4hdmi0, NOT the hdmi: plugin — the hdmi:
             # ALSA plugin silently downmixes multichannel PCM to stereo
@@ -786,9 +794,17 @@ class MeasurementEngine:
                 route,
                 hdmi_alsa_device=alsa_device,
                 hdmi_channels=hdmi_channels,
+                loopback_ref_device=loopback_ref_device,
+                loopback_ref_channels=loopback_ref_channels,
+                loopback_ref_channel_index=loopback_ref_channel_index,
             )
         else:
-            strategy = playback_for_route(route)
+            strategy = playback_for_route(
+                route,
+                loopback_ref_device=loopback_ref_device,
+                loopback_ref_channels=loopback_ref_channels,
+                loopback_ref_channel_index=loopback_ref_channel_index,
+            )
 
         # Lock: protects sd.default.device (module-level global) and serializes
         # play_and_record() so concurrent measure() calls don't clobber each other.
@@ -877,7 +893,11 @@ class MeasurementEngine:
                     ),
                     timeout=_MEASUREMENT_TIMEOUT_S,
                 )
-                sweep_1d, rec_1d = result
+                if len(result) == 3:
+                    sweep_1d, rec_1d, ref_1d = result
+                else:
+                    sweep_1d, rec_1d = result
+                    ref_1d = None
             except asyncio.TimeoutError:
                 raise RuntimeError(
                     f"Measurement timed out after {_MEASUREMENT_TIMEOUT_S:.0f}s — "
@@ -949,6 +969,23 @@ class MeasurementEngine:
             cal_curve=cal_curve,
         )
 
+        loopback_xcorr_peak_ms: Optional[float] = None
+        avr_processing_ms: Optional[float] = None
+        if ref_1d is not None and not np.all(ref_1d == 0):
+            loopback_xcorr_peak_ms = _xcorr_delay_ms(np, ref_1d, rec_for_deconv, sample_rate)
+            # Use unpadded sweep_1d: sweep_for_deconv includes pre_pad_samples offset
+            # that would inflate avr_processing_ms by ~pre_delay_s seconds.
+            avr_processing_ms = _xcorr_delay_ms(np, sweep_1d, ref_1d, sample_rate)
+            log.info(
+                "loopback: avr_processing=%.3f ms  loopback_xcorr=%.3f ms  "
+                "sum=%.3f ms  xcorr_peak=%.3f ms  delta=%.3f ms",
+                avr_processing_ms or 0.0,
+                loopback_xcorr_peak_ms or 0.0,
+                (avr_processing_ms or 0.0) + (loopback_xcorr_peak_ms or 0.0),
+                xcorr_peak_ms or 0.0,
+                ((avr_processing_ms or 0.0) + (loopback_xcorr_peak_ms or 0.0)) - (xcorr_peak_ms or 0.0),
+            )
+
         return FrequencyResponse(
             frequencies=frequencies,
             spl=spl,
@@ -961,6 +998,8 @@ class MeasurementEngine:
             recording_rms_dbfs=rec_rms_dbfs,
             coherence=coherence,
             xcorr_peak_ms=xcorr_peak_ms,
+            loopback_xcorr_peak_ms=loopback_xcorr_peak_ms,
+            avr_processing_ms=avr_processing_ms,
         )
 
     # ── Internals ─────────────────────────────────────────────────────────
@@ -1175,6 +1214,60 @@ class MeasurementEngine:
         x = sweep.timeSignal[:, 0]
         y = recording.timeSignal[:, 0]
         return self._compute_fr_arrays(np, x, y, freq_min, freq_max, sample_rate, cal_curve=cal_curve)
+
+
+def _xcorr_delay_ms(
+    np,
+    reference,   # 1-D float64 — the earlier-arriving signal
+    delayed,     # 1-D float64 — the later-arriving signal
+    sample_rate: int,
+    lo_ms: float = 3.0,
+    hi_ms: float = 250.0,
+) -> Optional[float]:
+    """FFT cross-correlation: return how many ms `delayed` lags behind `reference`.
+
+    Uses the same bandpass + onset-detection approach as ``_compute_fr_arrays``
+    so timing numbers are consistent.  Returns None if either signal is silent.
+    """
+    if np.max(np.abs(reference)) < 1e-9 or np.max(np.abs(delayed)) < 1e-9:
+        return None
+
+    n = 1
+    target = len(reference) + len(delayed)
+    while n < target:
+        n <<= 1
+
+    X = np.fft.rfft(reference, n=n)
+    Y = np.fft.rfft(delayed, n=n)
+    C_full = np.fft.irfft(np.conj(X) * Y, n=n)
+
+    try:
+        from scipy.signal import butter, sosfiltfilt, hilbert
+        bp_lo, bp_hi = 30.0, min(2000.0, sample_rate * 0.4)
+        sos = butter(4, [bp_lo, bp_hi], btype="band", fs=sample_rate, output="sos")
+        C_bp = sosfiltfilt(sos, C_full)
+        envelope = np.abs(hilbert(C_bp))
+    except Exception:
+        envelope = np.abs(C_full)
+
+    lo_idx = max(1, int(lo_ms / 1000.0 * sample_rate))
+    hi_idx = min(n, int(hi_ms / 1000.0 * sample_rate))
+    env_window = envelope[lo_idx:hi_idx]
+    if len(env_window) == 0 or float(np.max(env_window)) == 0.0:
+        return None
+
+    global_peak = float(np.max(env_window))
+    above = env_window > 0.10 * global_peak
+    if np.any(above):
+        rel_idx = int(np.argmax(above))
+        refine_lo = max(0, rel_idx - int(0.002 * sample_rate))
+        refine_hi = min(len(env_window), rel_idx + int(0.002 * sample_rate))
+        rel_idx = refine_lo + int(np.argmax(env_window[refine_lo:refine_hi]))
+    else:
+        rel_idx = int(np.argmax(env_window))
+
+    peak_idx = lo_idx + rel_idx
+    return round(peak_idx / sample_rate * 1000.0, 3)
 
 
 # ── IR onset detection constants ──────────────────────────────────────────────

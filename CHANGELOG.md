@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.10.2] - 2026-05-23
+
+### Added
+- **Loopback reference timing for sub sweep path.** When `loopback_ref_device` is configured in `config.yaml`, each sweep now records two derived timing floats alongside the UMIK measurement: `avr_processing_ms` (AVR DSP delay, from xcorr of sweep template against Scarlett IN3) and `loopback_xcorr_peak_ms` (CamillaDSP latency + acoustic travel, from xcorr of IN3 against UMIK). No new hardware required — Scarlett IN3 is already wired to the AVR LFE pre-out. A sanity check logs whether the sum of both values matches the existing full round-trip `xcorr_peak_ms`.
+
+### Changed
+- **`get_fr_summary` MCP tool** now exposes `loopback_xcorr_peak_ms` and `avr_processing_ms` when present in a stored measurement.
+
+### Removed
+- **`cal_mode` concept fully deleted.** The routing concept was already absent from `measurement_profiles.py`; this removes all remaining references in MCP server comments, the `preflight.py` docstring, `docs/measurement-chain.md`, and the core bass/mains calibration recipes. The `test_default_profiles_no_cal_mode` regression guard is retained.
+- **Measurement-chain docs** rewritten to reflect the HDMI-only signal path; the "four physical routes" section and `cal_mode` schema block are gone.
+
 ## [0.6.10.0] - 2026-04-30
 
 ### Added

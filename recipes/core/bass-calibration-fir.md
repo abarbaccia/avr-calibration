@@ -90,22 +90,16 @@ before measuring anything** — you'll be optimizing noise.
 
 ### 1. Confirm the sweep is going where you think
 
-`set_cal_mode(true)` then `mute_output` both subs and run `measure(label="silence-test")`.
-Expected: the measurement fails with `"Sweep not detected in recording (cross-correlation peak too low)"`. That failure means the DSP path is silenced
-correctly; the mic captured no signal correlated with the sweep.
+`mute_output` both subs and run `measure(label="silence-test")`.
+Expected: the measurement fails with `"Sweep not detected in recording (cross-correlation peak too low)"`. That failure means the subs are silenced
+correctly and the mic captured no signal correlated with the sweep.
 
 If the measurement succeeds with normal-looking data when both subs are
-muted, the sweep is reaching the mic by some other path (HDMI to AVR,
-PipeWire mirroring, etc.). Stop. Diagnose:
-- `playback_route` MUST be `"usb"` for cal-mode bypass to engage. `hdmi`
-  routes through the AVR regardless of `cal_mode_active`.
+muted, the sweep is reaching the mic by some other path. Stop. Diagnose:
 - `check_system` includes an `Audio stack` check that flags PipeWire/
   wireplumber/PulseAudio holding `/dev/snd` handles. Disable them on the
   host: `systemctl --user mask pipewire wireplumber pipewire-pulse`.
-- Verify the cal-mode loopback resolves to the right PortAudio device —
-  `_resolve_alsa_device_in_portaudio` reads `/proc/asound/cards` to map
-  `hw:Loopback,0,0` → the actual ALSA card index. If this fails, cal-mode
-  silently falls back to system default (HDMI on a Pi).
+- Verify `get_signal_graph` shows the sweep path is routed to subs only.
 
 ### 2. Trust coherence as the data quality signal
 
@@ -121,10 +115,9 @@ invalid on non-stationary sweeps). Reading rules:
   acoustic cancellation. Most common at 20-25 Hz when the sub is below
   port tuning or sitting in a deep null.
 
-A 3-second sweep is enough for ≥0.95 coherence at 31.5 Hz and up on the
-USB-direct cal-mode path. Bump to 5-10s only when chasing 20 Hz
-specifically. Longer sweeps don't help when the bottleneck is geometry,
-not SNR.
+A 3-second sweep is enough for ≥0.95 coherence at 31.5 Hz and up. Bump to
+5-10s only when chasing 20 Hz specifically. Longer sweeps don't help when
+the bottleneck is geometry, not SNR.
 
 ### 3. IR peak time can lie when a room mode dominates
 

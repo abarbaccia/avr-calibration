@@ -87,9 +87,8 @@ Pi → HDMI → AVR (Audyssey + bass-mgmt + our FIRs)
                                                   → subs → room → mic → Pi
 ```
 
-Sub-only `cal_mode` loopback is WRONG for this recipe — distances would
-be unreferenced. If `config.measurement.playback_route != "hdmi"`, the
-recipe MUST switch it (or refuse with a clear message).
+Both subs and mains sweep via HDMI so peak times share the same trigger
+and distances are referenced to each other.
 
 ## Configuration
 

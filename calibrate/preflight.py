@@ -581,14 +581,11 @@ class PreflightChecker:
     async def check_audio_stack_clean(self) -> CheckResult:
         """Detect competing userspace audio managers (PipeWire/PulseAudio) on the host.
 
-        cal-mode writes the sweep into ``hw:Loopback,0,0``; CamillaDSP captures
-        from ``hw:Loopback,1,0``. PipeWire's default behavior is to claim
-        ``snd-aloop`` as a managed sink with name
-        ``alsa_output.platform-snd_aloop.0.analog-stereo``. Even when nothing
-        is actively linked, PipeWire and wireplumber hold ALSA control handles
-        and may auto-route audio between sinks unpredictably — observed during
-        cal-mode debugging where the sweep was reaching the AVR via a path we
-        couldn't trace until we disabled PipeWire.
+        PipeWire's default behavior is to claim ALSA devices as managed sinks.
+        Even when nothing is actively linked, PipeWire and wireplumber hold ALSA
+        control handles and may auto-route audio between sinks unpredictably —
+        observed where sweeps were reaching the AVR via a path we couldn't trace
+        until we disabled PipeWire.
 
         Reads ``/proc/asound/cards`` and checks whether any non-CamillaDSP
         process holds ``controlC*`` or ``pcm*`` devices on the audio cards we
@@ -626,8 +623,8 @@ class PreflightChecker:
                 passed=False,
                 detail=(
                     f"Userspace audio managers holding ALSA devices: {', '.join(offenders)}. "
-                    "cal-mode routing is unreliable when these are active — they may auto-route "
-                    "the sweep to the AVR or other sinks."
+                    "audio routing is unreliable when these are active — they may intercept "
+                    "sweep playback and redirect it unexpectedly."
                 ),
                 error=(
                     "Disable on the host: "
