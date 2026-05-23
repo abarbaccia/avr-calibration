@@ -717,10 +717,9 @@ class TestSignalPathSyncEdgeCases:
 @pytest.mark.asyncio
 class TestAudioStackClean:
     """A userspace audio manager (PipeWire, PulseAudio, wireplumber) holding
-    /dev/snd handles can silently auto-route the cal-mode sweep to other
-    sinks (HDMI, Scarlett monitor outputs) — observed during cal-mode
-    debugging where the sweep was reaching the AVR via a path we couldn't
-    trace until we disabled PipeWire on the host.
+    /dev/snd handles can intercept sweep playback and redirect it to unexpected
+    sinks (HDMI, Scarlett monitor outputs). Observed where sweeps were reaching
+    the AVR via an untraceable path until PipeWire was disabled on the host.
     """
 
     async def test_passes_when_only_camilladsp_holds_snd_devices(self, config, monkeypatch):

@@ -443,6 +443,10 @@ async def _tool_get_fr_summary(
             }
             if s.metadata and "ir" in s.metadata:
                 entry["ir_summary"] = s.metadata["ir"]
+            if fr.loopback_xcorr_peak_ms is not None:
+                entry["loopback_xcorr_peak_ms"] = fr.loopback_xcorr_peak_ms
+            if fr.avr_processing_ms is not None:
+                entry["avr_processing_ms"] = fr.avr_processing_ms
             result.append(entry)
         return _ok(sessions=result, count=len(result))
     except Exception as exc:
@@ -6543,12 +6547,12 @@ async def _tool_analyze_ir(
     latest to get the delay offset. Both measurements share the same FIR and
     buffer latency, so those terms cancel.
 
-    INVALID use: cross-path comparisons (sub-vs-mains, FIR-chain vs no-FIR-chain,
-    cal-mode vs HDMI). The detected peak sits inside the sub chain's FIR
+    INVALID use: cross-path comparisons (sub-vs-mains, chains with different
+    FIR processing). The detected peak sits inside the sub chain's FIR
     non-causal window (~42 ms for a 4096-tap linear-phase filter @ 48 kHz);
     its absolute value reflects FIR shape + buffer latency, not acoustic
-    arrival. Use ``compare_sub_phase`` (phase-slope fit) or the loopback
-    alignment rig for sub-vs-mains timing instead.
+    arrival. Use ``compare_sub_phase`` (phase-slope fit) or a pre-out tap for
+    sub-vs-mains timing instead.
     """
     from .storage import SessionStore
 
@@ -10229,9 +10233,9 @@ _TOOLS: list[Tool] = [
             "Subtract the earliest peak_time_s from the latest to get the delay offset between subs; "
             "peak_sign tells you polarity (flip if it differs from the reference sub); "
             "spl_db is the relative level for gain matching. "
-            "INVALID for cross-path comparisons (sub-vs-mains, FIR-chain vs no-FIR, "
-            "cal-mode vs HDMI) — peak_time_s reflects FIR shape and buffer latency, not "
-            "acoustic arrival. Use compare_sub_phase or the loopback rig for cross-path timing. "
+            "INVALID for cross-path comparisons (sub-vs-mains, chains with different FIR processing) "
+            "— peak_time_s reflects FIR shape and buffer latency, not acoustic arrival. "
+            "Use compare_sub_phase or a pre-out tap for cross-path timing. "
             "Workflow: mute_output → measure → analyze_ir → unmute_output → repeat per sub → "
             "compute offsets → set_delay / set_polarity / set_output_gain."
         ),

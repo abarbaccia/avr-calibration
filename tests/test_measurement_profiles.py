@@ -212,7 +212,7 @@ def test_default_profiles_all_use_hdmi():
 
 
 def test_default_profiles_no_cal_mode():
-    """No default profiles reference cal_mode — the loopback path is gone."""
+    """Default profiles must not contain a cal_mode key (concept was removed)."""
     for role, prof in DEFAULT_MEASUREMENT_PROFILES.items():
         assert "cal_mode" not in prof, (
             f"Role {role}: unexpected cal_mode key"
