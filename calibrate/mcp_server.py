@@ -2773,6 +2773,7 @@ async def _tool_compare_sub_phase(
     session_b: int,
     min_hz: float = 20.0,
     max_hz: float = 120.0,
+    require_loopback: bool = True,
 ) -> dict:
     """Compare phase relationship between two solo sub measurements.
 
@@ -2798,6 +2799,22 @@ async def _tool_compare_sub_phase(
                 return _err(f"session {s_id} has no frequency response data")
             if not s_check.start_fr.phase:
                 return _err(f"session {s_id} has no phase data — needed for phase comparison")
+
+        loopback_warnings: list[str] = []
+        for s_check, s_id in [(sa, session_a), (sb, session_b)]:
+            if s_check.start_fr.loopback_xcorr_peak_ms is None:
+                msg = (
+                    f"session {s_id} was measured WITHOUT loopback reference "
+                    "(no loopback_xcorr_peak_ms). Sub-vs-sub phase comparison "
+                    "is meaningful with sequential same-path measurements, but "
+                    "loopback-anchored timing eliminates system-latency drift "
+                    "between measurements. Re-measure with the loopback ref "
+                    "wired (Scarlett input ch3 ← Denon LFE pre-out) for "
+                    "sub-millisecond timing accuracy."
+                )
+                if require_loopback:
+                    return _err(msg)
+                loopback_warnings.append(msg)
 
         import numpy as np
 
@@ -2924,7 +2941,7 @@ async def _tool_compare_sub_phase(
             except np.linalg.LinAlgError:
                 delay_estimate = None
 
-        return _ok(
+        result = dict(
             session_a=session_a,
             session_b=session_b,
             bands=bands,
@@ -2937,6 +2954,9 @@ async def _tool_compare_sub_phase(
                  "low values → phase is scattered, rely on polarity/positioning instead. "
                  "Cancelling bands after alignment cannot be fixed with EQ — consider repositioning.",
         )
+        if loopback_warnings:
+            result["loopback_warnings"] = loopback_warnings
+        return _ok(**result)
     except Exception as exc:
         return _err(f"compare_sub_phase failed: {exc}")
 
@@ -2951,6 +2971,7 @@ async def _tool_optimize_sub_alignment(
     gain_search_db: float = 3.0,
     priority_band: list[float] | None = None,
     seed: int = 42,
+    require_loopback: bool = True,
 ) -> dict:
     """MSO-style numerical sub alignment.
 
@@ -2991,6 +3012,7 @@ async def _tool_optimize_sub_alignment(
 
         store = SessionStore()
         subs = []
+        loopback_warnings: list[str] = []
         for sid in session_ids:
             s = store.get_session(sid)
             if s is None:
@@ -2999,6 +3021,21 @@ async def _tool_optimize_sub_alignment(
                 return _err(f"session {sid} has no impulse_response")
             if not s.start_fr or not s.start_fr.sample_rate:
                 return _err(f"session {sid} has no sample_rate")
+            if s.start_fr.loopback_xcorr_peak_ms is None:
+                msg = (
+                    f"session {sid} was measured WITHOUT loopback reference "
+                    "(no loopback_xcorr_peak_ms). Sub alignment relies on "
+                    "precise inter-session timing; without the hardware "
+                    "loopback, system latency drift between solo-sub sweeps "
+                    "can introduce ms-scale phantom delays the optimizer "
+                    "cannot distinguish from real acoustic offsets. "
+                    "Re-measure with the loopback ref wired "
+                    "(Scarlett input ch3 ← Denon LFE pre-out, "
+                    "config.measurement.loopback_ref_device set)."
+                )
+                if require_loopback:
+                    return _err(msg)
+                loopback_warnings.append(msg)
             subs.append(s)
 
         sr = int(subs[0].start_fr.sample_rate)
@@ -3249,7 +3286,7 @@ async def _tool_optimize_sub_alignment(
         except Exception:
             per_band_polarity = []
 
-        return _ok(
+        result_payload = dict(
             per_sub=per_sub,
             band_hz=[min_hz, max_hz],
             priority_band=priority_band if priority_band else None,
@@ -3276,6 +3313,9 @@ async def _tool_optimize_sub_alignment(
                 "objective for deep-bass-priority alignment."
             ),
         )
+        if loopback_warnings:
+            result_payload["loopback_warnings"] = loopback_warnings
+        return _ok(**result_payload)
     except Exception as exc:
         return _err(f"optimize_sub_alignment failed: {exc}")
 
