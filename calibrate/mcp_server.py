@@ -6302,6 +6302,84 @@ async def _tool_set_avr_mode(sound_mode: str) -> dict:
         return _err(f"set_avr_mode error: {exc}")
 
 
+async def _denon_telnet_set(commands: list[str]) -> dict:
+    """Send Denon Telnet write commands and verify via paired query.
+
+    Each item in ``commands`` is a write directive (e.g. ``"PSMULTEQ:FLAT"``).
+    Returns {ok, replies} on success or {ok: false, error}.
+    """
+    cfg = _config()
+    host = cfg.denon.get("host")
+    if not host:
+        return _err("no denon.host in config")
+    from .drivers.denon import DenonDriver
+    driver = DenonDriver(host=host)
+    try:
+        replies = await driver.telnet_query(commands)
+        return _ok(replies=replies)
+    except Exception as exc:
+        return _err(f"telnet write failed: {exc}")
+
+
+async def _tool_set_avr_multi_eq(slot: str) -> dict:
+    """Set the AVR Audyssey MultEQ slot via Telnet (PSMULTEQ).
+
+    Slot semantics on the X3800H:
+      - OFF        — Audyssey FIR bypassed entirely (calibration writes are inert)
+      - FLAT       — Flat target curve
+      - REFERENCE  — Audyssey Reference curve (default movie target)
+      - BYP.LR     — Bypass L/R only, EQ on surrounds + subs
+    """
+    _SLOT_MAP = {
+        "OFF": "OFF",
+        "FLAT": "FLAT",
+        "REFERENCE": "REF",
+        "REF": "REF",
+        "BYP.LR": "BYP.LR",
+        "BYPASS LR": "BYP.LR",
+    }
+    key = slot.strip().upper()
+    if key not in _SLOT_MAP:
+        return _err(
+            f"set_avr_multi_eq: slot must be one of OFF/FLAT/REFERENCE/BYP.LR, got {slot!r}"
+        )
+    return await _denon_telnet_set([f"PSMULTEQ:{_SLOT_MAP[key]}"])
+
+
+async def _tool_set_avr_dynamic_eq(enabled: bool) -> dict:
+    """Enable or disable Audyssey Dynamic EQ via Telnet (PSDYNEQ).
+
+    Dynamic EQ applies volume-dependent loudness compensation — fine for
+    movie watching but contaminates calibration measurements. Set OFF for
+    any measurement-bearing work.
+    """
+    arg = "ON" if enabled else "OFF"
+    return await _denon_telnet_set([f"PSDYNEQ {arg}"])
+
+
+async def _tool_set_avr_dynamic_volume(level: str) -> dict:
+    """Set Audyssey Dynamic Volume level via Telnet (PSDYNVOL).
+
+    Levels: OFF, LIGHT (LIT), MEDIUM (MED), HEAVY (HEV). Dynamic Volume
+    compresses dynamic range; set OFF for any measurement-bearing work.
+    """
+    _LEVEL_MAP = {
+        "OFF": "OFF",
+        "LIGHT": "LIT",
+        "LIT": "LIT",
+        "MEDIUM": "MED",
+        "MED": "MED",
+        "HEAVY": "HEV",
+        "HEV": "HEV",
+    }
+    key = level.strip().upper()
+    if key not in _LEVEL_MAP:
+        return _err(
+            f"set_avr_dynamic_volume: level must be one of OFF/LIGHT/MEDIUM/HEAVY, got {level!r}"
+        )
+    return await _denon_telnet_set([f"PSDYNVOL {_LEVEL_MAP[key]}"])
+
+
 async def _tool_set_avr_input(input_name: str) -> dict:
     """Switch the AVR input source persistently.
 
@@ -7419,6 +7497,7 @@ async def _tool_analyze_decay(
     t60_threshold_ms: float = 300.0,
     freq_min: float = 20.0,
     freq_max: float = 200.0,
+    bands_per_octave: int | None = None,
 ) -> dict:
     """Run T60 decay analysis on the impulse response from a stored session."""
     from .storage import SessionStore
@@ -7451,6 +7530,7 @@ async def _tool_analyze_decay(
             t60_threshold_ms=t60_threshold_ms,
             freq_min=freq_min,
             freq_max=freq_max,
+            bands_per_octave=bands_per_octave,
         )
 
         return _ok(
@@ -10085,6 +10165,63 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="set_avr_multi_eq",
+        description=(
+            "Set the AVR's Audyssey MultEQ slot via Telnet (PSMULTEQ). "
+            "Use OFF to fully bypass Audyssey for clean baseline measurements "
+            "and clean DSP-only calibration (the path we use post-soffit-trap). "
+            "FLAT/REFERENCE keep the Audyssey FIR engaged. BYP.LR bypasses L/R only."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "slot": {
+                    "type": "string",
+                    "enum": ["OFF", "FLAT", "REFERENCE", "BYP.LR"],
+                    "description": "Audyssey MultEQ slot to engage.",
+                },
+            },
+            "required": ["slot"],
+        },
+    ),
+    Tool(
+        name="set_avr_dynamic_eq",
+        description=(
+            "Enable or disable Audyssey Dynamic EQ via Telnet (PSDYNEQ). "
+            "Always OFF for calibration measurements — Dynamic EQ applies "
+            "volume-dependent loudness compensation that biases FR data."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "description": "true=ON, false=OFF.",
+                },
+            },
+            "required": ["enabled"],
+        },
+    ),
+    Tool(
+        name="set_avr_dynamic_volume",
+        description=(
+            "Set Audyssey Dynamic Volume level via Telnet (PSDYNVOL). "
+            "Always OFF for calibration — Dynamic Volume compresses dynamic "
+            "range and changes measured peak levels."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "level": {
+                    "type": "string",
+                    "enum": ["OFF", "LIGHT", "MEDIUM", "HEAVY"],
+                    "description": "Dynamic Volume level.",
+                },
+            },
+            "required": ["level"],
+        },
+    ),
+    Tool(
         name="get_avr_audyssey_state",
         description=(
             "Probe AVR Audyssey + sound-mode state for calibration recipes. "
@@ -12371,6 +12508,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _tool_discover_avr()
     elif name == "set_avr_mode":
         result = await _tool_set_avr_mode(str(arguments["sound_mode"]))
+    elif name == "set_avr_multi_eq":
+        result = await _tool_set_avr_multi_eq(str(arguments["slot"]))
+    elif name == "set_avr_dynamic_eq":
+        result = await _tool_set_avr_dynamic_eq(bool(arguments["enabled"]))
+    elif name == "set_avr_dynamic_volume":
+        result = await _tool_set_avr_dynamic_volume(str(arguments["level"]))
     elif name == "set_avr_input":
         result = await _tool_set_avr_input(str(arguments["input_name"]))
     elif name == "mute_output":

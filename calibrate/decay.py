@@ -37,16 +37,26 @@ def analyze_decay(
     freq_max: float = 200.0,
     nperseg: int = 2048,
     noverlap: int = 1536,
+    bands_per_octave: int | None = None,
 ) -> list[DecayMode]:
-    """Analyze impulse response for ringing modes via spectrogram + Schroeder integration.
+    """Analyze impulse response for ringing modes via Schroeder integration.
 
-    Algorithm:
-    1. scipy.signal.spectrogram(ir, fs, nperseg, noverlap)
-    2. Per frequency bin: Schroeder integration (cumulative energy sum in reverse)
-    3. T60 estimation: linear fit from -5dB to -35dB on Schroeder curve, extrapolate to -60dB
-    4. Filter to modes with T60 > threshold in freq_min..freq_max range
+    Two modes controlled by bands_per_octave:
+
+    bands_per_octave=None (default): fixed-FFT spectrogram. Resolution is
+    sample_rate/nperseg (23.4 Hz at 48kHz/2048). Fast, coarse.
+
+    bands_per_octave=N: bandpass filter bank at 1/N-octave spacing. Resolution
+    scales with frequency (e.g. ~2.4 Hz at 20 Hz with N=6). Use this when you
+    need to resolve modes closer than ~1 octave apart, especially below 50 Hz.
+    N=6 (1/6-octave) is a good default; N=12 is surgical but slow.
+
+    Algorithm (bandpass mode):
+    1. Generate center frequencies at 1/N-octave steps from freq_min to freq_max
+    2. Per frequency: 4th-order Butterworth bandpass → Schroeder integration
+    3. T60 estimation: linear fit from -5dB to -35dB, extrapolate to -60dB
+    4. Filter to modes with T60 > threshold
     5. Priority scoring: T60_ms × abs(peak_db)
-    6. Suggested Q: map T60 to Q (longer decay → narrower Q, range 1.0-10.0)
 
     Args:
         impulse_response: time-domain IR samples (48K samples = 1 second at 48kHz)
@@ -54,8 +64,9 @@ def analyze_decay(
         t60_threshold_ms: minimum T60 to flag as a ringing mode (default 300ms)
         freq_min: lower frequency bound for mode search
         freq_max: upper frequency bound for mode search
-        nperseg: spectrogram window size in samples
-        noverlap: spectrogram overlap in samples
+        nperseg: spectrogram window size (only used when bands_per_octave is None)
+        noverlap: spectrogram overlap (only used when bands_per_octave is None)
+        bands_per_octave: if set, use bandpass filter bank instead of spectrogram
 
     Returns:
         List of DecayMode sorted by priority (highest first).
@@ -64,6 +75,27 @@ def analyze_decay(
     Raises:
         ValueError: if impulse_response is empty or all zeros
     """
+    if bands_per_octave is not None:
+        return _analyze_decay_bandpass(
+            impulse_response, sample_rate, t60_threshold_ms,
+            freq_min, freq_max, bands_per_octave,
+        )
+    return _analyze_decay_spectrogram(
+        impulse_response, sample_rate, t60_threshold_ms,
+        freq_min, freq_max, nperseg, noverlap,
+    )
+
+
+def _analyze_decay_spectrogram(
+    impulse_response: list[float],
+    sample_rate: int,
+    t60_threshold_ms: float,
+    freq_min: float,
+    freq_max: float,
+    nperseg: int,
+    noverlap: int,
+) -> list[DecayMode]:
+    """Original spectrogram-based decay analysis (23.4 Hz bin resolution at 48kHz/2048)."""
     import numpy as np
     from scipy.signal import spectrogram
 
@@ -74,18 +106,15 @@ def analyze_decay(
     if np.all(ir == 0):
         raise ValueError("impulse_response is all zeros")
 
-    # Guard against IR shorter than spectrogram window
     if len(ir) < nperseg:
         log.warning("IR length %d < nperseg %d, no decay analysis possible", len(ir), nperseg)
         return []
 
-    # Compute spectrogram
     freqs, times, Sxx = spectrogram(
         ir, fs=sample_rate, nperseg=nperseg, noverlap=noverlap,
         scaling='spectrum',
     )
 
-    # Filter to bass frequency range
     freq_mask = (freqs >= freq_min) & (freqs <= freq_max)
     freqs_bass = freqs[freq_mask]
     Sxx_bass = Sxx[freq_mask, :]
@@ -93,9 +122,6 @@ def analyze_decay(
     if len(freqs_bass) == 0 or Sxx_bass.shape[1] < 3:
         return []
 
-    # Broadband reference level: mean only over bins with non-negligible energy.
-    # Using np.mean(Sxx_bass) directly would include near-zero bins, driving the
-    # mean to ~0 and producing astronomically large peak_db values (+300 dB range).
     active_mask = np.max(Sxx_bass, axis=1) >= 1e-20
     active_energy = Sxx_bass[active_mask, :]
     broadband_energy = np.mean(active_energy) if active_energy.size > 0 else 1e-20
@@ -104,26 +130,18 @@ def analyze_decay(
 
     for i, freq in enumerate(freqs_bass):
         energy = Sxx_bass[i, :]
-
-        # Skip bins with negligible energy
         if np.max(energy) < 1e-20:
             continue
 
-        # Schroeder integration: reverse cumulative sum of energy
         schroeder = np.cumsum(energy[::-1])[::-1]
         schroeder_db = 10.0 * np.log10(schroeder / (schroeder[0] + 1e-30) + 1e-30)
-
-        # T60 estimation: linear fit from -5dB to -35dB
         t60_ms = _estimate_t60(schroeder_db, times)
 
         if t60_ms is None or t60_ms < t60_threshold_ms:
             continue
 
-        # Peak magnitude relative to broadband
         peak_energy = np.max(energy)
         peak_db = 10.0 * np.log10(peak_energy / (broadband_energy + 1e-30) + 1e-30)
-
-        # Suggested Q: longer decay → narrower Q (1.0 to 10.0)
         suggested_q = _t60_to_q(t60_ms)
 
         modes.append(DecayMode(
@@ -131,14 +149,119 @@ def analyze_decay(
             t60_ms=round(float(t60_ms), 1),
             peak_db=round(float(peak_db), 1),
             suggested_q=round(float(suggested_q), 2),
-            priority=0,  # assigned below
+            priority=0,
         ))
 
-    # Assign priority by T60 × |peak_db| (highest score = priority 1)
     modes.sort(key=lambda m: m.t60_ms * abs(m.peak_db), reverse=True)
     for rank, mode in enumerate(modes, 1):
         mode.priority = rank
+    return modes
 
+
+def _analyze_decay_bandpass(
+    impulse_response: list[float],
+    sample_rate: int,
+    t60_threshold_ms: float,
+    freq_min: float,
+    freq_max: float,
+    bands_per_octave: int,
+    min_peak_db: float = 3.0,
+) -> list[DecayMode]:
+    """High-resolution T60 analysis using a bandpass filter bank.
+
+    Gives constant relative frequency resolution at all frequencies.
+    At 20 Hz with bands_per_octave=6: ~2.4 Hz resolution vs 23.4 Hz for spectrogram.
+    Uses 4th-order Butterworth bandpass + Schroeder integration per band.
+    """
+    import numpy as np
+    from scipy.signal import butter, sosfiltfilt
+
+    ir = np.array(impulse_response, dtype=np.float64)
+
+    if len(ir) == 0:
+        raise ValueError("impulse_response is empty")
+    if np.all(ir == 0):
+        raise ValueError("impulse_response is all zeros")
+
+    nyquist = sample_rate / 2.0
+    times = np.arange(len(ir)) / sample_rate
+    half_step = 0.5 / bands_per_octave
+
+    # Broadband RMS for peak_db reference
+    broadband_rms = float(np.sqrt(np.mean(ir ** 2))) + 1e-30
+
+    # Generate 1/N-octave center frequencies
+    center_freqs: list[float] = []
+    f = float(freq_min)
+    while f <= freq_max * 1.001:
+        center_freqs.append(f)
+        f *= 2 ** (1.0 / bands_per_octave)
+
+    # Pass 1: filter all bands, collect (fc, filtered_signal, band_rms) tuples.
+    # We need all band RMS values before computing peak_db so we can normalise
+    # each band against the mean-band RMS rather than broadband RMS.
+    # Broadband-relative peak_db fails for dominant single-mode IRs (all energy
+    # at one frequency → band_rms ≈ broadband_rms → peak_db ≈ 0 dB).
+    band_results: list[tuple[float, np.ndarray, float]] = []
+
+    for fc in center_freqs:
+        f_low = fc * 2 ** (-half_step)
+        f_high = fc * 2 ** half_step
+
+        if f_low < 1.0 or f_high >= nyquist * 0.95:
+            continue
+
+        try:
+            sos = butter(4, [f_low / nyquist, f_high / nyquist],
+                         btype='bandpass', output='sos')
+            filtered = sosfiltfilt(sos, ir)
+        except Exception:
+            continue
+
+        if np.max(np.abs(filtered)) < 1e-20:
+            continue
+
+        band_rms = float(np.sqrt(np.mean(filtered ** 2))) + 1e-30
+        band_results.append((fc, filtered, band_rms))
+
+    if not band_results:
+        return []
+
+    # Mean band RMS as reference: a real mode band will be significantly above
+    # the mean; filter ringing artifacts cluster near the mean (all bands similar).
+    mean_band_rms = float(np.mean([r[2] for r in band_results])) + 1e-30
+
+    modes: list[DecayMode] = []
+
+    for fc, filtered, band_rms in band_results:
+        peak_db = 20.0 * np.log10(band_rms / mean_band_rms)
+
+        # Reject bands at or below the mean — filter ringing artifacts are near 0 dB
+        # relative to the mean while real modes stand 3+ dB above it.
+        if peak_db < min_peak_db:
+            continue
+
+        energy = filtered ** 2
+        schroeder = np.cumsum(energy[::-1])[::-1]
+        schroeder_db = 10.0 * np.log10(schroeder / (schroeder[0] + 1e-30) + 1e-30)
+
+        t60_ms = _estimate_t60(schroeder_db, times)
+        if t60_ms is None or t60_ms < t60_threshold_ms:
+            continue
+
+        suggested_q = _t60_to_q(t60_ms)
+
+        modes.append(DecayMode(
+            freq_hz=round(fc, 1),
+            t60_ms=round(float(t60_ms), 1),
+            peak_db=round(float(peak_db), 1),
+            suggested_q=round(float(suggested_q), 2),
+            priority=0,
+        ))
+
+    modes.sort(key=lambda m: m.t60_ms * abs(m.peak_db), reverse=True)
+    for rank, mode in enumerate(modes, 1):
+        mode.priority = rank
     return modes
 
 

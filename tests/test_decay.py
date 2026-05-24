@@ -8,7 +8,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from calibrate.decay import DecayMode, _t60_to_q, analyze_decay, compare_decay
+from calibrate.decay import DecayMode, _t60_to_q, analyze_decay, compare_decay, _analyze_decay_bandpass
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -144,6 +144,73 @@ class TestT60ToQ:
         qs = [_t60_to_q(v) for v in values]
         for i in range(len(qs) - 1):
             assert qs[i] <= qs[i + 1], f"Q not monotonic: {qs}"
+
+
+# ── bandpass decay tests ─────────────────────────────────────────────────────
+
+
+class TestAnalyzeDecayBandpass:
+    """Tests for the bandpass filter-bank decay analysis."""
+
+    def test_finds_30hz_mode(self) -> None:
+        """A 30 Hz ringing mode should be detected — spectrogram misses it (bins at 23.4/46.9 Hz)."""
+        ir = _make_ringing_ir(freq_hz=30.0, t60_ms=600.0, duration_s=2.0)
+        modes = analyze_decay(ir, sample_rate=48000, t60_threshold_ms=200.0, bands_per_octave=6)
+
+        assert len(modes) >= 1
+        closest = min(modes, key=lambda m: abs(m.freq_hz - 30.0))
+        assert abs(closest.freq_hz - 30.0) < 5.0, f"Expected ~30Hz, got {closest.freq_hz}Hz"
+        assert closest.t60_ms > 200.0
+
+    def test_resolves_close_modes(self) -> None:
+        """30 Hz and 40 Hz modes should be resolved as distinct peaks."""
+        n = 48000 * 2
+        t = np.arange(n) / 48000
+        mode1 = np.sin(2 * np.pi * 30 * t) * np.exp(-6.9 / 0.7 * t)
+        mode2 = np.sin(2 * np.pi * 40 * t) * np.exp(-6.9 / 0.5 * t)
+        ir = (mode1 + mode2).tolist()
+
+        modes = analyze_decay(ir, sample_rate=48000, t60_threshold_ms=200.0, bands_per_octave=6)
+
+        freqs = [m.freq_hz for m in modes]
+        near_30 = any(abs(f - 30.0) < 5.0 for f in freqs)
+        near_40 = any(abs(f - 40.0) < 5.0 for f in freqs)
+        assert near_30, f"30 Hz mode not found in {freqs}"
+        assert near_40, f"40 Hz mode not found in {freqs}"
+
+    def test_mode_dominates_filter_ringing(self) -> None:
+        """A strong mode is detected even when filter ringing is present.
+
+        sosfiltfilt (zero-phase two-pass) at 20 Hz / 1/6-octave has ~300-1500ms of
+        inherent filter ringing, so clean-IR tests at low frequencies are not meaningful.
+        What matters is that a real mode with long T60 stands out above the mean-band RMS
+        (peak_db > min_peak_db=3.0) and is correctly reported.
+        """
+        # 50 Hz mode at 700ms T60 — well above filter ringing floor at 50 Hz (~130ms)
+        ir = _make_ringing_ir(freq_hz=50.0, t60_ms=700.0, duration_s=2.0)
+        modes = analyze_decay(ir, sample_rate=48000, t60_threshold_ms=400.0, bands_per_octave=6)
+        assert len(modes) >= 1
+        closest = min(modes, key=lambda m: abs(m.freq_hz - 50.0))
+        assert abs(closest.freq_hz - 50.0) < 5.0
+
+    def test_spectrogram_misses_30hz_bandpass_finds_it(self) -> None:
+        """Demonstrate the resolution improvement: spectrogram bins skip 30 Hz."""
+        ir = _make_ringing_ir(freq_hz=30.0, t60_ms=700.0, duration_s=2.0)
+
+        spectrogram_modes = analyze_decay(ir, sample_rate=48000, t60_threshold_ms=200.0)
+        bandpass_modes = analyze_decay(ir, sample_rate=48000, t60_threshold_ms=200.0, bands_per_octave=6)
+
+        # Spectrogram bins are at 23.4 and 46.9 Hz — closest is 23.4 Hz, >6 Hz away
+        if spectrogram_modes:
+            closest_spec = min(spectrogram_modes, key=lambda m: abs(m.freq_hz - 30.0))
+            assert abs(closest_spec.freq_hz - 30.0) > 5.0, \
+                "Spectrogram unexpectedly resolved 30 Hz precisely"
+
+        # Bandpass should find it within 5 Hz
+        assert len(bandpass_modes) >= 1
+        closest_bp = min(bandpass_modes, key=lambda m: abs(m.freq_hz - 30.0))
+        assert abs(closest_bp.freq_hz - 30.0) < 5.0, \
+            f"Bandpass should find ~30 Hz, got {closest_bp.freq_hz} Hz"
 
 
 # ── compare_decay tests ──────────────────────────────────────────────────────
