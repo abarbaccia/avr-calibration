@@ -25,7 +25,17 @@ sudo apt-get install -y -qq \
     udev \
     ca-certificates \
     gnupg \
-    inotify-tools
+    inotify-tools \
+    pipewire \
+    pipewire-alsa \
+    wireplumber
+
+# Enable PipeWire / WirePlumber as user services for `pi`. PipeWire runs
+# under uid 1000 (lingering enables it on boot before login).
+sudo loginctl enable-linger pi 2>/dev/null || true
+for svc in pipewire.socket pipewire.service wireplumber.service; do
+    sudo -u pi XDG_RUNTIME_DIR=/run/user/1000 systemctl --user enable --now "$svc" 2>/dev/null || true
+done
 
 # ── 2. Docker ─────────────────────────────────────────────────────────────
 
@@ -76,6 +86,16 @@ measurement:
 
   # USB route only (playback_route: usb)
   playback_device: "miniDSP" # substring matched against ALSA device names
+
+  # Loopback reference (Scarlett input ch3 ← Denon LFE pre-out).
+  # PipeWire bridges the Scarlett AUX2 capture to snd-aloop subdevice 1
+  # via loopback-ref-link.service. The container reads it as hw:Loopback,1,0
+  # (= hw:2,1 — the unique substring used here for sounddevice lookup).
+  # Cross-correlating the UMIK capture against this ref isolates pure
+  # acoustic delay from CamillaDSP / USB / Denon processing latency.
+  loopback_ref_device: hw:2,1
+  loopback_ref_channels: 2
+  loopback_ref_channel_index: 1
 EOF
     echo ""
     echo "IMPORTANT: Edit $DATA_DIR/config.yaml with your Denon IP:"
@@ -220,6 +240,45 @@ fi
 if [ -f "$SCRIPT_DIR/home-pi.asoundrc" ] && [ -d /home/pi ]; then
     sudo install -m 0644 -o pi -g pi "$SCRIPT_DIR/home-pi.asoundrc" /home/pi/.asoundrc
     echo "Installed: /home/pi/.asoundrc"
+fi
+
+# PipeWire configs: Scarlett pro-audio profile + 48kHz/256-frame clock lock.
+# These live alongside CamillaDSP's native PipeWire backend (camilladsp-linux-
+# pipewire-aarch64 binary at /usr/local/bin/camilladsp). CamillaDSP is a PW
+# client — it captures + plays back all 20 Scarlett channels via the PW graph,
+# letting the measurement engine attach a concurrent capture stream for the
+# loopback reference (Scarlett input ch3 → snd-aloop, bridged by the
+# loopback-ref-link service installed below).
+if [ -f "$SCRIPT_DIR/wireplumber-scarlett.lua" ] && [ -d /home/pi ]; then
+    sudo install -d -o pi -g pi /home/pi/.config/wireplumber/main.lua.d
+    sudo install -m 0644 -o pi -g pi "$SCRIPT_DIR/wireplumber-scarlett.lua" \
+        /home/pi/.config/wireplumber/main.lua.d/50-scarlett.lua
+    echo "Installed: /home/pi/.config/wireplumber/main.lua.d/50-scarlett.lua"
+fi
+if [ -f "$SCRIPT_DIR/pipewire-scarlett-clock.conf" ]; then
+    sudo install -d /etc/pipewire/pipewire.conf.d
+    sudo install -m 0644 "$SCRIPT_DIR/pipewire-scarlett-clock.conf" \
+        /etc/pipewire/pipewire.conf.d/10-scarlett-clock.conf
+    echo "Installed: /etc/pipewire/pipewire.conf.d/10-scarlett-clock.conf"
+fi
+
+# Loopback ref bridge: Scarlett input ch3 (AUX2) → snd-aloop sink. The
+# avr-calibration measurement engine reads hw:Loopback,1,0 as the
+# loopback reference. systemd user service so it follows pipewire.service.
+if [ -f "$SCRIPT_DIR/loopback-ref-link.sh" ]; then
+    sudo install -m 0755 "$SCRIPT_DIR/loopback-ref-link.sh" \
+        /usr/local/sbin/loopback-ref-link.sh
+    echo "Installed: /usr/local/sbin/loopback-ref-link.sh"
+fi
+if [ -f "$SCRIPT_DIR/loopback-ref-link.service" ] && [ -d /home/pi ]; then
+    sudo install -d -o pi -g pi /home/pi/.config/systemd/user
+    sudo install -m 0644 -o pi -g pi "$SCRIPT_DIR/loopback-ref-link.service" \
+        /home/pi/.config/systemd/user/loopback-ref-link.service
+    sudo -u pi XDG_RUNTIME_DIR=/run/user/1000 \
+        systemctl --user daemon-reload 2>/dev/null || true
+    sudo -u pi XDG_RUNTIME_DIR=/run/user/1000 \
+        systemctl --user enable --now loopback-ref-link.service 2>/dev/null || true
+    echo "Installed + enabled: loopback-ref-link.service (user)"
 fi
 
 for svc in camilladsp-watchdog.service denon-watch.service; do
