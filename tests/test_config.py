@@ -55,6 +55,39 @@ class TestConfigLoad:
         # null user_val → else branch uses default_val ({"host": None})
         assert cfg.denon == DEFAULT_CONFIG["denon"]
 
+    def test_load_preserves_measurement_profiles(self, tmp_path):
+        """measurement_profiles from YAML must survive Config.load() deep-merge.
+
+        Regression for the restart-wipe bug: measurement_profiles was missing
+        from DEFAULT_CONFIG, so Config.load() never copied it into merged{} and
+        every container restart silently dropped the user's USB-route override.
+        """
+        p = tmp_path / "config.yaml"
+        p.write_text(yaml.dump({
+            "measurement_profiles": {
+                "sub": {"route": "usb", "playback_device": "avr_cal_sweep"},
+            },
+        }))
+        cfg = Config.load(p)
+        profiles = cfg._data.get("measurement_profiles", {})
+        assert profiles.get("sub", {}).get("route") == "usb", (
+            "measurement_profiles.sub.route='usb' was lost — "
+            "DEFAULT_CONFIG is missing the 'measurement_profiles' key"
+        )
+
+    def test_load_passes_through_unknown_keys(self, tmp_path):
+        """Keys not in DEFAULT_CONFIG must be preserved, not silently dropped.
+
+        Any future config key added to the YAML before its DEFAULT_CONFIG entry
+        should not vanish on the first Config.load() call.
+        """
+        p = tmp_path / "config.yaml"
+        p.write_text(yaml.dump({"future_key": {"nested": 42}}))
+        cfg = Config.load(p)
+        assert cfg._data.get("future_key") == {"nested": 42}, (
+            "unknown config key was silently dropped by Config.load()"
+        )
+
 
 # ── Config.create_template ────────────────────────────────────────────────────
 
