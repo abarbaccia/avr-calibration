@@ -524,11 +524,15 @@ class ModalAwareFIRDesigner:
                 f"(min-phase magnitude FIR, {len(mag_fir)} taps convolved)"
             )
 
-        # 7. Normalize peak ≤ 1.0
-        peak = float(np.max(np.abs(fir)))
-        if peak > 1.0:
-            fir = fir / (peak * 1.001)
-            summary.notes.append(f"normalized: original peak {peak:.3f} → 0.999")
+        # 7. Normalize so max |H(f)| ≤ 1.0 (prevents gain pump from anti-pulse
+        # constructive interference — time-domain peak normalization is insufficient
+        # for mixed-phase FIRs with pre-ring where peak=1.0 from identity seed).
+        n_fft = max(len(fir) * 2, 8192)
+        H = np.fft.rfft(fir, n=n_fft)
+        max_freq_gain = float(np.max(np.abs(H)))
+        if max_freq_gain > 1.0:
+            fir = fir / max_freq_gain
+            summary.notes.append(f"freq-domain normalized: max gain {max_freq_gain:.3f} → 1.0")
         summary.peak_amplitude = float(np.max(np.abs(fir)))
 
         return fir.tolist(), summary

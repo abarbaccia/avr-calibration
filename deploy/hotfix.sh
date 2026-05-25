@@ -88,9 +88,14 @@ echo "Starting hotfixed container..."
 $SSH "sudo docker run -d \
     --name ${CONTAINER} \
     --network=host \
+    --ipc=host \
     --privileged \
+    -v /run/user/1000:/run/user/1000 \
+    -e XDG_RUNTIME_DIR=/run/user/1000 \
+    -e PIPEWIRE_RUNTIME_DIR=/run/user/1000 \
     -v \$HOME/.avr-calibration:/data/.avr-calibration \
     -v \$HOME/.avr-calibration/entrypoint.sh:/entrypoint.sh:ro \
+    -v /etc/asound.conf:/etc/asound.conf:ro \
     ${MOUNT_ARGS} \
     ${IMAGE} && echo 'Container started.'"
 
