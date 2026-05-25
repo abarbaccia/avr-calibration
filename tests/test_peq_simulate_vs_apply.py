@@ -146,6 +146,43 @@ def test_simulate_eq_full_chain_matches_bug_repro_filter_set() -> None:
             )
 
 
+# ── A2. Shelf filter simulator matches analytical biquad ──────────────────────
+
+@pytest.mark.parametrize(
+    "ftype,freq_hz,fc,gain_db,q",
+    [
+        # low_shelf — Harman bass shelf cases applied by apply_input_eq
+        ("low_shelf", 20.0,  38.0, 4.5, 0.7),   # well below shelf corner
+        ("low_shelf", 38.0,  38.0, 4.5, 0.7),   # at shelf corner (-3 dB point)
+        ("low_shelf", 80.0,  38.0, 4.5, 0.7),   # above shelf corner (gain→0)
+        ("low_shelf", 20.0,  68.0, 2.0, 0.7),   # second Harman shelf
+        ("low_shelf", 68.0,  68.0, 2.0, 0.7),
+        ("low_shelf", 120.0, 68.0, 2.0, 0.7),
+        # high_shelf — cuts AND boosts above a corner frequency
+        ("high_shelf", 200.0, 100.0, -3.0, 0.7),  # cut: above corner
+        ("high_shelf", 100.0, 100.0, -3.0, 0.7),  # cut: at corner
+        ("high_shelf", 50.0,  100.0, -3.0, 0.7),  # cut: below corner
+        ("high_shelf", 200.0, 100.0,  3.0, 0.7),  # boost: above corner
+        ("high_shelf", 100.0, 100.0,  3.0, 0.7),  # boost: at corner
+    ],
+)
+def test_simulate_eq_shelf_matches_analytical(
+    ftype: str, freq_hz: float, fc: float, gain_db: float, q: float
+) -> None:
+    """_biquad_response must agree with the RBJ analytical formula for shelf
+    filters — the same tolerance as peaking (1e-9 dB).  A regression here
+    would make simulate_eq mis-predict Harman target-curve shaping, causing
+    the LLM to over- or under-apply shelf depth before calling apply_input_eq.
+    """
+    from calibrate.mcp_server import _biquad_response
+    expected = _rbj_response_db(freq_hz, ftype, fc, gain_db, q)
+    actual = _biquad_response(freq_hz, ftype, fc, gain_db, q)
+    assert abs(actual - expected) < 1e-9, (
+        f"simulate_eq {ftype} diverges from analytical RBJ at {freq_hz} Hz "
+        f"({fc} Hz {gain_db} dB Q{q}): {actual} vs {expected}"
+    )
+
+
 # ── B. SafetyValidator agrees with simulator ──────────────────────────────────
 
 @pytest.mark.parametrize(
@@ -170,6 +207,35 @@ def test_safety_magnitude_matches_simulator(fc: float, gain_db: float, q: float)
         safety_db = _filter_magnitude_db(spec, f)
         assert abs(sim_db - safety_db) < 0.01, (
             f"simulator/safety divergence at {f} Hz for peaking "
+            f"{fc}/{gain_db}/{q}: sim={sim_db:.4f} safety={safety_db:.4f}"
+        )
+
+
+@pytest.mark.parametrize(
+    "ftype,fc,gain_db,q",
+    [
+        ("low_shelf",  38.0, 4.5, 0.7),    # Harman bass shelf 1
+        ("low_shelf",  68.0, 2.0, 0.7),    # Harman bass shelf 2
+        ("high_shelf", 100.0, -3.0, 0.7),  # high-shelf cut
+        ("low_shelf",  50.0, -4.0, 1.0),   # low-shelf cut
+    ],
+)
+def test_safety_magnitude_matches_simulator_shelf(
+    ftype: str, fc: float, gain_db: float, q: float
+) -> None:
+    """SafetyValidator and simulator must agree for shelf filters too.
+
+    The apply_input_eq Harman target path uses low_shelf filters — if the
+    validator approves on one set of numbers while the simulator shows another,
+    the safety gate is checking a different curve than what was simulated.
+    """
+    from calibrate.mcp_server import _biquad_response
+    spec = FilterSpec(freq=fc, gain_db=gain_db, q=q, type=ftype)
+    for f in (20.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0, 160.0, 200.0):
+        sim_db = _biquad_response(f, ftype, fc, gain_db, q)
+        safety_db = _filter_magnitude_db(spec, f)
+        assert abs(sim_db - safety_db) < 0.01, (
+            f"simulator/safety divergence at {f} Hz for {ftype} "
             f"{fc}/{gain_db}/{q}: sim={sim_db:.4f} safety={safety_db:.4f}"
         )
 
@@ -213,6 +279,80 @@ async def test_camilladsp_filter_block_matches_simulated_spec() -> None:
         assert p["freq"] == want["freq"], f"freq mismatch slot {i}"
         assert p["q"] == want["q"], f"q mismatch slot {i}"
         assert p["gain"] == want["gain_db"], f"gain mismatch slot {i}"
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_shelf_filter_block_emitted_correctly() -> None:
+    """Driver emits Lowshelf/Highshelf YAML blocks byte-for-byte matching the
+    designed spec — the same invariant as test C but for shelf filters.
+
+    The Harman target-curve path uses low_shelf filters on the input channel.
+    A regression where the driver mis-maps 'low_shelf' → wrong CamillaDSP
+    type (e.g. 'Peaking' or missing block) would apply a flat response while
+    group delay still changes (the phase-only symptom observed 2026-05-25).
+    """
+    driver = CamillaDSPDriver(input_channels=2, output_channels=4)
+    call = _stub_client(driver)
+
+    designed = [
+        {"freq": 18.0,  "gain_db": 0.0, "q": 0.707, "type": "hpf"},
+        {"freq": 38.0,  "gain_db": 4.5, "q": 0.7,   "type": "low_shelf"},
+        {"freq": 68.0,  "gain_db": 2.0, "q": 0.7,   "type": "low_shelf"},
+        {"freq": 100.0, "gain_db": -3.0, "q": 0.7,  "type": "high_shelf"},
+    ]
+    await driver.apply_input_eq(
+        preset=0, filters=designed, input_index=0,
+        simulation_verified=True, bypass_iteration_limit=True,
+    )
+
+    cfg = _last_pushed_config(call)
+    # slot 0: BiquadCombo HPF — skip
+    # slot 1: low_shelf → Biquad Lowshelf
+    block1 = cfg["filters"]["cal_in0_peq_1"]
+    assert block1["type"] == "Biquad"
+    p1 = block1["parameters"]
+    assert p1["type"] == "Lowshelf", f"low_shelf must emit Lowshelf, got {p1['type']!r}"
+    assert p1["freq"] == 38.0
+    assert p1["gain"] == 4.5
+    assert p1["q"] == 0.7
+
+    # slot 2: second low_shelf
+    block2 = cfg["filters"]["cal_in0_peq_2"]
+    assert block2["type"] == "Biquad"
+    p2 = block2["parameters"]
+    assert p2["type"] == "Lowshelf"
+    assert p2["freq"] == 68.0
+
+    # slot 3: high_shelf → Biquad Highshelf
+    block3 = cfg["filters"]["cal_in0_peq_3"]
+    assert block3["type"] == "Biquad"
+    p3 = block3["parameters"]
+    assert p3["type"] == "Highshelf", f"high_shelf must emit Highshelf, got {p3['type']!r}"
+    assert p3["freq"] == 100.0
+    assert p3["gain"] == -3.0
+
+
+# ── C2. apply_input_eq requires target ───────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_apply_input_eq_without_target_returns_error() -> None:
+    """_tool_apply_input_eq must reject calls with no target.
+
+    The legacy no-target dispatch path was removed (2026-05-25) because it
+    silently routed to the first DSP driver regardless of signal-graph
+    topology. Callers that omit target must get a clear error — not a silent
+    misroute to the wrong processor.
+    """
+    from calibrate.mcp_server import _tool_apply_input_eq
+    filters = [
+        {"freq": 18.0, "gain_db": 0.0, "q": 0.707, "type": "hpf"},
+        {"freq": 38.0, "gain_db": 4.5, "q": 0.7,   "type": "low_shelf"},
+    ]
+    result = await _tool_apply_input_eq(filters=filters, target=None)
+    assert result.get("ok") is False, "target=None must return ok=False"
+    assert "target" in result.get("error", "").lower(), (
+        f"error must mention 'target'; got: {result.get('error')!r}"
+    )
 
 
 # ── D. Single-application guard ───────────────────────────────────────────────
