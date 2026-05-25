@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.5] - 2026-05-25
+
+### Tests / Hardening
+- **PEQ simulate-vs-apply coefficient match pinned.** Investigation of the 2026-05-25 report that designed input-PEQ cut depths landed 2-3× deeper at the listener than `simulate_eq` predicted found no coefficient mismatch — the simulator (`mcp_server._biquad_response`), the SafetyValidator magnitude path (`safety._filter_magnitude_db`), and the CamillaDSP driver (`CamillaDSPDriver._filter_block`) all use identical RBJ-cookbook biquad math and agree to floating-point precision. The observed 2-3× over-cut is consistent with measurement-to-measurement variance (4 dB IR-peak drift between supposedly identical "HPF-only" baselines 262 vs 267, polarity flip across the session). To prevent a future regression that would manifest the same symptom, added `tests/test_peq_simulate_vs_apply.py` with 17 tests covering: (a) `_biquad_response` matches analytical z-domain RBJ within 1e-9 dB across the bug-repro filter set, (b) `_filter_magnitude_db` matches the simulator within 0.01 dB at 20–200 Hz, (c) the driver forwards {freq, q, gain} byte-for-byte to CamillaDSP's `Biquad::Peaking` (which is RBJ cookbook in the daemon), and (d) the routing-mixer single-application invariant — exactly one input may route to any given output, otherwise input PEQ stacks and cut depth lands 2-3× deeper. Documented the invariant in `CamillaDSPDriver.apply_input_eq`.
+
 ## [0.2.4] - 2026-05-25
 
 ### Fixed

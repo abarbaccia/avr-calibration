@@ -936,6 +936,16 @@ class CamillaDSPDriver(DSPDriver):
         *input_index* is None, the filters are written to every configured
         input channel so the EQ applies regardless of which input the signal
         arrives on (same semantics as MinidspDriver's dual-input write).
+
+        Single-application invariant — the routing mixer downstream MUST
+        deliver each output's signal from at most ONE input channel. If two
+        inputs route to the same output, the input PEQ gets summed twice and
+        cut depths land 2-3× deeper than ``simulate_eq`` predicts. The
+        ``test_input_peq_applied_exactly_once_on_routed_path`` regression
+        test in ``tests/test_peq_simulate_vs_apply.py`` pins this; if you add
+        input→output routing that violates it, switch this method to write
+        PEQ only on the routed input(s) or scale the mixer source gains
+        accordingly.
         """
         filter_specs = self._parse_filter_specs(filters)
         if len(filter_specs) > self._max_peq_slots:
