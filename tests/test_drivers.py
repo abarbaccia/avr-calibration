@@ -1967,17 +1967,35 @@ def test_camilladsp_config_samples_devices_block_from_constructor_args() -> None
     assert devices["playback"]["channels"] == 10
 
 
-def test_camilladsp_default_format_uses_camilladsp_spelling() -> None:
-    """CamillaDSP 2.x+ accepts S32_LE (underscore), not S32LE — regression guard.
+def test_camilladsp_default_devices_are_pipewire_shaped() -> None:
+    """Post-v0.2.0 the Pi runs PipeWire as the single audio orchestrator;
+    CamillaDSP attaches as a native PipeWire client. Driver defaults must
+    therefore emit PipeWire device dicts (node_name + autoconnect_to), not
+    ALSA hw: device strings.
 
-    Shipped once as S32LE and was rejected by the daemon with
-    `devices: unknown variant 'S32LE'`. Keep the test pinned so a future
-    rename doesn't silently revert.
+    The earlier ALSA-shaped defaults caused a watchdog-restart cascade when
+    `start_calibration` reset DSP state: SetConfig pushed an ALSA-shaped
+    device into the running PipeWire daemon, the audio thread died, the
+    watchdog issued `systemctl restart camilladsp`, the restart hung in
+    `deactivating`, and subsequent SetConfig calls failed with
+    RateLimitExceededError. Regression guard.
+
+    PipeWire negotiates format with WirePlumber (pinned to S32_LE / 48 kHz on
+    the Scarlett); the device dict must NOT carry a `format` key.
     """
     driver = CamillaDSPDriver()
     cfg = driver._build_config()
-    assert cfg["devices"]["capture"]["format"] == "S32_LE"
-    assert cfg["devices"]["playback"]["format"] == "S32_LE"
+    cap = cfg["devices"]["capture"]
+    pb = cfg["devices"]["playback"]
+    assert cap["type"] == "PipeWire"
+    assert pb["type"] == "PipeWire"
+    assert "node_name" in cap and cap["node_name"]
+    assert "node_name" in pb and pb["node_name"]
+    assert "autoconnect_to" in cap and "Scarlett" in cap["autoconnect_to"]
+    assert "autoconnect_to" in pb and "Scarlett" in pb["autoconnect_to"]
+    # PipeWire negotiates format; no explicit format key on the device dict.
+    assert "format" not in cap
+    assert "format" not in pb
 
 
 def test_camilladsp_pipeline_filter_steps_use_channels_list() -> None:

@@ -55,21 +55,33 @@ _WS_TIMEOUT_LARGE_S: float = 30.0  # SetConfig with large FIR payloads (~500 KB 
 
 # ── Defaults for the CamillaDSP audio devices ────────────────────────────────
 # Callers override via CamillaDSPDriver(..., capture_device=..., playback_device=...)
-# or via the `camilladsp` block in config.yaml. The defaults describe the target
-# HDMI-capture → USB-DAC path: 2-channel loopback capture feeding a 10-channel
-# USB playback (18i20 analog outs).
+# or via the `camilladsp` block in config.yaml. Post-v0.2.0 the Pi runs PipeWire
+# as the single audio orchestrator; CamillaDSP attaches as a native PipeWire
+# client. Devices are described by `node_name` + `autoconnect_to` (PipeWire
+# negotiates format with WirePlumber, which pins the Scarlett to
+# 48 kHz / S32_LE / 256-frame periods — so no `format` key needed here).
+# Channel counts on these dicts are placeholders; the driver overwrites them
+# at construction time (see lines below the constructor) from
+# `capture_channels` / `output_channels`.
+
+_SCARLETT_PIPEWIRE_INPUT_NODE = (
+    "alsa_input.usb-Focusrite_Scarlett_18i20_USB_P9W3FNX378D03D-00.multichannel-input"
+)
+_SCARLETT_PIPEWIRE_OUTPUT_NODE = (
+    "alsa_output.usb-Focusrite_Scarlett_18i20_USB_P9W3FNX378D03D-00.multichannel-output"
+)
 
 _DEFAULT_CAPTURE_DEVICE: dict[str, Any] = {
-    "type": "Alsa",
-    "device": "hw:Loopback,1,0",
+    "type": "PipeWire",
     "channels": 2,
-    "format": "S32_LE",
+    "node_name": "camilladsp_capture",
+    "autoconnect_to": _SCARLETT_PIPEWIRE_INPUT_NODE,
 }
 _DEFAULT_PLAYBACK_DEVICE: dict[str, Any] = {
-    "type": "Alsa",
-    "device": "hw:USB,0,0",
+    "type": "PipeWire",
     "channels": 10,
-    "format": "S32_LE",
+    "node_name": "camilladsp_playback",
+    "autoconnect_to": _SCARLETT_PIPEWIRE_OUTPUT_NODE,
 }
 
 
