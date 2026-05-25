@@ -169,12 +169,22 @@ def _peaking(freq: float, gain_db: float, q: float, sample_rate: int) -> BiquadC
 
 
 def _low_shelf(freq: float, gain_db: float, q: float, sample_rate: int) -> BiquadCoeffs:
-    """Low-shelf filter — Audio EQ Cookbook lowShelf."""
+    """Low-shelf filter — RBJ Q-based lowShelf, matching CamillaDSP's formula.
+
+    Uses alpha = sin(w0)/2 * sqrt((A + 1/A)*(1/q - 1) + 2), which is the
+    shelf-specific Q formula from the Audio EQ Cookbook. This differs from the
+    peaking EQ alpha (sin(w0)/(2*q)) — mixing them produces group-delay changes
+    without the expected amplitude effect, the bug observed 2026-05-25.
+
+    Q is clamped to [0.1, 3.0]: values above 3.0 make the inner sqrt term go
+    negative at typical boost levels (> 3 dB). Practical shelf Q is 0.5-1.5.
+    """
+    q = max(0.1, min(q, 3.0))
     w0 = 2.0 * math.pi * freq / sample_rate
     A = 10.0 ** (gain_db / 40.0)
     cos_w0 = math.cos(w0)
     sin_w0 = math.sin(w0)
-    alpha = sin_w0 / (2.0 * q)
+    alpha = sin_w0 / 2.0 * math.sqrt((A + 1.0 / A) * (1.0 / q - 1.0) + 2.0)
     sqrt_A = math.sqrt(A)
 
     b0 = A * ((A + 1.0) - (A - 1.0) * cos_w0 + 2.0 * sqrt_A * alpha)
@@ -187,12 +197,16 @@ def _low_shelf(freq: float, gain_db: float, q: float, sample_rate: int) -> Biqua
 
 
 def _high_shelf(freq: float, gain_db: float, q: float, sample_rate: int) -> BiquadCoeffs:
-    """High-shelf filter — Audio EQ Cookbook highShelf."""
+    """High-shelf filter — RBJ Q-based highShelf, matching CamillaDSP's formula.
+
+    Q is clamped to [0.1, 3.0] for the same reason as _low_shelf.
+    """
+    q = max(0.1, min(q, 3.0))
     w0 = 2.0 * math.pi * freq / sample_rate
     A = 10.0 ** (gain_db / 40.0)
     cos_w0 = math.cos(w0)
     sin_w0 = math.sin(w0)
-    alpha = sin_w0 / (2.0 * q)
+    alpha = sin_w0 / 2.0 * math.sqrt((A + 1.0 / A) * (1.0 / q - 1.0) + 2.0)
     sqrt_A = math.sqrt(A)
 
     b0 = A * ((A + 1.0) + (A - 1.0) * cos_w0 + 2.0 * sqrt_A * alpha)
