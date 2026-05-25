@@ -103,6 +103,7 @@ DEFAULT_CONFIG: dict = {
     },
     "speakers": [],
     "connections": [],
+    "measurement_profiles": {},
 }
 
 CONFIG_TEMPLATE = """\
@@ -365,7 +366,10 @@ class Config:
             return cls(DEFAULT_CONFIG.copy())
         with open(path) as f:
             data = yaml.safe_load(f) or {}
-        # Deep merge with defaults so missing keys fall back gracefully
+        # Deep merge: defaults first, then user values on top.
+        # Unknown keys in the user YAML (not in DEFAULT_CONFIG) are passed
+        # through verbatim so future config additions don't silently vanish
+        # after a container restart before the default is added here.
         merged: dict = {}
         for key, default_val in DEFAULT_CONFIG.items():
             user_val = data.get(key)
@@ -375,6 +379,9 @@ class Config:
                 merged[key] = user_val
             else:
                 merged[key] = default_val
+        for key, val in data.items():
+            if key not in merged:
+                merged[key] = val
         return cls(merged)
 
     @classmethod
