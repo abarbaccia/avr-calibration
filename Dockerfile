@@ -84,6 +84,16 @@ RUN set -e; \
     else DEB_ARCH="armhf"; fi; \
     DEB_ARCH_EXPORT="$DEB_ARCH" MINIDSP_VERSION_EXPORT="$MINIDSP_VERSION" python3 -c "import urllib.request, subprocess, os; ver=os.environ['MINIDSP_VERSION_EXPORT']; arch=os.environ['DEB_ARCH_EXPORT']; url=f'https://github.com/mrene/minidsp-rs/releases/download/v{ver}/minidsp_{ver}-1_{arch}.deb'; urllib.request.urlretrieve(url, '/tmp/minidsp.deb'); subprocess.run(['dpkg','-x','/tmp/minidsp.deb','/tmp/minidsp-pkg'],check=True); os.rename('/tmp/minidsp-pkg/usr/bin/minidsp','/usr/local/bin/minidsp'); os.rename('/tmp/minidsp-pkg/usr/bin/minidspd','/usr/local/bin/minidspd'); os.chmod('/usr/local/bin/minidsp',0o755); os.chmod('/usr/local/bin/minidspd',0o755); os.remove('/tmp/minidsp.deb')"
 
+#
+# PipeWire client libs: required so PortAudio + ALSA inside the container
+# can route audio through the host's PipeWire graph (socket bind-mounted at
+# /run/user/1000 by the systemd unit). pipewire-alsa installs the
+# /usr/share/alsa/alsa.conf.d/50-pipewire.conf hook that makes the ALSA
+# `default` PCM go through PipeWire — that's how the USB-route sweep
+# reaches the `avr_cal_sweep` null sink → camilladsp_capture → subs.
+#
+# We install ONLY client libs. No daemon, no WirePlumber starts in here —
+# this container is a PipeWire client of the host daemon.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libportaudio2 \
     libatlas3-base \
@@ -91,6 +101,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libatomic1 \
     libusb-1.0-0 \
     alsa-utils \
+    pipewire \
+    libpipewire-0.3-0 \
+    libspa-0.2-modules \
+    pipewire-alsa \
+    pipewire-pulse \
+    libasound2-plugins \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv

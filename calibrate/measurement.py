@@ -857,26 +857,67 @@ class MeasurementEngine:
                 except ImportError:
                     pass
             elif route == "usb":
+                # USB route, post v0.2.0 PipeWire migration:
+                #   sweep -> PortAudio -> pipewire-alsa default PCM -> the
+                #   `avr_cal_sweep` PipeWire null sink (created by the host
+                #   avr-cal-sweep-link.service) -> camilladsp_capture -> subs.
+                #
+                # PortAudio's ALSA backend doesn't enumerate PipeWire nodes by
+                # name, but the pipewire-alsa shim honors PIPEWIRE_NODE on the
+                # ALSA `default` PCM. We pick the default device + set the env
+                # var so PipeWire routes our output to the named sink.
+                #
+                # Legacy path (pre-PipeWire, direct miniDSP USB) still works:
+                # if the configured name resolves to a PortAudio device, we
+                # pin sd.default.device to it and skip the PIPEWIRE_NODE trick.
                 try:
+                    import os
                     import sounddevice as sd
                     devices = sd.query_devices()
                     usb_idx_cfg = cfg.get("usb_device_index")
+                    usb_name = cfg.get("playback_device") or "miniDSP"
                     if usb_idx_cfg is not None:
                         idx = int(usb_idx_cfg)
                         in_idx = int(sd.default.device[0])
                         sd.default.device = (in_idx, idx)
                         log.info("Output device (USB by index): %s (index %d)", devices[idx]["name"], idx)
                     else:
-                        usb_name = cfg.get("playback_device") or "miniDSP"
                         candidates = [
                             (idx, dev) for idx, dev in enumerate(devices)
                             if dev.get("max_output_channels", 0) > 0 and usb_name.lower() in dev["name"].lower()
                         ]
                         if candidates:
+                            # Direct PortAudio match (e.g. "miniDSP" on a
+                            # pre-PipeWire setup, or "pipewire" host API).
                             idx, dev = candidates[0]
                             in_idx = int(sd.default.device[0])
                             sd.default.device = (in_idx, idx)
                             log.info("Output device (USB by name): %s (index %d)", dev["name"], idx)
+                        else:
+                            # No direct match → assume this is a PipeWire
+                            # node name and route via pipewire-alsa default.
+                            default_idx = None
+                            for idx, dev in enumerate(devices):
+                                if (dev.get("max_output_channels", 0) > 0 and
+                                        dev.get("name", "").lower() == "default"):
+                                    default_idx = idx
+                                    break
+                            if default_idx is not None:
+                                in_idx = int(sd.default.device[0])
+                                sd.default.device = (in_idx, default_idx)
+                                os.environ["PIPEWIRE_NODE"] = usb_name
+                                log.info(
+                                    "Output device (USB via PipeWire): default "
+                                    "(index %d) PIPEWIRE_NODE=%s",
+                                    default_idx, usb_name,
+                                )
+                            else:
+                                log.warning(
+                                    "USB route: no PortAudio match for %r and "
+                                    "no ALSA `default` device available — sweep "
+                                    "playback will use sd.default unchanged.",
+                                    usb_name,
+                                )
                 except ImportError:
                     pass
 
