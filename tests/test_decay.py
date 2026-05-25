@@ -10,6 +10,7 @@ import pytest
 
 from calibrate.decay import (
     DecayMode,
+    _estimate_t60,
     _estimate_t60_envelope,
     _t60_to_q,
     analyze_decay,
@@ -342,6 +343,99 @@ class TestT60Envelope:
         assert best_t60 < 500.0, (
             f"Session 262 regression: best 47 Hz T60 should be <500ms "
             f"(realistic), got {best_t60}ms (pre-fix bug was ~1900ms for ALL bands)"
+        )
+
+
+class TestEstimateT60Spectrogram:
+    """Regression tests for _estimate_t60 (spectrogram path noise-floor fix).
+
+    Before the fix, _estimate_t60 used a raw -5 to -35 dB Schroeder fit with
+    no noise-floor awareness. A 500 ms IR with -45 dBFS noise floor would
+    return >1900 ms because the noise tail pulled the -35 dB intercept far
+    beyond the IR window. The fix adds:
+      1. Noise-floor gate: stops fitting 3 dB above the estimated tail floor.
+      2. IR-window cap: returns None when fitted T60 > 1.5× the IR duration.
+    """
+
+    def _schroeder_from_decay(
+        self,
+        freq_hz: float,
+        t60_ms: float,
+        ir_duration_ms: float,
+        noise_rms: float = 0.0,
+        sample_rate: int = 48000,
+    ):
+        """Build a (schroeder_db, times) pair from a synthetic decaying sinusoid."""
+        n = int(sample_rate * ir_duration_ms / 1000)
+        t = np.arange(n) / sample_rate
+        decay = np.exp(-6.9 / (t60_ms / 1000) * t)
+        signal = np.sin(2 * np.pi * freq_hz * t) * decay
+        if noise_rms > 0:
+            rng = np.random.default_rng(42)
+            signal += rng.normal(0, noise_rms, n)
+
+        # Build spectrogram-style energy (squared amplitude) and Schroeder curve
+        energy = signal ** 2
+        schroeder = np.cumsum(energy[::-1])[::-1]
+        schroeder_db = 10.0 * np.log10(schroeder / (schroeder[0] + 1e-30) + 1e-30)
+        times = t
+        return schroeder_db, times
+
+    def test_recovers_short_t60_in_long_ir(self) -> None:
+        """200 ms T60 in a 2 s IR: fit is valid and well within window cap."""
+        sch, times = self._schroeder_from_decay(50.0, t60_ms=200.0, ir_duration_ms=2000.0)
+        t60 = _estimate_t60(sch, times)
+        assert t60 is not None
+        assert 100.0 < t60 < 400.0, f"expected ~200 ms, got {t60:.0f} ms"
+
+    def test_session_262_regression_spectrogram_path(self) -> None:
+        """500 ms IR with 1900 ms T60 must return None (indeterminate).
+
+        Pre-fix: returned 1905 ms (extrapolated 3.8× past the 500 ms window).
+        Post-fix: IR-window cap (1.5×) returns None — caller skips this mode.
+        """
+        sch, times = self._schroeder_from_decay(
+            47.0, t60_ms=1900.0, ir_duration_ms=500.0, noise_rms=0.001,
+        )
+        t60 = _estimate_t60(sch, times)
+        assert t60 is None, (
+            f"500 ms IR should not report T60=1905 ms — got {t60:.0f} ms. "
+            "IR-window cap (1.5×) should return None for unobservable decays."
+        )
+
+    def test_noise_floor_gate_stops_early_fit(self) -> None:
+        """High noise floor pushes the Schroeder tail up: fit ceiling adapts."""
+        # 300 ms T60, 500 ms IR, noise floor at ~-20 dB relative → fit stops early
+        sch, times = self._schroeder_from_decay(
+            50.0, t60_ms=300.0, ir_duration_ms=500.0, noise_rms=0.1,
+        )
+        t60 = _estimate_t60(sch, times)
+        # Either returns a plausible T60 or None — must NOT return >750 ms
+        if t60 is not None:
+            assert t60 < 750.0, f"noise floor gate failed: returned {t60:.0f} ms"
+
+    def test_analyze_decay_spectrogram_session262_regression(self) -> None:
+        """End-to-end: analyze_decay (spectrogram, no bands_per_octave) on a
+        500 ms IR must NOT report a mode with T60 > 750 ms.
+
+        This is the bug that shipped in PR #177 — the fix was only applied to
+        the bandpass path; the default spectrogram path continued to return
+        1905 ms for session 262.
+        """
+        sample_rate = 48000
+        n = int(sample_rate * 0.5)  # 500 ms IR
+        t = np.arange(n) / sample_rate
+        # 47 Hz ringing, T60 ~250 ms, noise floor at ~-45 dBFS
+        ir = (np.sin(2 * np.pi * 47 * t) * np.exp(-6.9 / 0.25 * t)
+              + np.random.default_rng(262).normal(0, 0.001, n))
+
+        modes = analyze_decay(ir.tolist(), sample_rate=sample_rate,
+                              t60_threshold_ms=100.0)  # no bands_per_octave → spectrogram path
+        long_modes = [m for m in modes if m.t60_ms > 750.0]
+        assert not long_modes, (
+            f"Spectrogram path returned indeterminate T60 values > 750 ms: "
+            f"{[(m.freq_hz, m.t60_ms) for m in long_modes]}. "
+            "IR-window cap should have returned None for these."
         )
 
 
