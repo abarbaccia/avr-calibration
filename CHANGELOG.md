@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-05-25
+
+### Fixed
+- **CamillaDSP driver defaults are PipeWire-shaped**, matching the v0.2.0 audio-stack migration. The driver's `_DEFAULT_CAPTURE_DEVICE` / `_DEFAULT_PLAYBACK_DEVICE` were still ALSA (`type: Alsa`, `hw:USB,0,0` / `hw:Loopback,1,0`, explicit `S32_LE`). When `start_calibration` reset DSP state, `_build_config` → `SetConfig` pushed those ALSA-shaped devices into the running PipeWire daemon; the audio thread died silently, CamillaDSP went to Inactive, `camilladsp-watchdog.sh` issued `systemctl restart camilladsp`, the restart hung in `deactivating`, and every subsequent SetConfig hit `RateLimitExceededError` — killing the in-progress calibration session. Defaults now use `type: PipeWire` with `node_name` + `autoconnect_to` pointing at the Scarlett 18i20 multichannel PipeWire nodes (format is negotiated via WirePlumber, no explicit `format` key).
+
 ## [0.6.10.2] - 2026-05-23
 
 ### Added
