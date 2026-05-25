@@ -85,7 +85,12 @@ measurement:
   sweep_channel: lfe          # lfe | fl | fr | c | sl | sr
 
   # USB route only (playback_route: usb)
-  playback_device: "miniDSP" # substring matched against ALSA device names
+  # On the PipeWire stack (v0.2.0+), this is a PipeWire node name. The
+  # avr-cal-sweep-link.service host service creates this null sink and
+  # links it to camilladsp_capture so sweeps reach CamillaDSP -> subs.
+  # Legacy direct-ALSA setups: set to a PortAudio device substring like
+  # "miniDSP" instead.
+  playback_device: "avr_cal_sweep"
 
   # Loopback reference (Scarlett input ch3 ← Denon LFE pre-out).
   # PipeWire bridges the Scarlett AUX2 capture to snd-aloop subdevice 1
@@ -144,8 +149,12 @@ ExecStartPre=-/usr/bin/docker rm -f ${SERVICE_NAME}
 ExecStart=/usr/bin/docker run --rm \\
     --name ${SERVICE_NAME} \\
     --network=host \\
+    --ipc=host \\
     --privileged \\
     -v ${DATA_DIR}:/data/.avr-calibration \\
+    -v /run/user/1000:/run/user/1000 \\
+    -e XDG_RUNTIME_DIR=/run/user/1000 \\
+    -e PIPEWIRE_RUNTIME_DIR=/run/user/1000 \\
     ${IMAGE}
 ExecStop=/usr/bin/docker stop ${SERVICE_NAME}
 Restart=on-failure
@@ -260,6 +269,26 @@ if [ -f "$SCRIPT_DIR/pipewire-scarlett-clock.conf" ]; then
     sudo install -m 0644 "$SCRIPT_DIR/pipewire-scarlett-clock.conf" \
         /etc/pipewire/pipewire.conf.d/10-scarlett-clock.conf
     echo "Installed: /etc/pipewire/pipewire.conf.d/10-scarlett-clock.conf"
+fi
+
+# avr-cal-sweep PipeWire null sink + persistent link to camilladsp_capture.
+# Lets the container play the USB-route sweep into the PipeWire graph and
+# from there into CamillaDSP. Installed as a user systemd unit (same
+# pattern as loopback-ref-link below).
+if [ -f "$SCRIPT_DIR/avr-cal-sweep-link.sh" ]; then
+    sudo install -m 0755 "$SCRIPT_DIR/avr-cal-sweep-link.sh" \
+        /usr/local/sbin/avr-cal-sweep-link.sh
+    echo "Installed: /usr/local/sbin/avr-cal-sweep-link.sh"
+fi
+if [ -f "$SCRIPT_DIR/avr-cal-sweep-link.service" ] && [ -d /home/pi ]; then
+    sudo install -d -o pi -g pi /home/pi/.config/systemd/user
+    sudo install -m 0644 -o pi -g pi "$SCRIPT_DIR/avr-cal-sweep-link.service" \
+        /home/pi/.config/systemd/user/avr-cal-sweep-link.service
+    sudo -u pi XDG_RUNTIME_DIR=/run/user/1000 \
+        systemctl --user daemon-reload 2>/dev/null || true
+    sudo -u pi XDG_RUNTIME_DIR=/run/user/1000 \
+        systemctl --user enable --now avr-cal-sweep-link.service 2>/dev/null || true
+    echo "Installed + enabled: avr-cal-sweep-link.service (user)"
 fi
 
 # Loopback ref bridge: Scarlett input ch3 (AUX2) → snd-aloop sink. The

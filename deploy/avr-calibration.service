@@ -7,11 +7,20 @@ Requires=docker.service
 Type=simple
 User=pi
 ExecStartPre=-/usr/bin/docker rm -f avr-calibration
+# /run/user/1000 carries the PipeWire and PulseAudio sockets owned by uid 1000
+# (the `pi` user). Bind-mounting it into the container lets PortAudio + ALSA
+# (via pipewire-alsa) speak to the host PipeWire graph — without this the
+# container can only see raw ALSA devices and the USB-route sweep can't
+# reach the camilladsp_capture node.
 ExecStart=/usr/bin/docker run --rm \
     --name avr-calibration \
     --network=host \
+    --ipc=host \
     --privileged \
     -v /home/pi/.avr-calibration:/data/.avr-calibration \
+    -v /run/user/1000:/run/user/1000 \
+    -e XDG_RUNTIME_DIR=/run/user/1000 \
+    -e PIPEWIRE_RUNTIME_DIR=/run/user/1000 \
     ghcr.io/abarbaccia/avr-calibration:latest
 ExecStop=/usr/bin/docker stop avr-calibration
 Restart=always

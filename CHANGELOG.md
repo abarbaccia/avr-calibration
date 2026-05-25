@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.2] - 2026-05-25
+
+### Fixed
+- **USB-route sub calibration now works on the PipeWire audio stack.** After the v0.2.0 PipeWire migration, the container could no longer deliver sweeps to the subs via the USB route: PortAudio inside Docker only sees raw ALSA, the snd-aloop subdev used for the loopback ref is owned exclusively by PipeWire, and there was no PipeWire client in the image. The cascade kept the audio router as PipeWire end-to-end and restored the path:
+  - Dockerfile installs PipeWire **client** libs (`pipewire`, `libpipewire-0.3-0`, `libspa-0.2-modules`, `pipewire-alsa`, `pipewire-pulse`, `libasound2-plugins`). No daemon, no WirePlumber — the container is a PipeWire client of the host session.
+  - Systemd unit (`deploy/avr-calibration.service` + `deploy/install.sh`) bind-mounts `/run/user/1000` and exports `XDG_RUNTIME_DIR` / `PIPEWIRE_RUNTIME_DIR` so the container speaks to the host PipeWire socket; `--ipc=host` retained.
+  - New host service `avr-cal-sweep-link.service` (`deploy/avr-cal-sweep-link.sh`) creates a persistent PipeWire null sink `avr_cal_sweep` and links its monitor ports to `camilladsp_capture:input_1/2`, and also fans the same monitor into the `snd-aloop` sink so the existing loopback ref bridge captures the sweep electrically as a timing reference. Idempotent — re-running is safe; existing links and pre-loaded sink are detected and skipped.
+  - `MeasurementEngine.measure(route="usb")` resolves `playback_device` against PortAudio first (legacy direct-miniDSP setups still work). When no direct match is found, it pins `sd.default.device` to the ALSA `default` PCM (which pipewire-alsa hooks) and sets `PIPEWIRE_NODE=<playback_device>` so the OutputStream routes to the configured PipeWire node.
+  - `install.sh` default `config.yaml` now writes `playback_device: "avr_cal_sweep"`.
+  - CamillaDSP capture device is **unchanged** — still PipeWire-shaped from the v0.2.1 fix.
+
 ## [0.2.1] - 2026-05-25
 
 ### Fixed

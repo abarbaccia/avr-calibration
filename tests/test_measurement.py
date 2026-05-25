@@ -250,6 +250,82 @@ class TestMeasure:
         assert called_route == "hdmi"
 
     @pytest.mark.asyncio
+    async def test_usb_route_sets_pipewire_node_when_no_direct_match(self):
+        """USB route with a PipeWire-style playback_device should:
+          - pick the ALSA `default` PortAudio device,
+          - set os.environ['PIPEWIRE_NODE'] to that name.
+
+        This is the post-v0.2.0 PipeWire path: PortAudio doesn't enumerate
+        PipeWire nodes by name, so we ride the pipewire-alsa default PCM
+        and use PIPEWIRE_NODE to target the avr_cal_sweep null sink.
+        """
+        import os
+        cfg = make_config()
+        cfg.measurement["playback_route"] = "usb"
+        cfg.measurement["playback_device"] = "avr_cal_sweep"
+        engine, _, mock_sweep, mock_recording = self._make_engine_with_mocks(cfg)
+        mock_strategy = self._make_playback_mock(mock_sweep, mock_recording)
+
+        mock_sd = sys.modules["sounddevice"]
+        mock_sd.reset_mock()
+        # No device matches "avr_cal_sweep" by name; "default" does.
+        mock_sd.query_devices.return_value = [
+            {"name": "UMIK-1", "max_input_channels": 1, "max_output_channels": 0},
+            {"name": "default", "max_input_channels": 0, "max_output_channels": 2},
+            {"name": "hw:Loopback,1,0", "max_input_channels": 2, "max_output_channels": 0},
+        ]
+        mock_sd.default.device = [0, 1]
+
+        prev_node = os.environ.pop("PIPEWIRE_NODE", None)
+        try:
+            with patch(
+                "calibrate.drivers.playback.playback_for_route",
+                return_value=mock_strategy,
+            ):
+                await engine.measure(route="usb")
+            assert os.environ.get("PIPEWIRE_NODE") == "avr_cal_sweep"
+        finally:
+            if prev_node is None:
+                os.environ.pop("PIPEWIRE_NODE", None)
+            else:
+                os.environ["PIPEWIRE_NODE"] = prev_node
+
+    @pytest.mark.asyncio
+    async def test_usb_route_skips_pipewire_node_for_direct_portaudio_match(self):
+        """Legacy direct-ALSA setup (e.g. playback_device='miniDSP' matches a
+        PortAudio device by name): we pin sd.default to it and DO NOT set
+        PIPEWIRE_NODE — leaving the env alone for non-PipeWire deployments."""
+        import os
+        cfg = make_config()
+        cfg.measurement["playback_route"] = "usb"
+        cfg.measurement["playback_device"] = "miniDSP"
+        engine, _, mock_sweep, mock_recording = self._make_engine_with_mocks(cfg)
+        mock_strategy = self._make_playback_mock(mock_sweep, mock_recording)
+
+        mock_sd = sys.modules["sounddevice"]
+        mock_sd.reset_mock()
+        mock_sd.query_devices.return_value = [
+            {"name": "UMIK-1", "max_input_channels": 1, "max_output_channels": 0},
+            {"name": "miniDSP 2x4 HD", "max_input_channels": 0, "max_output_channels": 4},
+        ]
+        mock_sd.default.device = [0, 1]
+
+        prev_node = os.environ.pop("PIPEWIRE_NODE", None)
+        try:
+            with patch(
+                "calibrate.drivers.playback.playback_for_route",
+                return_value=mock_strategy,
+            ):
+                await engine.measure(route="usb")
+            # Direct PortAudio match → don't pollute env with PIPEWIRE_NODE.
+            assert "PIPEWIRE_NODE" not in os.environ
+        finally:
+            if prev_node is None:
+                os.environ.pop("PIPEWIRE_NODE", None)
+            else:
+                os.environ["PIPEWIRE_NODE"] = prev_node
+
+    @pytest.mark.asyncio
     async def test_pytta_import_error_raises_runtime_error(self):
         engine = MeasurementEngine(make_config())
         with patch.dict(sys.modules, {"pytta": None}):
