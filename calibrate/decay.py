@@ -342,37 +342,52 @@ def _estimate_t60_envelope(
 
 
 def _estimate_t60(schroeder_db: "np.ndarray", times: "np.ndarray") -> float | None:
-    """Estimate T60 from Schroeder decay curve via linear regression on -5 to -35dB range.
+    """Estimate T60 from Schroeder decay curve via linear regression.
 
-    Legacy helper used by the spectrogram path. The bandpass path uses the
-    envelope estimator (_estimate_t60_envelope) which is noise-floor-aware.
+    Used by the spectrogram path. Includes two sanity gates to prevent the
+    noise-floor inflation that caused 4-15× T60 over-estimation on 500 ms IRs
+    (validated against session 262, 2026-05-25):
 
-    Returns T60 in milliseconds, or None if the decay range is insufficient.
+    1. Noise-floor gate: estimate noise floor from the last 10% of the
+       Schroeder tail; stop fitting 3 dB above it so the regression doesn't
+       run into the noise-dominated region.
+    2. IR-window cap: if the extrapolated T60 exceeds 1.5× the observable IR
+       duration, the decay was not completed within the measurement window —
+       return None (indeterminate) instead of extrapolating.
+
+    Returns T60 in milliseconds, or None if any gate fails.
     """
     import numpy as np
 
-    # Find indices where decay is between -5 and -35 dB
-    mask = (schroeder_db >= -35.0) & (schroeder_db <= -5.0)
+    if len(times) < 3:
+        return None
 
+    ir_duration_ms = float(times[-1]) * 1000.0
+
+    # Gate 1: noise-floor-aware fit ceiling.
+    n_tail = max(1, len(schroeder_db) // 10)
+    noise_floor_db = float(np.median(schroeder_db[-n_tail:]))
+    fit_lower = max(noise_floor_db + 3.0, -35.0)
+
+    mask = (schroeder_db >= fit_lower) & (schroeder_db <= -5.0)
     if np.sum(mask) < 3:
-        # Not enough points for reliable linear fit
         return None
 
     t_fit = times[mask]
     db_fit = schroeder_db[mask]
 
     try:
-        # Linear fit: db = slope * t + intercept
         coeffs = np.polyfit(t_fit, db_fit, 1)
         slope = coeffs[0]
-
         if slope >= 0:
-            # Decay is not actually decaying
+            return None
+        t60_ms = (-60.0 / slope) * 1000.0
+
+        # Gate 2: can't reliably observe T60 > 1.5× the IR window.
+        if t60_ms > ir_duration_ms * 1.5:
             return None
 
-        # T60 = time for 60dB of decay = -60 / slope
-        t60_s = -60.0 / slope
-        return t60_s * 1000.0  # convert to ms
+        return t60_ms
 
     except (np.linalg.LinAlgError, ValueError):
         return None
