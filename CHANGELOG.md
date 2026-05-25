@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.4] - 2026-05-25
+
+### Fixed
+- **`analyze_decay` T60 over-estimation by 4–15× resolved.** The bandpass-mode estimator was reporting T60 values longer than the impulse response itself (e.g. 1905 ms for a 47 Hz mode in a 500 ms IR). Root cause: Schroeder backward integration treated the IR's noise tail as remaining modal energy and inflated the integral. Validated 2026-05-25 against session 262 — manual T20×3 gave 117–308 ms vs algorithm's 1905 ms. Replaced with a direct envelope-based T20 estimator (`_estimate_t60_envelope`): Hilbert envelope → time-to -5 dB and -25 dB crossings post-peak → T60 = (t₂₅ − t₅) × 3. Includes a noise-floor sanity gate: if the median envelope after the -25 dB crossing sits above -25 dB, the crossing was noise modulation and the estimate is rejected (returns None — never extrapolates past the IR window). Six new unit tests cover synthetic recovery, truncated IRs, high/low noise floors, and the session 262 regression.
+
 ## [0.2.3] - 2026-05-25
 
 ### Fixed

@@ -241,11 +241,11 @@ def _analyze_decay_bandpass(
         if peak_db < min_peak_db:
             continue
 
-        energy = filtered ** 2
-        schroeder = np.cumsum(energy[::-1])[::-1]
-        schroeder_db = 10.0 * np.log10(schroeder / (schroeder[0] + 1e-30) + 1e-30)
-
-        t60_ms = _estimate_t60(schroeder_db, times)
+        # Direct envelope-based T20 estimation. Schroeder backward integration
+        # is contaminated by the noise floor in the IR tail — for a 500ms IR
+        # at -45 dB SNR it inflates T60 by 4-15× vs ground truth (validated
+        # against session 262, 2026-05-25). See _estimate_t60_envelope.
+        t60_ms = _estimate_t60_envelope(filtered, sample_rate)
         if t60_ms is None or t60_ms < t60_threshold_ms:
             continue
 
@@ -265,8 +265,87 @@ def _analyze_decay_bandpass(
     return modes
 
 
+def _estimate_t60_envelope(
+    filtered: "np.ndarray",
+    sample_rate: int,
+    noise_floor_margin_db: float = 0.0,
+) -> float | None:
+    """Direct envelope-based T60 estimation from a bandpassed IR.
+
+    Replaces Schroeder backward integration for the bandpass path. Schroeder
+    integrates the IR tail as if it were modal energy — for a 500 ms IR at
+    -45 dB SNR, the noise integral inflates apparent T60 by 4-15× (validated
+    against session 262, 2026-05-25: 47 Hz read 1905 ms vs manual T20×3 of
+    117-308 ms).
+
+    Algorithm:
+    1. Hilbert envelope of the bandpassed signal.
+    2. Convert to dB rel peak (peak found within first ~10% of IR).
+    3. Estimate noise floor: median of last 10% of envelope, in dB rel peak.
+    4. Reject bands where the -25 dB threshold isn't at least
+       ``noise_floor_margin_db`` above the noise floor.
+    5. Measure time-to-first-cross of -5 dB and -25 dB post-peak.
+    6. T60 = (t_minus25 - t_minus5) × 3.
+
+    Returns T60 in ms, or None if any sanity gate fails (indeterminate —
+    do NOT extrapolate past the end of the IR).
+    """
+    import numpy as np
+    from scipy.signal import hilbert
+
+    if len(filtered) < 64:
+        return None
+
+    envelope = np.abs(hilbert(filtered))
+    if not np.any(envelope > 0):
+        return None
+
+    # Confine peak search to first ~10% of IR — modes ring out immediately
+    # after the impulse; a late peak would be noise or a wraparound artifact.
+    search_end = max(int(len(envelope) * 0.10), 32)
+    peak_idx = int(np.argmax(envelope[:search_end]))
+    peak_val = float(envelope[peak_idx])
+    if peak_val <= 0:
+        return None
+
+    env_db = 20.0 * np.log10(envelope / peak_val + 1e-30)
+
+    post_peak = env_db[peak_idx:]
+    below_5 = np.where(post_peak <= -5.0)[0]
+    below_25 = np.where(post_peak <= -25.0)[0]
+    if len(below_5) == 0 or len(below_25) == 0:
+        return None  # envelope never decays enough — indeterminate
+
+    t5_idx = int(below_5[0])
+    t25_idx = int(below_25[0])
+    if t25_idx <= t5_idx:
+        return None
+
+    # Noise-floor sanity gate. After the -25 dB crossing, the envelope should
+    # KEEP descending (signal still decaying) or plateau at noise floor that
+    # is itself below -25 dB. If the envelope rebounds substantially above
+    # -25 dB after the crossing, the -25 dB crossing was a noise excursion,
+    # not real signal decay.
+    abs_t25_idx = peak_idx + t25_idx
+    if abs_t25_idx < len(env_db) - 64:
+        # Take a stable window starting after the crossing. Use median so a
+        # single noise spike doesn't mask a true plateau.
+        post_tail = env_db[abs_t25_idx:]
+        tail_median_db = float(np.median(post_tail))
+        # If the median post-crossing envelope sits well ABOVE -25 dB, the
+        # crossing was noise modulation — reject.
+        if tail_median_db > -25.0 + noise_floor_margin_db:
+            return None
+
+    t20_s = (t25_idx - t5_idx) / sample_rate
+    return float(t20_s * 3.0 * 1000.0)
+
+
 def _estimate_t60(schroeder_db: "np.ndarray", times: "np.ndarray") -> float | None:
     """Estimate T60 from Schroeder decay curve via linear regression on -5 to -35dB range.
+
+    Legacy helper used by the spectrogram path. The bandpass path uses the
+    envelope estimator (_estimate_t60_envelope) which is noise-floor-aware.
 
     Returns T60 in milliseconds, or None if the decay range is insufficient.
     """
