@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.3] - 2026-05-25
+
+### Fixed
+- **USB-route cal coherence is now reproducible — engine deconvolves the mic recording against the captured loopback reference, cancelling PipeWire scheduling jitter as common-mode noise.** Before the fix, `MeasurementEngine` deconvolved the mic recording against the *analytical* sweep template (a sample-perfect digital reference with zero jitter). Under the PipeWire stack, sweep playback and mic capture are two separate client streams whose relative timing varies per run, so per-bin phase smear collapsed coherence. The `LoopbackRefPlayback` driver was already capturing an electrical reference in parallel; this change actually substitutes it in `_compute_fr_arrays`. Empirically: coherence improved from 0.05–0.6 (non-reproducible) to 0.94–1.00 across 20–200 Hz, with IR peak SPL from ~ -75 dBFS to ~ -22 dBFS (sessions 248 vs 255/256).
+
 ## [0.2.2] - 2026-05-25
 
 ### Fixed

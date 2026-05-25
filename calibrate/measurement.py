@@ -1005,8 +1005,29 @@ class MeasurementEngine:
             except Exception as exc:
                 log.warning("Failed to load mic cal file %s: %s", cal_path, exc)
 
+        # Architectural fix: when a recorded loopback reference is available,
+        # deconvolve mic against ref (not against the analytical sweep template).
+        # PipeWire schedules play and record streams independently — using the
+        # analytical sweep as the deconvolution reference makes any per-stream
+        # jitter show up as phase smear → per-bin coherence collapses.
+        # Cross-correlating two RECORDED signals (mic and ref) under the same
+        # PipeWire scheduling regime cancels common-mode jitter.
+        # See LoopbackRefPlayback docstring (drivers/playback.py:521-527).
+        if ref_1d is not None and not np.all(ref_1d == 0):
+            n_aligned = min(len(ref_1d), len(rec_1d))
+            deconv_x = ref_1d[:n_aligned].astype(np.float64)
+            deconv_y = rec_1d[:n_aligned].astype(np.float64)
+            log.info(
+                "deconvolution: using recorded loopback ref (n=%d) as X — "
+                "PipeWire jitter common-mode cancels",
+                n_aligned,
+            )
+        else:
+            deconv_x = sweep_for_deconv
+            deconv_y = rec_for_deconv
+
         frequencies, spl, ir_samples, phase, coherence, xcorr_peak_ms = self._compute_fr_arrays(
-            np, sweep_for_deconv, rec_for_deconv, freq_min, freq_max, sample_rate,
+            np, deconv_x, deconv_y, freq_min, freq_max, sample_rate,
             cal_curve=cal_curve,
         )
 

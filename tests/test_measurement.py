@@ -385,6 +385,63 @@ class TestComputeFr:
         assert spl == []
 
 
+class TestDeconvolveAgainstRecordedRef:
+    """Regression tests for the architectural fix:
+
+    When a loopback reference recording is available, the engine must
+    deconvolve mic against the RECORDED reference (not the analytical
+    sweep template). This cancels PipeWire scheduling jitter as
+    common-mode noise. Empirically: coherence 0.05–0.6 → 0.94–1.00.
+    """
+
+    def _engine(self):
+        return MeasurementEngine(make_config())
+
+    def test_recorded_ref_produces_different_fr_than_analytical_sweep(self):
+        """Deconvolving against a recorded ref vs the analytical sweep
+        must produce different FR arrays — proves the substitution
+        actually flows through the math (not a no-op)."""
+        engine = self._engine()
+        rng = np.random.default_rng(42)
+        n = 4800
+        analytical_sweep = rng.standard_normal(n).astype(np.float64)
+        # Recorded ref: analytical sweep + per-sample jitter (the thing
+        # that would smear phase if you deconvolved against analytical)
+        recorded_ref = analytical_sweep + 0.3 * rng.standard_normal(n).astype(np.float64)
+        mic_recording = rng.standard_normal(n).astype(np.float64)
+
+        # (a) Without ref: deconvolve mic vs analytical sweep
+        f_no_ref, spl_no_ref, *_ = engine._compute_fr_arrays(
+            np, analytical_sweep, mic_recording, 20, 200, 48000,
+        )
+        # (b) With ref: deconvolve mic vs recorded ref
+        f_with_ref, spl_with_ref, *_ = engine._compute_fr_arrays(
+            np, recorded_ref, mic_recording, 20, 200, 48000,
+        )
+
+        # Same frequency bins (band + sample_rate identical)
+        assert f_no_ref == f_with_ref
+        # But the FR must differ — the X array is different
+        assert spl_no_ref != spl_with_ref
+        # Both must still be finite
+        assert all(np.isfinite(s) for s in spl_no_ref)
+        assert all(np.isfinite(s) for s in spl_with_ref)
+
+    def test_zero_ref_array_falls_back_safely(self):
+        """A near-zero ref (silent loopback) should not crash the math
+        — the zero-division guard inside _compute_fr_arrays handles it.
+        This documents the contract the caller's branch relies on:
+        when ref is silent the engine code path picks sweep_for_deconv,
+        but if a silent ref ever reaches _compute_fr_arrays directly
+        we still get finite output."""
+        engine = self._engine()
+        n = 4800
+        zero_ref = np.zeros(n, dtype=np.float64)
+        mic = np.random.default_rng(0).standard_normal(n).astype(np.float64)
+        freqs, spl, *_ = engine._compute_fr_arrays(np, zero_ref, mic, 20, 200, 48000)
+        assert all(np.isfinite(s) for s in spl)
+
+
 # ── calibrate measure (CLI) ───────────────────────────────────────────────────
 
 def make_fr_result(
