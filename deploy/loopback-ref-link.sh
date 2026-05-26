@@ -1,15 +1,23 @@
 #!/bin/bash
-# Bridge Scarlett input ch3 (AUX2) -> snd-aloop sink (FL & FR) via PipeWire.
-# The measurement engine in the avr-calibration container reads
-# hw:Loopback,1,0 as the loopback reference (= the Denon LFE pre-out signal
-# tapped electrically at Scarlett input 3, so cross-correlation of the UMIK
-# capture against this reference isolates pure acoustic delay from any
-# CamillaDSP/USB/Denon processing latency).
+# DEPRECATED / DISABLED — do not re-enable without understanding the consequences.
 #
-# This script is invoked by the loopback-ref-link.service systemd user
-# unit at PipeWire start. CamillaDSP and the measurement engine can now
-# capture the Scarlett concurrently because PipeWire is the single ALSA
-# owner — both reach it through the PW graph.
+# Original intent: Bridge Scarlett input ch3 (AUX2 = Denon sub pre-out) to
+# snd-aloop as the measurement loopback reference.
+#
+# Why it's disabled:
+#   This contaminated the loopback reference with the Denon-processed signal.
+#   When the measurement deconvolves mic vs reference, Denon processing cancels
+#   out — making CamillaDSP input EQ (HPF, Harman shelf) invisible to measurements.
+#   Root cause analysis 2026-05-25: avr_cal_sweep:monitor is the correct reference
+#   (raw pre-processing sweep). The snd-aloop ONLY carries avr_cal_sweep:monitor
+#   now, set up by avr-cal-sweep-link.sh.
+#
+# Loopback reference architecture (current):
+#   avr_cal_sweep:monitor_FL/FR → snd-aloop → hw:2,1 (LoopbackRefPlayback)
+#   H = CamillaDSP(HPF+shelf) × room × mic  [full DSP chain visible]
+#
+# The loopback-ref-link.service is disabled. This script is kept for the
+# `down` path (to remove stale links if service was re-enabled manually).
 #
 # Idempotent: "File exists" from pw-link is treated as success.
 
