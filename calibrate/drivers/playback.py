@@ -16,11 +16,11 @@ from typing import Protocol
 log = logging.getLogger(__name__)
 
 
-def _start_pw_record(node: str, sample_rate: int) -> tuple:
+def _start_pw_record(node: str, sample_rate: int, channels: int = 1) -> tuple:
     """Start a pw-record subprocess reading from a PipeWire source node.
 
     Returns (proc, chunks, reader_thread).  Caller must call _stop_pw_record
-    when done.  pw-record writes raw f32le mono samples to stdout.
+    when done.  pw-record writes raw f32le interleaved samples to stdout.
     """
     import subprocess
     import threading
@@ -28,7 +28,7 @@ def _start_pw_record(node: str, sample_rate: int) -> tuple:
     cmd = [
         "pw-record",
         "--target", node,
-        "--channels", "1",
+        "--channels", str(channels),
         "--rate", str(sample_rate),
         "--format", "f32",
         "-",
@@ -695,114 +695,55 @@ class LoopbackRefPlayback:
     def __init__(
         self,
         base: PlaybackStrategy,
-        ref_device: str,
+        ref_device: str = "",
         ref_channels: int = 1,
         ref_channel_index: int = 1,  # 1-based
+        ref_pipewire_node: str | None = None,
+        ref_pw_channels: int = 1,
     ) -> None:
+        pw_ch = max(ref_pw_channels, ref_channel_index)
         if ref_channels < 1:
             raise ValueError(f"ref_channels must be >= 1, got {ref_channels}")
-        if not (1 <= ref_channel_index <= ref_channels):
+        if not (1 <= ref_channel_index <= max(ref_channels, pw_ch)):
             raise ValueError(
-                f"ref_channel_index ({ref_channel_index}) must be in "
-                f"[1, {ref_channels}]"
+                f"ref_channel_index ({ref_channel_index}) must be >= 1"
             )
         self.base = base
         self.ref_device = ref_device
         self.ref_channels = int(ref_channels)
         self.ref_channel_index = int(ref_channel_index)
+        self.ref_pipewire_node = ref_pipewire_node
+        self.ref_pw_channels = pw_ch  # actual channel count passed to pw-record
 
     def play_and_record(self, sweep, sample_rate, in_channel, out_channel):
         """Run base playback + capture the loopback ref in parallel.
 
-        Opens a parallel sd.InputStream on ``self.ref_device`` covering
-        the same time window as the base strategy's UMIK capture. The
-        base strategy runs in a worker thread so the ref InputStream
-        can run concurrently from the main thread. After both complete,
-        the ref recording is trimmed to the same length as the mic
-        recording (callers cross-correlate them; equal lengths simplify
-        FFT alignment).
+        Two capture paths:
+          pw-record (preferred): ref_pipewire_node set → pw-record subprocess
+            taps a PipeWire source node (e.g. Scarlett multichannel input
+            carrying the AVR pre-out signal). No ALSA bridge.
+          PortAudio (fallback): ref_device set → sd.InputStream on a named
+            ALSA device.
 
-        If ALSA can't open ``self.ref_device`` (e.g., the device doesn't
-        exist or no producer is feeding it), the call still returns a
-        3-tuple — ref_1d is zeros of the same length as mic_1d, with a
-        warning logged. Callers can detect "ref not present" via
-        ``np.all(ref_1d == 0)`` or by checking the warning in run logs.
-        This fail-soft behavior keeps the loopback rig opt-in: missing
-        upstream wiring (CamillaDSP YAML / asound.conf multi) doesn't
-        break the measurement, it just degrades to mic-only timing.
+        Both paths return a 3-tuple (sweep_1d, mic_1d, ref_1d). ref_1d is
+        zeros if reference capture fails — fail-soft keeps the measurement
+        working without the loopback rig.
+
+        Timing model (pw-record path):
+          ref capture starts when base.play_and_record() is called, which
+          includes any warmup burst (HDMI_WARMUP_S).  After base returns the
+          ref is trimmed to align with mic_1d: the first warmup_samples are
+          dropped so both arrays share the same t=0 (start of recording window
+          inside base).
         """
         import time as _time
         import threading
 
         import numpy as np
-        import sounddevice as sd
 
-        # Estimate the recording window from the base strategy's known
-        # parameters. Mirrors USBPlayback / HDMIAplayPlayback shape:
-        # pre-delay + sweep + post-delay. We don't have direct access
-        # to the base strategy's PRE_DELAY_S / POST_DELAY_S generically,
-        # so read from class attribute or fall back to conservative
-        # defaults (1.0s pre, 0.5s post — both base classes use these).
-        pre_s = getattr(self.base, "PRE_DELAY_S", 1.0)
-        post_s = getattr(self.base, "POST_DELAY_S", 0.5)
-
-        sweep_array_len = len(sweep.timeSignal[:, 0])
-        pre_samples = int(pre_s * sample_rate)
-        post_samples = int(post_s * sample_rate)
-        rec_n = pre_samples + sweep_array_len + post_samples
-
-        ref_buf = np.zeros((rec_n, self.ref_channels), dtype=np.float32)
-        ref_pos = [0]
         ref_failed = [False]
         ref_error: list = [None]
 
-        def _ref_callback(indata, frames, time_info, status):
-            end = min(ref_pos[0] + frames, rec_n)
-            count = end - ref_pos[0]
-            if count > 0:
-                ref_buf[ref_pos[0]:end] = indata[:count, :self.ref_channels]
-            ref_pos[0] = end
-
-        # Resolve the ref device. sounddevice accepts integer indices
-        # or substring names. ALSA-style names like "hw:Loopback,1,0"
-        # don't match PortAudio's enumeration directly — look up by
-        # substring against the device list first.
-        ref_dev_idx: int | str | None = None
-        try:
-            devices = sd.query_devices()
-            for idx, dev in enumerate(devices):
-                if (dev.get("max_input_channels", 0) >= self.ref_channels and
-                        self.ref_device.lower() in str(dev.get("name", "")).lower()):
-                    ref_dev_idx = idx
-                    break
-        except Exception as exc:
-            ref_failed[0] = True
-            ref_error[0] = f"device lookup failed: {exc}"
-
-        if ref_dev_idx is None and not ref_failed[0]:
-            # Fallback: try the ref_device string directly. PortAudio's
-            # newer builds accept some ALSA-ish names. If not, the
-            # InputStream open below will fail and ref_failed flips True.
-            ref_dev_idx = self.ref_device
-
-        ref_stream = None
-        if not ref_failed[0]:
-            try:
-                ref_stream = sd.InputStream(
-                    device=ref_dev_idx,
-                    samplerate=sample_rate,
-                    channels=self.ref_channels,
-                    dtype="float32",
-                    callback=_ref_callback,
-                )
-            except Exception as exc:
-                ref_failed[0] = True
-                ref_error[0] = f"InputStream open failed: {exc}"
-                ref_stream = None
-
-        # Run base.play_and_record in a worker thread so the ref
-        # InputStream can run concurrently in the main thread. Capture
-        # exceptions to re-raise on join.
         base_result: list = [None]
         base_exc: list = [None]
 
@@ -814,75 +755,168 @@ class LoopbackRefPlayback:
             except Exception as exc:
                 base_exc[0] = exc
 
-        try:
-            if ref_stream is not None:
-                ref_stream.start()
+        if self.ref_pipewire_node:
+            # Native PipeWire reference capture via pw-record.
+            ref_proc = None
+            ref_chunks: list[bytes] = []
+            ref_reader = None
+            try:
+                ref_proc, ref_chunks, ref_reader = _start_pw_record(
+                    self.ref_pipewire_node, sample_rate, channels=self.ref_pw_channels
+                )
+            except Exception as exc:
+                ref_failed[0] = True
+                ref_error[0] = f"pw-record start failed: {exc}"
+
             base_thread = threading.Thread(target=_base_runner, daemon=True)
             base_thread.start()
             base_thread.join(timeout=120.0)
             if base_thread.is_alive():
-                # Base hung. Stop ref stream and surface the timeout.
+                if ref_proc is not None:
+                    _stop_pw_record(ref_proc, ref_reader)
+                raise RuntimeError("LoopbackRefPlayback: base strategy timeout (120s)")
+
+            if ref_proc is not None:
+                _stop_pw_record(ref_proc, ref_reader)
+
+            if base_exc[0] is not None:
+                raise base_exc[0]
+            if base_result[0] is None:
+                raise RuntimeError("LoopbackRefPlayback: base strategy returned no result")
+            sweep_1d, mic_1d = base_result[0]
+
+            if not ref_failed[0]:
+                try:
+                    raw = b"".join(ref_chunks)
+                    if raw and len(raw) >= self.ref_pw_channels * 4:
+                        all_ch = np.frombuffer(raw, dtype=np.float32).reshape(-1, self.ref_pw_channels)
+                        ref_full = all_ch[:, self.ref_channel_index - 1].astype(np.float64)
+                        # Drop HDMI_WARMUP_S leading samples so ref aligns with mic_1d.
+                        warmup_s = getattr(self.base, "HDMI_WARMUP_S", 0.0)
+                        warmup_n = int(warmup_s * sample_rate)
+                        ref_aligned = ref_full[warmup_n:]
+                        # Trim both to the same length.
+                        n = min(len(ref_aligned), len(mic_1d))
+                        ref_1d = ref_aligned[:n]
+                        mic_1d = mic_1d[:n]
+                    else:
+                        ref_failed[0] = True
+                        ref_error[0] = "pw-record returned no data"
+                        ref_1d = np.zeros_like(mic_1d)
+                except Exception as exc:
+                    ref_failed[0] = True
+                    ref_error[0] = f"parse failed: {exc}"
+                    ref_1d = np.zeros_like(mic_1d)
+            else:
+                ref_1d = np.zeros_like(mic_1d)
+
+        else:
+            # PortAudio sd.InputStream fallback (ref_device substring match).
+            import sounddevice as sd
+
+            pre_s = getattr(self.base, "PRE_DELAY_S", 1.0)
+            post_s = getattr(self.base, "POST_DELAY_S", 0.5)
+            sweep_array_len = len(sweep.timeSignal[:, 0])
+            rec_n = int(pre_s * sample_rate) + sweep_array_len + int(post_s * sample_rate)
+
+            ref_buf = np.zeros((rec_n, self.ref_channels), dtype=np.float32)
+            ref_pos = [0]
+
+            def _ref_callback(indata, frames, time_info, status):
+                end = min(ref_pos[0] + frames, rec_n)
+                count = end - ref_pos[0]
+                if count > 0:
+                    ref_buf[ref_pos[0]:end] = indata[:count, :self.ref_channels]
+                ref_pos[0] = end
+
+            ref_dev_idx: int | str | None = None
+            try:
+                devices = sd.query_devices()
+                for idx, dev in enumerate(devices):
+                    if (dev.get("max_input_channels", 0) >= self.ref_channels and
+                            self.ref_device.lower() in str(dev.get("name", "")).lower()):
+                        ref_dev_idx = idx
+                        break
+            except Exception as exc:
+                ref_failed[0] = True
+                ref_error[0] = f"device lookup failed: {exc}"
+
+            if ref_dev_idx is None and not ref_failed[0]:
+                ref_dev_idx = self.ref_device
+
+            ref_stream = None
+            if not ref_failed[0]:
+                try:
+                    ref_stream = sd.InputStream(
+                        device=ref_dev_idx,
+                        samplerate=sample_rate,
+                        channels=self.ref_channels,
+                        dtype="float32",
+                        callback=_ref_callback,
+                    )
+                except Exception as exc:
+                    ref_failed[0] = True
+                    ref_error[0] = f"InputStream open failed: {exc}"
+
+            try:
+                if ref_stream is not None:
+                    ref_stream.start()
+                base_thread = threading.Thread(target=_base_runner, daemon=True)
+                base_thread.start()
+                base_thread.join(timeout=120.0)
+                if base_thread.is_alive():
+                    if ref_stream is not None:
+                        try: ref_stream.stop()
+                        except Exception: pass
+                        try: ref_stream.close()
+                        except Exception: pass
+                    raise RuntimeError("LoopbackRefPlayback: base strategy timeout (120s)")
+                if ref_stream is not None:
+                    _time.sleep(0.05)
+                    try: ref_stream.stop()
+                    except Exception: pass
+                    try: ref_stream.close()
+                    except Exception: pass
+            except Exception as exc:
+                ref_failed[0] = True
+                ref_error[0] = f"runtime: {exc}"
                 if ref_stream is not None:
                     try: ref_stream.stop()
                     except Exception: pass
                     try: ref_stream.close()
                     except Exception: pass
-                raise RuntimeError(
-                    "LoopbackRefPlayback: base strategy timeout (120s)"
-                )
 
-            if ref_stream is not None:
-                # Brief settle so the last callback frames flush.
-                _time.sleep(0.05)
-                try: ref_stream.stop()
-                except Exception: pass
-                try: ref_stream.close()
-                except Exception: pass
-        except Exception as exc:
-            ref_failed[0] = True
-            ref_error[0] = f"runtime: {exc}"
-            if ref_stream is not None:
-                try: ref_stream.stop()
-                except Exception: pass
-                try: ref_stream.close()
-                except Exception: pass
+            if base_exc[0] is not None:
+                raise base_exc[0]
+            if base_result[0] is None:
+                raise RuntimeError("LoopbackRefPlayback: base strategy returned no result")
+            sweep_1d, mic_1d = base_result[0]
 
-        if base_exc[0] is not None:
-            raise base_exc[0]
+            n_recorded = min(ref_pos[0], len(mic_1d))
+            if n_recorded > 0 and not ref_failed[0]:
+                ref_1d = ref_buf[:n_recorded, self.ref_channel_index - 1].astype(np.float64)
+                if len(ref_1d) < len(mic_1d):
+                    mic_1d = mic_1d[:len(ref_1d)]
+            else:
+                ref_1d = np.zeros_like(mic_1d)
 
-        if base_result[0] is None:
-            raise RuntimeError(
-                "LoopbackRefPlayback: base strategy returned no result"
-            )
-        sweep_1d, mic_1d = base_result[0]
-
-        # Trim ref to mic's actual recorded length. Both should be the
-        # same length for cross-correlation; if ref captured fewer
-        # samples (stream stopped early), trim mic to match.
-        n_recorded = min(ref_pos[0], len(mic_1d))
-        if n_recorded > 0 and not ref_failed[0]:
-            ref_1d = ref_buf[
-                :n_recorded, self.ref_channel_index - 1
-            ].astype(np.float64)
-            if len(ref_1d) < len(mic_1d):
-                mic_1d = mic_1d[:len(ref_1d)]
+        ref_source = self.ref_pipewire_node or self.ref_device
+        if not ref_failed[0] and np.any(ref_1d != 0):
             ref_peak_db = 20 * np.log10(np.max(np.abs(ref_1d)) + 1e-12)
-            ref_rms_db = 20 * np.log10(
-                np.sqrt(np.mean(ref_1d ** 2)) + 1e-12
-            )
+            ref_rms_db = 20 * np.log10(np.sqrt(np.mean(ref_1d ** 2)) + 1e-12)
             log.info(
-                "LoopbackRefPlayback: ref captured device=%s ch=%d/%d "
-                "n=%d peak=%.1f dBFS rms=%.1f dBFS",
-                self.ref_device, self.ref_channel_index, self.ref_channels,
-                n_recorded, ref_peak_db, ref_rms_db,
+                "LoopbackRefPlayback: ref captured source=%s ch=%d n=%d "
+                "peak=%.1f dBFS rms=%.1f dBFS",
+                ref_source, self.ref_channel_index, len(ref_1d),
+                ref_peak_db, ref_rms_db,
             )
         else:
             ref_1d = np.zeros_like(mic_1d)
             log.warning(
-                "LoopbackRefPlayback: ref capture failed (device=%s err=%s) "
+                "LoopbackRefPlayback: ref capture failed (source=%s err=%s) "
                 "— ref_1d is zeros. Cross-correlation timing falls back to "
                 "the analytical sweep template.",
-                self.ref_device, ref_error[0],
+                ref_source, ref_error[0],
             )
 
         return sweep_1d, mic_1d, ref_1d
@@ -898,6 +932,8 @@ def playback_for_route(
     loopback_ref_device: str | None = None,
     loopback_ref_channels: int = 1,
     loopback_ref_channel_index: int = 1,
+    loopback_ref_pipewire_node: str | None = None,
+    loopback_ref_pw_channels: int = 1,
 ) -> PlaybackStrategy:
     """Factory: return the right playback strategy for the configured route.
 
@@ -927,11 +963,13 @@ def playback_for_route(
     else:
         base = USBPlayback(capture_pipewire_node=capture_pipewire_node)
 
-    if loopback_ref_device is not None:
+    if loopback_ref_pipewire_node is not None or loopback_ref_device is not None:
         return LoopbackRefPlayback(
             base=base,
-            ref_device=loopback_ref_device,
+            ref_device=loopback_ref_device or "",
             ref_channels=loopback_ref_channels,
             ref_channel_index=loopback_ref_channel_index,
+            ref_pipewire_node=loopback_ref_pipewire_node,
+            ref_pw_channels=loopback_ref_pw_channels,
         )
     return base

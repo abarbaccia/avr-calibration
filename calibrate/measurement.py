@@ -756,6 +756,8 @@ class MeasurementEngine:
         loopback_ref_channel_index: int = int(cfg.get("loopback_ref_channel_index", 1))
 
         mic_pipewire_node = cfg.get("mic_pipewire_node") or None
+        loopback_ref_pw_node = cfg.get("loopback_ref_pipewire_node") or None
+        loopback_ref_pw_channels = int(cfg.get("loopback_ref_pw_channels", 1))
 
         if use_aplay_hdmi:
             # Use PipeWire natively via pw-cat --target <node>.  The ALSA
@@ -780,6 +782,8 @@ class MeasurementEngine:
                 loopback_ref_device=loopback_ref_device,
                 loopback_ref_channels=loopback_ref_channels,
                 loopback_ref_channel_index=loopback_ref_channel_index,
+                loopback_ref_pipewire_node=loopback_ref_pw_node,
+                loopback_ref_pw_channels=loopback_ref_pw_channels,
             )
         else:
             strategy = playback_for_route(
@@ -788,6 +792,8 @@ class MeasurementEngine:
                 loopback_ref_device=loopback_ref_device,
                 loopback_ref_channels=loopback_ref_channels,
                 loopback_ref_channel_index=loopback_ref_channel_index,
+                loopback_ref_pipewire_node=loopback_ref_pw_node,
+                loopback_ref_pw_channels=loopback_ref_pw_channels,
             )
 
         # Lock: protects sd.default.device (module-level global) and serializes

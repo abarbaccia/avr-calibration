@@ -79,6 +79,8 @@ DEFAULT_CONFIG: dict = {
         "hdmi_playback_device": None,  # deprecated; use hdmi_pipewire_node
         "mic_pipewire_node": None,
         "mic_device_index": None,  # deprecated; use mic_pipewire_node
+        "loopback_ref_pipewire_node": None,
+        "loopback_ref_pw_channels": 1,
         "hdmi_device_index": None,
         "usb_device_index": None,
         "master_gain_hdmi_db": None,
