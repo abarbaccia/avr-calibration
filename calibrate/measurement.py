@@ -759,6 +759,8 @@ class MeasurementEngine:
         loopback_ref_pw_node = cfg.get("loopback_ref_pipewire_node") or None
         loopback_ref_pw_channels = int(cfg.get("loopback_ref_pw_channels", 1))
 
+        usb_pipewire_node = cfg.get("usb_pipewire_node") or None
+
         if use_aplay_hdmi:
             # Use PipeWire natively via pw-cat --target <node>.  The ALSA
             # default:CARD= syntax fails inside the container, and aplay
@@ -778,6 +780,23 @@ class MeasurementEngine:
                 route,
                 hdmi_pipewire_node=hdmi_pipewire_node,
                 hdmi_channels=hdmi_channels,
+                capture_pipewire_node=mic_pipewire_node,
+                loopback_ref_device=loopback_ref_device,
+                loopback_ref_channels=loopback_ref_channels,
+                loopback_ref_channel_index=loopback_ref_channel_index,
+                loopback_ref_pipewire_node=loopback_ref_pw_node,
+                loopback_ref_pw_channels=loopback_ref_pw_channels,
+            )
+        elif usb_pipewire_node:
+            # USB route targeting a PipeWire node (e.g. avr_cal_sweep null sink).
+            # sounddevice/PortAudio cannot see PW virtual nodes, so use pw-cat
+            # via the HDMI pw-cat path with the USB node as the target.
+            # avr_cal_sweep is stereo — cap at 2 channels.
+            pw_channels = min(max(2, out_channel), 2)
+            strategy = playback_for_route(
+                "hdmi",
+                hdmi_pipewire_node=usb_pipewire_node,
+                hdmi_channels=pw_channels,
                 capture_pipewire_node=mic_pipewire_node,
                 loopback_ref_device=loopback_ref_device,
                 loopback_ref_channels=loopback_ref_channels,

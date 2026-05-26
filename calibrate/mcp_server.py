@@ -266,10 +266,19 @@ def _filter_and_decimate_fr(
     )
 
 
+_SMOOTH_BPO: dict[str, int | None] = {
+    "third_octave": 3,
+    "sixth_octave": 6,
+    "twelfth_octave": 12,
+    "raw": None,
+}
+
+
 async def _tool_get_measurement_history(
     limit: int = 10,
     min_hz: float | None = None,
     max_hz: float | None = None,
+    smooth: str = "twelfth_octave",
     decimation: int = 1,
     fmt: str = "compact",
     include_phase: bool = False,
@@ -278,16 +287,18 @@ async def _tool_get_measurement_history(
 
     Args:
         limit: Number of sessions to return.
-        min_hz: Low-frequency cutoff — only return data at or above this frequency.
-        max_hz: High-frequency cutoff — only return data at or below this frequency.
-        decimation: Keep every Nth point (1 = all points, 2 = every other, etc.).
-        fmt: Output format — "compact" (default; single "fr" string "freq:spl,...",
-             ~3x smaller) or "full" (separate freq_hz[]/spl_db[] arrays).
-        include_phase: When True and fmt="full", include phase_rad[] array.
-             Phase is only needed for sub alignment and analyze_phase — omit it
-             from the per-iteration EQ loop to save ~8K tokens per measurement.
+        min_hz: Low-frequency cutoff (Hz).
+        max_hz: High-frequency cutoff (Hz).
+        smooth: Octave smoothing — "twelfth_octave" (default, ~40 bands for subs),
+            "sixth_octave" (~20 bands), "third_octave" (~10 bands), "raw" (full resolution).
+        decimation: Legacy stride decimation (ignored when smooth != "raw").
+        fmt: "compact" (default; "freq:spl,..." string) or "full" (arrays).
+        include_phase: Include phase_rad[] (fmt="full" only). Omit for EQ iteration loops.
     """
     from .storage import SessionStore
+    bpo = _SMOOTH_BPO.get(smooth)
+    if bpo is None and smooth != "raw":
+        return _err(f"invalid smooth={smooth!r}; choose: {list(_SMOOTH_BPO)}")
     try:
         store = SessionStore()
         sessions = store.list_sessions(limit=limit)
@@ -297,9 +308,24 @@ async def _tool_get_measurement_history(
             freqs: list[float]
             spls: list[float]
             if fr:
-                freqs, spls = _filter_and_decimate_fr(
-                    fr.frequencies, fr.spl, min_hz, max_hz, decimation
-                )
+                if bpo is not None:
+                    # Octave smoothing: filter range first, then smooth
+                    pairs = [
+                        (f, v) for f, v in zip(fr.frequencies, fr.spl)
+                        if (min_hz is None or f >= min_hz) and (max_hz is None or f <= max_hz)
+                    ]
+                    if pairs:
+                        fq = [p[0] for p in pairs]
+                        sv = [p[1] for p in pairs]
+                        smoothed = _downsample_fr_octave(fq, sv, bpo)
+                        freqs = [p[0] for p in smoothed]
+                        spls = [p[1] for p in smoothed]
+                    else:
+                        freqs, spls = [], []
+                else:
+                    freqs, spls = _filter_and_decimate_fr(
+                        fr.frequencies, fr.spl, min_hz, max_hz, decimation
+                    )
                 if fr.phase and fmt == "full" and include_phase:
                     phase_freqs, phase_vals = _filter_and_decimate_fr(
                         fr.frequencies, fr.phase, min_hz, max_hz, decimation
@@ -344,6 +370,38 @@ async def _tool_get_measurement_history(
         return _err(f"storage error: {exc}")
 
 
+# ── Octave-band smoothing helpers ─────────────────────────────────────────────
+
+def _octave_centres(f_min: float, f_max: float, bpo: int) -> list[float]:
+    """Generate octave band centre frequencies in [f_min, f_max] anchored to 1000 Hz."""
+    step = 2 ** (1 / bpo)
+    f = 1000.0
+    while f / step > f_min:
+        f /= step
+    centres = []
+    while f <= f_max:
+        if f >= f_min:
+            centres.append(f)
+        f *= step
+    return centres
+
+
+def _downsample_fr_octave(
+    freqs: list[float], vals: list[float], bpo: int
+) -> list[tuple[float, float]]:
+    """Average (freqs, vals) into 1/bpo-octave bands. Returns (centre_hz, avg) pairs."""
+    if not freqs:
+        return []
+    half_step = 2 ** (1 / (2 * bpo))
+    centres = _octave_centres(min(freqs), max(freqs), bpo)
+    result = []
+    for c in centres:
+        band_vals = [v for f, v in zip(freqs, vals) if c / half_step <= f < c * half_step]
+        if band_vals:
+            result.append((round(c, 1), round(sum(band_vals) / len(band_vals), 1 if isinstance(band_vals[0], float) else 3)))
+    return result
+
+
 # ── 1/3-octave centre frequencies (ISO 266) for bass calibration band ────────
 _THIRD_OCTAVE_CENTRES = [
     20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0, 160.0, 200.0,
@@ -353,56 +411,42 @@ _THIRD_OCTAVE_CENTRES = [
 def _downsample_to_third_octave(
     freqs: list[float], spl: list[float],
 ) -> list[dict]:
-    """Average FR data into 1/3-octave bands. Returns list of {freq_hz, spl_db}."""
-    import math
+    """Average FR data into ISO 1/3-octave bands. Returns list of {freq_hz, spl_db}."""
+    factor = 2 ** (1 / 6)
     bands = []
     for centre in _THIRD_OCTAVE_CENTRES:
-        # 1/3-octave band edges: centre / 2^(1/6) to centre * 2^(1/6)
-        factor = 2 ** (1 / 6)
-        lo = centre / factor
-        hi = centre * factor
+        lo, hi = centre / factor, centre * factor
         vals = [s for f, s in zip(freqs, spl) if lo <= f < hi]
         if vals:
-            bands.append({
-                "freq_hz": centre,
-                "spl_db": round(sum(vals) / len(vals), 1),
-            })
+            bands.append({"freq_hz": centre, "spl_db": round(sum(vals) / len(vals), 1)})
     return bands
 
 
 def _downsample_group_delay(
     freqs: list[float], delay_ms: list[float],
 ) -> list[dict]:
-    """Downsample group delay to 1/3-octave bands. Returns list of {freq_hz, delay_ms}."""
+    """Downsample group delay to ISO 1/3-octave bands."""
+    factor = 2 ** (1 / 6)
     bands = []
     for centre in _THIRD_OCTAVE_CENTRES:
-        factor = 2 ** (1 / 6)
-        lo = centre / factor
-        hi = centre * factor
+        lo, hi = centre / factor, centre * factor
         vals = [d for f, d in zip(freqs, delay_ms) if lo <= f < hi]
         if vals:
-            bands.append({
-                "freq_hz": centre,
-                "delay_ms": round(sum(vals) / len(vals), 1),
-            })
+            bands.append({"freq_hz": centre, "delay_ms": round(sum(vals) / len(vals), 1)})
     return bands
 
 
 def _downsample_coherence(
     freqs: list[float], coherence: list[float],
 ) -> list[dict]:
-    """Downsample coherence to 1/3-octave bands. Returns list of {freq_hz, coherence}."""
+    """Downsample coherence to ISO 1/3-octave bands."""
+    factor = 2 ** (1 / 6)
     bands = []
     for centre in _THIRD_OCTAVE_CENTRES:
-        factor = 2 ** (1 / 6)
-        lo = centre / factor
-        hi = centre * factor
+        lo, hi = centre / factor, centre * factor
         vals = [c for f, c in zip(freqs, coherence) if lo <= f < hi]
         if vals:
-            bands.append({
-                "freq_hz": centre,
-                "coherence": round(sum(vals) / len(vals), 3),
-            })
+            bands.append({"freq_hz": centre, "coherence": round(sum(vals) / len(vals), 3)})
     return bands
 
 
@@ -8846,65 +8890,51 @@ _TOOLS: list[Tool] = [
     Tool(
         name="get_measurement_history",
         description=(
-            "Return the last N calibration measurement sessions from the Pi's "
-            "local database. Each session includes frequency response data, timestamp, and label.\n\n"
-            "ALWAYS use format='compact' for bass calibration filter design — it encodes FR as "
-            "'freq:spl,freq:spl,...' strings (~12 chars/point vs ~40 chars/point in full format). "
-            "Combined with min_hz=20, max_hz=120, a 2-session compact response fits comfortably "
-            "in context (~8KB vs 115KB full). "
-            "Parse compact fr string: split on ',' then ':' to get (freq_hz, spl_db) pairs."
+            "Return the last N measurement sessions. FR data is octave-smoothed by default "
+            "(twelfth_octave ≈ 40 bands for subs, 120 for mains) — use smooth='raw' for full "
+            "resolution when designing precise filters. Parse compact fr string: split on ',' "
+            "then ':' → (freq_hz, spl_db)."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "limit": {
                     "type": "integer",
-                    "description": "Number of sessions to return (default: 10)",
+                    "description": "Sessions to return (default 10).",
                     "default": 10,
                 },
                 "min_hz": {
                     "type": "number",
-                    "description": (
-                        "Low-frequency cutoff in Hz — only return data at or above this "
-                        "frequency. For sub bass calibration use 20."
-                    ),
+                    "description": "Low-frequency cutoff Hz (e.g. 20 for sub cal).",
                 },
                 "max_hz": {
                     "type": "number",
+                    "description": "High-frequency cutoff Hz (e.g. 200 for sub cal).",
+                },
+                "smooth": {
+                    "type": "string",
+                    "enum": ["twelfth_octave", "sixth_octave", "third_octave", "raw"],
                     "description": (
-                        "High-frequency cutoff in Hz — only return data at or below this "
-                        "frequency. For sub bass calibration use 120."
+                        "Octave smoothing. twelfth_octave (default): ~40 bands 20-200 Hz, "
+                        "good for EQ decisions. sixth_octave: ~20 bands, quick status. "
+                        "raw: full resolution, use for FIR design input."
                     ),
+                    "default": "twelfth_octave",
                 },
                 "decimation": {
                     "type": "integer",
-                    "description": (
-                        "Keep every Nth point (1 = all, 2 = every other, 4 = quarter). "
-                        "Default: 1 (no decimation). With format='compact' and min_hz/max_hz, "
-                        "decimation=1 already fits in context — only use higher values if you "
-                        "want coarser resolution."
-                    ),
+                    "description": "Legacy stride (ignored unless smooth='raw').",
                     "default": 1,
                 },
                 "format": {
                     "type": "string",
                     "enum": ["full", "compact"],
-                    "description": (
-                        "Output format. 'compact' (default): FR data as 'freq:spl,...' string "
-                        "(~12 chars/point, recommended for filter design). 'full': separate "
-                        "freq_hz[] and spl_db[] arrays (verbose, ~3x larger — only use if you "
-                        "need raw arrays for downstream numerical work)."
-                    ),
+                    "description": "compact (default): 'freq:spl,...' string. full: freq_hz[]/spl_db[] arrays.",
                     "default": "compact",
                 },
                 "include_phase": {
                     "type": "boolean",
-                    "description": (
-                        "When true (and format='full'), include phase_rad[] array alongside "
-                        "freq_hz[]/spl_db[]. Default false — phase is only needed for sub "
-                        "alignment and analyze_phase, so it's excluded from the per-iteration "
-                        "EQ loop to save ~8K tokens per measurement."
-                    ),
+                    "description": "Include phase_rad[] (format='full' only). Only needed for alignment/analyze_phase.",
                     "default": False,
                 },
             },
@@ -8913,21 +8943,10 @@ _TOOLS: list[Tool] = [
     Tool(
         name="apply_eq",
         description=(
-            "Apply EQ filters to DSP output(s). Target a scope by name via `target` — "
-            "a group name ('bass', 'front_soundstage'), a transducer name ('sub_left', "
-            "'left_main'), or a role ('sub', 'main'). Pass `output_index` instead for raw "
-            "output dispatch (legacy). Omit both for the legacy broadcast-to-all-subs "
-            "behaviour. Filters are validated by SafetyValidator with the target's "
-            "per-transducer profile; unsafe filters return {ok: false, "
-            "error: 'SafetyValidator: ...'}. Each filter: {freq, gain_db, q, type}. "
-            "A mandatory HPF (default 18 Hz) must be included when the profile requires one.\n\n"
-            "**For per-sub modal correction, prefer design_fir on FIR-capable hardware.** "
-            "PEQ reduces modal peak amplitude but leaves the ringing time unchanged; FIR "
-            "both flattens magnitude AND shortens T60 decay. Check `eq_capabilities.fir_capable` "
-            "in get_config. Use apply_eq for: (a) the mandatory infrasonic HPF, (b) per-sub "
-            "safety limiting, (c) fallback when the hardware is FIR-incapable (miniDSP 2x4 HD), "
-            "(d) allpass filters for phase-only correction (e.g., aligning two subs at a single "
-            "frequency without affecting magnitude). Allpass: gain_db is ignored."
+            "Apply PEQ/HPF filters to DSP output(s). Filters validated by SafetyValidator. "
+            "Each filter: {freq, gain_db, q, type}. Prefer design_fir for modal correction "
+            "(FIR shortens T60; PEQ only reduces peak). Use apply_eq for the mandatory "
+            "infrasonic HPF, allpass phase correction, or FIR-incapable hardware."
         ),
         inputSchema={
             "type": "object",
@@ -8951,42 +8970,19 @@ _TOOLS: list[Tool] = [
                 },
                 "target": {
                     "type": "string",
-                    "description": (
-                        "Named scope — group ('bass'), transducer ('sub_left'), or "
-                        "role ('sub'). Resolves via the signal graph. Mutually exclusive "
-                        "with output_index; omit both for legacy broadcast-to-subs."
-                    ),
+                    "description": "Named scope — group ('bass'), transducer ('sub_left'), or role ('sub'). Prefer over output_index.",
                 },
                 "output_index": {
                     "type": "integer",
-                    "description": (
-                        "Raw DSP output index. Legacy path; prefer `target` for new "
-                        "recipes. If omitted (and target omitted), writes to all "
-                        "configured sub outputs."
-                    ),
+                    "description": "Raw DSP output index (legacy). Omit both target+output_index to broadcast to all subs.",
                 },
                 "simulation_verified": {
                     "type": "boolean",
-                    "description": (
-                        "Set to true if the filter set was verified by simulate_eq "
-                        "immediately before this apply call. Relaxes the per-iteration "
-                        "change limit from +3 dB to +6 dB."
-                    ),
+                    "description": "True if simulate_eq was verified immediately before. Relaxes per-iteration delta cap to +6 dB.",
                 },
                 "bypass_iteration_limit": {
                     "type": "boolean",
-                    "description": (
-                        "Bypass the per-iteration +3 dB delta cap (cuts are always "
-                        "allowed regardless). Use only after simulating the proposed "
-                        "filter set against the current measurement and verifying the "
-                        "predicted response. Absolute boost caps "
-                        "(max_boost_per_band_db, max_boost_above_threshold_db, "
-                        "modal_cancel_max_boost_db) and the mandatory infrasonic HPF "
-                        "are STILL ENFORCED. Risk: if combined with a buggy filter "
-                        "design that applies a sustained boost, you'd produce an "
-                        "audible level jump before the next measurement, but driver "
-                        "protection (absolute boost caps + HPF) is intact."
-                    ),
+                    "description": "Bypass per-iteration +3 dB delta cap. Absolute boost caps and HPF are still enforced.",
                 },
             },
             "required": ["filters"],
@@ -8995,17 +8991,9 @@ _TOOLS: list[Tool] = [
     Tool(
         name="apply_input_eq",
         description=(
-            "Apply EQ filters to the DSP input channel (shared across all outputs). "
-            "Use this for the TARGET CURVE — the shared shape every output receives "
-            "(Harman, cinema-bass, flat). Designed to be applied AFTER per-sub correction "
-            "(design_fir / apply_eq per sub) has flattened each sub's individual response. "
-            "Do NOT use input EQ to notch individual modes — modal cuts belong on the "
-            "specific sub that excites them. Pair with fit_shelf_for_target to auto-derive "
-            "the shelf parameters for a given target curve. "
-            "Each filter: {freq: Hz, gain_db: dB, q: float, type: 'peaking'|"
-            "'low_shelf'|'high_shelf'|'hpf'|'allpass'}. A mandatory 18Hz HPF must always be included. "
-            "Allpass is unity-magnitude (gain_db is ignored) and is for phase-only correction "
-            "(e.g., aligning two subs at one frequency)."
+            "Apply PEQ filters to the DSP input channel (shared target-curve shape). "
+            "Apply AFTER per-sub correction flattens individual responses. Do NOT notch "
+            "individual modes here — those belong on per-sub outputs. Mandatory 18 Hz HPF required."
         ),
         inputSchema={
             "type": "object",
@@ -9029,18 +9017,11 @@ _TOOLS: list[Tool] = [
                 },
                 "target": {
                     "type": "string",
-                    "description": (
-                        "Required. Transducer group name ('subs'), individual transducer name "
-                        "('sub_front_right'), or processor name ('camilla'). Routes the filter "
-                        "to the correct DSP and selects the strictest safety profile among the "
-                        "downstream transducers. Use get_signal_graph to enumerate valid targets."
-                    ),
+                    "description": "Required. Group ('subs'), transducer ('sub_front_right'), or processor ('camilla'). Use get_signal_graph for valid names.",
                 },
                 "target_curve": {
                     "type": "object",
-                    "description": "Optional: the optimization target curve for dashboard display. "
-                        "Include when applying a target curve (e.g. Harman). "
-                        "Shape: {type, reference_spl, band, points: [{freq, spl}]}",
+                    "description": "Optional target curve for dashboard display. Shape: {type, reference_spl, band, points: [{freq, spl}]}",
                     "properties": {
                         "type": {"type": "string", "description": "Curve name, e.g. 'harman'"},
                         "reference_spl": {"type": "number", "description": "Anchor reference SPL in dB"},
@@ -9059,26 +9040,11 @@ _TOOLS: list[Tool] = [
                 },
                 "simulation_verified": {
                     "type": "boolean",
-                    "description": (
-                        "Set to true if the filter set was verified by simulate_eq "
-                        "immediately before this apply call. Relaxes the per-iteration "
-                        "change limit from +3 dB to +6 dB."
-                    ),
+                    "description": "True if simulate_eq was verified immediately before. Relaxes per-iteration delta cap to +6 dB.",
                 },
                 "bypass_iteration_limit": {
                     "type": "boolean",
-                    "description": (
-                        "Bypass the per-iteration +3 dB delta cap (cuts are always "
-                        "allowed regardless). Use only after simulating the proposed "
-                        "filter set against the current measurement and verifying the "
-                        "predicted response. Absolute boost caps "
-                        "(max_boost_per_band_db, max_boost_above_threshold_db, "
-                        "modal_cancel_max_boost_db) and the mandatory infrasonic HPF "
-                        "are STILL ENFORCED. Risk: if combined with a buggy filter "
-                        "design that applies a sustained boost, you'd produce an "
-                        "audible level jump before the next measurement, but driver "
-                        "protection (absolute boost caps + HPF) is intact."
-                    ),
+                    "description": "Bypass per-iteration +3 dB delta cap. Absolute boost caps and HPF still enforced.",
                 },
             },
             "required": ["filters", "target"],
@@ -9331,40 +9297,17 @@ _TOOLS: list[Tool] = [
                 },
                 "samplerate_hz": {
                     "type": "number",
-                    "description": (
-                        "FIR design sample rate. Default 48000 (matches "
-                        "the AVR's native processing rate for the 48 kHz "
-                        "bank — XT32 stores three banks but uploads the "
-                        "same coefficients to all)."
-                    ),
+                    "description": "FIR sample rate. Default 48000 (XT32 stores three banks; same coefficients uploaded to all).",
                     "default": 48000,
                 },
                 "auto_smooth_below_hz": {
                     "type": "number",
-                    "description": (
-                        "Frequency floor below which target curve points "
-                        "are smoothed (1/1-octave by default) before the "
-                        "IR is designed. The polyphase decimation in the "
-                        "AVR's FIR format heavily attenuates narrow "
-                        "features below ~200 Hz — empirically a -6 dB cut "
-                        "at 70 Hz lands as ~-2 dB. A1EvoAcoustica handles "
-                        "this by not EQ-ing below 200 Hz at all; we "
-                        "auto-smooth the target so the polyphase loss is "
-                        "absorbed predictably. Set to 0 to disable. "
-                        "Default 200."
-                    ),
+                    "description": "Smooth target below this Hz before IR design (polyphase decimation attenuates narrow features <200 Hz). Default 200. Set 0 to disable.",
                     "default": 200,
                 },
                 "smooth_octaves": {
                     "type": "number",
-                    "description": (
-                        "Width of the moving-average smoother applied "
-                        "below auto_smooth_below_hz. 1.0 = full-octave "
-                        "(matches A1Evo's REW match-target setting). "
-                        "Wider = smoother, narrower = preserves more of "
-                        "the requested shape but risks polyphase loss. "
-                        "Default 1.0."
-                    ),
+                    "description": "Moving-average smoother width (octaves) below auto_smooth_below_hz. Default 1.0 (matches A1Evo).",
                     "default": 1.0,
                 },
             },
@@ -9374,26 +9317,9 @@ _TOOLS: list[Tool] = [
     Tool(
         name="apply_avr_fir",
         description=(
-            "Push cached AVR-format FIR coefficients to the receiver via "
-            "the Audyssey TCP/1256 protocol. Overwrites the AVR's MultEQ "
-            "filter banks with the per-channel coefficients designed by "
-            "prior design_avr_fir calls (matched by cache_key). The full "
-            "16-field SET_SETDAT envelope is sent to keep the AVR's EQ "
-            "state coherent; coefficient streams are shipped per channel × "
-            "target_curve × sample_rate; the AudyFinFlg=Fin commit at "
-            "the end persists everything to the AVR's flash. "
-            "HARD RULE: caller MUST NOT enter Manual Setup > Distances "
-            "on the AVR after a successful push — that triggers firmware "
-            "re-validation. Always backup the original .ady before calling "
-            "this tool. REQUIRES EXPLICIT USER CONFIRMATION. "
-            "GATING: pushed FIRs are bypassed when PSMULTEQ:OFF or when "
-            "the AVR sound mode is DIRECT/PURE DIRECT — both forcibly "
-            "disable the Audyssey processing chain that hosts these "
-            "filters. Verify PSMULTEQ:FLAT (or another active slot) and "
-            "a non-DIRECT sound mode (MULTI CH STEREO, DOLBY SURROUND, "
-            "STEREO) before assuming the push is audible. The slot is "
-            "still written by the push regardless — this is a runtime "
-            "engagement gate, not a write gate."
+            "Push cached AVR FIR coefficients via Audyssey TCP/1256. REQUIRES EXPLICIT USER CONFIRMATION. "
+            "Bypassed at runtime when PSMULTEQ:OFF or DIRECT mode — verify PSMULTEQ:FLAT and non-DIRECT "
+            "sound mode before assuming FIRs are audible."
         ),
         inputSchema={
             "type": "object",
@@ -9404,14 +9330,7 @@ _TOOLS: list[Tool] = [
                 },
                 "ady_path": {
                     "type": "string",
-                    "description": (
-                        "Path to a .ady file with the AVR's stored "
-                        "calibration state. Provides per-channel "
-                        "speaker-type, crossover, level, and the "
-                        "channel list. Distances are taken from .ady "
-                        "but can be selectively overridden via "
-                        "distances_override_m."
-                    ),
+                    "description": "Path to .ady calibration state file. Provides channel list, speaker types, distances.",
                 },
                 "cache_key": {
                     "type": "string",
@@ -9420,90 +9339,41 @@ _TOOLS: list[Tool] = [
                 "channel_ids": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": (
-                        "Subset of channels to upload. Default: all "
-                        "channels in the .ady that have a cached FIR "
-                        "under cache_key."
-                    ),
+                    "description": "Subset of channels to upload. Default: all .ady channels with a cached FIR.",
                 },
                 "distances_override_m": {
                     "type": "object",
-                    "description": (
-                        "Optional {channel: meters} map to override .ady "
-                        "distances during the upload. Use to push past "
-                        "the variance cap (e.g. SW1=20.0)."
-                    ),
+                    "description": "Optional {channel: meters} to override .ady distances (e.g. SW1=20.0).",
                     "additionalProperties": {"type": "number"},
                 },
                 "target_curves": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": (
-                        "Which target-curve banks to write. Default "
-                        "[\"00\", \"01\"] writes both Flat and Reference "
-                        "so user can toggle at runtime via AudyEqSet."
-                    ),
+                    "description": "Target-curve banks to write. Default ['00','01'] (Flat + Reference).",
                 },
                 "samplerates_hz": {
                     "type": "array",
                     "items": {"type": "integer"},
-                    "description": (
-                        "Sample rates to ship per channel. Default "
-                        "[32000, 44100, 48000] (XT32's three banks)."
-                    ),
+                    "description": "Sample rates to ship. Default [32000,44100,48000] (XT32's three banks).",
                 },
                 "inter_packet_delay_ms": {
                     "type": "number",
-                    "description": (
-                        "Pause between SET_COEFDT packets in ms. "
-                        "Default 25 — verified on X3800H 2026-05-04 to "
-                        "drive coef_nack_count to 0 across 1-channel "
-                        "commits. The prior default of 5 ms produced "
-                        "high NACK rates (~30%) that aborted the Fin "
-                        "commit gate. Decrease only if profiling shows "
-                        "a less-aggressive pacing is sufficient."
-                    ),
+                    "description": "Delay between SET_COEFDT packets ms. Default 25 (drives NACK rate to 0 on X3800H).",
                     "default": 25.0,
                 },
                 "commit_fin": {
                     "type": "boolean",
-                    "description": (
-                        "When True (default), send the AudyFinFlg=Fin commit "
-                        "after FINZ_COEFS to persist coefficients to NVRAM. "
-                        "Set False for non-destructive verification — the "
-                        "AVR's persisted state is unchanged after EXIT_AUDMD. "
-                        "Use False to verify a multi-channel push end-to-end "
-                        "before risking the X3800H's documented Fin-commit-"
-                        "wipes-ChSetup failure mode."
-                    ),
+                    "description": "Send AudyFinFlg=Fin to persist to NVRAM (default True). Set False for dry-run verification.",
                     "default": True,
                 },
                 "abort_fin_on_nack": {
                     "type": "boolean",
-                    "description": (
-                        "When True (default), the Fin commit is gated on "
-                        "zero NACKs during the SET_COEFDT stream. NACKs "
-                        "indicate a corrupted coefficient bank; committing "
-                        "on top of one wipes ChSetup on the X3800H. Set "
-                        "False only if you specifically want to ignore the "
-                        "gate (e.g. for protocol probing)."
-                    ),
+                    "description": "Gate Fin commit on zero NACKs (default True). NACKs mean corrupted bank; committing wipes ChSetup.",
                     "default": True,
                 },
                 "allow_partial": {
                     "type": "boolean",
-                    "description": (
-                        "Coverage gate. When False (default), refuses to "
-                        "push if `channel_ids` is a subset of the .ady's "
-                        "detected channels. Verified 2026-05-09: pushing "
-                        "FL/FR/C/SLA/SRA but skipping SW1 left SW1's stored "
-                        "MultEQ FIR silently attenuating the LFE → sub-pre-"
-                        "out path to noise floor under MultEQ:FLAT. Default "
-                        "behaviour now: design+push a passthrough FIR for "
-                        "EVERY detected channel. Set True only when you "
-                        "have intentionally pushed the others under the "
-                        "same AVR power cycle and trust their stored state."
-                    ),
+                    "description": "Allow pushing a channel subset (default False). False ensures every .ady channel gets a FIR; partial pushes leave stale MultEQ FIRs on skipped channels.",
                     "default": False,
                 },
             },
@@ -9513,94 +9383,46 @@ _TOOLS: list[Tool] = [
     Tool(
         name="measure",
         description=(
-            "Trigger a frequency response measurement using the UMIK microphone. "
-            "Takes a sweep measurement via PyTTa, saves to the session store, "
-            "and returns the session ID. Use get_fr_summary() for 1/3-octave FR data (compact), "
-            "or get_measurement_history() for full-resolution FR. "
-            "IMPORTANT: Always pass label and position so measurements are identifiable in the dashboard."
+            "Trigger a sweep measurement via UMIK+PyTTa. Returns session_id. "
+            "Use get_measurement_history() for FR data. Always pass label+position."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "label": {
                     "type": "string",
-                    "description": (
-                        "Descriptive label for this measurement. Use a consistent format: "
-                        "'combined' (all subs), 'sub1-solo', 'sub2-solo', 'subcrawl-pos1', "
-                        "'baseline', 'iter-1', 'iter-2', etc."
-                    ),
+                    "description": "Session label. E.g. 'combined', 'sub1-solo', 'baseline', 'iter-2'.",
                 },
                 "position": {
                     "type": "string",
-                    "description": (
-                        "Listening/mic position description. Examples: "
-                        "'MLP' (main listening position), 'front-left', 'nearfield', "
-                        "'subcrawl-candidate-1', 'seat-2'."
-                    ),
+                    "description": "Mic position. E.g. 'MLP', 'subcrawl-candidate-1', 'seat-2'.",
                 },
                 "target_curve": {
                     "type": "object",
                     "description": (
-                        "The optimization target being pursued in this calibration iteration. "
-                        "Pass ONLY during a calibration loop — include the reference_spl and band "
-                        "that were used to compute the filters for this iteration. "
-                        "Omit (or pass null) for standalone/diagnostic measurements; those sessions "
-                        "will not show a dB delta on the dashboard. "
-                        "Shape: {type: 'harman'|'flat', reference_spl: float, band: [min_hz, max_hz], "
-                        "points: [{freq, spl}, ...]}"
+                        "Active calibration target (pass during cal loop only). "
+                        "Omit for diagnostic measurements. Shape: {type, reference_spl, band, points: [{freq,spl}]}"
                     ),
                 },
                 "target": {
                     "type": "string",
-                    "description": (
-                        "Speaker / group identifier for sweep-range resolution. "
-                        "Looks up config.yaml's `speakers[].sweep_range_hz` (or "
-                        "`sub.sweep_range_hz`) to pick the right frequency band. "
-                        "Accepts position codes ('FL', 'C', 'TFL'), speaker types "
-                        "('main'/'mains', 'atmos', 'sub'/'subs', 'surround'), or "
-                        "'LFE'. Examples: target='subs' → 15-150 Hz, "
-                        "target='mains' → 60-20000 Hz, target='FL' → looks up the "
-                        "main speaker config. Ignored if explicit "
-                        "freq_min/freq_max are also passed."
-                    ),
+                    "description": "Speaker/group for sweep-range lookup in config.yaml. E.g. 'subs'→15-150 Hz, 'mains'→60-20kHz, 'FL'. Ignored if freq_min/max set.",
                 },
                 "freq_min": {
                     "type": "integer",
-                    "description": (
-                        "Lower frequency bound for the sweep in Hz. Overrides "
-                        "any value resolved from `target`. Default behavior: "
-                        "use the global measurement.freq_min config (currently "
-                        "20 Hz — sub-only)."
-                    ),
+                    "description": "Sweep lower bound Hz. Overrides target. Default: config measurement.freq_min (20 Hz).",
                 },
                 "freq_max": {
                     "type": "integer",
-                    "description": (
-                        "Upper frequency bound for the sweep in Hz. Overrides "
-                        "any value resolved from `target`. For mains "
-                        "calibration use 20000; for sub use 200 or less."
-                    ),
+                    "description": "Sweep upper bound Hz. Overrides target. Use 20000 for mains, ≤200 for subs.",
                 },
                 "sweep_channel": {
                     "type": "string",
-                    "description": (
-                        "HDMI output channel to play the sweep through. Required "
-                        "for per-speaker mains measurements. Accepts: "
-                        "'FL'/'L' (front left, ch 1), 'FR'/'R' (front right, ch 2), "
-                        "'C'/'center' (center, ch 3), 'LFE' (sub, ch 4), "
-                        "'SL'/'LS' (surround left, ch 5), 'SR'/'RS' (surround right, ch 6). "
-                        "Defaults to config output_channel (ch 1 / FL)."
-                    ),
+                    "description": "HDMI channel: 'FL','FR','C','LFE','SL','SR'. Required for per-speaker mains. Defaults to config output_channel.",
                 },
                 "sweep_volume_db": {
                     "type": "number",
-                    "description": (
-                        "Override the Denon sweep volume for this measurement only "
-                        "(does not persist to config). Mains measurements need a "
-                        "higher level than subs — use -10 to -15 dB for mains at MLP. "
-                        "Default: config denon_sweep_volume (currently -31.1 dB, "
-                        "calibrated for subs)."
-                    ),
+                    "description": "AVR sweep volume override (not persistent). Use -10 to -15 dB for mains. Default: config denon_sweep_volume.",
                 },
             },
         },
@@ -11042,55 +10864,28 @@ _TOOLS: list[Tool] = [
                 },
                 "null_threshold_db": {
                     "type": "number",
-                    "description": (
-                        "Frequencies where measured SPL is this many dB below the band average "
-                        "are classified as nulls and excluded from RMS. Default: 15."
-                    ),
+                    "description": "dB below band average to classify as null (excluded from RMS). Default 15.",
                 },
                 "port_rolloff_hz": {
                     "type": "number",
-                    "description": (
-                        "Frequencies below this are excluded as below-port rolloff. Default: 28 Hz "
-                        "(SVS PB12-NSD port tuning ~22 Hz, rolloff becomes steep by 28 Hz)."
-                    ),
+                    "description": "Exclude freqs below this as below-port rolloff. Default 28 Hz.",
                 },
                 "resolution": {
                     "type": "string",
                     "enum": ["third_octave", "sixth_octave", "twelfth_octave"],
-                    "description": (
-                        "Summary band density. 'third_octave': ~6 bands (coarse), "
-                        "'sixth_octave': ~12 bands (default), "
-                        "'twelfth_octave': ~24 bands (full detail). Default: sixth_octave."
-                    ),
+                    "description": "Per-band summary density. Default sixth_octave (~12 bands).",
                 },
                 "convergence_threshold": {
                     "type": "number",
-                    "description": (
-                        "RMS threshold in dB below which the result is marked 'converged'. "
-                        "Default: 1.5. Adjust based on recipe's convergence goals."
-                    ),
+                    "description": "RMS dB below which result is 'converged'. Default 1.5.",
                 },
                 "exclude_geometry": {
                     "type": "boolean",
-                    "description": (
-                        "Default true. When true, runs analyze_phase on the "
-                        "session and excludes 1/3-octave bands classified as "
-                        "'geometry' (near-π phase offset from cancellation at "
-                        "the listener position) from the RMS calculation. EQ "
-                        "cannot fix these; including them inflates RMS and "
-                        "drives the driving agent to iterate past convergence."
-                    ),
+                    "description": "Exclude cancellation-null bands from RMS (default true). Prevents iterating past convergence on unfixable geometry.",
                 },
                 "weight_by_coherence": {
                     "type": "boolean",
-                    "description": (
-                        "Default false. When true, weights each frequency's "
-                        "contribution to RMS by its measured coherence — "
-                        "low-coherence bands (noisy measurement) contribute "
-                        "proportionally less. Also returns noise_floor_estimate_db; "
-                        "if rms_db ≈ noise_floor_estimate_db, further iteration is "
-                        "chasing measurement noise. Use this to know when to stop."
-                    ),
+                    "description": "Weight RMS by coherence (default false). Returns noise_floor_estimate_db — if rms≈floor, stop iterating.",
                 },
             },
             "required": ["session_id", "target_curve"],
@@ -11114,11 +10909,7 @@ _TOOLS: list[Tool] = [
                 },
                 "target_offsets": {
                     "type": "array",
-                    "description": (
-                        "Target curve as relative offsets. Each item: {freq_hz, offset_db}. "
-                        "offset_db is relative to the reference frequency (e.g. 80 Hz = 0 dB). "
-                        "Example for Cinema Bass: [{freq_hz:20,offset_db:10},{freq_hz:25,offset_db:9},...,{freq_hz:80,offset_db:0}]"
-                    ),
+                    "description": "Target curve as relative offsets. Each: {freq_hz, offset_db} where offset_db is relative to reference freq (e.g. 80 Hz = 0 dB).",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -11156,30 +10947,12 @@ _TOOLS: list[Tool] = [
                 },
                 "exclude_geometry": {
                     "type": "boolean",
-                    "description": (
-                        "Default true. When true, runs analyze_phase and excludes "
-                        "1/3-octave bands classified as 'geometry' (cancellation "
-                        "nulls) from the headroom calculation — prevents the "
-                        "anchor from being dragged toward a target the room can't "
-                        "physically reach."
-                    ),
+                    "description": "Exclude cancellation nulls from headroom calc (default true). Prevents anchor from targeting unfixable bands.",
                 },
                 "direction": {
                     "type": "string",
                     "enum": ["balanced", "cuts_only"],
-                    "description": (
-                        "balanced (default) preserves legacy behavior: places the "
-                        "reference at min(headroom)+max_boost so the limiting "
-                        "frequency needs exactly max_boost_db. cuts_only picks the "
-                        "LOWEST-frequency anchor where every band above has "
-                        "measured-relative ≥ target-relative — yielding a target "
-                        "that needs only cuts above the anchor. Use cuts_only for "
-                        "deep-bass-priority sub calibration where boosts are only "
-                        "~25-50% effective at the listener but cuts are unconstrained. "
-                        "If no fully-cuts anchor exists, picks the lowest-freq "
-                        "anchor with the smallest shortfall and returns "
-                        "residual_boost_band_hz."
-                    ),
+                    "description": "balanced (default): reference at min(headroom)+max_boost. cuts_only: lowest anchor where all bands above are cuts-only — prefer for deep-bass-priority cal.",
                     "default": "balanced",
                 },
             },
@@ -11450,22 +11223,9 @@ _TOOLS: list[Tool] = [
     Tool(
         name="design_fir",
         description=(
-            "**Magnitude-correction FIR.** Designed against a session's FR; produces a "
-            "filter whose magnitude response is the inverse of the measured response "
-            "(scaled to the target curve). Phase mode is one of: "
-            "``minimum`` (zero pre-ring; flattens magnitude only — leaves T60 untouched), "
-            "``linear`` (symmetric impulse; full magnitude+phase correction; substantial latency), "
-            "``mixed`` (homomorphic decomposition with bounded pre-ring; reduces some "
-            "modal resonance via phase correction but does NOT actively cancel modes). "
-            "\n\n"
-            "**WHEN TO USE THIS:** baseline magnitude shaping per sub. Smooth FR targets "
-            "(Harman shelf, flat). Modes with short T60 (<400 ms) where peak reduction "
-            "is enough. \n\n"
-            "**WHEN TO USE design_modal_fir INSTEAD:** rooms with long modal ringing "
-            "(any mode T60 > 500 ms at peak > +6 dB). The phase_mode='mixed' option here "
-            "does NOT actively cancel modes — it just allows non-causal magnitude correction. "
-            "Active anti-pulse cancellation (which actually shortens T60, not just the peak) "
-            "is design_modal_fir's job."
+            "Magnitude-correction FIR against a session's FR. phase_mode: minimum (no pre-ring, "
+            "flattens magnitude only), linear (full mag+phase, high latency), mixed (bounded pre-ring). "
+            "For active T60 reduction use design_modal_fir instead."
         ),
         inputSchema={
             "type": "object",
@@ -11503,44 +11263,18 @@ _TOOLS: list[Tool] = [
                 },
                 "return_coefficients": {
                     "type": "boolean",
-                    "description": (
-                        "Default true. Set false to skip the coefficient array in the "
-                        "response — coefficients are cached server-side keyed by "
-                        "session_id; apply via apply_fir(design_session_id=<session_id>). "
-                        "Use false when the array (e.g. 8k+ taps ≈ 140 KB JSON) would "
-                        "exceed the client's token budget."
-                    ),
+                    "description": "Return coeff array in response (default true). Set false to use cached server-side coefficients via apply_fir(design_session_id=...).",
                 },
                 "preringing_ms": {
                     "type": "number",
-                    "description": (
-                        "Mixed-phase only: maximum pre-ringing window in ms. "
-                        "Bounds how far the excess-phase impulse extends before "
-                        "the main energy peak — this is both the filter's added "
-                        "audio latency AND the psychoacoustic smear window. "
-                        "Default 25 ms (inaudible below ~100 Hz). Set to 0 to "
-                        "degenerate to minimum-phase. Ignored by minimum/linear modes."
-                    ),
+                    "description": "Mixed-phase only: pre-ring window ms. Default 25. Set 0 to degenerate to minimum-phase.",
                     "default": 25.0,
                 },
                 "anchor": {
                     "type": "object",
-                    "description": (
-                        "Optional re-anchoring of target_curve. Default (omitted) "
-                        "preserves legacy behavior: target_curve points are used "
-                        "as absolute SPL. \n"
-                        "- mode='band_mean': legacy (default). \n"
-                        "- mode='freq': force target(freq_hz) == measured(freq_hz); "
-                        "downward-sloping curves above the anchor become pure cuts. \n"
-                        "- mode='deep_bass_priority': pick the lowest freq in "
-                        "[band_lo, band_lo+20] where every band above is "
-                        "cut-implementable (gap ≥ -0.5 dB)."
-                    ),
+                    "description": "Target-curve anchoring. mode: 'band_mean' (default), 'freq' (force target==measured at freq_hz), 'deep_bass_priority' (cuts-only anchor).",
                     "properties": {
-                        "mode": {
-                            "type": "string",
-                            "enum": ["band_mean", "freq", "deep_bass_priority"],
-                        },
+                        "mode": {"type": "string", "enum": ["band_mean", "freq", "deep_bass_priority"]},
                         "freq_hz": {"type": "number"},
                     },
                 },
@@ -11551,44 +11285,21 @@ _TOOLS: list[Tool] = [
     Tool(
         name="design_modal_fir",
         description=(
-            "**Active modal-cancellation FIR.** Designs a mixed-phase FIR that "
-            "places band-limited anti-pulses one half-wavelength before the main "
-            "impulse for each room mode flagged as ``anti_pulse``. This actively "
-            "cancels modal ringing in the time domain — both the peak magnitude "
-            "AND the T60 decay tail are reduced. \n\n"
-            "**WHEN TO USE THIS** (over plain ``design_fir``): \n"
-            "- Combined or solo measurement shows mode T60 > 500 ms at peak > +6 dB \n"
-            "- Multiple ringy modes (47, 70, 94 Hz, etc) — handles all in one FIR \n"
-            "- You want T60 reduction, not just magnitude flattening \n\n"
-            "**WHEN NOT TO USE** (use ``design_fir`` instead): \n"
-            "- Rooms with already-short T60 (< 400 ms) — anti-pulse adds latency for "
-            "marginal benefit \n"
-            "- Pure target-curve shaping with no modal problem \n"
-            "- Tight latency budgets (< 5 ms) — anti-pulse needs half-wavelength of "
-            "pre-ring per mode (e.g. 7.14 ms at 70 Hz) \n\n"
-            "Per-mode treatments via the ``intents`` argument: ``anti_pulse`` (cancel "
-            "T60), ``linear_notch`` (precise magnitude cut), ``min_phase`` (gentle "
-            "magnitude EQ), ``skip``. Omit ``intents`` to auto-classify based on "
-            "T60+peak heuristics."
+            "Active modal-cancellation FIR. Places anti-pulses one half-wavelength before the "
+            "main impulse to cancel T60 ringing. Use when mode T60 > 500 ms at peak > +6 dB. "
+            "Per-mode treatments: anti_pulse (T60 cancel), linear_notch (magnitude cut), "
+            "min_phase (gentle EQ), skip. Omit intents for auto-classification."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "session_id": {
                     "type": "integer",
-                    "description": (
-                        "Measurement session whose decay_modes drive the design. "
-                        "Use combined-sub session for shared correction; per-sub "
-                        "session if each sub needs distinct treatment."
-                    ),
+                    "description": "Measurement session whose decay_modes drive the design.",
                 },
                 "intents": {
                     "type": "array",
-                    "description": (
-                        "Optional per-mode intents. If omitted, auto-classify via "
-                        "default heuristic. Each entry: "
-                        "{freq_hz, t60_ms, peak_db, treatment, cancel_strength?, rationale?}"
-                    ),
+                    "description": "Per-mode intents (omit for auto-classify). Each: {freq_hz, treatment, t60_ms?, peak_db?, cancel_strength?, bp_q?, envelope?, rationale?}",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -11599,33 +11310,9 @@ _TOOLS: list[Tool] = [
                                 "type": "string",
                                 "enum": ["anti_pulse", "linear_notch", "min_phase", "skip"],
                             },
-                            "cancel_strength": {
-                                "type": "number",
-                                "description": "0-1, default 0.6 — how aggressively to cancel.",
-                            },
-                            "bp_q": {
-                                "type": "number",
-                                "description": (
-                                    "Bandpass Q on the anti-pulse envelope. "
-                                    "Higher = narrower band = less adjacent-band "
-                                    "spectral leakage (lets safety caps pass) but "
-                                    "longer time-domain tail. Default 1.5; raise "
-                                    "to 3-4 if a per-band thermal cap trips."
-                                ),
-                            },
-                            "envelope": {
-                                "type": "string",
-                                "enum": ["gabor", "butterworth"],
-                                "description": (
-                                    "Anti-pulse envelope shape. ``gabor`` "
-                                    "(default) is a Gaussian-windowed sinusoid "
-                                    "with optimal time-frequency localization "
-                                    "— minimal adjacent-band skirts. "
-                                    "``butterworth`` is the legacy filtered-"
-                                    "impulse with wider skirts; kept for "
-                                    "regression / A-B testing only."
-                                ),
-                            },
+                            "cancel_strength": {"type": "number", "description": "0-1, default 0.6."},
+                            "bp_q": {"type": "number", "description": "Anti-pulse bandpass Q. Default 1.5; raise to 3-4 if cap trips."},
+                            "envelope": {"type": "string", "enum": ["gabor", "butterworth"], "description": "gabor (default) or butterworth (legacy)."},
                             "rationale": {"type": "string"},
                         },
                         "required": ["freq_hz", "treatment"],
@@ -11633,149 +11320,70 @@ _TOOLS: list[Tool] = [
                 },
                 "target_t60_ms": {
                     "type": "number",
-                    "description": (
-                        "Room-quality target T60 — modes already meeting it "
-                        "are skipped, modes far above (T60 > target × "
-                        "long_ringy_t60_factor) get anti-pulse treatment. "
-                        "Industry references: 250 ms mastering, 300 ms "
-                        "THX/Dolby (default), 500 ms HT, >700 ms untreated. "
-                        "Used for auto-classification when ``intents`` is "
-                        "omitted."
-                    ),
+                    "description": "Target T60 ms for auto-classification. Default 300 (THX/Dolby).",
                     "default": 300.0,
                 },
                 "peak_action_db": {
                     "type": "number",
-                    "description": (
-                        "Below this peak magnitude, modes are skipped "
-                        "regardless of T60 (too quiet to bother)."
-                    ),
+                    "description": "Skip modes quieter than this peak dB. Default 3.",
                     "default": 3.0,
                 },
                 "short_loud_t60_factor": {
                     "type": "number",
-                    "description": (
-                        "Multiplier on target_t60_ms defining 'short' for "
-                        "the linear_notch rule. T60 < target × this AND "
-                        "peak > short_loud_peak_db → linear_notch."
-                    ),
+                    "description": "T60 < target×this AND peak > short_loud_peak_db → linear_notch. Default 0.5.",
                     "default": 0.5,
                 },
                 "short_loud_peak_db": {
                     "type": "number",
-                    "description": (
-                        "Peak threshold for the linear_notch rule. Loud "
-                        "short peaks get a precise magnitude cut instead "
-                        "of an anti-pulse."
-                    ),
+                    "description": "Peak threshold for linear_notch rule. Default 12.",
                     "default": 12.0,
                 },
                 "long_ringy_t60_factor": {
                     "type": "number",
-                    "description": (
-                        "Multiplier on target_t60_ms defining 'long ringy' "
-                        "for the anti_pulse rule. T60 > target × this → "
-                        "anti_pulse."
-                    ),
+                    "description": "T60 > target×this → anti_pulse. Default 2.0.",
                     "default": 2.0,
                 },
                 "anti_pulse_cancel_strength": {
                     "type": "number",
-                    "description": (
-                        "How aggressively each anti_pulse cancels its mode. "
-                        "0-1; default 0.6. Higher = more T60 reduction but "
-                        "risks over-cancellation creating dips. Predicted "
-                        "T60 reduction ≈ 60% × this."
-                    ),
+                    "description": "Anti-pulse aggressiveness 0-1. Default 0.6. Higher → more T60 reduction, risk of dips.",
                     "default": 0.6,
                 },
                 "num_taps": {
                     "type": "integer",
-                    "description": "FIR length. Default 4096 at 8 kHz internal = 512 ms span.",
+                    "description": "FIR length. Default 4096 at 8 kHz = 512 ms span.",
                     "default": 4096,
                 },
                 "max_pre_ring_ms": {
                     "type": "number",
-                    "description": (
-                        "Pre-ring budget across all anti-pulses. Default 25 ms "
-                        "(psychoacoustic threshold for sub-band content). The "
-                        "actual pre-ring used = max half-wavelength of the "
-                        "anti_pulse modes + a tail."
-                    ),
+                    "description": "Pre-ring budget ms across all anti-pulses. Default 25.",
                     "default": 25.0,
                 },
                 "samplerate": {
                     "type": "integer",
-                    "description": (
-                        "FIR design sample rate. Must match CamillaDSP processing "
-                        "rate for coefficients to apply 1:1. Default 8000 (matches "
-                        "current 8 kHz processing). Set to 48000 when running "
-                        "48 kHz native (requires num_taps=24576 for same 512 ms window)."
-                    ),
+                    "description": "FIR sample rate — must match CamillaDSP processing rate. Default 8000. Use 48000 for native 48 kHz (needs num_taps=24576).",
                     "default": 8000,
                 },
                 "return_coefficients": {
                     "type": "boolean",
-                    "description": (
-                        "When false (default), coefficients are cached server-side "
-                        "and applied via apply_fir(design_session_id=...). When true, "
-                        "the array is returned in the response."
-                    ),
+                    "description": "Return coeff array in response (default false). False → cached server-side, apply via apply_fir(design_session_id=...).",
                     "default": False,
                 },
                 "anchor": {
                     "type": "object",
-                    "description": (
-                        "Optional re-anchoring for the target_curve magnitude "
-                        "correction layer. Only the magnitude layer is affected — "
-                        "anti-pulse modal cancellation is independent. \n"
-                        "- mode='band_mean' (default): legacy 60-100 Hz mean anchor. \n"
-                        "- mode='freq': force target(freq_hz) == measured(freq_hz). \n"
-                        "- mode='deep_bass_priority': pick the lowest freq in "
-                        "[band_lo, band_lo+20] where every band above is "
-                        "cut-implementable (gap ≥ -0.5 dB)."
-                    ),
+                    "description": "Target-curve anchoring (magnitude layer only; anti-pulse is independent). mode: 'band_mean' (default), 'freq', 'deep_bass_priority'.",
                     "properties": {
-                        "mode": {
-                            "type": "string",
-                            "enum": ["band_mean", "freq", "deep_bass_priority"],
-                        },
+                        "mode": {"type": "string", "enum": ["band_mean", "freq", "deep_bass_priority"]},
                         "freq_hz": {"type": "number"},
                     },
                 },
                 "compensation_notch": {
                     "type": "boolean",
-                    "description": (
-                        "When true, keep cancel_strength HIGH and instead "
-                        "add narrow Q≈5 magnitude cuts on adjacent 1/3-oct "
-                        "bands that exceed the modal_cancel cap. Verifies "
-                        "the mode's cancellation depression is preserved "
-                        "(≥80% of pre-notch); aborts the notch if it would "
-                        "destroy cancellation. Returns added notches in "
-                        "the ``compensation_notches`` field. Default false "
-                        "preserves the post-2d18420 iterative-amplitude "
-                        "behaviour."
-                    ),
+                    "description": "Add narrow magnitude cuts on adjacent bands that exceed the cap. Default false.",
                     "default": False,
                 },
                 "gabor_n_cycles": {
                     "type": "integer",
-                    "description": (
-                        "Number of cycles in the Gabor anti-pulse envelope. "
-                        "Default 3 (industry standard, balanced spectral / "
-                        "temporal localization). Reduce to 2 to shrink the "
-                        "FIR pre-ring budget by ~T/2 per mode (e.g. saves "
-                        "~10 ms at 47 Hz, ~7 ms at 70 Hz) — useful when "
-                        "sub-vs-mains alignment requires latency savings. "
-                        "Tradeoff: shorter Gabor = wider frequency-domain "
-                        "skirt = more spectral leakage to adjacent 1/3-oct "
-                        "bands. Verify post-design that adjacent_band_peak_db "
-                        "stays under the profile's modal_cancel cap; if it "
-                        "trips, the iterative-fit loop will scale "
-                        "cancel_strength down or auto-demote to linear_notch. "
-                        "Use n_cycles=4 for stricter spectral confinement at "
-                        "the cost of more pre-ring."
-                    ),
+                    "description": "Gabor envelope cycles. Default 3. Reduce to 2 to save pre-ring budget; wider spectral skirt. Raise to 4 for stricter confinement.",
                     "default": 3,
                     "minimum": 2,
                     "maximum": 6,
@@ -11783,18 +11391,7 @@ _TOOLS: list[Tool] = [
                 "skip_freqs_hz": {
                     "type": "array",
                     "items": {"type": "number"},
-                    "description": (
-                        "Convenience: list of frequencies (Hz) to force-skip "
-                        "during auto-classification. Any auto-classified mode "
-                        "within ±5% of one of these frequencies is demoted to "
-                        "``treatment='skip'``. Useful when a single mode "
-                        "(e.g. 23 Hz port-tune) needs exclusion without "
-                        "writing the full per-mode ``intents`` list. The "
-                        "±5% tolerance allows for slight measurement-to-"
-                        "measurement frequency variation. IGNORED when "
-                        "``intents`` is supplied — caller already has full "
-                        "control via that list."
-                    ),
+                    "description": "Frequencies Hz to force-skip during auto-classify (±5% match). Ignored when intents supplied.",
                 },
             },
             "required": ["session_id"],
@@ -12354,6 +11951,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             limit=int(arguments.get("limit", 10)),
             min_hz=float(min_hz) if min_hz is not None else None,
             max_hz=float(max_hz) if max_hz is not None else None,
+            smooth=arguments.get("smooth", "twelfth_octave"),
             decimation=int(arguments.get("decimation", 1)),
             fmt=arguments.get("format", "compact"),
             include_phase=bool(arguments.get("include_phase", False)),
