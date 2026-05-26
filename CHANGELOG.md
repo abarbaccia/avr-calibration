@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.6] - 2026-05-25
+
+### Fixed
+- **Low-shelf and high-shelf biquad alpha formula corrected.** `calibrate/dsp.py` `_low_shelf` and `_high_shelf` were using the peaking EQ alpha (`sin(w0)/(2q)`) instead of the RBJ-cookbook shelf-specific alpha (`sin(w0)/2 * sqrt((A+1/A)*(1/q−1)+2)`). When `apply_input_eq` pushed Harman target-curve shelf filters, CamillaDSP received the correct `{type, freq, q, gain}` spec but our simulation used wrong coefficients — the predicted frequency response did not match what the daemon applied. Symptom: group delay changed (both formulas shift phase) but amplitude barely changed. Shelf Q is now clamped to `[0.1, 3.0]` to prevent the sqrt argument going negative at high Q + boost combinations.
+- **`apply_input_eq` target parameter now required.** The legacy no-target dispatch path (`_dsp = _drivers.default_dsp()`) silently routed input EQ to the first driver regardless of signal-graph topology. Removed the legacy path; tool now returns `{ok: False}` with a clear error message if `target` is omitted. JSON schema updated: `"required": ["filters", "target"]`.
+- **`hotfix.sh` PipeWire socket mounts.** Added `--ipc=host`, `/run/user/1000` bind-mount, `XDG_RUNTIME_DIR`, `PIPEWIRE_RUNTIME_DIR`, and `/etc/asound.conf` to the hotfix container launch so hotfix containers have the same PipeWire access as the systemd-deployed container.
+- **`modal_fir.py` frequency-domain normalization.** FIR normalization now divides by `max(|H(f)|)` in the frequency domain rather than `max(|fir|)` in the time domain, preventing a class of anti-pulse filters from amplifying passband content.
+
+### Tests
+- **Shelf filter simulation vs analytical coverage added.** Extended `tests/test_peq_simulate_vs_apply.py` with 16 new test cases: (a) `_biquad_response` matches analytical RBJ z-domain evaluation within 1e-9 dB for `low_shelf` and `high_shelf` at below/at/above corner frequencies and boost/cut, (b) `SafetyValidator._filter_magnitude_db` agrees with the simulator within 0.01 dB for shelf types, (c) CamillaDSP driver emits `Lowshelf`/`Highshelf` YAML blocks byte-for-byte from the designed spec, (d) `_tool_apply_input_eq` returns `{ok: False}` when `target` is omitted.
+
 ## [0.2.5] - 2026-05-25
 
 ### Tests / Hardening

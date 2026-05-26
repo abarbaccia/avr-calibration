@@ -1,28 +1,26 @@
 #!/bin/bash
-# avr-cal-sweep PipeWire null sink + persistent link to camilladsp_capture.
+# avr-cal-sweep PipeWire null sink + persistent links to camilladsp_capture + snd-aloop.
 #
-# Why this exists:
-#   After PipeWire migration (v0.2.0) CamillaDSP captures via the PipeWire
-#   node `camilladsp_capture` (autoconnected to Scarlett multichannel-input).
-#   The avr-calibration container has no way to "play to CamillaDSP" directly
-#   — PortAudio inside Docker only sees raw ALSA, and the snd-aloop subdev
-#   used as the loopback ref is owned exclusively by PipeWire.
+# Design principle — unified loopback reference:
+#   The snd-aloop (hw:2,1 capture = what PipeWire writes to hw:2,0 playback) is the
+#   ONLY loopback reference. It carries the raw pre-processing sweep from avr_cal_sweep
+#   monitor. This single reference works for BOTH sub and mains calibration:
 #
-#   This service creates a persistent PipeWire null sink named `avr_cal_sweep`
-#   and links its monitor ports to camilladsp_capture's input ports. The
-#   container plays the calibration sweep to `avr_cal_sweep` (via pipewire-alsa
-#   + PIPEWIRE_NODE env), PipeWire pumps the audio into camilladsp_capture,
-#   CamillaDSP processes + routes it to the subs.
+#   Sub cal:   avr_cal_sweep → camilladsp_capture:input_3 (LFE path)
+#              H = CamillaDSP(HPF+shelf) × room_sub × mic  ← full chain visible
 #
-#   It also links the same monitor to the snd-aloop sink so the loopback ref
-#   path (Scarlett input ch3 → snd-aloop, bridged by loopback-ref-link.service)
-#   captures the sweep electrically as a timing reference during USB-route cal.
+#   Mains cal: avr_cal_sweep → HDMI → Denon → mains  (separate HDMI sink, future)
+#              H = Denon_processing × room_mains × mic
+#
+#   Sub-vs-mains delay: same aloop reference for both → IR peak comparison gives
+#   exact relative delay including all DSP latencies.
+#
+#   NOTE: loopback-ref-link.service (Scarlett input ch3 → snd-aloop) is DISABLED.
+#   It was contaminating the reference with the Denon sub pre-out signal. The
+#   reference is now purely the raw avr_cal_sweep monitor.
 #
 # Idempotent: re-running the script (or restarting the service) skips
 # existing links and a pre-existing null sink without erroring.
-#
-# Sister service: loopback-ref-link.service (Scarlett ch3 → snd-aloop). That
-# bridge is untouched — this service is additive.
 
 set -u
 
@@ -62,20 +60,21 @@ up() {
     for _ in $(seq 1 15); do
         if ! ensure_sink; then sleep 1; continue; fi
 
-        # Link the null sink's monitor to CamillaDSP capture (FL, FR -> input_1, input_2).
+        # Sub calibration path: monitor_FL/FR → input_3 (CamillaDSP LFE channel).
+        # Both channels sum into input_3 (lfe_source mixer reads channel 2, 0-indexed).
         ok=1
-        link_one "${SINK_NAME}:monitor_FL" "${CAM_CAPTURE}:input_1" || ok=0
-        link_one "${SINK_NAME}:monitor_FR" "${CAM_CAPTURE}:input_2" || ok=0
+        link_one "${SINK_NAME}:monitor_FL" "${CAM_CAPTURE}:input_3" || ok=0
+        link_one "${SINK_NAME}:monitor_FR" "${CAM_CAPTURE}:input_3" || ok=0
 
-        # Also fan the same monitor into the snd-aloop sink so the loopback
-        # ref capture sees the sweep electrically. Failure here is non-fatal:
-        # the loopback ref is an optional timing aid, not a hard dependency
-        # for sweep delivery.
+        # Fan the raw sweep into snd-aloop as the loopback reference.
+        # LoopbackRefPlayback reads hw:2,1 (the cross-loopback of what PipeWire
+        # writes to hw:2,0 = alsa_output.platform-snd_aloop.0).
+        # Reference = raw pre-CamillaDSP sweep → H includes full DSP chain.
         link_one "${SINK_NAME}:monitor_FL" "${ALOOP_SINK}:playback_FL" || true
         link_one "${SINK_NAME}:monitor_FR" "${ALOOP_SINK}:playback_FR" || true
 
         if [ "$ok" = "1" ]; then
-            echo "avr-cal-sweep link active (${SINK_NAME} -> ${CAM_CAPTURE})"
+            echo "avr-cal-sweep link active (${SINK_NAME} → ${CAM_CAPTURE}:input_3 + ${ALOOP_SINK})"
             exit 0
         fi
         sleep 1
@@ -85,8 +84,8 @@ up() {
 }
 
 down() {
-    pw-link -d "${SINK_NAME}:monitor_FL" "${CAM_CAPTURE}:input_1" 2>/dev/null || true
-    pw-link -d "${SINK_NAME}:monitor_FR" "${CAM_CAPTURE}:input_2" 2>/dev/null || true
+    pw-link -d "${SINK_NAME}:monitor_FL" "${CAM_CAPTURE}:input_3" 2>/dev/null || true
+    pw-link -d "${SINK_NAME}:monitor_FR" "${CAM_CAPTURE}:input_3" 2>/dev/null || true
     pw-link -d "${SINK_NAME}:monitor_FL" "${ALOOP_SINK}:playback_FL" 2>/dev/null || true
     pw-link -d "${SINK_NAME}:monitor_FR" "${ALOOP_SINK}:playback_FR" 2>/dev/null || true
     # Leave the null sink loaded; pactl module IDs aren't stable across

@@ -670,25 +670,12 @@ async def _tool_apply_input_eq(
         except DriverError as exc:
             return _err(str(exc))
 
-    # Legacy path: single default-DSP apply.
-    try:
-        preset = await _dsp.current_preset()  # type: ignore[union-attr]
-    except DriverError as exc:
-        return _err(str(exc))
-
-    try:
-        await _dsp.apply_input_eq(preset, filters, simulation_verified=simulation_verified, bypass_iteration_limit=bypass_iteration_limit)  # type: ignore[union-attr]
-        processor_name = _default_dsp_name() or "dsp"
-        _persist_dsp_state(
-            dsp_input_key(processor_name, "eq"),
-            {"filters": filters, "preset": preset},
-        )
-        if target_curve:
-            # target_curve is a calibration intent, not processor state — keep flat.
-            _persist_dsp_state("target_curve", target_curve)
-        return _ok(filters_applied=len(filters), preset=preset, target="input")
-    except DriverError as exc:
-        return _err(str(exc))
+    return _err(
+        "apply_input_eq: target is required. Pass a transducer group name "
+        "(e.g. 'subs', 'sub_front_right') or processor name ('camilla') so the "
+        "filter is routed to the correct DSP. The legacy no-target path has been "
+        "removed to prevent silent misrouting."
+    )
 
 
 async def _tool_compute_deviation(
@@ -9040,6 +9027,15 @@ _TOOLS: list[Tool] = [
                         "required": ["freq", "gain_db", "q", "type"],
                     },
                 },
+                "target": {
+                    "type": "string",
+                    "description": (
+                        "Required. Transducer group name ('subs'), individual transducer name "
+                        "('sub_front_right'), or processor name ('camilla'). Routes the filter "
+                        "to the correct DSP and selects the strictest safety profile among the "
+                        "downstream transducers. Use get_signal_graph to enumerate valid targets."
+                    ),
+                },
                 "target_curve": {
                     "type": "object",
                     "description": "Optional: the optimization target curve for dashboard display. "
@@ -9085,7 +9081,7 @@ _TOOLS: list[Tool] = [
                     ),
                 },
             },
-            "required": ["filters"],
+            "required": ["filters", "target"],
         },
     ),
     Tool(
