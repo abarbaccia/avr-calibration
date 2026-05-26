@@ -314,7 +314,10 @@ async def test_camilladsp_shelf_filter_block_emitted_correctly() -> None:
     assert p1["type"] == "Lowshelf", f"low_shelf must emit Lowshelf, got {p1['type']!r}"
     assert p1["freq"] == 38.0
     assert p1["gain"] == 4.5
-    assert p1["q"] == 0.7
+    # shelves use slope (dB/oct), not q; Q=0.7 → slope = 6/(0.7*√2) ≈ 6.06
+    assert "slope" in p1, f"Lowshelf must use slope, not q; got keys {list(p1.keys())}"
+    assert "q" not in p1, "Lowshelf must NOT emit q parameter"
+    assert 5.5 <= p1["slope"] <= 7.0, f"slope for Q=0.7 expected ~6.06, got {p1['slope']}"
 
     # slot 2: second low_shelf
     block2 = cfg["filters"]["cal_in0_peq_2"]
@@ -322,6 +325,7 @@ async def test_camilladsp_shelf_filter_block_emitted_correctly() -> None:
     p2 = block2["parameters"]
     assert p2["type"] == "Lowshelf"
     assert p2["freq"] == 68.0
+    assert "slope" in p2
 
     # slot 3: high_shelf → Biquad Highshelf
     block3 = cfg["filters"]["cal_in0_peq_3"]
@@ -330,6 +334,8 @@ async def test_camilladsp_shelf_filter_block_emitted_correctly() -> None:
     assert p3["type"] == "Highshelf", f"high_shelf must emit Highshelf, got {p3['type']!r}"
     assert p3["freq"] == 100.0
     assert p3["gain"] == -3.0
+    assert "slope" in p3, f"Highshelf must use slope, not q; got keys {list(p3.keys())}"
+    assert "q" not in p3, "Highshelf must NOT emit q parameter"
 
 
 # ── C2. apply_input_eq requires target ───────────────────────────────────────

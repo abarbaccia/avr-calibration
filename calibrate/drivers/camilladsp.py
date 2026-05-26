@@ -547,7 +547,7 @@ class CamillaDSPDriver(DSPDriver):
         a single CamillaDSP filter.
         """
         t = spec.type.lower()
-        # Peaking and shelves: Biquad with {freq, q, gain}
+        # Peaking: Biquad with {freq, q, gain}
         if t in {"peaking", "pk", "peq"}:
             return {
                 "type": "Biquad",
@@ -556,19 +556,27 @@ class CamillaDSPDriver(DSPDriver):
                     "gain": spec.gain_db,
                 },
             }
+        # Shelves: use slope (dB/octave), NOT q. CamillaDSP 4.x accepts both,
+        # but the q parameter for shelves produces near-zero effect empirically
+        # (verified 2026-05-26: Q=0.7 → ~0 dB shelf; slope=6 → expected 6 dB/oct).
+        # Convert spec.q to slope using the RBJ S↔Q relationship at 0 dB:
+        # S=1 ↔ Q=1/sqrt(2)=0.707, so slope_dBOct = 6 / (spec.q * sqrt(2)).
+        # Clamp to [1, 12] to stay within 2nd-order filter capability.
         if t in {"high_shelf", "highshelf", "hs"}:
+            slope = max(1.0, min(12.0, 6.0 / (spec.q * 1.4142)))
             return {
                 "type": "Biquad",
                 "parameters": {
-                    "type": "Highshelf", "freq": spec.freq, "q": spec.q,
+                    "type": "Highshelf", "freq": spec.freq, "slope": slope,
                     "gain": spec.gain_db,
                 },
             }
         if t in {"low_shelf", "lowshelf", "ls"}:
+            slope = max(1.0, min(12.0, 6.0 / (spec.q * 1.4142)))
             return {
                 "type": "Biquad",
                 "parameters": {
-                    "type": "Lowshelf", "freq": spec.freq, "q": spec.q,
+                    "type": "Lowshelf", "freq": spec.freq, "slope": slope,
                     "gain": spec.gain_db,
                 },
             }
