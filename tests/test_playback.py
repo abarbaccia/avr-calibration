@@ -23,7 +23,8 @@ import numpy as np
 import pytest
 
 from calibrate.drivers.playback import (
-    HDMIAplayPlayback,
+    HDMIAplayPlayback,  # backward-compat alias for HDMIPwCatPlayback
+    HDMIPwCatPlayback,
     HDMIPlayback,
     USBPlayback,
     playback_for_route,
@@ -168,8 +169,11 @@ class TestHDMIPlayback:
         assert write_args[0].dtype == np.int16
 
 
-class TestHDMIAplayPlayback:
-    """Direct-ALSA HDMI playback via the aplay subprocess."""
+_PW_NODE = "alsa_output.platform-107c701400.hdmi.hdmi-stereo"
+
+
+class TestHDMIPwCatPlayback:
+    """Native PipeWire HDMI playback via pw-cat subprocess."""
 
     def _make_sweep(self, n_samples: int = 4800) -> MagicMock:
         sweep_data = np.linspace(-0.5, 0.5, n_samples, dtype=np.float32).reshape(-1, 1)
@@ -186,24 +190,30 @@ class TestHDMIAplayPlayback:
         mock_sd.default.device = (1, 0)
         return mock_sd, in_stream
 
-    def test_factory_returns_aplay_when_device_provided(self):
-        s = playback_for_route("hdmi", hdmi_alsa_device="hdmi:CARD=vc4hdmi0,DEV=0", hdmi_channels=8)
-        assert isinstance(s, HDMIAplayPlayback)
-        assert s.alsa_device == "hdmi:CARD=vc4hdmi0,DEV=0"
-        assert s.channels == 8
+    def test_factory_returns_pwcat_when_node_provided(self):
+        s = playback_for_route("hdmi", hdmi_pipewire_node=_PW_NODE, hdmi_channels=6)
+        assert isinstance(s, HDMIPwCatPlayback)
+        assert s.pipewire_node == _PW_NODE
+        assert s.channels == 6
 
-    def test_factory_returns_legacy_when_no_device(self):
-        # Backward-compat: callers that don't pass a device still get HDMIPlayback.
+    def test_factory_compat_alias_still_works(self):
+        # HDMIAplayPlayback is an alias; isinstance checks both names.
+        s = playback_for_route("hdmi", hdmi_alsa_device=_PW_NODE, hdmi_channels=6)
+        assert isinstance(s, HDMIPwCatPlayback)
+        assert isinstance(s, HDMIAplayPlayback)
+
+    def test_factory_returns_legacy_when_no_node(self):
+        # Backward-compat: callers that pass neither node nor device get HDMIPlayback.
         assert isinstance(playback_for_route("hdmi"), HDMIPlayback)
 
-    def test_constructor_validates_device(self):
+    def test_constructor_validates_node(self):
         with pytest.raises(ValueError, match="non-empty"):
-            HDMIAplayPlayback(alsa_device="")
+            HDMIPwCatPlayback(pipewire_node="")
         with pytest.raises(ValueError, match="channels"):
-            HDMIAplayPlayback(alsa_device="hdmi:CARD=x,DEV=0", channels=0)
+            HDMIPwCatPlayback(pipewire_node=_PW_NODE, channels=0)
 
-    def test_play_and_record_invokes_aplay_with_correct_args(self):
-        """aplay is called with the configured device, S16_LE, channel count, sample rate."""
+    def test_play_and_record_invokes_pwcat_with_correct_args(self):
+        """pw-cat is called with --playback --target <node> --channels --rate --format s16."""
         mock_sd, in_stream = self._patch_sd()
         sweep = self._make_sweep(n_samples=4800)
 
@@ -212,30 +222,34 @@ class TestHDMIAplayPlayback:
         proc.communicate = MagicMock(return_value=(b"", b""))
         proc.poll = MagicMock(return_value=0)
 
-        strategy = HDMIAplayPlayback(alsa_device="hdmi:CARD=vc4hdmi0,DEV=0", channels=8)
+        strategy = HDMIPwCatPlayback(pipewire_node=_PW_NODE, channels=6)
         with (
             patch("subprocess.Popen", return_value=proc) as MockPopen,
             patch("time.sleep"),
         ):
             sweep_1d, rec_1d = strategy.play_and_record(sweep, 48000, 1, 1)
 
-        # aplay command shape
+        # pw-cat command shape
         cmd = MockPopen.call_args[0][0]
-        assert cmd[0] == "aplay"
-        assert "-D" in cmd
-        assert cmd[cmd.index("-D") + 1] == "hdmi:CARD=vc4hdmi0,DEV=0"
-        assert cmd[cmd.index("-c") + 1] == "8"
-        assert cmd[cmd.index("-r") + 1] == "48000"
-        assert cmd[cmd.index("-f") + 1] == "S16_LE"
-        assert cmd[cmd.index("-t") + 1] == "raw"
+        assert cmd[0] == "pw-cat"
+        assert "--playback" in cmd
+        assert "--target" in cmd
+        assert cmd[cmd.index("--target") + 1] == _PW_NODE
+        assert "--channels" in cmd
+        assert cmd[cmd.index("--channels") + 1] == "6"
+        assert "--rate" in cmd
+        assert cmd[cmd.index("--rate") + 1] == "48000"
+        assert "--format" in cmd
+        assert cmd[cmd.index("--format") + 1] == "s16"
         assert cmd[-1] == "-"  # stdin
 
-        # The sweep bytes were written to aplay's stdin via communicate(input=...)
+        # The sweep bytes were written via communicate(input=...)
         kwargs = proc.communicate.call_args.kwargs
         assert "input" in kwargs
         pcm_bytes = kwargs["input"]
-        # 4800 frames × 8 channels × 2 bytes/sample
-        assert len(pcm_bytes) == 4800 * 8 * 2
+        # (preroll_samples + 4800 sweep frames) × 6 channels × 2 bytes/sample
+        preroll = int(HDMIPwCatPlayback.HDMI_PREROLL_S * 48000)
+        assert len(pcm_bytes) == (preroll + 4800) * 6 * 2
 
         # Capture path still ran via PortAudio
         mock_sd.InputStream.assert_called_once()
@@ -245,7 +259,7 @@ class TestHDMIAplayPlayback:
         assert rec_1d.dtype == np.float64
 
     def test_multichannel_interleave_only_target_channel_has_signal(self):
-        """sweep on channel 3 of 8 puts non-zero only on channel 3, zeros elsewhere."""
+        """sweep on channel 3 of 6 puts non-zero only on channel 3, zeros elsewhere."""
         mock_sd, in_stream = self._patch_sd()
         sweep = self._make_sweep(n_samples=480)
 
@@ -258,35 +272,39 @@ class TestHDMIAplayPlayback:
         proc.communicate = MagicMock(side_effect=_fake_communicate)
         proc.poll = MagicMock(return_value=0)
 
-        strategy = HDMIAplayPlayback(alsa_device="hdmi:CARD=vc4hdmi0,DEV=0", channels=8)
+        strategy = HDMIPwCatPlayback(pipewire_node=_PW_NODE, channels=6)
         with (
             patch("subprocess.Popen", return_value=proc),
             patch("time.sleep"),
         ):
             strategy.play_and_record(sweep, 48000, 1, 3)
 
-        pcm = np.frombuffer(captured["input"], dtype=np.int16).reshape(-1, 8)
-        # Channel 3 (1-based) → column index 2 has signal; all others zero.
-        for ch in range(8):
-            col = pcm[:, ch]
+        preroll = int(HDMIPwCatPlayback.HDMI_PREROLL_S * 48000)
+        pcm = np.frombuffer(captured["input"], dtype=np.int16).reshape(-1, 6)
+        # Preroll is all-zero across all channels.
+        assert np.all(pcm[:preroll] == 0), "preroll must be silent on all channels"
+        # Sweep region: channel 3 (1-based) → column index 2 has signal; others zero.
+        sweep_pcm = pcm[preroll:]
+        for ch in range(6):
+            col = sweep_pcm[:, ch]
             if ch == 2:
                 assert np.any(col != 0), "target channel must have signal"
             else:
                 assert np.all(col == 0), f"channel {ch} must be silent (got {col[col != 0][:4]})"
 
-    def test_aplay_nonzero_returncode_raises(self):
+    def test_pwcat_nonzero_returncode_raises(self):
         mock_sd, _ = self._patch_sd()
         sweep = self._make_sweep(n_samples=480)
 
         proc = MagicMock()
         proc.returncode = 1
-        proc.communicate = MagicMock(return_value=(b"", b"aplay: device busy"))
+        proc.communicate = MagicMock(return_value=(b"", b"pw-cat: no such node"))
         proc.poll = MagicMock(return_value=1)
 
-        strategy = HDMIAplayPlayback(alsa_device="hdmi:CARD=vc4hdmi0,DEV=0", channels=2)
+        strategy = HDMIPwCatPlayback(pipewire_node=_PW_NODE, channels=2)
         with (
             patch("subprocess.Popen", return_value=proc),
             patch("time.sleep"),
-            pytest.raises(RuntimeError, match="aplay.*device busy"),
+            pytest.raises(RuntimeError, match="pw-cat.*no such node"),
         ):
             strategy.play_and_record(sweep, 48000, 1, 1)

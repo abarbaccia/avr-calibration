@@ -2511,7 +2511,7 @@ def test_loopback_ref_playback_validates_channel_count() -> None:
 def test_playback_for_route_no_ref_returns_base() -> None:
     """Without loopback_ref_device, factory returns the base strategy unchanged."""
     from calibrate.drivers.playback import (
-        USBPlayback, HDMIAplayPlayback, LoopbackRefPlayback, playback_for_route,
+        USBPlayback, HDMIPwCatPlayback, LoopbackRefPlayback, playback_for_route,
     )
 
     p_usb = playback_for_route("usb")
@@ -2519,9 +2519,9 @@ def test_playback_for_route_no_ref_returns_base() -> None:
     assert not isinstance(p_usb, LoopbackRefPlayback)
 
     p_hdmi = playback_for_route(
-        "hdmi", hdmi_alsa_device="default:CARD=vc4hdmi0", hdmi_channels=6,
+        "hdmi", hdmi_pipewire_node="alsa_output.platform-107c701400.hdmi.hdmi-stereo", hdmi_channels=6,
     )
-    assert isinstance(p_hdmi, HDMIAplayPlayback)
+    assert isinstance(p_hdmi, HDMIPwCatPlayback)
     assert not isinstance(p_hdmi, LoopbackRefPlayback)
 
 

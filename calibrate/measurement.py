@@ -756,43 +756,23 @@ class MeasurementEngine:
         loopback_ref_channel_index: int = int(cfg.get("loopback_ref_channel_index", 1))
 
         if use_aplay_hdmi:
-            # Use default:CARD=vc4hdmi0, NOT the hdmi: plugin — the hdmi:
-            # ALSA plugin silently downmixes multichannel PCM to stereo
-            # (verified 2026-05-04: SSINFAISSIG=02 stereo via hdmi:, =12
-            # via default:). That made every C/SL/SR/LFE sweep land as a
-            # Dolby Surround upmix at the AVR instead of an isolated per-
-            # channel measurement, and the LFE channel got dropped entirely.
-            # The hw:/plughw: devices on this Pi (vc4hdmi0) reject S16_LE
-            # — they only accept IEC958_SUBFRAME_LE. default: handles the
-            # PCM→IEC958 framing AND preserves channel count.
+            # Use PipeWire natively via pw-cat --target <node>.  The ALSA
+            # default:CARD= syntax fails inside the container, and aplay
+            # routes through an ALSA bridge anyway.  pw-cat speaks PipeWire
+            # directly — no bridge, no plugin lookup.
             #
-            # Channel count: the Pi 5 vc4-hdmi driver (Linux 6.8) ships
-            # very limited chmaps. `amixer -c 0 cget numid=2` returns:
-            #   2-ch: FL,FR
-            #   4-ch: driver picks one of {FL,FR,LFE,NA / FL,FR,NA,FC /
-            #         FL,FR,LFE,FC} based on EDID speaker_alloc. Empirically
-            #         the driver picked FL,FR,LFE,NA on this AVR, so FC is
-            #         not reachable in 4-ch mode. SNR also collapses at 4-ch.
-            #   6-ch: FL,FR,LFE,NA,RC,NA — no FC slot at all
-            #   8-ch: NO CHMAP, default: plug downmixes to stereo
-            #
-            # **Hard kernel-level limit on this hardware:** Center and
-            # surrounds (SL/SR/SBL/SBR) are NOT reachable via per-channel
-            # HDMI sweeps. Only FL and FR work reliably. Atmos heights also
-            # blocked. See project_hdmi_multichannel_kernel_blocked.md.
-            #
-            # We use 6-ch as the cap because it gets the AVR to detect
-            # multichannel input (OPINFINS reports 6 active channels),
-            # which is the documented operating-chain mode the recipe
-            # expects. FL+FR baselines come out clean.
-            alsa_device = cfg.get("hdmi_playback_device") or "default:CARD=vc4hdmi0"
+            # Channel count cap at 6: the vc4-hdmi driver (Linux 6.8) has
+            # limited chmaps.  6-ch with FL,FR,LFE,FC,RL,RR gets the AVR
+            # into multichannel mode and makes FL/FR/FC/RL/RR all reachable.
+            # 8-ch silently downmixes to stereo.
+            hdmi_pipewire_node = cfg.get("hdmi_pipewire_node") or cfg.get("hdmi_playback_device")
             hdmi_channels = int(cfg.get("hdmi_channels", 6))
             # Ensure we always have room for the requested out_channel,
             # but cap at 6 — see comment above for the chmap rationale.
             hdmi_channels = min(max(hdmi_channels, out_channel), 6)
             strategy = playback_for_route(
                 route,
-                hdmi_alsa_device=alsa_device,
+                hdmi_pipewire_node=hdmi_pipewire_node,
                 hdmi_channels=hdmi_channels,
                 loopback_ref_device=loopback_ref_device,
                 loopback_ref_channels=loopback_ref_channels,
