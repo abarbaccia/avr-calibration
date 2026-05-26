@@ -280,20 +280,5 @@ They exist in Python code, not just in prompts. Never bypass them.
 
 ## Skill routing
 
-When the user's request matches an available skill, ALWAYS invoke it using the Skill
-tool as your FIRST action. Do NOT answer directly, do NOT use other tools first.
-The skill has specialized workflows that produce better results than ad-hoc answers.
-
-Key routing rules:
-- "Calibrate", "run calibration", "tune the subs" → invoke avr:calibrate
-- "Verify", "check integration", "how's it all sound", "post-Audyssey" → invoke avr:calibrate (full-room-verify recipe)
-- "Set up", "configure", "new hardware" → invoke avr:configure
-- "Build a recipe", "new recipe", "full room recipe" → invoke avr:recipe
-- "Sub crawl", "find best position" → invoke avr:calibrate (sub-crawl recipe when available)
-- "Take a measurement", "how does it sound" → invoke avr:measure
-- "Check system", "is everything connected" → invoke avr:check
-- "What's the current state", "where are we" → invoke avr:status
-- Bugs, errors, "why is this broken" → invoke investigate
-- Ship, deploy, push, create PR → invoke ship
-- Code review, check my diff → invoke review
-- Architecture review → invoke plan-eng-review
+gstack skills are disabled for this repo. Do NOT auto-invoke ship, review, investigate,
+or other gstack skills. Handle all requests directly without routing to skills.
