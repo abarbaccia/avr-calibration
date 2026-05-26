@@ -755,6 +755,8 @@ class MeasurementEngine:
         loopback_ref_channels: int = int(cfg.get("loopback_ref_channels", 1))
         loopback_ref_channel_index: int = int(cfg.get("loopback_ref_channel_index", 1))
 
+        mic_pipewire_node = cfg.get("mic_pipewire_node") or None
+
         if use_aplay_hdmi:
             # Use PipeWire natively via pw-cat --target <node>.  The ALSA
             # default:CARD= syntax fails inside the container, and aplay
@@ -774,6 +776,7 @@ class MeasurementEngine:
                 route,
                 hdmi_pipewire_node=hdmi_pipewire_node,
                 hdmi_channels=hdmi_channels,
+                capture_pipewire_node=mic_pipewire_node,
                 loopback_ref_device=loopback_ref_device,
                 loopback_ref_channels=loopback_ref_channels,
                 loopback_ref_channel_index=loopback_ref_channel_index,
@@ -781,6 +784,7 @@ class MeasurementEngine:
         else:
             strategy = playback_for_route(
                 route,
+                capture_pipewire_node=mic_pipewire_node,
                 loopback_ref_device=loopback_ref_device,
                 loopback_ref_channels=loopback_ref_channels,
                 loopback_ref_channel_index=loopback_ref_channel_index,

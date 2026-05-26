@@ -3,7 +3,7 @@
 Three strategies:
   USBPlayback       — PyTTa PlayRecMeasure (float32 duplex, both devices support it)
   HDMIPlayback      — split sd.rec() + sd.play() (legacy, HDMI only supports int16 output)
-  HDMIPwCatPlayback — pw-cat native PipeWire playback; PortAudio capture for mic
+  HDMIPwCatPlayback — pw-cat native PipeWire playback + pw-record native PipeWire capture
 
 Both return (sweep_1d, rec_1d) numpy arrays for deconvolution.
 """
@@ -14,6 +14,63 @@ import logging
 from typing import Protocol
 
 log = logging.getLogger(__name__)
+
+
+def _start_pw_record(node: str, sample_rate: int) -> tuple:
+    """Start a pw-record subprocess reading from a PipeWire source node.
+
+    Returns (proc, chunks, reader_thread).  Caller must call _stop_pw_record
+    when done.  pw-record writes raw f32le mono samples to stdout.
+    """
+    import subprocess
+    import threading
+
+    cmd = [
+        "pw-record",
+        "--target", node,
+        "--channels", "1",
+        "--rate", str(sample_rate),
+        "--format", "f32",
+        "-",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    chunks: list[bytes] = []
+
+    def _read():
+        try:
+            while True:
+                data = proc.stdout.read(4096)
+                if not data:
+                    break
+                chunks.append(data)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_read, daemon=True)
+    t.start()
+    return proc, chunks, t
+
+
+def _stop_pw_record(proc, reader_thread) -> None:
+    """Terminate pw-record and wait for the reader thread to drain."""
+    try:
+        proc.terminate()
+        proc.wait(timeout=5.0)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    reader_thread.join(timeout=3.0)
+
+
+def _assemble_pw_recording(chunks: list) -> "np.ndarray":  # type: ignore[name-defined]
+    """Concatenate pw-record stdout chunks into a float64 1D array."""
+    import numpy as np
+    raw = b"".join(chunks)
+    if not raw:
+        return np.zeros(0, dtype=np.float64)
+    return np.frombuffer(raw, dtype=np.float32).astype(np.float64)
 
 
 class PlaybackStrategy(Protocol):
@@ -53,6 +110,9 @@ class USBPlayback:
     # (including room reverb tail) is captured before the input stream stops.
     POST_DELAY_S: float = 0.5
 
+    def __init__(self, capture_pipewire_node: str | None = None) -> None:
+        self.capture_pipewire_node = capture_pipewire_node
+
     def play_and_record(self, sweep, sample_rate, in_channel, out_channel):
         import time as _time
 
@@ -62,44 +122,18 @@ class USBPlayback:
         sweep_array = sweep.timeSignal[:, 0].astype(np.float32)
         n_samples = len(sweep_array)
 
-        in_dev = int(sd.default.device[0])
         out_dev = int(sd.default.device[1])
 
         pre_samples = int(self.PRE_DELAY_S * sample_rate)
         post_samples = int(self.POST_DELAY_S * sample_rate)
 
-        # Output buffer: sweep only (pre-delay handled by sleeping before start).
-        # Append post-silence so the output stream stays open long enough for
-        # the full room response to be captured by the input stream.
         n_out_ch = max(2, out_channel)
         sweep_buf = np.zeros((n_samples, n_out_ch), dtype=np.float32)
         sweep_buf[:, out_channel - 1] = sweep_array  # 1-based → 0-based
         post_silence = np.zeros((post_samples, n_out_ch), dtype=np.float32)
         out_buf = np.vstack([sweep_buf, post_silence])
 
-        # Recording buffer: pre_delay + sweep + post_delay
-        # CRITICAL: must be larger than n_samples. With a 1s pre-delay, the
-        # sweep starts 48000 samples into the recording. A buffer sized to only
-        # n_samples would fill up before the sweep finishes, truncating the
-        # recording and corrupting the cross-correlation / SNR calculation.
-        rec_n = pre_samples + n_samples + post_samples
-        rec_buf = np.zeros((rec_n, 1), dtype=np.float32)
-        rec_pos = [0]
-
-        def _rec_callback(indata, frames, time_info, status):
-            end = min(rec_pos[0] + frames, rec_n)
-            count = end - rec_pos[0]
-            if count > 0:
-                rec_buf[rec_pos[0]:end] = indata[:count, in_channel - 1 : in_channel]
-            rec_pos[0] = end
-
-        in_stream = sd.InputStream(
-            device=in_dev,
-            samplerate=sample_rate,
-            channels=in_channel,
-            dtype="float32",
-            callback=_rec_callback,
-        )
+        sweep_1d = sweep.timeSignal[:, 0]
         out_stream = sd.OutputStream(
             device=out_dev,
             samplerate=sample_rate,
@@ -107,62 +141,101 @@ class USBPlayback:
             dtype="float32",
         )
 
-        # Sequence: recording FIRST, then sleep PRE_DELAY_S, then play.
-        # The sleep guarantees the first 500ms of recording (the noise floor
-        # window) contains only pre-sweep silence regardless of USB playback
-        # buffer start latency (~50-200ms). out_stream.write() is blocking and
-        # returns when all samples have been consumed by the OS audio buffer.
-        try:
-            in_stream.start()
-            _time.sleep(self.PRE_DELAY_S)
-            out_stream.start()
-            out_stream.write(out_buf)   # sweep + post_silence — blocking
-            out_stream.stop()
-            out_stream.close()
-
-            # Give the OS and PortAudio a moment to flush the last mic callback
-            # frames before stopping the input stream.
-            _time.sleep(0.1)
-            in_stream.stop()
-            in_stream.close()
-        except Exception as exc:
-            # Clean up streams on any audio device error, then surface as
-            # RuntimeError so callers get a consistent exception type.
-            for s in (in_stream, out_stream):
+        if self.capture_pipewire_node:
+            # Native PipeWire capture via pw-record subprocess.
+            # Recording starts BEFORE the pre-delay sleep so the noise-floor
+            # window (first 500ms) captures silence, not sweep energy.
+            rec_proc, chunks, reader_t = _start_pw_record(
+                self.capture_pipewire_node, sample_rate
+            )
+            try:
+                _time.sleep(self.PRE_DELAY_S)
+                out_stream.start()
+                out_stream.write(out_buf)
+                out_stream.stop()
+                out_stream.close()
+                _time.sleep(0.1)
+            except Exception as exc:
                 try:
-                    s.stop()
+                    out_stream.stop()
                 except Exception:
                     pass
                 try:
-                    s.close()
+                    out_stream.close()
                 except Exception:
                     pass
-            raise RuntimeError(f"Audio device error: {exc}") from exc
+                _stop_pw_record(rec_proc, reader_t)
+                raise RuntimeError(f"Audio device error: {exc}") from exc
+            _stop_pw_record(rec_proc, reader_t)
+            rec_1d = _assemble_pw_recording(chunks)
+            n_recorded = len(rec_1d)
+            rec_n = pre_samples + n_samples + post_samples
+            log_prefix = f"USBPlayback[pw-record node={self.capture_pipewire_node}]"
+        else:
+            # PortAudio sd.InputStream capture (fallback when no PW node configured).
+            in_dev = int(sd.default.device[0])
+            rec_n = pre_samples + n_samples + post_samples
+            rec_buf = np.zeros((rec_n, 1), dtype=np.float32)
+            rec_pos = [0]
 
-        n_recorded = rec_pos[0]
-        sweep_1d = sweep.timeSignal[:, 0]
-        rec_1d = rec_buf[:n_recorded, 0].astype(np.float64)
+            def _rec_callback(indata, frames, time_info, status):
+                end = min(rec_pos[0] + frames, rec_n)
+                count = end - rec_pos[0]
+                if count > 0:
+                    rec_buf[rec_pos[0]:end] = indata[:count, in_channel - 1 : in_channel]
+                rec_pos[0] = end
 
-        # Debug: log recording stats to diagnose SNR failures.
-        # floor = first 500ms; sig = everything after (includes pre-delay gap).
+            in_stream = sd.InputStream(
+                device=in_dev,
+                samplerate=sample_rate,
+                channels=in_channel,
+                dtype="float32",
+                callback=_rec_callback,
+            )
+            try:
+                in_stream.start()
+                _time.sleep(self.PRE_DELAY_S)
+                out_stream.start()
+                out_stream.write(out_buf)
+                out_stream.stop()
+                out_stream.close()
+                _time.sleep(0.1)
+                in_stream.stop()
+                in_stream.close()
+            except Exception as exc:
+                for s in (in_stream, out_stream):
+                    try:
+                        s.stop()
+                    except Exception:
+                        pass
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                raise RuntimeError(f"Audio device error: {exc}") from exc
+            n_recorded = rec_pos[0]
+            rec_1d = rec_buf[:n_recorded, 0].astype(np.float64)
+            log_prefix = f"USBPlayback[portaudio in_dev={in_dev}]"
+
         if len(rec_1d) > 0:
             peak = float(np.max(np.abs(rec_1d)))
             floor_n = min(int(0.5 * sample_rate), len(rec_1d) // 2)
             floor_rms = float(np.sqrt(np.mean(rec_1d[:floor_n] ** 2)))
             sig_rms = float(np.sqrt(np.mean(rec_1d[floor_n:] ** 2)))
             log.info(
-                "USBPlayback: pre=%.0fms n_sweep=%d rec_n=%d n_recorded=%d "
-                "in_dev=%d out_dev=%d peak=%.1f dBFS floor=%.1f dBFS "
+                "%s: pre=%.0fms n_sweep=%d rec_n=%d n_recorded=%d "
+                "out_dev=%d peak=%.1f dBFS floor=%.1f dBFS "
                 "sig=%.1f dBFS SNR=%.1f dB",
+                log_prefix,
                 self.PRE_DELAY_S * 1000, n_samples, rec_n, n_recorded,
-                in_dev, out_dev,
+                out_dev,
                 20 * np.log10(peak + 1e-12),
                 20 * np.log10(floor_rms + 1e-12),
                 20 * np.log10(sig_rms + 1e-12),
                 20 * np.log10(sig_rms / (floor_rms + 1e-12)),
             )
         else:
-            log.warning("USBPlayback: recording is empty (0 samples captured)")
+            log.warning("%s: recording is empty (0 samples captured)", log_prefix)
 
         return sweep_1d, rec_1d
 
@@ -366,20 +439,31 @@ class HDMIPwCatPlayback:
     POST_DELAY_S: float = 0.5
     """Seconds of trailing capture after pw-cat exits, to capture the room reverb tail."""
 
-    HDMI_PREROLL_S: float = 2.0
-    """Seconds of silence prepended to pcm_bytes before the actual sweep.
+    HDMI_WARMUP_S: float = 2.5
+    """Seconds of silent PCM sent to the AVR *before* the recording starts.
     The AVR's PCM detection engine needs 1-2 s to lock onto the incoming HDMI
-    audio and start routing to the speakers. Without this preroll the first
-    seconds of the sweep are lost before the AVR's output activates, which
-    collapses the cross-correlation peak below the "Sweep not detected" threshold."""
+    audio and begin routing to the speakers.  If the first pass of sweep
+    audio arrives before the AVR locks, those samples are swallowed and the
+    cross-correlation peak collapses below the "Sweep not detected" threshold.
 
-    def __init__(self, pipewire_node: str, channels: int = 6) -> None:
+    The warmup is a separate pw-cat subprocess that runs *outside* the
+    recording window, so it does not shift the sweep inside rec_array.  After
+    the warmup finishes, the AVR is in PCM-output mode; the recording then
+    starts and captures the full sweep without any window mismatch."""
+
+    def __init__(
+        self,
+        pipewire_node: str,
+        channels: int = 6,
+        capture_pipewire_node: str | None = None,
+    ) -> None:
         if not pipewire_node:
             raise ValueError("HDMIPwCatPlayback requires a non-empty PipeWire node name")
         if channels < 1:
             raise ValueError(f"channels must be >= 1, got {channels}")
         self.pipewire_node = pipewire_node
         self.channels = int(channels)
+        self.capture_pipewire_node = capture_pipewire_node
 
     def play_and_record(self, sweep, sample_rate, in_channel, out_channel):
         import subprocess
@@ -392,39 +476,15 @@ class HDMIPwCatPlayback:
         n_samples = len(sweep_array)
         n_channels = max(self.channels, out_channel)
 
-        # Build N-channel int16 PCM: silent pre-roll + sweep on out_channel-1.
-        # The preroll gives the AVR's PCM detection engine time to lock onto the
-        # HDMI signal before the sweep starts — without it the first 1-2 s of
-        # sweep are swallowed and cross-correlation fails.
-        preroll_samples = int(self.HDMI_PREROLL_S * sample_rate)
+        # Build N-channel int16 PCM with sweep on out_channel-1, others silent.
         sweep_int16 = (np.clip(sweep_array, -1.0, 1.0) * 32767).astype(np.int16)
-        total_samples = preroll_samples + n_samples
-        out_buf = np.zeros((total_samples, n_channels), dtype=np.int16)
-        out_buf[preroll_samples:, out_channel - 1] = sweep_int16  # sweep after preroll
+        out_buf = np.zeros((n_samples, n_channels), dtype=np.int16)
+        out_buf[:, out_channel - 1] = sweep_int16
         pcm_bytes = out_buf.tobytes()
-
-        in_dev = int(sd.default.device[0])
 
         pre_samples = int(self.PRE_DELAY_S * sample_rate)
         post_samples = int(self.POST_DELAY_S * sample_rate)
-        rec_n = pre_samples + total_samples + post_samples
-        rec_buf = np.zeros((rec_n, 1), dtype=np.float32)
-        rec_pos = [0]
-
-        def _rec_callback(indata, frames, time_info, status):
-            end = min(rec_pos[0] + frames, rec_n)
-            count = end - rec_pos[0]
-            if count > 0:
-                rec_buf[rec_pos[0]:end] = indata[:count, in_channel - 1 : in_channel]
-            rec_pos[0] = end
-
-        in_stream = sd.InputStream(
-            device=in_dev,
-            samplerate=sample_rate,
-            channels=in_channel,
-            dtype="float32",
-            callback=_rec_callback,
-        )
+        rec_n = pre_samples + n_samples + post_samples
 
         # Force the channel map so FC lands at the right PCM slot.
         # Without this, the vc4-hdmi driver picks FL,FR,LFE,NA,RC,NA for
@@ -449,71 +509,149 @@ class HDMIPwCatPlayback:
             pw_cmd.extend(["--channel-map", chmap_arg])
         pw_cmd += ["-"]  # read PCM from stdin
 
-        proc = None
+        # Warm up AVR PCM detection before the recording starts.
+        # Send HDMI_WARMUP_S of silent PCM so the AVR locks and begins
+        # routing to the speakers.  This runs outside the recording window
+        # so the sweep is never shifted inside rec_array.
+        warmup_frames = int(self.HDMI_WARMUP_S * sample_rate)
+        warmup_bytes = np.zeros((warmup_frames, n_channels), dtype=np.int16).tobytes()
         try:
-            in_stream.start()
-            _time.sleep(self.PRE_DELAY_S)
-            proc = subprocess.Popen(
+            wu = subprocess.Popen(
                 pw_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
+            wu.communicate(input=warmup_bytes, timeout=self.HDMI_WARMUP_S + 5.0)
+        except Exception as _wu_exc:
+            log.warning("HDMIPwCatPlayback warmup failed (non-fatal): %s", _wu_exc)
+
+        sweep_1d = sweep.timeSignal[:, 0]
+
+        if self.capture_pipewire_node:
+            # Native PipeWire capture via pw-record — no ALSA bridge.
+            rec_proc, chunks, reader_t = _start_pw_record(
+                self.capture_pipewire_node, sample_rate
+            )
+            proc = None
             try:
-                stdout_b, stderr_b = proc.communicate(
-                    input=pcm_bytes,
-                    timeout=max(30.0, n_samples / sample_rate + 10.0),
+                _time.sleep(self.PRE_DELAY_S)
+                proc = subprocess.Popen(
+                    pw_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                 )
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.communicate()
-                raise RuntimeError(
-                    f"pw-cat --target {self.pipewire_node!r} timed out — HDMI sink may be unplugged"
-                )
-            if proc.returncode != 0:
-                raise RuntimeError(
-                    f"pw-cat --target {self.pipewire_node!r} failed (rc={proc.returncode}): "
-                    f"{stderr_b.decode('utf-8', errors='replace').strip()}"
-                )
-            # Drain any trailing room reverb tail.
-            _time.sleep(self.POST_DELAY_S)
-        finally:
-            try:
-                in_stream.stop()
-            except Exception:
-                pass
-            try:
-                in_stream.close()
-            except Exception:
-                pass
-            if proc is not None and proc.poll() is None:
                 try:
+                    _stdout_b, stderr_b = proc.communicate(
+                        input=pcm_bytes,
+                        timeout=max(30.0, n_samples / sample_rate + 10.0),
+                    )
+                except subprocess.TimeoutExpired:
                     proc.kill()
+                    proc.communicate()
+                    _stop_pw_record(rec_proc, reader_t)
+                    raise RuntimeError(
+                        f"pw-cat --target {self.pipewire_node!r} timed out — HDMI sink may be unplugged"
+                    )
+                if proc.returncode != 0:
+                    _stop_pw_record(rec_proc, reader_t)
+                    raise RuntimeError(
+                        f"pw-cat --target {self.pipewire_node!r} failed (rc={proc.returncode}): "
+                        f"{stderr_b.decode('utf-8', errors='replace').strip()}"
+                    )
+                _time.sleep(self.POST_DELAY_S)
+            finally:
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            _stop_pw_record(rec_proc, reader_t)
+            rec_1d = _assemble_pw_recording(chunks)
+            n_recorded = len(rec_1d)
+        else:
+            # Fallback: PortAudio sd.InputStream capture.
+            import sounddevice as sd
+            in_dev = int(sd.default.device[0])
+            rec_buf = np.zeros((rec_n, 1), dtype=np.float32)
+            rec_pos = [0]
+
+            def _rec_callback(indata, frames, time_info, status):
+                end = min(rec_pos[0] + frames, rec_n)
+                count = end - rec_pos[0]
+                if count > 0:
+                    rec_buf[rec_pos[0]:end] = indata[:count, in_channel - 1 : in_channel]
+                rec_pos[0] = end
+
+            in_stream = sd.InputStream(
+                device=in_dev,
+                samplerate=sample_rate,
+                channels=in_channel,
+                dtype="float32",
+                callback=_rec_callback,
+            )
+            proc = None
+            try:
+                in_stream.start()
+                _time.sleep(self.PRE_DELAY_S)
+                proc = subprocess.Popen(
+                    pw_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                try:
+                    _stdout_b, stderr_b = proc.communicate(
+                        input=pcm_bytes,
+                        timeout=max(30.0, n_samples / sample_rate + 10.0),
+                    )
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+                    raise RuntimeError(
+                        f"pw-cat --target {self.pipewire_node!r} timed out — HDMI sink may be unplugged"
+                    )
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"pw-cat --target {self.pipewire_node!r} failed (rc={proc.returncode}): "
+                        f"{stderr_b.decode('utf-8', errors='replace').strip()}"
+                    )
+                _time.sleep(self.POST_DELAY_S)
+            finally:
+                try:
+                    in_stream.stop()
                 except Exception:
                     pass
+                try:
+                    in_stream.close()
+                except Exception:
+                    pass
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            n_recorded = rec_pos[0]
+            rec_1d = rec_buf[:n_recorded, 0].astype(np.float64)
 
-        n_recorded = rec_pos[0]
-        sweep_1d = sweep.timeSignal[:, 0]
-        rec_1d = rec_buf[:n_recorded, 0].astype(np.float64)
-
+        cap_info = self.capture_pipewire_node or "portaudio"
         if len(rec_1d) > 0:
             peak = float(np.max(np.abs(rec_1d)))
             floor_n = min(int(0.5 * sample_rate), len(rec_1d) // 2)
             floor_rms = float(np.sqrt(np.mean(rec_1d[:floor_n] ** 2)))
             sig_rms = float(np.sqrt(np.mean(rec_1d[floor_n:] ** 2)))
             log.info(
-                "HDMIPwCatPlayback: node=%s ch=%d/%d pre=%.0fms preroll=%.0fms n_sweep=%d "
+                "HDMIPwCatPlayback: node=%s cap=%s ch=%d/%d warmup=%.0fms pre=%.0fms n_sweep=%d "
                 "rec_n=%d n_recorded=%d peak=%.1f dBFS floor=%.1f dBFS "
                 "sig=%.1f dBFS SNR=%.1f dB",
-                self.pipewire_node, out_channel, n_channels,
-                self.PRE_DELAY_S * 1000, self.HDMI_PREROLL_S * 1000, n_samples, rec_n, n_recorded,
+                self.pipewire_node, cap_info, out_channel, n_channels,
+                self.HDMI_WARMUP_S * 1000, self.PRE_DELAY_S * 1000, n_samples, rec_n, n_recorded,
                 20 * np.log10(peak + 1e-12),
                 20 * np.log10(floor_rms + 1e-12),
                 20 * np.log10(sig_rms + 1e-12),
                 20 * np.log10(sig_rms / (floor_rms + 1e-12)),
             )
         else:
-            log.warning("HDMIPwCatPlayback: recording is empty (0 samples captured)")
+            log.warning("HDMIPwCatPlayback: recording is empty (0 samples captured) cap=%s", cap_info)
 
         return sweep_1d, rec_1d
 
@@ -756,6 +894,7 @@ def playback_for_route(
     hdmi_pipewire_node: str | None = None,
     hdmi_alsa_device: str | None = None,  # deprecated; ignored when hdmi_pipewire_node is set
     hdmi_channels: int = 6,
+    capture_pipewire_node: str | None = None,
     loopback_ref_device: str | None = None,
     loopback_ref_channels: int = 1,
     loopback_ref_channel_index: int = 1,
@@ -779,12 +918,14 @@ def playback_for_route(
         node = hdmi_pipewire_node or hdmi_alsa_device  # hdmi_alsa_device kept for compat
         if node:
             base: PlaybackStrategy = HDMIPwCatPlayback(
-                pipewire_node=node, channels=hdmi_channels,
+                pipewire_node=node,
+                channels=hdmi_channels,
+                capture_pipewire_node=capture_pipewire_node,
             )
         else:
             base = HDMIPlayback()
     else:
-        base = USBPlayback()
+        base = USBPlayback(capture_pipewire_node=capture_pipewire_node)
 
     if loopback_ref_device is not None:
         return LoopbackRefPlayback(

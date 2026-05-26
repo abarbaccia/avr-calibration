@@ -243,13 +243,13 @@ class TestHDMIPwCatPlayback:
         assert cmd[cmd.index("--format") + 1] == "s16"
         assert cmd[-1] == "-"  # stdin
 
-        # The sweep bytes were written via communicate(input=...)
-        kwargs = proc.communicate.call_args.kwargs
-        assert "input" in kwargs
-        pcm_bytes = kwargs["input"]
-        # (preroll_samples + 4800 sweep frames) × 6 channels × 2 bytes/sample
-        preroll = int(HDMIPwCatPlayback.HDMI_PREROLL_S * 48000)
-        assert len(pcm_bytes) == (preroll + 4800) * 6 * 2
+        # Two Popen calls: first is the warmup burst, second is the sweep.
+        assert MockPopen.call_count == 2
+        sweep_kwargs = proc.communicate.call_args.kwargs
+        assert "input" in sweep_kwargs
+        pcm_bytes = sweep_kwargs["input"]
+        # 4800 sweep frames × 6 channels × 2 bytes/sample (no preroll in sweep buffer)
+        assert len(pcm_bytes) == 4800 * 6 * 2
 
         # Capture path still ran via PortAudio
         mock_sd.InputStream.assert_called_once()
@@ -279,14 +279,11 @@ class TestHDMIPwCatPlayback:
         ):
             strategy.play_and_record(sweep, 48000, 1, 3)
 
-        preroll = int(HDMIPwCatPlayback.HDMI_PREROLL_S * 48000)
         pcm = np.frombuffer(captured["input"], dtype=np.int16).reshape(-1, 6)
-        # Preroll is all-zero across all channels.
-        assert np.all(pcm[:preroll] == 0), "preroll must be silent on all channels"
-        # Sweep region: channel 3 (1-based) → column index 2 has signal; others zero.
-        sweep_pcm = pcm[preroll:]
+        # Sweep buffer has no preroll — channel 3 (1-based) → column index 2
+        # has signal across the full buffer; all others are zero.
         for ch in range(6):
-            col = sweep_pcm[:, ch]
+            col = pcm[:, ch]
             if ch == 2:
                 assert np.any(col != 0), "target channel must have signal"
             else:
@@ -308,3 +305,62 @@ class TestHDMIPwCatPlayback:
             pytest.raises(RuntimeError, match="pw-cat.*no such node"),
         ):
             strategy.play_and_record(sweep, 48000, 1, 1)
+
+    def test_pw_record_capture_used_when_node_configured(self):
+        """When capture_pipewire_node is set, pw-record subprocess is used instead of sd.InputStream."""
+        import struct
+
+        mock_sd = sys.modules["sounddevice"]
+        mock_sd.reset_mock()
+        # sd.InputStream must NOT be called when using pw-record capture
+        mock_sd.InputStream = MagicMock()
+
+        n_samples = 480
+        sweep = self._make_sweep(n_samples=n_samples)
+
+        # Fake pw-record stdout: f32le silence (same length as sweep + pre/post)
+        sr = 48000
+        pre_s = int(HDMIPwCatPlayback.PRE_DELAY_S * sr)
+        post_s = int(HDMIPwCatPlayback.POST_DELAY_S * sr)
+        fake_audio = struct.pack(f"{pre_s + n_samples + post_s}f", *([0.0] * (pre_s + n_samples + post_s)))
+
+        warmup_proc = MagicMock()
+        warmup_proc.returncode = 0
+        warmup_proc.communicate = MagicMock(return_value=(b"", b""))
+        warmup_proc.poll = MagicMock(return_value=0)
+
+        sweep_proc = MagicMock()
+        sweep_proc.returncode = 0
+        sweep_proc.communicate = MagicMock(return_value=(b"", b""))
+        sweep_proc.poll = MagicMock(return_value=0)
+
+        rec_proc = MagicMock()
+        rec_proc.returncode = 0
+        rec_proc.stdout = MagicMock()
+        rec_proc.stdout.read = MagicMock(side_effect=[fake_audio, b""])
+        rec_proc.poll = MagicMock(return_value=0)
+
+        _UMIK_NODE = "alsa_input.usb-miniDSP_Umik-1"
+        call_count = [0]
+
+        def _popen(cmd, **kwargs):
+            call_count[0] += 1
+            if cmd[0] == "pw-record":
+                return rec_proc
+            return warmup_proc if call_count[0] == 2 else sweep_proc
+
+        strategy = HDMIPwCatPlayback(
+            pipewire_node=_PW_NODE, channels=6,
+            capture_pipewire_node=_UMIK_NODE,
+        )
+        with (
+            patch("subprocess.Popen", side_effect=_popen),
+            patch("time.sleep"),
+        ):
+            sweep_1d, rec_1d = strategy.play_and_record(sweep, sr, 1, 1)
+
+        # sd.InputStream must NOT be called — pw-record handles capture
+        mock_sd.InputStream.assert_not_called()
+
+        assert sweep_1d.shape == (n_samples,)
+        assert rec_1d.dtype == np.float64

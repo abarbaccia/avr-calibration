@@ -77,7 +77,8 @@ DEFAULT_CONFIG: dict = {
         "playback_device": "miniDSP",
         "hdmi_pipewire_node": None,
         "hdmi_playback_device": None,  # deprecated; use hdmi_pipewire_node
-        "mic_device_index": None,
+        "mic_pipewire_node": None,
+        "mic_device_index": None,  # deprecated; use mic_pipewire_node
         "hdmi_device_index": None,
         "usb_device_index": None,
         "master_gain_hdmi_db": None,
