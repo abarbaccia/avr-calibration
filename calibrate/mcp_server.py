@@ -6404,8 +6404,9 @@ async def _tool_set_avr_multi_eq(slot: str) -> dict:
     _SLOT_MAP = {
         "OFF": "OFF",
         "FLAT": "FLAT",
-        "REFERENCE": "REF",
-        "REF": "REF",
+        "REFERENCE": "AUDYSSEY",
+        "REF": "AUDYSSEY",
+        "AUDYSSEY": "AUDYSSEY",
         "BYP.LR": "BYP.LR",
         "BYPASS LR": "BYP.LR",
     }
@@ -6414,7 +6415,13 @@ async def _tool_set_avr_multi_eq(slot: str) -> dict:
         return _err(
             f"set_avr_multi_eq: slot must be one of OFF/FLAT/REFERENCE/BYP.LR, got {slot!r}"
         )
-    return await _denon_telnet_set([f"PSMULTEQ:{_SLOT_MAP[key]}"])
+    # Send SET + immediate query so telnet_query always sees at least one reply.
+    # SET commands don't echo; the query prevents a false "no replies" DriverError.
+    result = await _denon_telnet_set([f"PSMULTEQ:{_SLOT_MAP[key]}", "PSMULTEQ: ?"])
+    if not result.get("ok"):
+        return result
+    confirmed = result.get("replies", {}).get("PSMULTEQ: ?", "")
+    return _ok(sent=_SLOT_MAP[key], confirmed=confirmed)
 
 
 async def _tool_set_avr_dynamic_eq(enabled: bool) -> dict:

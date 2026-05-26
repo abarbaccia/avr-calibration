@@ -274,7 +274,7 @@ def polyphase_decimate(
         for p in range(M):
             phase_p = phases[p]
             for i, tap in enumerate(phase_p):
-                in_index = k * M + p - i * M
+                in_index = k * M - p - i * M
                 if 0 <= in_index < signal_len:
                     y_k += tap * sig[in_index]
         output[k] = y_k
@@ -326,7 +326,7 @@ def _calculate_band(
 
     processed_band = [0.0] * band_len
     delay = (
-        (dec_filter_original_len * 3 - 3) // 2 if use_delay_comp else 0
+        (dec_filter_original_len - 1) // 2 if use_delay_comp else 0
     )
     win_len = band_len - delay
     if win_len < 0:

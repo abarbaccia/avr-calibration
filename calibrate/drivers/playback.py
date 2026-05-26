@@ -464,9 +464,9 @@ class HDMIPwCatPlayback:
     POST_DELAY_S: float = 0.5
     """Seconds of trailing capture after pw-cat exits, to capture the room reverb tail."""
 
-    HDMI_WARMUP_S: float = 2.5
+    HDMI_WARMUP_S: float = 5.0
     """Seconds of silent PCM sent to the AVR *before* the recording starts.
-    The AVR's PCM detection engine needs 1-2 s to lock onto the incoming HDMI
+    The AVR's PCM detection engine needs 3-5 s to lock onto the incoming HDMI
     audio and begin routing to the speakers.  If the first pass of sweep
     audio arrives before the AVR locks, those samples are swallowed and the
     cross-correlation peak collapses below the "Sweep not detected" threshold.

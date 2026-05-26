@@ -136,6 +136,32 @@ def test_polyphase_decimate_empty_signal_returns_empty() -> None:
     assert polyphase_decimate([], [[1.0]], 1, 1) == []
 
 
+def test_polyphase_decimate_matches_direct_convolution() -> None:
+    """polyphase_decimate must equal convolve-then-downsample exactly.
+
+    Regression for the sign bug: `in_index = k*M + p - i*M` gave a
+    cross-correlation-like result; the correct formula is `k*M - p - i*M`.
+    The test uses the real SAT129 filter (symmetric, L=129) so it would
+    pass even with the wrong sign for truly symmetric inputs — using a
+    non-symmetric random filter to guarantee detection.
+    """
+    from scipy.signal import fftconvolve  # type: ignore[import]
+
+    rng = np.random.default_rng(7)
+    signal = rng.normal(size=400).tolist()
+    filt = rng.normal(size=29).tolist()   # non-symmetric
+    M = 4
+    phases = decompose_filter(filt, M)
+
+    direct_conv = np.convolve(np.array(signal), np.array(filt))
+    direct = direct_conv[::M]
+    poly = np.array(polyphase_decimate(signal, phases, M, len(filt)))
+
+    min_len = min(len(direct), len(poly))
+    diff = np.max(np.abs(direct[:min_len] - poly[:min_len]))
+    assert diff < 1e-10, f"polyphase_decimate deviated {diff:.2e} from direct conv+decimate"
+
+
 # ── Window ──────────────────────────────────────────────────────────────
 
 
@@ -207,6 +233,24 @@ def test_convert_xt32_passthrough_ir_is_finite_and_nonzero() -> None:
     out = np.asarray(convert_xt32(ir))
     assert np.all(np.isfinite(out))
     assert np.any(np.abs(out) > 0.0), "passthrough IR should produce nonzero output"
+
+
+def test_convert_xt32_delta_at_zero_is_passthrough() -> None:
+    """A min-phase delta (1.0 at tap 0) must produce a near-unity passthrough.
+
+    Regression for the delay formula bug: `(L*3-3)//2 = 192` for SAT129
+    left only 64 taps for the transition window, so the first 192 samples
+    of every residual were dropped from the analysis — corrupting band 0/1
+    boundaries for any IR with energy in that range.
+    The correct formula `(L-1)//2 = 64` matches the LP filter group delay.
+    """
+    speaker_len = FILTER_CONFIGS["xt32Speaker"]["input_length"]
+    ir = [0.0] * speaker_len
+    ir[0] = 1.0
+    out = np.asarray(convert_xt32(ir))
+    # Band 0 (first 256 taps) should capture the delta faithfully.
+    assert out[0] == pytest.approx(1.0, abs=1e-6), "peak at tap 0 expected"
+    assert np.max(np.abs(out[1:])) < 1e-6, "no energy outside tap 0 for a delta"
 
 
 # ── FIR design helpers ─────────────────────────────────────────────────
