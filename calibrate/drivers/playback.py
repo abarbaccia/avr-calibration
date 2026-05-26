@@ -16,23 +16,39 @@ from typing import Protocol
 log = logging.getLogger(__name__)
 
 
-def _start_pw_record(node: str, sample_rate: int, channels: int = 1) -> tuple:
+def _start_pw_record(
+    node: str,
+    sample_rate: int,
+    channels: int = 1,
+    channel_map: str | None = None,
+) -> tuple:
     """Start a pw-record subprocess reading from a PipeWire source node.
 
     Returns (proc, chunks, reader_thread).  Caller must call _stop_pw_record
     when done.  pw-record writes raw f32le interleaved samples to stdout.
+
+    channel_map: explicit PipeWire channel map string (e.g. "AUX0,AUX1,AUX2").
+    Required for multichannel devices whose ports are named AUX0…AUXN rather
+    than FL/FR — without it PipeWire only maps FL/FR and silences the rest.
     """
     import subprocess
     import threading
 
+    # Multichannel devices (>2 ch) name their ports AUX0-AUXN. Without an
+    # explicit channel map pw-record only maps FL/FR and silences the rest.
+    effective_map = channel_map if channel_map is not None else (
+        _aux_channel_map(channels) if channels > 2 else None
+    )
     cmd = [
         "pw-record",
         "--target", node,
         "--channels", str(channels),
         "--rate", str(sample_rate),
         "--format", "f32",
-        "-",
     ]
+    if effective_map:
+        cmd += ["--channel-map", effective_map]
+    cmd.append("-")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     chunks: list[bytes] = []
 
@@ -62,6 +78,15 @@ def _stop_pw_record(proc, reader_thread) -> None:
         except Exception:
             pass
     reader_thread.join(timeout=3.0)
+
+
+def _aux_channel_map(n: int) -> str:
+    """Return a PipeWire AUX channel-map string for n channels (AUX0,AUX1,…,AUX{n-1}).
+
+    Multichannel devices (e.g. Focusrite Scarlett 18i20) name their ports AUX0-AUXN.
+    Without an explicit map pw-record only maps FL/FR and silences all other channels.
+    """
+    return ",".join(f"AUX{i}" for i in range(n))
 
 
 def _assemble_pw_recording(chunks: list) -> "np.ndarray":  # type: ignore[name-defined]
