@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "avr-calibration": {
-      "type": "streamable-http",
+      "type": "http",
       "url": "http://192.168.1.117:8765/mcp"
     }
   }
