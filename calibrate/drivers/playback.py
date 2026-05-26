@@ -1,8 +1,9 @@
 """Playback strategies for measurement sweep play+record.
 
-Two strategies:
-  USBPlayback  — PyTTa PlayRecMeasure (float32 duplex, both devices support it)
-  HDMIPlayback — split sd.rec() + sd.play() (HDMI only supports int16 output)
+Three strategies:
+  USBPlayback       — PyTTa PlayRecMeasure (float32 duplex, both devices support it)
+  HDMIPlayback      — split sd.rec() + sd.play() (legacy, HDMI only supports int16 output)
+  HDMIPwCatPlayback — pw-cat native PipeWire playback; PortAudio capture for mic
 
 Both return (sweep_1d, rec_1d) numpy arrays for deconvolution.
 """
@@ -334,23 +335,19 @@ class MultichannelPlayback:
         return recording, n_recorded
 
 
-class HDMIAplayPlayback:
-    """HDMI sweep playback via the ``aplay`` subprocess (direct ALSA), capture via PortAudio.
+class HDMIPwCatPlayback:
+    """HDMI sweep playback via ``pw-cat`` (native PipeWire), capture via PortAudio.
 
-    Why this exists:
+    Why pw-cat instead of aplay:
         Inside the avr-calibration container on the Pi 5 (Docker, ``--privileged``,
-        ``--network=host``) PortAudio enumerates only the ALSA Loopback PCMs and
-        does NOT see ``vc4hdmi0`` even though ``aplay -L`` and ``speaker-test
-        -D hdmi:CARD=vc4hdmi0,DEV=0`` work cleanly. The result is that the prior
-        ``HDMIPlayback`` route silently fell back to a Loopback device, the sweep
-        never reached the AVR, and cross-correlation reported "Sweep not detected."
-
-        ``aplay`` invokes the ALSA hw device directly, bypassing PortAudio's
-        broken enumeration. Capture stays on PortAudio/sounddevice (the UMIK
-        path works fine).
+        ``--network=host``) PortAudio does NOT enumerate ``vc4hdmi0``.  aplay with
+        ALSA ``default:CARD=vc4hdmi0`` also fails inside the container because the
+        ALSA ``default`` plugin with ``CARD=`` parameters is not available there.
+        ``pw-cat --target <node>`` speaks PipeWire natively — no ALSA bridge,
+        no plugin lookup — and reaches the vc4hdmi0 sink directly.
 
     Sequence (mirrors ``USBPlayback``):
-        recording-first → sleep PRE_DELAY_S → spawn aplay → wait for aplay to
+        recording-first → sleep PRE_DELAY_S → spawn pw-cat → wait for pw-cat to
         exit → small POST_DELAY_S settle → stop recording. The 1 s pre-delay
         guarantees the noise-floor window in ``validate_recording`` lands on
         pre-sweep silence.
@@ -358,8 +355,8 @@ class HDMIAplayPlayback:
     Multi-channel layout:
         Builds an N-channel S16_LE buffer and writes the sweep onto channel
         ``out_channel - 1`` (1-based input). Other channels are silent. So
-        ``out_channel=1, channels=8`` puts the sweep on FL only and zero-fills
-        the rest of the 8-ch HDMI stream.
+        ``out_channel=1, channels=6`` puts the sweep on FL only and zero-fills
+        the rest of the 6-ch HDMI stream.
     """
 
     PRE_DELAY_S: float = 1.0
@@ -367,14 +364,21 @@ class HDMIAplayPlayback:
     the deconvolution alignment math (sweep-pad shared anchor) is identical."""
 
     POST_DELAY_S: float = 0.5
-    """Seconds of trailing capture after aplay exits, to capture the room reverb tail."""
+    """Seconds of trailing capture after pw-cat exits, to capture the room reverb tail."""
 
-    def __init__(self, alsa_device: str, channels: int = 8) -> None:
-        if not alsa_device:
-            raise ValueError("HDMIAplayPlayback requires a non-empty ALSA device string")
+    HDMI_PREROLL_S: float = 2.0
+    """Seconds of silence prepended to pcm_bytes before the actual sweep.
+    The AVR's PCM detection engine needs 1-2 s to lock onto the incoming HDMI
+    audio and start routing to the speakers. Without this preroll the first
+    seconds of the sweep are lost before the AVR's output activates, which
+    collapses the cross-correlation peak below the "Sweep not detected" threshold."""
+
+    def __init__(self, pipewire_node: str, channels: int = 6) -> None:
+        if not pipewire_node:
+            raise ValueError("HDMIPwCatPlayback requires a non-empty PipeWire node name")
         if channels < 1:
             raise ValueError(f"channels must be >= 1, got {channels}")
-        self.alsa_device = alsa_device
+        self.pipewire_node = pipewire_node
         self.channels = int(channels)
 
     def play_and_record(self, sweep, sample_rate, in_channel, out_channel):
@@ -388,17 +392,22 @@ class HDMIAplayPlayback:
         n_samples = len(sweep_array)
         n_channels = max(self.channels, out_channel)
 
-        # Build N-channel int16 PCM with sweep on out_channel-1, others silent.
+        # Build N-channel int16 PCM: silent pre-roll + sweep on out_channel-1.
+        # The preroll gives the AVR's PCM detection engine time to lock onto the
+        # HDMI signal before the sweep starts — without it the first 1-2 s of
+        # sweep are swallowed and cross-correlation fails.
+        preroll_samples = int(self.HDMI_PREROLL_S * sample_rate)
         sweep_int16 = (np.clip(sweep_array, -1.0, 1.0) * 32767).astype(np.int16)
-        out_buf = np.zeros((n_samples, n_channels), dtype=np.int16)
-        out_buf[:, out_channel - 1] = sweep_int16
+        total_samples = preroll_samples + n_samples
+        out_buf = np.zeros((total_samples, n_channels), dtype=np.int16)
+        out_buf[preroll_samples:, out_channel - 1] = sweep_int16  # sweep after preroll
         pcm_bytes = out_buf.tobytes()
 
         in_dev = int(sd.default.device[0])
 
         pre_samples = int(self.PRE_DELAY_S * sample_rate)
         post_samples = int(self.POST_DELAY_S * sample_rate)
-        rec_n = pre_samples + n_samples + post_samples
+        rec_n = pre_samples + total_samples + post_samples
         rec_buf = np.zeros((rec_n, 1), dtype=np.float32)
         rec_pos = [0]
 
@@ -417,40 +426,35 @@ class HDMIAplayPlayback:
             callback=_rec_callback,
         )
 
-        # Force the chmap that has FC at index 4. Without this, the
-        # vc4-hdmi driver picks `FL,FR,LFE,NA,RC,NA` for AVRs whose EDID
-        # advertises back-center — that maps PCM ch 4 to NA, so any
-        # Center sweep goes nowhere (AVR drops it or routes by fallback
-        # to sub). With --chmap=FL,FR,LFE,FC,RL,RR explicit, ch 4 = FC,
-        # ch 5 = RL, ch 6 = RR — all reachable. Verified 2026-05-07
-        # against amixer numid=2 reading values 3,4,8,7,5,6,0,0.
+        # Force the channel map so FC lands at the right PCM slot.
+        # Without this, the vc4-hdmi driver picks FL,FR,LFE,NA,RC,NA for
+        # AVRs whose EDID advertises back-center — FC is unreachable.
+        # With FL,FR,LFE,FC,RL,RR explicit, ch 4 = FC, ch 5/6 = RL/RR.
+        # Verified 2026-05-07 against amixer numid=2 values 3,4,8,7,5,6,0,0.
         chmap_for_channels = {
             2: "FL,FR",
             4: "FL,FR,LFE,FC",
             6: "FL,FR,LFE,FC,RL,RR",
         }
         chmap_arg = chmap_for_channels.get(n_channels)
-        aplay_cmd = [
-            "aplay",
-            "-D", self.alsa_device,
-            "-c", str(n_channels),
-            "-r", str(sample_rate),
-            "-f", "S16_LE",
+        pw_cmd = [
+            "pw-cat",
+            "--playback",
+            "--target", self.pipewire_node,
+            "--channels", str(n_channels),
+            "--rate", str(sample_rate),
+            "--format", "s16",
         ]
         if chmap_arg is not None:
-            aplay_cmd.extend(["--chmap", chmap_arg])
-        aplay_cmd += [
-            "-t", "raw",
-            "-q",  # quiet — don't pollute MCP logs with progress chatter
-            "-",
-        ]
+            pw_cmd.extend(["--channel-map", chmap_arg])
+        pw_cmd += ["-"]  # read PCM from stdin
 
         proc = None
         try:
             in_stream.start()
             _time.sleep(self.PRE_DELAY_S)
             proc = subprocess.Popen(
-                aplay_cmd,
+                pw_cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -464,11 +468,11 @@ class HDMIAplayPlayback:
                 proc.kill()
                 proc.communicate()
                 raise RuntimeError(
-                    f"aplay -D {self.alsa_device!r} timed out — HDMI sink may be unplugged"
+                    f"pw-cat --target {self.pipewire_node!r} timed out — HDMI sink may be unplugged"
                 )
             if proc.returncode != 0:
                 raise RuntimeError(
-                    f"aplay -D {self.alsa_device!r} failed (rc={proc.returncode}): "
+                    f"pw-cat --target {self.pipewire_node!r} failed (rc={proc.returncode}): "
                     f"{stderr_b.decode('utf-8', errors='replace').strip()}"
                 )
             # Drain any trailing room reverb tail.
@@ -498,20 +502,24 @@ class HDMIAplayPlayback:
             floor_rms = float(np.sqrt(np.mean(rec_1d[:floor_n] ** 2)))
             sig_rms = float(np.sqrt(np.mean(rec_1d[floor_n:] ** 2)))
             log.info(
-                "HDMIAplayPlayback: device=%s ch=%d/%d pre=%.0fms n_sweep=%d "
+                "HDMIPwCatPlayback: node=%s ch=%d/%d pre=%.0fms preroll=%.0fms n_sweep=%d "
                 "rec_n=%d n_recorded=%d peak=%.1f dBFS floor=%.1f dBFS "
                 "sig=%.1f dBFS SNR=%.1f dB",
-                self.alsa_device, out_channel, n_channels,
-                self.PRE_DELAY_S * 1000, n_samples, rec_n, n_recorded,
+                self.pipewire_node, out_channel, n_channels,
+                self.PRE_DELAY_S * 1000, self.HDMI_PREROLL_S * 1000, n_samples, rec_n, n_recorded,
                 20 * np.log10(peak + 1e-12),
                 20 * np.log10(floor_rms + 1e-12),
                 20 * np.log10(sig_rms + 1e-12),
                 20 * np.log10(sig_rms / (floor_rms + 1e-12)),
             )
         else:
-            log.warning("HDMIAplayPlayback: recording is empty (0 samples captured)")
+            log.warning("HDMIPwCatPlayback: recording is empty (0 samples captured)")
 
         return sweep_1d, rec_1d
+
+
+# Backward-compat alias — callers that still reference HDMIAplayPlayback by name keep working.
+HDMIAplayPlayback = HDMIPwCatPlayback
 
 
 class LoopbackRefPlayback:
@@ -745,7 +753,8 @@ class LoopbackRefPlayback:
 def playback_for_route(
     route: str,
     *,
-    hdmi_alsa_device: str | None = None,
+    hdmi_pipewire_node: str | None = None,
+    hdmi_alsa_device: str | None = None,  # deprecated; ignored when hdmi_pipewire_node is set
     hdmi_channels: int = 6,
     loopback_ref_device: str | None = None,
     loopback_ref_channels: int = 1,
@@ -754,11 +763,10 @@ def playback_for_route(
     """Factory: return the right playback strategy for the configured route.
 
     HDMI path:
-      - ``hdmi_alsa_device`` set → ``HDMIAplayPlayback`` (direct ALSA via
-        the ``aplay`` subprocess; bypasses PortAudio's broken vc4hdmi0
-        enumeration inside containers).
-      - ``hdmi_alsa_device`` None → legacy PortAudio-based ``HDMIPlayback``,
-        kept for back-compat with callers that don't yet plumb a device.
+      - ``hdmi_pipewire_node`` set → ``HDMIPwCatPlayback`` (native PipeWire
+        via ``pw-cat --target <node>``; no ALSA bridge required).
+      - ``hdmi_pipewire_node`` None → legacy PortAudio-based ``HDMIPlayback``,
+        kept for back-compat with callers that don't yet plumb a node.
 
     Loopback ref:
       - ``loopback_ref_device`` set (e.g. ``"hw:Loopback,1,0"`` or
@@ -768,9 +776,10 @@ def playback_for_route(
         instead of 2-tuples. See project_loopback_alignment_rig.md.
     """
     if route == "hdmi":
-        if hdmi_alsa_device:
-            base: PlaybackStrategy = HDMIAplayPlayback(
-                alsa_device=hdmi_alsa_device, channels=hdmi_channels,
+        node = hdmi_pipewire_node or hdmi_alsa_device  # hdmi_alsa_device kept for compat
+        if node:
+            base: PlaybackStrategy = HDMIPwCatPlayback(
+                pipewire_node=node, channels=hdmi_channels,
             )
         else:
             base = HDMIPlayback()
