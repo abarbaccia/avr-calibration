@@ -729,9 +729,11 @@ class LoopbackRefPlayback:
         pw_ch = max(ref_pw_channels, ref_channel_index)
         if ref_channels < 1:
             raise ValueError(f"ref_channels must be >= 1, got {ref_channels}")
-        if not (1 <= ref_channel_index <= max(ref_channels, pw_ch)):
+        upper = pw_ch if ref_pipewire_node is not None else ref_channels
+        if not (1 <= ref_channel_index <= upper):
             raise ValueError(
                 f"ref_channel_index ({ref_channel_index}) must be >= 1"
+                f" and <= {upper}"
             )
         self.base = base
         self.ref_device = ref_device
