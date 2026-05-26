@@ -20,11 +20,15 @@
 
 set -u
 
-# Channels that carry calibration / playback traffic on this rig.
+# Channels that carry CamillaDSP sub/shaker output on this rig.
 # (Channels 1–4 on the 18i20 are slaved to the Monitor 1/2 hardware knobs;
 # see memory/project_focusrite_monitor_gotcha.md. The 18i20 simple-mixer
 # only exposes PCM 01–09; channel 10 is not a switchable output here.)
-CHANNELS="5 6 7 8 9"
+# Channel 5 is intentionally omitted: PCM 05 is set to "Analogue 5" below
+# so that Scarlett physical input 5 (FR AVR pre-out loopback cable) is
+# visible as USB capture channel 5 (PW AUX4). CamillaDSP dest 4 is empty
+# (silence), so analog output 5 is unused — the passthrough is harmless.
+CHANNELS="6 7 8 9"
 
 # Wait up to ~10s for the USB card to enumerate.
 ATTEMPTS=20
@@ -78,6 +82,16 @@ for ch in $CHANNELS; do
 done
 
 echo "[fix-scarlett-routing] Done — ${OK} ok, ${FAIL} failed." >&2
+
+# PCM 05 → Analogue 5: route FR AVR pre-out loopback (physical input 5) to
+# USB capture channel 5 (PW AUX4). CamillaDSP dest 4 is empty so analog
+# output 5 is unused — this passthrough does not affect sub DSP output.
+echo "[fix-scarlett-routing] Setting PCM 05 -> Analogue 5 (FR loopback capture)..." >&2
+if amixer -c USB sget "PCM 05" >/dev/null 2>&1; then
+    amixer -c USB sset "PCM 05" "Analogue 5" >/dev/null 2>&1 && \
+        echo "[fix-scarlett-routing]   PCM 05 -> Analogue 5 OK" >&2 || \
+        echo "[fix-scarlett-routing]   PCM 05 -> Analogue 5 FAILED" >&2
+fi
 
 # Karaoke summing matrix: Mix A → Line 1 (Denon L), Mix B → Line 2 (Denon R).
 # Each Mix bus sums Mic 1 (Mixer In 01) + Mic 2 (Mixer In 02) + Pi karaoke L/R
