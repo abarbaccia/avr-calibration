@@ -4067,6 +4067,127 @@ async def _tool_design_fir(
         return _err(f"design_fir failed: {exc}")
 
 
+async def _tool_design_fir_multi(
+    measurements: list[dict],
+    target_curve: dict,
+    num_taps: int = 4096,
+    phase_mode: str = "mixed",
+    preringing_ms: float = 20.0,
+    regularization_lambda: float = 0.1,
+    freq_focus_hz: list[float] | None = None,
+    return_coefficients: bool = False,
+) -> dict:
+    """Coherent multi-sub FIR design — N FIRs that sum to target at MLP.
+
+    Standard per-sub design_fir flattens each sub's magnitude independently
+    and uses min-phase reconstruction.  At MLP, the two sub contributions
+    may still cancel because their PHASES differ at any given frequency.
+    This tool fixes that: each per-sub FIR is given the complex correction
+    K_i = T_per_sub * conj(H_i) / (|H_i|^2 + lambda^2), which delivers
+    each sub's contribution to the mic at the SAME phase (the target's
+    min-phase reconstruction).  Coherent sum, no cancellation.
+
+    ``measurements``: list of {"session_id": int, "output_index": int, "label": str}.
+    Each session must have phase data (modern measurements do).
+    ``target_curve``: same shape as design_fir's: {"points": [{"freq", "spl"}, ...]}.
+    Target points are absolute SPL across the focus band.
+    ``regularization_lambda``: damping factor for the Wiener inverse.
+    Lower = stronger correction at nulls (more boost requested); higher =
+    accept the null, smaller boost.  Default 0.1 (linear, ~ -20 dB).
+    """
+    from .storage import SessionStore
+    from .multi_fir import design_multi_input_fir, SubMeasurement
+
+    try:
+        store = SessionStore()
+        sub_meas = []
+        for m in measurements:
+            sid = int(m["session_id"])
+            session = store.get_session(sid)
+            if session is None:
+                return _err(f"session {sid} not found")
+            fr = session.start_fr
+            if not fr or not fr.frequencies:
+                return _err(f"session {sid} has no FR data")
+            if not fr.phase:
+                return _err(
+                    f"session {sid} has no phase data — re-measure to get a session "
+                    "with phase; multi-input design requires complex response per sub"
+                )
+            sub_meas.append(SubMeasurement(
+                freqs=list(fr.frequencies),
+                spl_db=list(fr.spl),
+                phase_rad=list(fr.phase),
+                label=m.get("label", f"output_{m.get('output_index', '?')}"),
+            ))
+
+        if not target_curve or not target_curve.get("points"):
+            return _err("target_curve.points required (list of {freq, spl})")
+        target_points = [(float(p["freq"]), float(p["spl"]))
+                         for p in target_curve["points"]]
+        target_points.sort()
+
+        focus = None
+        if freq_focus_hz and len(freq_focus_hz) >= 2:
+            focus = (float(freq_focus_hz[0]), float(freq_focus_hz[1]))
+
+        # Get sample rate / tap limits from active DSP
+        sample_rate = 48000
+        if _dsp is not None:
+            caps = _dsp.capabilities
+            sample_rate = caps.fir_sample_rate_hz or 48000
+            if num_taps > caps.fir_max_taps_per_output:
+                return _err(
+                    f"num_taps={num_taps} exceeds {caps.fir_max_taps_per_output}"
+                )
+            if num_taps < caps.fir_min_taps:
+                return _err(f"num_taps={num_taps} below {caps.fir_min_taps}")
+
+        result = design_multi_input_fir(
+            sub_meas,
+            target_points,
+            sample_rate=sample_rate,
+            num_taps=num_taps,
+            phase_mode=phase_mode,
+            preringing_ms=preringing_ms,
+            regularization_lambda=regularization_lambda,
+            freq_focus_hz=focus,
+        )
+
+        # Cache each FIR keyed by a synthetic id so apply_fir(design_session_id=...) works
+        # Use (first_session_id * 1000 + output_index) as cache key.
+        primary_sid = int(measurements[0]["session_id"])
+        cache_ids = []
+        for i, (m, fir) in enumerate(zip(measurements, result["firs"])):
+            out_idx = int(m.get("output_index", i))
+            cache_id = primary_sid * 1000 + out_idx
+            _fir_design_cache[cache_id] = fir
+            cache_ids.append({"output_index": out_idx, "design_session_id": cache_id})
+
+        response = {
+            "num_subs": result["num_subs"],
+            "num_taps": result["num_taps"],
+            "phase_mode": result["phase_mode"],
+            "regularization_lambda": result["regularization_lambda"],
+            "latency_ms": result["latency_ms"],
+            "predicted_combined": result["predicted_combined"],
+            "predicted_per_sub": result["predicted_per_sub"],
+            "per_sub_peak_boost_db": result["per_sub_peak_boost_db"],
+            "cache_ids": cache_ids,
+            "note": (
+                f"FIR designed for {result['num_subs']} subs in {phase_mode} mode. "
+                f"Latency ≈ {result['latency_ms']} ms. "
+                f"Apply each via apply_fir(output_index, design_session_id). "
+                "See cache_ids for the mapping."
+            ),
+        }
+        if return_coefficients:
+            response["firs"] = result["firs"]
+        return _ok(**response)
+    except Exception as exc:
+        return _err(f"design_fir_multi failed: {exc}")
+
+
 async def _tool_design_modal_fir(
     session_id: int,
     intents: list[dict] | None = None,
@@ -5240,10 +5361,21 @@ async def _tool_trigger_measurement(
                     route=route,
                 )
         else:
-            await _ensure_sweep_session()
-            fr = await engine.measure(
-                route=route,
-            )
+            # USB route: enter the DSP sweep context per-measurement so any
+            # save/restore (e.g. master_gain_db) wraps each individual sweep
+            # — _ensure_sweep_session is persistent and only re-enters once,
+            # which is wrong for master-gain handling but fine for one-shot
+            # source switches.
+            if _dsp is not None:
+                sweep_ctx = _dsp.sweep_context(cfg)
+                async with sweep_ctx:
+                    fr = await engine.measure(
+                        route=route,
+                    )
+            else:
+                fr = await engine.measure(
+                    route=route,
+                )
 
         # Compute IR-derived metadata at capture time. Query the DSP for the
         # current per-output FIR pre-delay so the onset detector can skip
@@ -5284,10 +5416,23 @@ async def _tool_trigger_measurement(
             coh_summary = _downsample_coherence(fr.frequencies, fr.coherence)
             response_metadata["coherence"] = coh_summary
 
+        # ⚠️  Surface the no-loopback warning in the tool response so the
+        # LLM/operator sees it on every measurement, not just buried in logs.
+        meas_cfg = cfg.measurement
+        warnings_out = []
+        if not (meas_cfg.get("loopback_ref_pipewire_node")
+                or meas_cfg.get("loopback_ref_device")):
+            warnings_out.append(
+                "⚠️  LOOPBACK REFERENCE NOT CONFIGURED — measurements show "
+                "4–10 dB run-to-run jitter. Filter A/B comparisons cannot be "
+                "trusted until measurement.loopback_ref_pipewire_node is set."
+            )
+
         return _ok(
             session_id=session_id,
             label=full_label,
             metadata=response_metadata,
+            warnings=warnings_out if warnings_out else None,
             message="Measurement complete — use get_measurement_history() to retrieve results.",
         )
     except Exception as exc:
@@ -11290,6 +11435,99 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="design_fir_multi",
+        description=(
+            "Coherent multi-sub FIR design. Designs N FIRs (one per sub) that "
+            "sum coherently at MLP to the target curve, using regularized "
+            "Wiener inverse with explicit phase alignment. Each per-sub FIR "
+            "delivers its sub's contribution at the SAME phase as the target, "
+            "so subs add constructively instead of cancelling. Use this instead "
+            "of design_fir-per-sub when you need to fix multi-sub cancellation "
+            "at MLP. Requires solo measurements with phase data."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "measurements": {
+                    "type": "array",
+                    "description": (
+                        "List of solo measurements, one per sub. Each item: "
+                        "{session_id, output_index, label?}. session_id must "
+                        "have phase data."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": {"type": "integer"},
+                            "output_index": {"type": "integer"},
+                            "label": {"type": "string"},
+                        },
+                        "required": ["session_id", "output_index"],
+                    },
+                },
+                "target_curve": {
+                    "type": "object",
+                    "description": (
+                        "Target combined response at MLP. Points as absolute "
+                        "SPL across the focus band. Same shape as design_fir."
+                    ),
+                    "properties": {
+                        "points": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "freq": {"type": "number"},
+                                    "spl": {"type": "number"},
+                                },
+                            },
+                        },
+                    },
+                },
+                "num_taps": {
+                    "type": "integer",
+                    "description": "FIR length per sub. Default 4096.",
+                },
+                "phase_mode": {
+                    "type": "string",
+                    "enum": ["minimum", "linear", "mixed"],
+                    "description": (
+                        "mixed (recommended) = bounded pre-ringing for phase "
+                        "correction. linear = full phase, ~num_taps/2 latency. "
+                        "minimum = no phase coherence (equivalent to running "
+                        "design_fir per sub independently)."
+                    ),
+                },
+                "preringing_ms": {
+                    "type": "number",
+                    "description": "Mixed-phase only: pre-ring window ms. Default 20.",
+                },
+                "regularization_lambda": {
+                    "type": "number",
+                    "description": (
+                        "Wiener damping factor (linear amplitude). Lower = "
+                        "stronger correction at room nulls, more boost demanded. "
+                        "Higher = accept the null, less boost. Default 0.1 "
+                        "(~-20 dB null acceptance)."
+                    ),
+                },
+                "freq_focus_hz": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "[lo, hi] — correct only within this band.",
+                },
+                "return_coefficients": {
+                    "type": "boolean",
+                    "description": (
+                        "Return coeff arrays in response. Default false "
+                        "(use cache_ids + apply_fir(design_session_id=…))."
+                    ),
+                },
+            },
+            "required": ["measurements", "target_curve"],
+        },
+    ),
+    Tool(
         name="design_modal_fir",
         description=(
             "Active modal-cancellation FIR. Places anti-pulses one half-wavelength before the "
@@ -12373,6 +12611,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return_coefficients=bool(arguments.get("return_coefficients", True)),
             preringing_ms=float(arguments.get("preringing_ms", 25.0)),
             anchor=arguments.get("anchor"),
+        )
+    elif name == "design_fir_multi":
+        result = await _tool_design_fir_multi(
+            measurements=arguments["measurements"],
+            target_curve=arguments["target_curve"],
+            num_taps=int(arguments.get("num_taps", 4096)),
+            phase_mode=arguments.get("phase_mode", "mixed"),
+            preringing_ms=float(arguments.get("preringing_ms", 20.0)),
+            regularization_lambda=float(arguments.get("regularization_lambda", 0.1)),
+            freq_focus_hz=arguments.get("freq_focus_hz"),
+            return_coefficients=bool(arguments.get("return_coefficients", False)),
         )
     elif name == "design_modal_fir":
         result = await _tool_design_modal_fir(

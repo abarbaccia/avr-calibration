@@ -430,6 +430,7 @@ class MinidspDriver(DSPDriver):
                 "gain_db": self._output_gain.get(idx, 0.0),
                 "delay_ms": self._output_delay.get(idx, 0.0),
                 "polarity_inverted": self._output_polarity.get(idx, False),
+                "muted": self._output_muted.get(idx, False),
                 "fir_taps": len(self._fir_state.get(idx, [])),
             }
             for idx in range(4)

@@ -90,6 +90,7 @@ $SSH "sudo docker run -d \
     --network=host \
     --ipc=host \
     --privileged \
+    -e PYTHONDONTWRITEBYTECODE=1 \
     -v /run/user/1000:/run/user/1000 \
     -e XDG_RUNTIME_DIR=/run/user/1000 \
     -e PIPEWIRE_RUNTIME_DIR=/run/user/1000 \
@@ -97,7 +98,10 @@ $SSH "sudo docker run -d \
     -v \$HOME/.avr-calibration/entrypoint.sh:/entrypoint.sh:ro \
     -v /etc/asound.conf:/etc/asound.conf:ro \
     ${MOUNT_ARGS} \
-    ${IMAGE} && echo 'Container started.'"
+    --entrypoint sh \
+    ${IMAGE} \
+    -c 'find /opt/venv/lib/python3.11/site-packages/calibrate -name __pycache__ -exec rm -rf {} + 2>/dev/null; exec /entrypoint.sh' \
+    && echo 'Container started.'"
 
 # ── Follow logs ───────────────────────────────────────────────────────────────
 

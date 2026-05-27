@@ -79,6 +79,7 @@ class PreflightChecker:
             ("Output routing", self.check_output_routing_safety()),
             ("Audio stack", self.check_audio_stack_clean()),
             ("DSP persisted state", self.check_dsp_persisted_state()),
+            ("Loopback reference", self.check_loopback_reference()),
         ]
         names = [name for name, _ in checks]
         coros = [coro for _, coro in checks]
@@ -415,6 +416,48 @@ class PreflightChecker:
                 error=str(exc),
             )
 
+    async def check_loopback_reference(self) -> CheckResult:
+        """Verify a loopback reference is configured for deconvolution.
+
+        ⚠️  Without a loopback ref, the analytical sweep is used as the
+        deconvolution X. PipeWire schedules play and record streams
+        independently — the resulting jitter shows up as phase smear,
+        causing 4–10 dB run-to-run SPL variance and coherence collapse.
+        Documented in MEMORY (2026-05-27 baseline jitter investigation).
+        Fail-fast here so the operator can't accidentally run a cal session
+        on unrepeatable measurements.
+        """
+        meas = self.config.measurement
+        ref_node = meas.get("loopback_ref_pipewire_node")
+        ref_device = meas.get("loopback_ref_device")
+
+        if ref_node or ref_device:
+            ref_id = ref_node or ref_device
+            ref_ch_idx = int(meas.get("loopback_ref_channel_index", 1))
+            ref_chs = int(meas.get("loopback_ref_channels", 1))
+            return CheckResult(
+                name="Loopback reference",
+                passed=True,
+                detail=(
+                    f"enabled: {ref_id}, channels "
+                    f"{ref_ch_idx}..{ref_ch_idx + ref_chs - 1}"
+                ),
+            )
+
+        return CheckResult(
+            name="Loopback reference",
+            passed=False,
+            detail="",
+            error=(
+                "⚠️  LOOPBACK REFERENCE NOT CONFIGURED. Measurements will "
+                "have 4–10 dB run-to-run jitter and coherence collapse. "
+                "Filter A/B comparisons CANNOT be trusted. Set "
+                "measurement.loopback_ref_pipewire_node in config.yaml "
+                "(connections show inputs 4=FL, 5=FR are wired as loopback "
+                "taps on this rig)."
+            ),
+        )
+
     async def check_signal_path_sync(self) -> CheckResult:
         """Compare the configured signal path against the live device state.
 
@@ -547,10 +590,44 @@ class PreflightChecker:
         route = self.config.measurement.get("playback_route", "usb")
 
         if route == "hdmi":
+            # Also enumerate available PipeWire HDMI sinks so the operator can
+            # confirm hdmi_pipewire_node is set to a real node.
+            pw_nodes_detail = ""
+            hdmi_node = self.config.measurement.get("hdmi_pipewire_node") or ""
+            try:
+                import subprocess as _sp
+                # List PW nodes and pactl card profiles to show available HDMI configs
+                node_result = _sp.run(
+                    ["pw-cli", "list-objects", "PipeWire:Interface:Node"],
+                    capture_output=True, text=True, timeout=5.0,
+                )
+                node_raw = (node_result.stdout + node_result.stderr).strip()
+                hdmi_node_lines = [l.strip() for l in node_raw.splitlines()
+                                   if "hdmi" in l.lower() or "alsa_output" in l.lower()]
+
+                card_result = _sp.run(
+                    ["pactl", "list", "cards", "short"],
+                    capture_output=True, text=True, timeout=5.0,
+                )
+                card_raw = (card_result.stdout + card_result.stderr).strip()
+                hdmi_card_lines = [l.strip() for l in card_raw.splitlines()
+                                   if "hdmi" in l.lower() or "vc4" in l.lower()]
+
+                parts = []
+                if hdmi_node_lines:
+                    parts.append(f"nodes: {' | '.join(hdmi_node_lines[:8])}")
+                if hdmi_card_lines:
+                    parts.append(f"cards: {' | '.join(hdmi_card_lines[:4])}")
+                elif card_raw:
+                    parts.append(f"pactl cards: {card_raw[:200]}")
+                pw_nodes_detail = ("; " + "; ".join(parts)) if parts else "; pw-cli: no hdmi nodes found"
+            except Exception as _exc:
+                pw_nodes_detail = f"; pw node probe error: {_exc}"
+            configured = f" (configured: {hdmi_node})" if hdmi_node else " (hdmi_pipewire_node not set)"
             return CheckResult(
                 name="Denon AVR",
                 passed=True,
-                detail=f"{denon_result.detail}; HDMI playback ready",
+                detail=f"{denon_result.detail}; HDMI playback ready{configured}{pw_nodes_detail}",
             )
 
         # USB route: also verify the USB audio output device

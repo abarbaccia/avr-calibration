@@ -302,6 +302,34 @@ class TestDenonCheck:
         assert not result.passed
 
 
+# ── check_loopback_reference() ────────────────────────────────────────────────
+
+class TestCheckLoopbackReference:
+    async def test_fails_when_no_loopback_configured(self, config):
+        config._data.setdefault("measurement", {})["loopback_ref_pipewire_node"] = None
+        config._data.setdefault("measurement", {})["loopback_ref_device"] = None
+        result = await PreflightChecker(config).check_loopback_reference()
+        assert not result.passed
+        assert "LOOPBACK REFERENCE NOT CONFIGURED" in result.error
+
+    async def test_passes_when_pipewire_node_configured(self, config):
+        config._data.setdefault("measurement", {})["loopback_ref_pipewire_node"] = "scarlett_input"
+        config._data.setdefault("measurement", {})["loopback_ref_device"] = None
+        config._data.setdefault("measurement", {})["loopback_ref_channel_index"] = 4
+        config._data.setdefault("measurement", {})["loopback_ref_channels"] = 2
+        result = await PreflightChecker(config).check_loopback_reference()
+        assert result.passed
+        assert "scarlett_input" in result.detail
+        assert "4..5" in result.detail
+
+    async def test_passes_when_alsa_device_configured(self, config):
+        config._data.setdefault("measurement", {})["loopback_ref_pipewire_node"] = None
+        config._data.setdefault("measurement", {})["loopback_ref_device"] = "hw:1,0"
+        result = await PreflightChecker(config).check_loopback_reference()
+        assert result.passed
+        assert "hw:1,0" in result.detail
+
+
 # ── run_all() ────────────────────────────────────────────────────────────────
 
 class TestRunAll:
@@ -316,10 +344,11 @@ class TestRunAll:
             patch.object(checker, "check_output_routing_safety", return_value=CheckResult("Output routing", True, "not applicable")),
             patch.object(checker, "check_audio_stack_clean", return_value=CheckResult("Audio stack", True, "no PipeWire holders")),
             patch.object(checker, "check_dsp_persisted_state", return_value=CheckResult("DSP persisted state", True, "all defaults")),
+            patch.object(checker, "check_loopback_reference", return_value=CheckResult("Loopback reference", True, "enabled")),
         ):
             results = await checker.run_all()
         assert all(r.passed for r in results)
-        assert len(results) == 8
+        assert len(results) == 9
 
     async def test_unhandled_exception_becomes_failed_result(self, config):
         checker = PreflightChecker(config)
@@ -347,6 +376,7 @@ class TestRunAll:
             patch.object(checker, "check_output_routing_safety", side_effect=RuntimeError("err")),
             patch.object(checker, "check_audio_stack_clean", side_effect=RuntimeError("err")),
             patch.object(checker, "check_dsp_persisted_state", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_loopback_reference", side_effect=RuntimeError("err")),
         ):
             results = await checker.run_all()
         # DSP label now comes from the configured driver — "miniDSP 2x4 HD" for
@@ -354,6 +384,7 @@ class TestRunAll:
         assert [r.name for r in results] == [
             "Config", "Microphone", "miniDSP 2x4 HD", "Denon AVR", "Signal Path",
             "Output routing", "Audio stack", "DSP persisted state",
+            "Loopback reference",
         ]
 
     async def test_result_names_camilladsp_label(self, config):

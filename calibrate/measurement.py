@@ -759,6 +759,24 @@ class MeasurementEngine:
         loopback_ref_pw_node = cfg.get("loopback_ref_pipewire_node") or None
         loopback_ref_pw_channels = int(cfg.get("loopback_ref_pw_channels", 1))
 
+        # ⚠️  LOUD WARNING when running without a loopback reference.
+        # Empirically (2026-05-27) causes 4–10 dB run-to-run SPL jitter and
+        # collapses coherence, because PipeWire schedules play and record
+        # streams independently → analytical-sweep deconvolution sees
+        # per-stream jitter as phase smear. With loopback both reference and
+        # mic share the same scheduling regime so jitter is common-mode.
+        if not loopback_ref_pw_node and not loopback_ref_device:
+            warning_msg = (
+                "⚠️  LOOPBACK REFERENCE NOT CONFIGURED — measurement results "
+                "will NOT be repeatable (4–10 dB run-to-run SPL jitter, "
+                "coherence collapse). Filter A/B comparisons CANNOT be "
+                "trusted. Set measurement.loopback_ref_pipewire_node in "
+                "config.yaml to enable a recorded reference."
+            )
+            log.warning("=" * 78)
+            log.warning(warning_msg)
+            log.warning("=" * 78)
+
         usb_pipewire_node = cfg.get("usb_pipewire_node") or None
 
         if use_aplay_hdmi:

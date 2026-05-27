@@ -1392,11 +1392,11 @@ def test_camilladsp_output_state_shape_matches_minidsp_contract() -> None:
     assert set(state.keys()) == {0, 1, 2, 3}
     for per_out in state.values():
         assert set(per_out.keys()) == {
-            "gain_db", "delay_ms", "polarity_inverted", "fir_taps",
+            "gain_db", "delay_ms", "polarity_inverted", "muted", "fir_taps",
         }
         assert per_out == {
             "gain_db": 0.0, "delay_ms": 0.0,
-            "polarity_inverted": False, "fir_taps": 0,
+            "polarity_inverted": False, "muted": False, "fir_taps": 0,
         }
 
 

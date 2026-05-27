@@ -232,7 +232,7 @@ class _USBSweepContext:
         self._saved_gain: float | None = None
         self.active = False
 
-    async def __aenter__(self) -> "_USBSweepContext":
+    async def enter(self) -> "_USBSweepContext":
         sweep_gain = self._config.measurement.get("master_gain_db")
         if sweep_gain is not None:
             try:
@@ -249,7 +249,7 @@ class _USBSweepContext:
         self.active = True
         return self
 
-    async def __aexit__(self, *_) -> None:
+    async def exit(self) -> None:
         self.active = False
         if self._saved_gain is not None:
             try:
@@ -258,6 +258,12 @@ class _USBSweepContext:
             except Exception as exc:
                 log.warning("USB sweep: failed to restore master gain: %s", exc)
             self._saved_gain = None
+
+    async def __aenter__(self) -> "_USBSweepContext":
+        return await self.enter()
+
+    async def __aexit__(self, *_) -> None:
+        await self.exit()
 
 
 class CamillaDSPDriver(DSPDriver):
@@ -466,12 +472,17 @@ class CamillaDSPDriver(DSPDriver):
 
         Same shape as MinidspDriver.get_output_state. Covers the configured
         output channel count (default 10 for the 18i20 analog outs).
+
+        ``muted`` is surfaced because a muted output produces audible silence
+        but reads as ``gain_db: 0`` elsewhere — invisible mute caused a full
+        session of "measurement chain instability" debugging on 2026-05-27.
         """
         return {
             idx: {
                 "gain_db": self._output_gain.get(idx, 0.0),
                 "delay_ms": self._output_delay.get(idx, 0.0),
                 "polarity_inverted": self._output_polarity.get(idx, False),
+                "muted": self._output_muted.get(idx, False),
                 "fir_taps": len(self._fir_state.get(idx, [])),
             }
             for idx in range(self._output_channels)
