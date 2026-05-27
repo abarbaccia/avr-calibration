@@ -481,6 +481,8 @@ class HDMIPwCatPlayback:
         pipewire_node: str,
         channels: int = 6,
         capture_pipewire_node: str | None = None,
+        skip_warmup: bool = False,
+        host_pipewire_pid: int | None = None,
     ) -> None:
         if not pipewire_node:
             raise ValueError("HDMIPwCatPlayback requires a non-empty PipeWire node name")
@@ -489,6 +491,11 @@ class HDMIPwCatPlayback:
         self.pipewire_node = pipewire_node
         self.channels = int(channels)
         self.capture_pipewire_node = capture_pipewire_node
+        self.skip_warmup = skip_warmup
+        # When set, pw-cat is wrapped with nsenter --target <pid> so that the
+        # HOST's pw-cat binary (PW 1.2.7) runs instead of the container's older
+        # version (0.3.65 vs 1.2.7 client-server mismatch causes scheduling hangs).
+        self.host_pipewire_pid = host_pipewire_pid
 
     def play_and_record(self, sweep, sample_rate, in_channel, out_channel):
         import subprocess
@@ -522,8 +529,23 @@ class HDMIPwCatPlayback:
             6: "FL,FR,LFE,FC,RL,RR",
         }
         chmap_arg = chmap_for_channels.get(n_channels)
-        pw_cmd = [
-            "pw-cat",
+
+        # Build the pw-cat base command. If host_pipewire_pid is set, wrap with
+        # nsenter so the HOST's pw-cat (PW 1.2.7) runs instead of the container's
+        # older PW 0.3.65 — the version mismatch causes scheduling hangs when
+        # targeting a null sink that is part of CamillaDSP's hardware-clocked graph.
+        pw_cat_bin = "/usr/bin/pw-cat"  # host binary via nsenter mount namespace
+        if self.host_pipewire_pid:
+            pw_prefix = [
+                "nsenter",
+                f"--target={self.host_pipewire_pid}",
+                "--mount", "--net", "--uts", "--pid", "--",
+                pw_cat_bin,
+            ]
+        else:
+            pw_prefix = ["pw-cat"]
+
+        pw_cmd = pw_prefix + [
             "--playback",
             "--target", self.pipewire_node,
             "--channels", str(n_channels),
@@ -535,19 +557,26 @@ class HDMIPwCatPlayback:
         pw_cmd += ["-"]  # read PCM from stdin
 
         # Warm up AVR PCM detection before the recording starts.
-        # Send HDMI_WARMUP_S of silent PCM so the AVR locks and begins
-        # routing to the speakers.  This runs outside the recording window
-        # so the sweep is never shifted inside rec_array.
-        warmup_frames = int(self.HDMI_WARMUP_S * sample_rate)
-        warmup_bytes = np.zeros((warmup_frames, n_channels), dtype=np.int16).tobytes()
-        try:
-            wu = subprocess.Popen(
-                pw_cmd,
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            )
-            wu.communicate(input=warmup_bytes, timeout=self.HDMI_WARMUP_S + 5.0)
-        except Exception as _wu_exc:
-            log.warning("HDMIPwCatPlayback warmup failed (non-fatal): %s", _wu_exc)
+        # Skipped for null-sink (USB) targets — they need no AVR PCM lock time.
+        if not self.skip_warmup:
+            warmup_frames = int(self.HDMI_WARMUP_S * sample_rate)
+            warmup_bytes = np.zeros((warmup_frames, n_channels), dtype=np.int16).tobytes()
+            try:
+                wu = subprocess.Popen(
+                    pw_cmd,
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                try:
+                    wu.communicate(input=warmup_bytes, timeout=self.HDMI_WARMUP_S + 5.0)
+                except Exception:
+                    try:
+                        wu.kill()
+                        wu.communicate()
+                    except Exception:
+                        pass
+                    raise
+            except Exception as _wu_exc:
+                log.warning("HDMIPwCatPlayback warmup failed (non-fatal): %s", _wu_exc)
 
         sweep_1d = sweep.timeSignal[:, 0]
 
@@ -683,6 +712,134 @@ class HDMIPwCatPlayback:
 
 # Backward-compat alias — callers that still reference HDMIAplayPlayback by name keep working.
 HDMIAplayPlayback = HDMIPwCatPlayback
+
+
+class FIFOPlayback:
+    """Sweep playback via a host-side FIFO pipe.
+
+    Writes raw S16-LE interleaved PCM to a named pipe. The host
+    avr-sweep-player.service daemon reads from the pipe and plays via the
+    host's pw-cat (PW 1.2.7), bypassing the PW 0.3.65/1.2.7 version mismatch
+    that prevents the container from running pw-cat directly.
+
+    The write to the FIFO blocks at hardware rate because the daemon's pw-cat
+    consumes at 48 kHz.  This makes the FIFO write a natural playback-complete
+    synchronization point — no separate sleep or poll is needed.
+    """
+
+    PRE_DELAY_S: float = 1.0
+    POST_DELAY_S: float = 0.5
+    HDMI_WARMUP_S: float = 0.0  # null-sink path; no AVR PCM-lock warmup needed
+
+    def __init__(
+        self,
+        fifo_path: str,
+        channels: int = 2,
+        capture_pipewire_node: str | None = None,
+    ) -> None:
+        if not fifo_path:
+            raise ValueError("FIFOPlayback requires a non-empty fifo_path")
+        self.fifo_path = fifo_path
+        self.channels = int(channels)
+        self.capture_pipewire_node = capture_pipewire_node
+
+    def play_and_record(self, sweep, sample_rate, in_channel, out_channel):
+        import time as _time
+
+        import numpy as np
+
+        sweep_array = sweep.timeSignal[:, 0].astype(np.float32)
+        n_samples = len(sweep_array)
+        n_channels = self.channels  # avr_cal_sweep is stereo; cap at configured count
+
+        out_buf = np.zeros((n_samples, n_channels), dtype=np.int16)
+        ch_idx = min(out_channel - 1, n_channels - 1)
+        out_buf[:, ch_idx] = (np.clip(sweep_array, -1.0, 1.0) * 32767).astype(np.int16)
+        pcm_bytes = out_buf.tobytes()
+
+        pre_samples = int(self.PRE_DELAY_S * sample_rate)
+        post_samples = int(self.POST_DELAY_S * sample_rate)
+        rec_n = pre_samples + n_samples + post_samples
+
+        sweep_1d = sweep.timeSignal[:, 0]
+
+        if self.capture_pipewire_node:
+            rec_proc, chunks, reader_t = _start_pw_record(
+                self.capture_pipewire_node, sample_rate
+            )
+            try:
+                _time.sleep(self.PRE_DELAY_S)
+                # Write to FIFO — blocks at hardware rate as daemon consumes.
+                # open() blocks until the daemon's `cat` opens the read end;
+                # write() blocks per-quantum while avr_cal_sweep is clocked by
+                # the Scarlett hardware driver.
+                with open(self.fifo_path, "wb") as f:
+                    f.write(pcm_bytes)
+                _time.sleep(self.POST_DELAY_S)
+            finally:
+                _stop_pw_record(rec_proc, reader_t)
+            rec_1d = _assemble_pw_recording(chunks)
+            n_recorded = len(rec_1d)
+        else:
+            import sounddevice as sd
+
+            in_dev = int(sd.default.device[0])
+            rec_buf = np.zeros((rec_n, 1), dtype=np.float32)
+            rec_pos = [0]
+
+            def _rec_callback(indata, frames, time_info, status):
+                end = min(rec_pos[0] + frames, rec_n)
+                count = end - rec_pos[0]
+                if count > 0:
+                    rec_buf[rec_pos[0]:end] = indata[:count, in_channel - 1 : in_channel]
+                rec_pos[0] = end
+
+            in_stream = sd.InputStream(
+                device=in_dev,
+                samplerate=sample_rate,
+                channels=in_channel,
+                dtype="float32",
+                callback=_rec_callback,
+            )
+            try:
+                in_stream.start()
+                _time.sleep(self.PRE_DELAY_S)
+                with open(self.fifo_path, "wb") as f:
+                    f.write(pcm_bytes)
+                _time.sleep(self.POST_DELAY_S)
+                in_stream.stop()
+                in_stream.close()
+            except Exception as exc:
+                for attr in ("stop", "close"):
+                    try:
+                        getattr(in_stream, attr)()
+                    except Exception:
+                        pass
+                raise RuntimeError(f"Audio device error: {exc}") from exc
+            n_recorded = rec_pos[0]
+            rec_1d = rec_buf[:n_recorded, 0].astype(np.float64)
+
+        cap_info = self.capture_pipewire_node or "portaudio"
+        if len(rec_1d) > 0:
+            peak = float(np.max(np.abs(rec_1d)))
+            floor_n = min(int(0.5 * sample_rate), len(rec_1d) // 2)
+            floor_rms = float(np.sqrt(np.mean(rec_1d[:floor_n] ** 2)))
+            sig_rms = float(np.sqrt(np.mean(rec_1d[floor_n:] ** 2)))
+            log.info(
+                "FIFOPlayback: fifo=%s cap=%s ch=%d/%d pre=%.0fms n_sweep=%d "
+                "rec_n=%d n_recorded=%d peak=%.1f dBFS floor=%.1f dBFS "
+                "sig=%.1f dBFS SNR=%.1f dB",
+                self.fifo_path, cap_info, out_channel, n_channels,
+                self.PRE_DELAY_S * 1000, n_samples, rec_n, n_recorded,
+                20 * np.log10(peak + 1e-12),
+                20 * np.log10(floor_rms + 1e-12),
+                20 * np.log10(sig_rms + 1e-12),
+                20 * np.log10(sig_rms / (floor_rms + 1e-12)),
+            )
+        else:
+            log.warning("FIFOPlayback: recording is empty (0 samples) cap=%s", cap_info)
+
+        return sweep_1d, rec_1d
 
 
 class LoopbackRefPlayback:
@@ -961,6 +1118,8 @@ def playback_for_route(
     loopback_ref_channel_index: int = 1,
     loopback_ref_pipewire_node: str | None = None,
     loopback_ref_pw_channels: int = 1,
+    hdmi_skip_warmup: bool = False,
+    host_pipewire_pid: int | None = None,
 ) -> PlaybackStrategy:
     """Factory: return the right playback strategy for the configured route.
 
@@ -984,6 +1143,8 @@ def playback_for_route(
                 pipewire_node=node,
                 channels=hdmi_channels,
                 capture_pipewire_node=capture_pipewire_node,
+                skip_warmup=hdmi_skip_warmup,
+                host_pipewire_pid=host_pipewire_pid,
             )
         else:
             base = HDMIPlayback()

@@ -85,28 +85,39 @@ RUN set -e; \
     DEB_ARCH_EXPORT="$DEB_ARCH" MINIDSP_VERSION_EXPORT="$MINIDSP_VERSION" python3 -c "import urllib.request, subprocess, os; ver=os.environ['MINIDSP_VERSION_EXPORT']; arch=os.environ['DEB_ARCH_EXPORT']; url=f'https://github.com/mrene/minidsp-rs/releases/download/v{ver}/minidsp_{ver}-1_{arch}.deb'; urllib.request.urlretrieve(url, '/tmp/minidsp.deb'); subprocess.run(['dpkg','-x','/tmp/minidsp.deb','/tmp/minidsp-pkg'],check=True); os.rename('/tmp/minidsp-pkg/usr/bin/minidsp','/usr/local/bin/minidsp'); os.rename('/tmp/minidsp-pkg/usr/bin/minidspd','/usr/local/bin/minidspd'); os.chmod('/usr/local/bin/minidsp',0o755); os.chmod('/usr/local/bin/minidspd',0o755); os.remove('/tmp/minidsp.deb')"
 
 #
-# PipeWire client libs: required so PortAudio + ALSA inside the container
-# can route audio through the host's PipeWire graph (socket bind-mounted at
-# /run/user/1000 by the systemd unit). pipewire-alsa installs the
-# /usr/share/alsa/alsa.conf.d/50-pipewire.conf hook that makes the ALSA
-# `default` PCM go through PipeWire — that's how the USB-route sweep
-# reaches the `avr_cal_sweep` null sink → camilladsp_capture → subs.
+# PipeWire client libs: required so pw-cat/pw-record inside the container
+# can connect to the host's PipeWire graph (socket bind-mounted at
+# /run/user/1000). pipewire-alsa hooks the ALSA `default` PCM through PW.
 #
-# We install ONLY client libs. No daemon, no WirePlumber starts in here —
-# this container is a PipeWire client of the host daemon.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libportaudio2 \
-    libatlas3-base \
-    libopenblas0 \
-    libatomic1 \
-    libusb-1.0-0 \
-    alsa-utils \
-    pipewire \
-    libpipewire-0.3-0 \
-    libspa-0.2-modules \
-    pipewire-alsa \
-    pipewire-pulse \
-    libasound2-plugins \
+# On arm64 (Pi 5 target) we pull from the Raspberry Pi repo so the container
+# gets PipeWire 1.2.7, matching the host. Stock Bookworm has 0.3.65; the
+# client/server version mismatch causes pw-cat scheduling hangs when targeting
+# null sinks like avr_cal_sweep. On amd64 (developer builds) 0.3.65 is fine.
+#
+# We install ONLY client libs — no daemon, no WirePlumber in the container.
+RUN set -e; \
+    if [ "${TARGETARCH}" = "arm64" ]; then \
+        apt-get update -qq && apt-get install -y --no-install-recommends gnupg; \
+        python3 -c "import urllib.request; urllib.request.urlretrieve('https://archive.raspberrypi.com/debian/raspberrypi.gpg.key', '/tmp/rpi.key')"; \
+        gpg --dearmor < /tmp/rpi.key > /etc/apt/trusted.gpg.d/raspberrypi.gpg; \
+        rm /tmp/rpi.key; \
+        echo "deb http://archive.raspberrypi.com/debian bookworm main" \
+            > /etc/apt/sources.list.d/raspberrypi.list; \
+        apt-get purge -y gnupg && apt-get autoremove -y; \
+    fi; \
+    apt-get update && apt-get install -y --no-install-recommends \
+        libportaudio2 \
+        libatlas3-base \
+        libopenblas0 \
+        libatomic1 \
+        libusb-1.0-0 \
+        alsa-utils \
+        pipewire \
+        libpipewire-0.3-0 \
+        libspa-0.2-modules \
+        pipewire-alsa \
+        pipewire-pulse \
+        libasound2-plugins \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv

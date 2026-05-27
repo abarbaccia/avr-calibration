@@ -778,6 +778,18 @@ class MeasurementEngine:
             log.warning("=" * 78)
 
         usb_pipewire_node = cfg.get("usb_pipewire_node") or None
+        usb_sweep_fifo = cfg.get("usb_sweep_fifo") or None
+
+        # host_pipewire_pid_file / nsenter path kept for reference but superseded
+        # by the FIFO approach (usb_sweep_fifo).  nsenter doesn't work from a
+        # Docker container because the container's /proc doesn't expose host PIDs.
+        host_pw_pid: int | None = None
+        host_pw_pid_file = cfg.get("host_pipewire_pid_file") or None
+        if host_pw_pid_file:
+            try:
+                host_pw_pid = int(open(host_pw_pid_file).read().strip())
+            except Exception as _e:
+                log.warning("Could not read host_pipewire_pid_file %s: %s", host_pw_pid_file, _e)
 
         if use_aplay_hdmi:
             # Use PipeWire natively via pw-cat --target <node>.  The ALSA
@@ -805,11 +817,37 @@ class MeasurementEngine:
                 loopback_ref_pipewire_node=loopback_ref_pw_node,
                 loopback_ref_pw_channels=loopback_ref_pw_channels,
             )
+        elif usb_sweep_fifo:
+            # FIFO bridge: write PCM bytes to a named pipe; the host-side
+            # avr-sweep-player daemon reads and plays via pw-cat (PW 1.2.7).
+            # This bypasses the PW 0.3.65 vs 1.2.7 version mismatch that prevents
+            # the container from running pw-cat directly against avr_cal_sweep.
+            # The FIFO write blocks at hardware rate — natural sync, no extra sleep.
+            from .drivers.playback import FIFOPlayback, LoopbackRefPlayback
+            base: PlaybackStrategy = FIFOPlayback(
+                fifo_path=usb_sweep_fifo,
+                channels=2,
+                capture_pipewire_node=mic_pipewire_node,
+            )
+            if loopback_ref_pipewire_node is not None or loopback_ref_device is not None:
+                strategy = LoopbackRefPlayback(
+                    base=base,
+                    ref_device=loopback_ref_device or "",
+                    ref_channels=loopback_ref_channels,
+                    ref_channel_index=loopback_ref_channel_index,
+                    ref_pipewire_node=loopback_ref_pw_node,
+                    ref_pw_channels=loopback_ref_pw_channels,
+                )
+            else:
+                strategy = base
         elif usb_pipewire_node:
             # USB route targeting a PipeWire node (e.g. avr_cal_sweep null sink).
             # sounddevice/PortAudio cannot see PW virtual nodes, so use pw-cat
             # via the HDMI pw-cat path with the USB node as the target.
             # avr_cal_sweep is stereo — cap at 2 channels.
+            # skip_warmup=True: null sinks need no AVR PCM lock warmup.
+            # host_pw_pid: use nsenter so the HOST's pw-cat (1.2.7) runs instead
+            # of the container's 0.3.65 — version mismatch causes scheduling hangs.
             pw_channels = min(max(2, out_channel), 2)
             strategy = playback_for_route(
                 "hdmi",
@@ -821,6 +859,8 @@ class MeasurementEngine:
                 loopback_ref_channel_index=loopback_ref_channel_index,
                 loopback_ref_pipewire_node=loopback_ref_pw_node,
                 loopback_ref_pw_channels=loopback_ref_pw_channels,
+                hdmi_skip_warmup=True,
+                host_pipewire_pid=host_pw_pid,
             )
         else:
             strategy = playback_for_route(
