@@ -1512,6 +1512,92 @@ async def test_camilladsp_set_master_gain_dispatches_setvolume() -> None:
     driver._client.call.assert_awaited_once_with("SetVolume", -9.5)
 
 
+# ── _USBSweepContext ──────────────────────────────────────────────────────────
+
+from calibrate.drivers.camilladsp import _USBSweepContext, _NoOpSweepContext
+
+
+def _make_config_with_gain(gain_db):
+    from unittest.mock import MagicMock
+    cfg = MagicMock()
+    cfg.measurement.get.side_effect = lambda k, default=None: (
+        gain_db if k == "master_gain_db" else default
+    )
+    return cfg
+
+
+def _make_camilla_stub(gains_set, initial_volume=-20.0):
+    """Return a side_effect callable that stubs the CamillaDSP WS protocol."""
+    def _call(cmd, *args):
+        if cmd == "GetState":
+            return "Running"
+        if cmd == "GetVolume":
+            return initial_volume
+        if cmd == "GetMute":
+            return False
+        if cmd == "GetProcessingLoad":
+            return 0.0
+        if cmd == "SetVolume":
+            gains_set.append(args[0])
+            return None
+        return None
+    return _call
+
+
+@pytest.mark.asyncio
+async def test_usb_sweep_context_sets_and_restores_master_gain() -> None:
+    driver = CamillaDSPDriver()
+    gains_set = []
+
+    driver._client._ws = object()  # mark as connected
+    driver._client.call = AsyncMock(side_effect=_make_camilla_stub(gains_set))
+    cfg = _make_config_with_gain(-50.0)
+
+    ctx = _USBSweepContext(driver, cfg)
+    async with ctx:
+        assert ctx.active is True
+
+    # Should have set -50.0 on enter, then restored -20.0 on exit
+    assert gains_set == [-50.0, -20.0]
+    assert ctx.active is False
+
+
+@pytest.mark.asyncio
+async def test_usb_sweep_context_restores_on_exception() -> None:
+    driver = CamillaDSPDriver()
+    gains_set = []
+
+    driver._client._ws = object()
+    driver._client.call = AsyncMock(side_effect=_make_camilla_stub(gains_set))
+    cfg = _make_config_with_gain(-50.0)
+
+    ctx = _USBSweepContext(driver, cfg)
+    try:
+        async with ctx:
+            raise RuntimeError("simulated sweep failure")
+    except RuntimeError:
+        pass
+
+    assert gains_set == [-50.0, -20.0]
+
+
+def test_camilladsp_sweep_context_returns_usb_context_when_gain_configured() -> None:
+    from calibrate.drivers.camilladsp import _USBSweepContext
+    driver = CamillaDSPDriver()
+    cfg = _make_config_with_gain(-50.0)
+    ctx = driver.sweep_context(cfg)
+    assert isinstance(ctx, _USBSweepContext)
+
+
+def test_camilladsp_sweep_context_returns_noop_when_no_gain_configured() -> None:
+    driver = CamillaDSPDriver()
+    from unittest.mock import MagicMock
+    cfg = MagicMock()
+    cfg.measurement.get.side_effect = lambda k, default=None: default
+    ctx = driver.sweep_context(cfg)
+    assert isinstance(ctx, _NoOpSweepContext)
+
+
 # ── _CamillaWSClient ──────────────────────────────────────────────────────────
 
 

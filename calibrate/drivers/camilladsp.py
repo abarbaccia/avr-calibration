@@ -218,6 +218,48 @@ class _NoOpSweepContext:
         await self.exit()
 
 
+class _USBSweepContext:
+    """USB-route sweep context that applies a configured master gain for measurement.
+
+    CamillaDSP's operating volume (master_gain_db in config) is set before
+    each USB sweep and restored afterward.  Without this the sweep runs at
+    whatever volume was last set, which is typically the loud listening level.
+    """
+
+    def __init__(self, driver, config) -> None:
+        self._driver = driver
+        self._config = config
+        self._saved_gain: float | None = None
+        self.active = False
+
+    async def __aenter__(self) -> "_USBSweepContext":
+        sweep_gain = self._config.measurement.get("master_gain_db")
+        if sweep_gain is not None:
+            try:
+                state = await self._driver.get_state()
+                self._saved_gain = float(state.get("volume", 0.0) or 0.0)
+                log.info(
+                    "USB sweep: master gain %.1f dB (was %.1f dB)",
+                    float(sweep_gain), self._saved_gain,
+                )
+                await self._driver.set_master_gain(float(sweep_gain))
+            except Exception as exc:
+                log.warning("USB sweep: failed to set master gain: %s", exc)
+                self._saved_gain = None
+        self.active = True
+        return self
+
+    async def __aexit__(self, *_) -> None:
+        self.active = False
+        if self._saved_gain is not None:
+            try:
+                await self._driver.set_master_gain(self._saved_gain)
+                log.info("USB sweep: restored master gain to %.1f dB", self._saved_gain)
+            except Exception as exc:
+                log.warning("USB sweep: failed to restore master gain: %s", exc)
+            self._saved_gain = None
+
+
 class CamillaDSPDriver(DSPDriver):
     """DSPDriver for CamillaDSP via its websocket control API.
 
@@ -1128,15 +1170,18 @@ class CamillaDSPDriver(DSPDriver):
     def sweep_context(self, config):
         """Return an async context manager that prepares CamillaDSP for a sweep.
 
-        USB route: no-op — CamillaDSP captures directly from the USB DAC, no
-        bridge or loopback priming required.
+        USB route: applies ``master_gain_db`` from config for sweep duration,
+        then restores the previous volume.  Without this the sweep runs at
+        whatever listening volume was last set.
 
-        HDMI route: returns a ``DSPHDMISweepContext`` for master-gain management.
+        HDMI route: returns a ``DSPHDMISweepContext`` for source + gain management.
         """
         from .dsp_driver import DSPHDMISweepContext
         route = config.measurement.get("playback_route", "usb")
         if route == "hdmi":
             return DSPHDMISweepContext(self, config)
+        if config.measurement.get("master_gain_db") is not None:
+            return _USBSweepContext(self, config)
         return _NoOpSweepContext()
 
     async def pipeline_state(self) -> str:
