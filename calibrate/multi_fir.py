@@ -143,21 +143,35 @@ def design_multi_input_fir(
     # Per-sub allocation
     T_per_sub = T_complex / n_subs
 
-    # Compute K_i for each sub
-    fir_list: list[np.ndarray] = []
-    contribution_db_list: list[np.ndarray] = []
+    # ── Phase 1: compute ideal K_i and pre-IFFT each one ──
+    # We need a UNIFIED time-domain rotation across all subs so they
+    # remain phase-coherent after realization. Per-sub rotation would
+    # introduce per-sub linear phase shifts that break the coherent-sum
+    # property we designed into the complex K_i.
+    K_full_list = []
+    k_full_list = []
     for H_i in H_complex:
         H_mag_sq = np.abs(H_i) ** 2
-        # Regularized Wiener inverse — note this is COMPLEX
-        # K_i = T_per_sub · conj(H_i) / (|H_i|² + λ²)
-        # When applied: K_i · H_i = T_per_sub · |H_i|² / (|H_i|² + λ²)
-        # The phase of K_i·H_i = phase of T_per_sub (= target phase).
         K_i = T_per_sub * np.conj(H_i) / (H_mag_sq + regularization_lambda ** 2)
+        K_i_full = np.where(in_band, K_i, 0.0 + 0j)
+        K_full_list.append(K_i_full)
+        k_full_list.append(np.fft.irfft(K_i_full, n=n_fft))
 
-        # Outside focus band: unity passthrough (no correction applied).
-        K_i_full = np.where(in_band, K_i, 1.0 + 0j)
+    # Choose a single rotation amount: the maximum peak across all subs.
+    # This guarantees every sub's impulse fits within the FIR window after
+    # the same rotation, AND keeps the relative phase alignment intact.
+    peak_indices = [int(np.argmax(np.abs(k))) for k in k_full_list]
+    # If any peak is in the "wrap" region (high index = negative time),
+    # interpret it as a negative shift; pick rotation that puts the
+    # maximum-positive-time peak at the target center.
+    target_center = n_fft // 2
+    common_rotation = target_center - max(peak_indices)
 
-        # Track per-sub acoustic contribution magnitude for predicted output
+    # ── Phase 2: realize each FIR via shared rotation, window, truncate ──
+    fir_list: list[np.ndarray] = []
+    contribution_db_list: list[np.ndarray] = []
+    for K_i_full, k_full, H_i in zip(K_full_list, k_full_list, H_complex):
+        # Track ideal per-sub acoustic contribution magnitude for predicted output
         contribution_at_mic = K_i_full * H_i
         contribution_db_list.append(
             20 * np.log10(np.abs(contribution_at_mic) + 1e-12)
@@ -180,69 +194,55 @@ def design_multi_input_fir(
             K_min = np.abs(K_i_full) * np.exp(1j * mp_phase)
             k_td = np.fft.irfft(K_min, n=n_fft)[:num_taps]
         else:
-            # linear or mixed: preserve K_i's complex phase, add bulk delay
-            # to make it causal, window in time domain.
+            # linear / mixed: preserve K_i's complex phase.
+            # Apply the SAME rotation across all subs (common_rotation,
+            # chosen above to put the largest peak at target_center). This
+            # preserves the inter-sub phase relationship that the complex
+            # K_i was designed to produce coherent summing at MLP.
+            k_centered = np.roll(k_full, common_rotation)
+
             if phase_mode == "linear":
-                # Place impulse at the midpoint of the FIR window.
-                # Maximum allowable pre-ringing = num_taps/2 samples.
-                bulk_delay_samples = num_taps // 2
+                half = num_taps // 2
             else:
-                # mixed: limit pre-ringing to preringing_ms.
-                bulk_delay_samples = int(preringing_ms / 1000 * sample_rate)
+                # mixed: keep only preringing_ms before the peak, rest after
+                pre_samples = int(preringing_ms / 1000 * sample_rate)
+                half = min(pre_samples, num_taps // 2)
 
-            # Apply linear-phase delay to K_i (shift impulse forward in time).
-            phase_shift = -2 * math.pi * freqs_out * bulk_delay_samples / sample_rate
-            K_shifted = K_i_full * np.exp(1j * phase_shift)
-
-            # IFFT to time domain
-            k_full = np.fft.irfft(K_shifted, n=n_fft)
-
-            # Extract num_taps samples centered on bulk_delay_samples
-            # (where the impulse should now be).
-            half = num_taps // 2
-            start = bulk_delay_samples - half
+            start = target_center - half
             end = start + num_taps
-            # Clamp to FFT bounds
-            if start < 0:
-                k_td = np.concatenate([
-                    np.zeros(-start),
-                    k_full[0:end],
-                ])
-            elif end > n_fft:
-                k_td = np.concatenate([
-                    k_full[start:n_fft],
-                    np.zeros(end - n_fft),
-                ])
-            else:
-                k_td = k_full[start:end]
+            k_td = k_centered[start:end].copy()
 
-            # Apply a soft window to suppress edge truncation ringing.
-            # Tukey window (cosine taper) preserves the central impulse
-            # better than full Hanning, which would attenuate the peak.
-            try:
-                from scipy.signal.windows import tukey
-                window = tukey(num_taps, alpha=0.25)
-            except Exception:
-                # Fall back to a simple cosine taper on edges only
-                taper_len = max(1, num_taps // 8)
-                window = np.ones(num_taps)
-                edge = 0.5 * (1 - np.cos(np.pi * np.arange(taper_len) / taper_len))
-                window[:taper_len] = edge
-                window[-taper_len:] = edge[::-1]
+            # Soft cosine taper at the edges only (preserve central impulse).
+            # Short taper (1/32 of FIR length) to avoid attenuating the
+            # impulse tails — those tails carry LOW-frequency response
+            # information, so an aggressive taper kills the bottom octave.
+            taper_len = max(1, num_taps // 32)
+            window = np.ones(num_taps)
+            edge = 0.5 * (1 - np.cos(np.pi * np.arange(taper_len) / taper_len))
+            window[:taper_len] = edge
+            window[-taper_len:] = edge[::-1]
             k_td = k_td * window
 
         fir_list.append(k_td)
 
-    # Unified peak normalization across ALL FIRs.
-    # CamillaDSP requires each FIR's peak coefficient ≤ 1.0, but per-sub
-    # normalization would scale each FIR independently — breaking the
-    # relative magnitudes that produce coherent sum at MLP. Use a single
-    # scale factor across all subs so the inter-sub relationship is
-    # preserved; the caller can compensate with master gain if needed.
+    # Conditional unified peak normalization.
+    # CamillaDSP requires each coefficient |c| ≤ 1.0 — but only normalize
+    # if peak EXCEEDS 1.0. Unconditional scaling (peak → 1) when peak < 1
+    # inflates the gain to bizarre levels (in earlier iterations we saw
+    # combined output at +50 dB above target because the bandpass impulse's
+    # natural peak ~0.005 was being scaled up 200x). The natural magnitude
+    # of K_i already gives the correct frequency response for coherent sum;
+    # don't change it unless we have to.
+    #
+    # When normalizing, use a UNIFIED factor across all FIRs to preserve
+    # inter-sub relative magnitudes (per-sub normalization would break the
+    # coherent-sum math).
     global_peak = max(float(np.max(np.abs(fir))) for fir in fir_list)
-    if global_peak > 0:
+    if global_peak > 1.0:
         fir_list = [fir / global_peak for fir in fir_list]
-    output_gain_db = round(-20 * math.log10(global_peak) if global_peak > 0 else 0.0, 2)
+        output_gain_db = round(-20 * math.log10(global_peak), 2)
+    else:
+        output_gain_db = 0.0
 
     # Predicted combined response = sum of K_actual_i · H_i across freq bins,
     # computed from the post-normalization, post-truncation FIRs so the
