@@ -4079,6 +4079,9 @@ async def _tool_design_fir_multi(
     regularization_lambda: float = 0.1,
     freq_focus_hz: list[float] | None = None,
     return_coefficients: bool = False,
+    modal_intents: list[dict] | None = None,
+    modal_taps: int | None = None,
+    gabor_n_cycles: int = 1,
 ) -> dict:
     """Coherent multi-sub FIR design — N FIRs that sum to target at MLP.
 
@@ -4155,6 +4158,9 @@ async def _tool_design_fir_multi(
             preringing_ms=preringing_ms,
             regularization_lambda=regularization_lambda,
             freq_focus_hz=focus,
+            modal_intents=modal_intents or None,
+            modal_taps=modal_taps,
+            gabor_n_cycles=int(gabor_n_cycles),
         )
 
         # Cache each FIR keyed by a synthetic id so apply_fir(design_session_id=...) works
@@ -4173,6 +4179,7 @@ async def _tool_design_fir_multi(
             "phase_mode": result["phase_mode"],
             "regularization_lambda": result["regularization_lambda"],
             "latency_ms": result["latency_ms"],
+            "modal_pre_delay_ms": result.get("modal_pre_delay_ms", 0.0),
             "predicted_combined": result["predicted_combined"],
             "predicted_per_sub": result["predicted_per_sub"],
             "per_sub_peak_boost_db": result["per_sub_peak_boost_db"],
@@ -11530,6 +11537,42 @@ _TOOLS: list[Tool] = [
                         "(use cache_ids + apply_fir(design_session_id=…))."
                     ),
                 },
+                "modal_intents": {
+                    "type": "array",
+                    "description": (
+                        "Optional modal anti-pulse intents to combine with the per-sub "
+                        "magnitude FIRs. Each: {freq_hz, treatment='anti_pulse', "
+                        "cancel_strength?, bp_q?, peak_db?}. The shared anti-pulse FIR "
+                        "is convolved with each per-sub Wiener FIR into a single "
+                        "combined FIR per output — no extra FIR slot needed."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "freq_hz": {"type": "number"},
+                            "treatment": {"type": "string", "enum": ["anti_pulse", "skip"]},
+                            "cancel_strength": {"type": "number"},
+                            "bp_q": {"type": "number"},
+                            "peak_db": {"type": "number"},
+                        },
+                        "required": ["freq_hz", "treatment"],
+                    },
+                },
+                "modal_taps": {
+                    "type": "integer",
+                    "description": (
+                        "Tap budget for the modal FIR. Defaults to auto-size from mode "
+                        "frequencies. Total output taps = num_taps; magnitude FIR gets "
+                        "num_taps - modal_taps + 1 taps."
+                    ),
+                },
+                "gabor_n_cycles": {
+                    "type": "integer",
+                    "default": 1,
+                    "minimum": 1,
+                    "maximum": 6,
+                    "description": "Gabor envelope cycles for anti-pulses. Default 1 (no trailing truncation).",
+                },
             },
             "required": ["measurements", "target_curve"],
         },
@@ -12629,6 +12672,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             regularization_lambda=float(arguments.get("regularization_lambda", 0.1)),
             freq_focus_hz=arguments.get("freq_focus_hz"),
             return_coefficients=bool(arguments.get("return_coefficients", False)),
+            modal_intents=arguments.get("modal_intents"),
+            modal_taps=int(arguments["modal_taps"]) if arguments.get("modal_taps") is not None else None,
+            gabor_n_cycles=int(arguments.get("gabor_n_cycles", 1)),
         )
     elif name == "design_modal_fir":
         result = await _tool_design_modal_fir(

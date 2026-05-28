@@ -72,6 +72,69 @@ def _min_phase_from_magnitude(mag_db, np_):
     return min_phase_full[:n]
 
 
+def _build_anti_pulse_fir(
+    modal_intents: list[dict],
+    sample_rate: int,
+    n_taps: int,
+    gabor_n_cycles: int = 1,
+) -> "np.ndarray":
+    """Build a shared anti-pulse FIR: [anti-pulses ... main-delta ... zeros].
+
+    Each intent dict: {freq_hz, treatment, cancel_strength?, bp_q?, peak_db?}
+    Only 'anti_pulse' treatment entries are processed.
+
+    Returns n_taps coefficients with the main delta at pre_samples and
+    anti-pulses placed half-cycle earlier. Convolving any per-sub FIR with
+    this produces a combined FIR that corrects both magnitude and modal T60.
+    """
+    import numpy as np
+    from calibrate.modal_fir import design_anti_pulse
+
+    anti_intents = [i for i in modal_intents if i.get("treatment") == "anti_pulse"]
+    if not anti_intents:
+        fir = np.zeros(n_taps, dtype=np.float64)
+        fir[0] = 1.0
+        return fir
+
+    # Pre-ring budget: must be >= T/2 + Gabor_half for the lowest-freq mode.
+    # With n_cycles=1 this is exactly T, so pre_samples >= T.
+    min_needed_ms = max(
+        (0.5 + 0.5 * gabor_n_cycles) * 1000.0 / float(i["freq_hz"])
+        for i in anti_intents
+    )
+    pre_samples = min(int(math.ceil(min_needed_ms * sample_rate / 1000)), n_taps - 1)
+
+    fir = np.zeros(n_taps, dtype=np.float64)
+
+    for intent in anti_intents:
+        freq = float(intent["freq_hz"])
+        cancel_strength = float(intent.get("cancel_strength", 0.5))
+        bp_q = float(intent.get("bp_q", 1.5))
+        peak_db = float(intent.get("peak_db", 6.0))
+
+        anti = design_anti_pulse(
+            freq_hz=freq,
+            peak_db=peak_db,
+            cancel_strength=cancel_strength,
+            sample_rate=sample_rate,
+            bp_q=bp_q,
+            envelope="gabor",
+            n_cycles=gabor_n_cycles,
+        )
+        half_cycle = int(0.5 * sample_rate / freq)
+        anti_center = pre_samples - half_cycle
+        start_unclamped = anti_center - len(anti) // 2
+        anti_offset = max(0, -start_unclamped)
+        start = max(0, start_unclamped)
+        end = min(start + len(anti) - anti_offset, pre_samples)
+        segment = anti[anti_offset: anti_offset + (end - start)]
+        fir[start:end] += segment
+
+    # Main impulse (delta) at pre_samples
+    fir[pre_samples] += 1.0
+    return fir
+
+
 def design_multi_input_fir(
     measurements: Sequence[SubMeasurement],
     target_points: Sequence[tuple[float, float]],
@@ -82,8 +145,17 @@ def design_multi_input_fir(
     preringing_ms: float = 20.0,
     regularization_lambda: float = 0.1,
     freq_focus_hz: tuple[float, float] | None = None,
+    modal_intents: list[dict] | None = None,
+    modal_taps: int | None = None,
+    gabor_n_cycles: int = 1,
 ) -> dict:
     """Design FIRs for N subs to achieve coherent target sum at MLP.
+
+    Optionally includes modal anti-pulse correction: if modal_intents is
+    provided, a shared anti-pulse FIR is built (one half-wavelength before
+    the main impulse per mode) and convolved with each per-sub FIR.  The
+    total tap budget is split as: magnitude_taps = num_taps - modal_taps + 1,
+    modal_taps = modal_taps (default auto-sized from mode frequencies).
 
     Returns dict with:
         firs:                list[list[float]]  — one FIR per sub, peak-normalized
@@ -91,6 +163,7 @@ def design_multi_input_fir(
         predicted_combined:  1/3-octave band SPL of coherent sum
         per_sub_peak_boost:  max dB boost per sub (for safety check by caller)
         latency_ms:          effective latency of the design
+        modal_pre_delay_ms:  pre-ring from anti-pulses (0 if no modal_intents)
     """
     import numpy as np
 
@@ -100,7 +173,44 @@ def design_multi_input_fir(
     if phase_mode not in ("minimum", "linear", "mixed"):
         raise ValueError(f"phase_mode must be minimum/linear/mixed, got {phase_mode!r}")
 
-    n_fft = max(num_taps * 4, 16384)
+    # When modal_intents are provided, split the tap budget between the
+    # per-sub Wiener FIR and the shared anti-pulse FIR so that after
+    # convolution the total stays within num_taps.
+    modal_pre_delay_ms = 0.0
+    _modal_fir_arr = None
+    if modal_intents:
+        anti_intents = [i for i in modal_intents if i.get("treatment") == "anti_pulse"]
+        if anti_intents:
+            if modal_taps is None:
+                # Auto-size: need at least pre_samples + a few hundred samples tail.
+                min_needed_ms = max(
+                    (0.5 + 0.5 * gabor_n_cycles) * 1000.0 / float(i["freq_hz"])
+                    for i in anti_intents
+                )
+                pre_s = int(math.ceil(min_needed_ms * sample_rate / 1000))
+                modal_taps = min(max(pre_s + 512, 2048), num_taps // 2)
+            mag_taps = num_taps - modal_taps + 1
+            if mag_taps < 256:
+                raise ValueError(
+                    f"modal_taps={modal_taps} leaves only {mag_taps} taps for "
+                    f"magnitude FIR (num_taps={num_taps}). Increase num_taps or reduce modal_taps."
+                )
+            _modal_fir_arr = _build_anti_pulse_fir(
+                modal_intents, sample_rate, modal_taps, gabor_n_cycles
+            )
+            # Pre-delay from the anti-pulse FIR = position of the main delta
+            anti_only = [i for i in modal_intents if i.get("treatment") == "anti_pulse"]
+            _modal_pre_ms = max(
+                (0.5 + 0.5 * gabor_n_cycles) * 1000.0 / float(i["freq_hz"])
+                for i in anti_only
+            )
+            modal_pre_delay_ms = round(_modal_pre_ms, 2)
+        else:
+            mag_taps = num_taps
+    else:
+        mag_taps = num_taps
+
+    n_fft = max(mag_taps * 4, 16384)
     freqs_out = np.fft.rfftfreq(n_fft, d=1.0 / sample_rate)
 
     # Interpolate each measurement onto the FFT grid
@@ -192,7 +302,7 @@ def design_multi_input_fir(
             mag_db = 20 * np.log10(np.abs(K_i_full) + 1e-12)
             mp_phase = _min_phase_from_magnitude(mag_db, np)
             K_min = np.abs(K_i_full) * np.exp(1j * mp_phase)
-            k_td = np.fft.irfft(K_min, n=n_fft)[:num_taps]
+            k_td = np.fft.irfft(K_min, n=n_fft)[:mag_taps]
         else:
             # linear / mixed: preserve K_i's complex phase.
             # Apply the SAME rotation across all subs (common_rotation,
@@ -202,28 +312,38 @@ def design_multi_input_fir(
             k_centered = np.roll(k_full, common_rotation)
 
             if phase_mode == "linear":
-                half = num_taps // 2
+                half = mag_taps // 2
             else:
                 # mixed: keep only preringing_ms before the peak, rest after
                 pre_samples = int(preringing_ms / 1000 * sample_rate)
-                half = min(pre_samples, num_taps // 2)
+                half = min(pre_samples, mag_taps // 2)
 
             start = target_center - half
-            end = start + num_taps
+            end = start + mag_taps
             k_td = k_centered[start:end].copy()
 
             # Soft cosine taper at the edges only (preserve central impulse).
             # Short taper (1/32 of FIR length) to avoid attenuating the
             # impulse tails — those tails carry LOW-frequency response
             # information, so an aggressive taper kills the bottom octave.
-            taper_len = max(1, num_taps // 32)
-            window = np.ones(num_taps)
+            taper_len = max(1, mag_taps // 32)
+            window = np.ones(mag_taps)
             edge = 0.5 * (1 - np.cos(np.pi * np.arange(taper_len) / taper_len))
             window[:taper_len] = edge
             window[-taper_len:] = edge[::-1]
             k_td = k_td * window
 
         fir_list.append(k_td)
+
+    # ── Modal convolution: convolve each per-sub FIR with the shared anti-pulse FIR ──
+    if _modal_fir_arr is not None:
+        convolved = []
+        for fir_td in fir_list:
+            conv = np.convolve(fir_td, _modal_fir_arr)[:num_taps]
+            if len(conv) < num_taps:
+                conv = np.pad(conv, (0, num_taps - len(conv)))
+            convolved.append(conv)
+        fir_list = convolved
 
     # Conditional unified peak normalization.
     # CamillaDSP requires each coefficient |c| ≤ 1.0 — but only normalize
@@ -322,4 +442,5 @@ def design_multi_input_fir(
         "per_sub_peak_boost_db": per_sub_peak_boost,
         "output_gain_db": output_gain_db,
         "latency_ms": latency_ms,
+        "modal_pre_delay_ms": modal_pre_delay_ms,
     }
