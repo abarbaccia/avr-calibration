@@ -11635,9 +11635,9 @@ _TOOLS: list[Tool] = [
                 },
                 "gabor_n_cycles": {
                     "type": "integer",
-                    "description": "Gabor envelope cycles. Default 3. Reduce to 2 to save pre-ring budget; wider spectral skirt. Raise to 4 for stricter confinement.",
-                    "default": 3,
-                    "minimum": 2,
+                    "description": "Gabor envelope cycles. Default 1 (recommended). n_cycles=1 avoids trailing truncation — the Gabor fits entirely before the main impulse. Higher values clip the trailing half, breaking the -π cancellation phase and amplifying modes instead of cancelling them.",
+                    "default": 1,
+                    "minimum": 1,
                     "maximum": 6,
                 },
                 "skip_freqs_hz": {
