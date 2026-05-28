@@ -477,3 +477,117 @@ def design_multi_input_fir(
         "latency_ms": latency_ms,
         "modal_pre_delay_ms": modal_pre_delay_ms,
     }
+
+
+def design_fir_multi_modal(
+    measurements: Sequence[SubMeasurement],
+    target_points: Sequence[tuple[float, float]],
+    modal_intents: list[dict],
+    *,
+    sample_rate: int = 48000,
+    num_taps: int = 24576,
+    phase_mode: str = "minimum",
+    regularization_lambda: float = 0.1,
+    freq_focus_hz: tuple[float, float] | None = None,
+    gabor_n_cycles: int = 1,
+) -> dict:
+    """Design per-sub FIRs combining Wiener magnitude correction with modal
+    anti-pulse T60 correction — the correct Trinnov-style architecture.
+
+    Architecture (anti-pulse BEFORE Wiener main impulse in same buffer):
+      fir[0..pre_samples-1]   = Gabor anti-pulses (T60 cancellation)
+      fir[pre_samples..]      = min-phase Wiener magnitude correction
+
+    This is correct because anti-pulses are a TIME-DOMAIN technique: the
+    pulse arrives T/2 before the room excitation and creates destructive
+    interference at the mode frequency via the room's own T60 decay.
+    Convolving them as separate FIRs breaks this (see block in design_fir_multi).
+
+    The tap budget is split: mag_taps = num_taps - pre_samples, where
+    pre_samples is auto-sized from the lowest-frequency anti_pulse mode.
+    """
+    import math
+    import numpy as np
+    from calibrate.modal_fir import ModalAwareFIRDesigner, ModeIntent
+
+    # Validate modal_intents
+    anti_intents_raw = [i for i in modal_intents if i.get("treatment") == "anti_pulse"]
+    if not anti_intents_raw:
+        # No anti-pulses — fall back to plain multi-sub Wiener design
+        return design_multi_input_fir(
+            measurements, target_points,
+            sample_rate=sample_rate, num_taps=num_taps,
+            phase_mode=phase_mode, regularization_lambda=regularization_lambda,
+            freq_focus_hz=freq_focus_hz,
+        )
+
+    # Compute pre-ring budget from the lowest-frequency anti-pulse mode
+    min_needed_ms = max(
+        (0.5 + 0.5 * gabor_n_cycles) * 1000.0 / float(i["freq_hz"])
+        for i in anti_intents_raw
+    )
+    pre_samples = math.ceil(min_needed_ms * sample_rate / 1000)
+    mag_taps = num_taps - pre_samples
+    if mag_taps < 512:
+        raise ValueError(
+            f"pre_samples={pre_samples} leaves only {mag_taps} taps for Wiener "
+            f"magnitude correction (num_taps={num_taps}). Increase num_taps."
+        )
+
+    # Step 1 — design per-sub Wiener magnitude FIRs with reduced tap budget
+    wiener = design_multi_input_fir(
+        measurements, target_points,
+        sample_rate=sample_rate, num_taps=mag_taps,
+        phase_mode=phase_mode, regularization_lambda=regularization_lambda,
+        freq_focus_hz=freq_focus_hz,
+    )
+
+    # Convert modal_intents dicts → ModeIntent objects
+    mode_intents = [
+        ModeIntent(
+            freq_hz=float(d["freq_hz"]),
+            t60_ms=float(d.get("t60_ms", 1000.0)),
+            peak_db=float(d.get("peak_db", 6.0)),
+            treatment=d["treatment"],
+            cancel_strength=float(d.get("cancel_strength", 0.5)),
+            bp_q=float(d.get("bp_q", 1.5)),
+        )
+        for d in modal_intents
+    ]
+
+    # Step 2 — for each sub, use ModalAwareFIRDesigner to place anti-pulses
+    # BEFORE the Wiener FIR's main impulse in the same time-domain buffer.
+    # ModalAwareFIRDesigner.design() converts base_correction to min-phase
+    # and places it at fir[pre_samples:]; anti-pulses go at fir[0:pre_samples].
+    combined_firs: list[list[float]] = []
+    modal_notes: list[str] = []
+    designer = ModalAwareFIRDesigner(
+        sample_rate=sample_rate,
+        n_taps=num_taps,
+        max_pre_ring_ms=min_needed_ms * 1.05,
+    )
+    for wiener_taps in wiener["firs"]:
+        fir_taps, summary = designer.design(
+            decay_modes=[],          # explicit intents provided
+            base_correction=wiener_taps,
+            intents=mode_intents,
+            gabor_n_cycles=gabor_n_cycles,
+        )
+        combined_firs.append(fir_taps)
+        modal_notes.extend(summary.notes)
+
+    return {
+        "firs": combined_firs,
+        "num_subs": wiener["num_subs"],
+        "num_taps": num_taps,
+        "sample_rate": sample_rate,
+        "phase_mode": phase_mode,
+        "regularization_lambda": regularization_lambda,
+        "predicted_combined": wiener["predicted_combined"],
+        "predicted_per_sub": wiener["predicted_per_sub"],
+        "per_sub_peak_boost_db": wiener["per_sub_peak_boost_db"],
+        "output_gain_db": wiener.get("output_gain_db", 0.0),
+        "latency_ms": round(pre_samples / sample_rate * 1000, 2),
+        "modal_pre_delay_ms": round(min_needed_ms, 2),
+        "modal_notes": modal_notes,
+    }

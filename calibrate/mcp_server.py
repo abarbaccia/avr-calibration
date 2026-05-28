@@ -4198,6 +4198,113 @@ async def _tool_design_fir_multi(
         return _err(f"design_fir_multi failed: {exc}")
 
 
+async def _tool_design_fir_multi_modal(
+    measurements: list[dict],
+    target_curve: dict,
+    modal_intents: list[dict],
+    num_taps: int = 24576,
+    phase_mode: str = "minimum",
+    regularization_lambda: float = 0.01,
+    freq_focus_hz: list[float] | None = None,
+    gabor_n_cycles: int = 1,
+    return_coefficients: bool = False,
+) -> dict:
+    """Combined per-sub Wiener magnitude + anti-pulse T60 correction FIR.
+
+    The correct Trinnov-style architecture: anti-pulses are placed T/2 BEFORE
+    the Wiener correction's main impulse in the same time-domain FIR buffer,
+    so modal cancellation and magnitude leveling cooperate rather than conflict.
+
+    ``measurements``: solo measurements per sub (same format as design_fir_multi).
+    ``target_curve``: combined Harman target (absolute SPL points).
+    ``modal_intents``: anti-pulse specs — list of {freq_hz, treatment='anti_pulse',
+        cancel_strength?, bp_q?, peak_db?, t60_ms?}.
+    ``num_taps``: total taps (split between Wiener mag + anti-pulse budget).
+    """
+    import json as _json
+    from .storage import SessionStore
+    from .multi_fir import design_fir_multi_modal, SubMeasurement
+
+    try:
+        # Parse string-encoded lists (tool framework passes arrays as strings)
+        if isinstance(modal_intents, str):
+            modal_intents = _json.loads(modal_intents)
+
+        store = SessionStore()
+        sub_meas = []
+        for m in measurements:
+            sid = int(m["session_id"])
+            session = store.get_session(sid)
+            if session is None:
+                return _err(f"session {sid} not found")
+            fr = session.start_fr
+            if not fr or not fr.frequencies:
+                return _err(f"session {sid} has no FR data")
+            if not fr.phase:
+                return _err(f"session {sid} has no phase data")
+            sub_meas.append(SubMeasurement(
+                freqs=list(fr.frequencies),
+                spl_db=list(fr.spl),
+                phase_rad=list(fr.phase),
+                label=m.get("label", f"output_{m.get('output_index', '?')}"),
+            ))
+
+        if not target_curve or not target_curve.get("points"):
+            return _err("target_curve.points required")
+        target_points = [(float(p["freq"]), float(p["spl"])) for p in target_curve["points"]]
+        target_points.sort()
+
+        focus = None
+        if freq_focus_hz and len(freq_focus_hz) >= 2:
+            focus = (float(freq_focus_hz[0]), float(freq_focus_hz[1]))
+
+        sample_rate = 48000
+        if _dsp is not None:
+            caps = _dsp.capabilities
+            sample_rate = caps.fir_sample_rate_hz or 48000
+            if num_taps > caps.fir_max_taps_per_output:
+                return _err(f"num_taps={num_taps} exceeds {caps.fir_max_taps_per_output}")
+
+        result = design_fir_multi_modal(
+            sub_meas, target_points, modal_intents,
+            sample_rate=sample_rate, num_taps=num_taps,
+            phase_mode=phase_mode, regularization_lambda=regularization_lambda,
+            freq_focus_hz=focus, gabor_n_cycles=int(gabor_n_cycles),
+        )
+
+        primary_sid = int(measurements[0]["session_id"])
+        cache_ids = []
+        for i, (m, fir) in enumerate(zip(measurements, result["firs"])):
+            out_idx = int(m.get("output_index", i))
+            cache_id = primary_sid * 1000 + out_idx
+            _fir_design_cache[cache_id] = fir
+            cache_ids.append({"output_index": out_idx, "design_session_id": cache_id})
+
+        response = {
+            "num_subs": result["num_subs"],
+            "num_taps": result["num_taps"],
+            "phase_mode": result["phase_mode"],
+            "regularization_lambda": result["regularization_lambda"],
+            "latency_ms": result["latency_ms"],
+            "modal_pre_delay_ms": result["modal_pre_delay_ms"],
+            "predicted_combined": result["predicted_combined"],
+            "predicted_per_sub": result["predicted_per_sub"],
+            "per_sub_peak_boost_db": result["per_sub_peak_boost_db"],
+            "modal_notes": result.get("modal_notes", []),
+            "cache_ids": cache_ids,
+            "note": (
+                f"Combined Wiener+modal FIR: {result['num_subs']} subs, "
+                f"{num_taps} taps, {result['modal_pre_delay_ms']:.1f} ms anti-pulse pre-ring. "
+                "Apply each via apply_fir(output_index, design_session_id)."
+            ),
+        }
+        if return_coefficients:
+            response["firs"] = result["firs"]
+        return _ok(**response)
+    except Exception as exc:
+        return _err(f"design_fir_multi_modal failed: {exc}")
+
+
 async def _tool_design_modal_fir(
     session_id: int,
     intents: list[dict] | None = None,
@@ -11580,6 +11687,43 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="design_fir_multi_modal",
+        description=(
+            "Trinnov-style combined per-sub magnitude + T60 correction FIR. "
+            "Correct architecture: Gabor anti-pulses are placed T/2 BEFORE the Wiener "
+            "correction's main impulse in the same time-domain buffer — they cooperate "
+            "rather than conflict. Use this instead of design_fir_multi when you also "
+            "need T60 reduction at specific room modes. Requires solo measurements with "
+            "phase data (same as design_fir_multi) plus modal_intents anti-pulse specs."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "measurements": {
+                    "type": "array",
+                    "description": "Solo measurements per sub: [{session_id, output_index, label?}].",
+                    "items": {"type": "object", "properties": {"session_id": {"type": "integer"}, "output_index": {"type": "integer"}, "label": {"type": "string"}}, "required": ["session_id", "output_index"]},
+                },
+                "target_curve": {
+                    "type": "object",
+                    "description": "Combined Harman target SPL: {points: [{freq, spl}]}.",
+                    "properties": {"points": {"type": "array", "items": {"type": "object", "properties": {"freq": {"type": "number"}, "spl": {"type": "number"}}}}},
+                },
+                "modal_intents": {
+                    "type": "string",
+                    "description": "JSON array of anti-pulse intents: '[{\"freq_hz\":23.4,\"treatment\":\"anti_pulse\",\"cancel_strength\":0.5,\"bp_q\":1.5,\"peak_db\":7.9}]'.",
+                },
+                "num_taps": {"type": "integer", "description": "Total taps per sub FIR (split between Wiener mag + anti-pulse). Default 24576.", "default": 24576},
+                "phase_mode": {"type": "string", "enum": ["minimum", "linear", "mixed"], "description": "Wiener FIR phase mode. Default minimum."},
+                "regularization_lambda": {"type": "number", "description": "Wiener damping. Default 0.01 for our signal levels.", "default": 0.01},
+                "freq_focus_hz": {"type": "array", "items": {"type": "number"}, "description": "[lo, hi] correction band."},
+                "gabor_n_cycles": {"type": "integer", "default": 1, "minimum": 1, "description": "Gabor cycles for anti-pulses. Default 1 (no trailing truncation)."},
+                "return_coefficients": {"type": "boolean", "description": "Return FIR coefficients in response. Default false."},
+            },
+            "required": ["measurements", "target_curve", "modal_intents"],
+        },
+    ),
+    Tool(
         name="design_modal_fir",
         description=(
             "Active modal-cancellation FIR. Places anti-pulses one half-wavelength before the "
@@ -12664,6 +12808,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return_coefficients=bool(arguments.get("return_coefficients", True)),
             preringing_ms=float(arguments.get("preringing_ms", 25.0)),
             anchor=arguments.get("anchor"),
+        )
+    elif name == "design_fir_multi_modal":
+        import json as _json
+        _raw_mi = arguments.get("modal_intents")
+        _modal_intents = _json.loads(_raw_mi) if isinstance(_raw_mi, str) else _raw_mi
+        result = await _tool_design_fir_multi_modal(
+            measurements=arguments["measurements"],
+            target_curve=arguments["target_curve"],
+            modal_intents=_modal_intents or [],
+            num_taps=int(arguments.get("num_taps", 24576)),
+            phase_mode=arguments.get("phase_mode", "minimum"),
+            regularization_lambda=float(arguments.get("regularization_lambda", 0.01)),
+            freq_focus_hz=arguments.get("freq_focus_hz"),
+            gabor_n_cycles=int(arguments.get("gabor_n_cycles", 1)),
+            return_coefficients=bool(arguments.get("return_coefficients", False)),
         )
     elif name == "design_fir_multi":
         import json as _json
