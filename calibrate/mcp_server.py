@@ -9594,14 +9594,13 @@ _TOOLS: list[Tool] = [
                     "description": "AVR sweep volume override (not persistent). Use -10 to -15 dB for mains. Default: config denon_sweep_volume.",
                 },
                 "direct_path_window_ms": {
-                    "type": "number",
+                    "type": "string",
                     "description": (
-                        "Optional Hanning window (ms) centred on the IR peak for "
-                        "time-windowed analysis. Isolates the direct path from room "
-                        "reflections — makes FIR effect verification reliable below the "
-                        "Schroeder frequency (~150 Hz) by excluding late room modes. "
-                        "Frequency resolution ≈ 2/window_s; need ≥ 100 ms for 20 Hz "
-                        "resolution. Default: None (full 500 ms IR gate, existing behaviour)."
+                        "Optional Hanning window duration in ms (e.g. '100') centred on "
+                        "the IR peak for time-windowed analysis. Isolates the direct path "
+                        "from room reflections — makes FIR effect verification reliable "
+                        "below the Schroeder frequency. Δf ≈ 2/window_s; use '100' for "
+                        "20 Hz resolution. Default: omit (full 500 ms IR gate)."
                     ),
                 },
             },
@@ -12325,7 +12324,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             freq_max=(int(arguments["freq_max"]) if arguments.get("freq_max") is not None else None),
             sweep_channel=arguments.get("sweep_channel"),
             sweep_volume_db=(float(arguments["sweep_volume_db"]) if arguments.get("sweep_volume_db") is not None else None),
-            direct_path_window_ms=(float(arguments["direct_path_window_ms"]) if arguments.get("direct_path_window_ms") is not None else None),
+            direct_path_window_ms=(float(arguments["direct_path_window_ms"]) if arguments.get("direct_path_window_ms") not in (None, "") else None),
         )
     elif name == "calibrate_level":
         result = await _tool_calibrate_level(
