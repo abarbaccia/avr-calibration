@@ -3956,9 +3956,12 @@ async def _tool_design_fir(
                 # also the effective latency.
                 pre_ringing_ms = round(pre_samples / fir_fs * 1000, 2)
 
-        # Normalize so peak <= 1.0
+        # Normalize only when the filter would clip (peak > 1.0).
+        # Do NOT normalize attenuation filters: a filter with peak < 1.0 is
+        # already below the CamillaDSP hard limit, and dividing by peak < 1.0
+        # would invert the gain direction (turning cuts into boosts).
         peak = float(np.max(np.abs(fir_td)))
-        if peak > 0:
+        if peak > 1.0:
             fir_td = fir_td / peak
 
         # Effective audio latency: position of the impulse's energy peak.
