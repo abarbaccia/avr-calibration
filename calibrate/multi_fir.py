@@ -368,10 +368,27 @@ def design_multi_input_fir(
     # computed from the post-normalization, post-truncation FIRs so the
     # prediction reflects what will actually be loaded into CamillaDSP
     # (not the idealized K we computed pre-realization).
-    H_combined = np.zeros_like(H_complex[0])
-    for fir_td, H_i in zip(fir_list, H_complex):
+    #
+    # IMPORTANT: after modal convolution fir_list entries have num_taps taps
+    # (not mag_taps), so the prediction FFT must be sized to num_taps, not
+    # the pre-convolution mag_taps. Recompute freqs_out for the prediction loop.
+    pred_n_fft = max(num_taps * 4, 16384)
+    pred_freqs = np.fft.rfftfreq(pred_n_fft, d=1.0 / sample_rate)
+    # Re-interpolate H_complex onto the prediction frequency grid
+    H_complex_pred = []
+    for m in measurements:
+        meas_f = np.array(m.freqs)
+        meas_mag = np.array(m.spl_db)
+        meas_ph = np.array(m.phase_rad)
+        mag_db_full = np.interp(pred_freqs, meas_f, meas_mag, left=meas_mag[0], right=meas_mag[-1])
+        mag_lin = 10 ** (mag_db_full / 20.0)
+        ph_full = np.interp(pred_freqs, meas_f, np.unwrap(meas_ph), left=np.unwrap(meas_ph)[0], right=np.unwrap(meas_ph)[-1])
+        H_complex_pred.append(mag_lin * np.exp(1j * ph_full))
+
+    H_combined = np.zeros_like(H_complex_pred[0])
+    for fir_td, H_i in zip(fir_list, H_complex_pred):
         # FIR's frequency response
-        fir_full = np.zeros(n_fft)
+        fir_full = np.zeros(pred_n_fft)
         fir_full[:len(fir_td)] = fir_td
         K_actual = np.fft.rfft(fir_full)
         H_combined += K_actual * H_i
@@ -400,14 +417,13 @@ def design_multi_input_fir(
     # Per-sub contribution at mic (post-normalization)
     predicted_per_sub = []
     per_sub_peak_boost = []
-    for i, (fir_td, H_i) in enumerate(zip(fir_list, H_complex)):
-        fir_full = np.zeros(n_fft)
+    for i, (fir_td, H_i) in enumerate(zip(fir_list, H_complex_pred)):
+        fir_full = np.zeros(pred_n_fft)
         fir_full[:len(fir_td)] = fir_td
         K_actual = np.fft.rfft(fir_full)
         contrib = K_actual * H_i
         contrib_db = 20 * np.log10(np.abs(contrib) + 1e-12)
-        fir_db = 20 * np.log10(np.abs(K_actual) + 1e-12)
-        meas_db_full = np.interp(freqs_out,
+        meas_db_full = np.interp(pred_freqs,
                                  np.array(measurements[i].freqs),
                                  np.array(measurements[i].spl_db),
                                  left=measurements[i].spl_db[0],
@@ -421,9 +437,9 @@ def design_multi_input_fir(
         # Peak boost in the focus band, for safety check
         if freq_focus_hz:
             lo, hi = freq_focus_hz
-            band_mask = (freqs_out >= lo) & (freqs_out <= hi)
+            band_mask = (pred_freqs >= lo) & (pred_freqs <= hi)
         else:
-            band_mask = np.ones_like(freqs_out, dtype=bool)
+            band_mask = np.ones_like(pred_freqs, dtype=bool)
         per_sub_peak_boost.append(round(float(np.max(fir_only_effect_db[band_mask])), 2))
 
     # Latency: position of peak in the design (the "effective delay")
