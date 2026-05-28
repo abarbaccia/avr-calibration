@@ -11538,32 +11538,21 @@ _TOOLS: list[Tool] = [
                     ),
                 },
                 "modal_intents": {
-                    "type": "array",
+                    "type": "string",
                     "description": (
-                        "Optional modal anti-pulse intents to combine with the per-sub "
-                        "magnitude FIRs. Each: {freq_hz, treatment='anti_pulse', "
-                        "cancel_strength?, bp_q?, peak_db?}. The shared anti-pulse FIR "
-                        "is convolved with each per-sub Wiener FIR into a single "
-                        "combined FIR per output — no extra FIR slot needed."
+                        "JSON array of modal anti-pulse intents, e.g. "
+                        "'[{\"freq_hz\":23.4,\"treatment\":\"anti_pulse\","
+                        "\"cancel_strength\":0.5,\"bp_q\":1.5,\"peak_db\":7.9}]'. "
+                        "The shared anti-pulse FIR is convolved with each per-sub "
+                        "Wiener FIR so both magnitude leveling AND T60 correction "
+                        "land in a single FIR per output."
                     ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "freq_hz": {"type": "number"},
-                            "treatment": {"type": "string", "enum": ["anti_pulse", "skip"]},
-                            "cancel_strength": {"type": "number"},
-                            "bp_q": {"type": "number"},
-                            "peak_db": {"type": "number"},
-                        },
-                        "required": ["freq_hz", "treatment"],
-                    },
                 },
                 "modal_taps": {
-                    "type": "integer",
+                    "type": "string",
                     "description": (
-                        "Tap budget for the modal FIR. Defaults to auto-size from mode "
-                        "frequencies. Total output taps = num_taps; magnitude FIR gets "
-                        "num_taps - modal_taps + 1 taps."
+                        "Integer tap budget for the modal anti-pulse FIR (e.g. '4096'). "
+                        "Auto-sized from mode frequencies if omitted."
                     ),
                 },
                 "gabor_n_cycles": {
@@ -12663,6 +12652,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             anchor=arguments.get("anchor"),
         )
     elif name == "design_fir_multi":
+        import json as _json
+        _raw_mi = arguments.get("modal_intents")
+        _modal_intents = _json.loads(_raw_mi) if isinstance(_raw_mi, str) else _raw_mi
+        _raw_mt = arguments.get("modal_taps")
+        _modal_taps = int(_json.loads(_raw_mt) if isinstance(_raw_mt, str) else _raw_mt) if _raw_mt is not None else None
         result = await _tool_design_fir_multi(
             measurements=arguments["measurements"],
             target_curve=arguments["target_curve"],
@@ -12672,8 +12666,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             regularization_lambda=float(arguments.get("regularization_lambda", 0.1)),
             freq_focus_hz=arguments.get("freq_focus_hz"),
             return_coefficients=bool(arguments.get("return_coefficients", False)),
-            modal_intents=arguments.get("modal_intents"),
-            modal_taps=int(arguments["modal_taps"]) if arguments.get("modal_taps") is not None else None,
+            modal_intents=_modal_intents,
+            modal_taps=_modal_taps,
             gabor_n_cycles=int(arguments.get("gabor_n_cycles", 1)),
         )
     elif name == "design_modal_fir":
