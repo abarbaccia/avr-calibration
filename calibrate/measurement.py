@@ -1242,6 +1242,27 @@ class MeasurementEngine:
             taper = np.hanning(2 * taper_samples)[taper_samples:]
             ir_gated[gate_samples - taper_samples:gate_samples] *= taper
 
+        # ── Optional direct-path window (time-windowed analysis) ─────
+        # When direct_path_window_ms is set, apply a Hanning window of
+        # that duration centered on the IR peak. This isolates the direct
+        # path from late reflections and room modes, making FIR effect
+        # verification reliable below the Schroeder frequency. The window
+        # must be long enough for the desired frequency resolution:
+        #   Δf ≈ 2 / window_s   (Hanning effective bandwidth)
+        # For 20 Hz resolution: window ≥ 100 ms. Default None = no change.
+        _dpw_ms = getattr(self, "direct_path_window_ms", None)
+        if _dpw_ms is not None and _dpw_ms > 0:
+            dpw_samples = int(_dpw_ms * sample_rate / 1000)
+            peak_idx = int(np.argmax(np.abs(ir_gated[:gate_samples])))
+            half = dpw_samples // 2
+            win_start = max(0, peak_idx - half)
+            win_end = min(gate_samples, win_start + dpw_samples)
+            # Hanning window centered on peak
+            win = np.hanning(win_end - win_start)
+            ir_windowed = np.zeros(n)
+            ir_windowed[win_start:win_end] = ir_gated[win_start:win_end] * win
+            ir_gated = ir_windowed
+
         H_gated = np.fft.rfft(ir_gated, n=n)
 
         freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
