@@ -7679,9 +7679,13 @@ async def _tool_restore_listening_mode(
             avr_speaker_check_error = str(exc)
 
         applied = not dry_run
-        if applied and added:
+        if applied and bound_outputs:
+            # Always write ALL bound outputs — idempotent against CamillaDSP
+            # restart.  _routing is pre-populated on driver init but CamillaDSP
+            # may have restarted with an empty statefile; writing all bound
+            # outputs unconditionally is safe and self-healing.
             await _dsp.set_routing(  # type: ignore[union-attr]
-                {int(lfe_input): {int(o): True for o in added}}
+                {int(lfe_input): {int(o): True for o in bound_outputs}}
             )
         master_changed = False
         if applied:
