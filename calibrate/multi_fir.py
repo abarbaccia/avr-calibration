@@ -173,9 +173,35 @@ def design_multi_input_fir(
     if phase_mode not in ("minimum", "linear", "mixed"):
         raise ValueError(f"phase_mode must be minimum/linear/mixed, got {phase_mode!r}")
 
-    # When modal_intents are provided, split the tap budget between the
-    # per-sub Wiener FIR and the shared anti-pulse FIR so that after
-    # convolution the total stays within num_taps.
+    # Modal anti-pulse + Wiener FIR combination — ARCHITECTURAL LIMITATION.
+    #
+    # A Gabor anti-pulse has Fourier energy across its entire bandwidth
+    # (~±15 Hz for Q=1.5 at 23 Hz). Convolving it with the Wiener FIR
+    # produces a combined FIR whose frequency response is DOMINATED by the
+    # anti-pulse's large Fourier components (+50 dB at the mode bandwidth),
+    # completely swamping the Wiener magnitude correction. The result is a
+    # FIR that AMPLIFIES 20-80 Hz by 30-50 dB instead of attenuating it.
+    #
+    # Anti-pulse correction is a TIME-DOMAIN technique: the Gabor must be
+    # placed in the same FIR as the main impulse, T/2 before it, and the
+    # correction only works because of destructive interference in the ROOM
+    # at the mode frequency. It cannot be combined with a frequency-domain
+    # Wiener filter via simple convolution.
+    #
+    # To apply modal T60 correction together with multi-sub magnitude
+    # correction, use ModalAwareFIRDesigner with the combined per-sub
+    # response as the base_correction — the anti-pulses are then placed in
+    # the same time-domain FIR buffer, before the main impulse.
+    if modal_intents and any(i.get("treatment") == "anti_pulse" for i in modal_intents):
+        raise ValueError(
+            "modal_intents with anti_pulse treatment cannot be combined with the "
+            "Wiener multi-sub FIR via convolution — the anti-pulse's broad Fourier "
+            "spectrum swamps the magnitude correction (+40-50 dB at target bands). "
+            "Use ModalAwareFIRDesigner with the per-sub corrected response as "
+            "base_correction to place anti-pulses in the same time-domain buffer "
+            "as the main impulse."
+        )
+
     modal_pre_delay_ms = 0.0
     _modal_fir_arr = None
     if modal_intents:
