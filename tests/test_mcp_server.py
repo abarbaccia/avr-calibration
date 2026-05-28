@@ -7133,13 +7133,15 @@ async def test_skip_freqs_hz_ignored_when_intents_supplied() -> None:
 
 @pytest.mark.asyncio
 async def test_design_modal_fir_anti_pulse_uses_pre_ring_budget() -> None:
-    """Anti_pulse pre-ring is ≥ T/2 + Gabor_half so the envelope isn't clipped.
+    """Anti_pulse pre-ring is ≥ T so the Gabor envelope isn't clipped.
 
-    The user-supplied max_pre_ring_ms is a floor that may be EXCEEDED when
-    physics demands more — clipping the Gabor leading edge flips the
-    anti-pulse phase from destructive to constructive at the mode and turns
-    cancellation into amplification. For 70 Hz with n_cycles=3 the floor is
-    2*T = 28.57 ms, which exceeds a 25 ms budget request.
+    Default n_cycles=1: the full Gabor (length T) fits entirely before the
+    main impulse — no trailing truncation, symmetric anti-pulse, correct -π
+    cancellation phase. The pre-ring floor is T = 1000/freq_hz ms. When the
+    user requests less than T, the floor overrides it.
+
+    For 70 Hz with n_cycles=1: floor = T ≈ 14.29 ms. Requesting 8 ms must be
+    bumped to ≥ 14 ms.
     """
     decay_modes = [{"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0}]
     intents = [{"freq_hz": 70.0, "t60_ms": 1100, "peak_db": 9.0,
@@ -7148,12 +7150,12 @@ async def test_design_modal_fir_anti_pulse_uses_pre_ring_budget() -> None:
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
         result = await _tool_design_modal_fir(
-            session_id=1, intents=intents, num_taps=4096, max_pre_ring_ms=25.0,
+            session_id=1, intents=intents, num_taps=4096, max_pre_ring_ms=8.0,
         )
     assert result["ok"]
-    # Floor for 70 Hz, n_cycles=3 = 2*T = 28.57 ms. Must be ≥ this even
-    # though the request was 25 ms.
-    assert result["pre_delay_ms"] >= 28.0
+    # Floor for 70 Hz, n_cycles=1 = T ≈ 14.29 ms. Must be ≥ this even
+    # though the request was 8 ms.
+    assert result["pre_delay_ms"] >= 14.0
     treatment = result["per_mode_treatments"][0]
     assert treatment["treatment"] == "anti_pulse"
     assert "anti_pulse_pre_ms" in treatment
@@ -7162,18 +7164,14 @@ async def test_design_modal_fir_anti_pulse_uses_pre_ring_budget() -> None:
 
 @pytest.mark.asyncio
 async def test_design_modal_fir_pre_ring_fits_full_gabor_envelope() -> None:
-    """Regression for Gabor-truncation bug (2026-05-01).
+    """Regression for Gabor-truncation bug. Default n_cycles=1 avoids truncation.
 
-    The anti-pulse is centered at ``pre_samples - T/2``. The Gabor envelope
-    extends ±n_cycles*sample_rate/(2*freq_hz) samples around that center.
-    If pre_samples is too small the leading edge clips off, which destroys
-    the destructive time-domain phase relationship (it flips from -π toward
-    0 as the asymmetry grows) so the FIR no longer cancels the mode.
+    The anti-pulse is centered at ``pre_samples - T/2``. With n_cycles=1 the
+    Gabor length is exactly T, so the trailing end lands at pre_samples with
+    no truncation. The symmetric Gabor preserves the -π cancellation phase.
 
-    The pre_samples floor must be ≥ T/2 + Gabor_half. For the 47 Hz mode at
-    48 kHz with default n_cycles=3 that's 511 + 1532 = 2043 samples
-    (~42.6 ms). The buggy formula gave only T (~1023 samples), clipping
-    1020 leading Gabor samples — verified +38 dB amplification on hardware.
+    Pre-ring floor for 47 Hz at n_cycles=1 is T ≈ 21.28 ms. When the user
+    requests less (10 ms here), the floor overrides it.
     """
     decay_modes = [{"freq_hz": 47.0, "t60_ms": 770, "peak_db": 9.0}]
     intents = [{"freq_hz": 47.0, "t60_ms": 770, "peak_db": 9.0,
@@ -7183,13 +7181,13 @@ async def test_design_modal_fir_pre_ring_fits_full_gabor_envelope() -> None:
         _wire_mock_store(MockStore, [session])
         result = await _tool_design_modal_fir(
             session_id=1, intents=intents, num_taps=24576, samplerate=48000,
-            max_pre_ring_ms=25.0,
+            max_pre_ring_ms=10.0,
         )
     assert result["ok"]
-    # 47 Hz mode at n_cycles=3 needs T/2 + 1.5T = 2T ≈ 42.55 ms pre-ring.
-    # User asked for 25 ms — must be exceeded since physics requires more.
-    assert result["pre_delay_ms"] >= 42.0, (
-        f"pre_delay_ms={result['pre_delay_ms']:.2f} < 42 ms — "
+    # Floor for 47 Hz, n_cycles=1 = T ≈ 21.28 ms. User asked for 10 ms —
+    # must be exceeded so the leading edge of the Gabor isn't clipped.
+    assert result["pre_delay_ms"] >= 21.0, (
+        f"pre_delay_ms={result['pre_delay_ms']:.2f} < 21 ms — "
         "Gabor envelope will clip and amplify the mode"
     )
     # No truncation warning should fire when the budget is correctly sized.
@@ -7959,8 +7957,9 @@ async def test_restore_listening_mode_routes_unrouted_transducers(mock_avr) -> N
     assert result["applied"] is True
     assert result["routed_added"] == [7]
     assert sorted(result["already_routed"]) == [5, 6]
-    # set_routing called exactly once with the missing output.
-    dsp.set_routing.assert_awaited_once_with({0: {7: True}})
+    # set_routing called with ALL bound outputs (idempotent — always writes
+    # the full set to self-heal after a CamillaDSP restart wipes the config).
+    dsp.set_routing.assert_awaited_once_with({0: {5: True, 6: True, 7: True}})
     # Master gain set to the documented operating level.
     dsp.set_master_gain.assert_awaited_once_with(-20.0)
     assert result["master_gain_db"] == -20.0
@@ -8010,9 +8009,11 @@ async def test_restore_listening_mode_idempotent_when_fully_routed(mock_avr) -> 
 
     assert result["ok"]
     assert result["routed_added"] == []
-    dsp.set_routing.assert_not_called()
-    # Master gain is still asserted — that's the other half of the
-    # invariant and cheap to write idempotently.
+    # set_routing is always called with ALL bound outputs even when they appear
+    # already routed — this is the idempotent self-healing behavior that
+    # recovers from CamillaDSP restarts that wipe the config.
+    dsp.set_routing.assert_awaited_once_with({0: {5: True, 6: True, 7: True}})
+    # Master gain is still asserted — that's the other half of the invariant.
     dsp.set_master_gain.assert_awaited_once_with(-20.0)
 
 

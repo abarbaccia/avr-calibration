@@ -267,7 +267,7 @@ class ModalAwareFIRDesigner:
                 anchor_freq_hz: float | None = None,
                 modal_cancel_max_boost_db: float | None = None,
                 compensation_notch: bool = False,
-                gabor_n_cycles: int = 3,
+                gabor_n_cycles: int = 1,
                 ) -> tuple[list[float], DesignSummary]:
         """Generate a modal-aware mixed-phase FIR.
 
@@ -322,12 +322,15 @@ class ModalAwareFIRDesigner:
         # half-length, not just T/2 + tail/2.
         active_anti = [i for i in intents if i.treatment == "anti_pulse"]
         if active_anti:
+            # n_cycles=1 is the only safe value: the Gabor trailing half extends
+            # exactly to pre_samples (the main impulse position) so there is no
+            # trailing truncation and the Gabor remains symmetric. For n_cycles≥2
+            # the trailing half extends T/2*(n_cycles-1) PAST pre_samples and gets
+            # clipped by `end = min(..., pre_samples)` below, breaking the -π
+            # cancellation phase and causing the anti-pulse to AMPLIFY modes
+            # instead of cancelling them (the May-2026 regression).
             # Per-mode pre-need = T/2 (placement) + n_cycles*T/2 (envelope).
-            # For n_cycles=3 this collapses to 2T. For n_cycles=2 it's 1.5*T.
-            # Take the max across modes since lower-frequency modes need more
-            # pre-ring. Reducing n_cycles trades sub-vs-mains latency budget
-            # against Gabor spectral skirt width (less pre-ring → wider skirt
-            # → more leakage to adjacent 1/3-oct bands → tighter cap headroom).
+            # n_cycles=1 → T. Take the max across modes.
             min_needed_ms = max(
                 (0.5 + 0.5 * gabor_n_cycles) * 1000.0 / i.freq_hz
                 for i in active_anti

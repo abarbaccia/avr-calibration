@@ -4207,7 +4207,7 @@ async def _tool_design_modal_fir(
     return_coefficients: bool = False,
     anchor: dict | None = None,
     compensation_notch: bool = False,
-    gabor_n_cycles: int = 3,
+    gabor_n_cycles: int = 1,
     auto_samplerate: bool = True,
     skip_freqs_hz: list[float] | None = None,
 ) -> dict:
@@ -12646,7 +12646,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             samplerate=int(arguments.get("samplerate", 48000)),
             return_coefficients=bool(arguments.get("return_coefficients", False)),
             anchor=arguments.get("anchor"),
-            gabor_n_cycles=int(arguments.get("gabor_n_cycles", 3)),
+            gabor_n_cycles=int(arguments.get("gabor_n_cycles", 1)),
             skip_freqs_hz=arguments.get("skip_freqs_hz"),
         )
     elif name == "analyze_per_sub_modal_contribution":
