@@ -564,6 +564,58 @@ class SafetyValidator:
                         f"different frequency."
                     )
 
+    @staticmethod
+    def validate_sweep_safe(
+        fir_taps: list[float],
+        sample_rate: int,
+        sweep_amplitude: float = 0.1,
+        headroom_db: float = 3.0,
+    ) -> None:
+        """Raise if a calibration sweep would clip when the given FIR is active.
+
+        Anti-pulse FIRs (e.g. Gabor modal correction) have large
+        frequency-domain magnitude at the mode frequency — a log sweep that
+        dwells coherently at that frequency accumulates gain proportional to
+        the Gabor integral (~428× for a 23 Hz mode with Q=1.5).  The resulting
+        DAC output clips severely, producing garbage measurements.
+
+        ``sweep_amplitude``: normalised amplitude of the sweep signal entering
+            CamillaDSP (0.1 = -20 dB, the default master gain).
+        ``headroom_db``: additional safety margin before flagging (default 3 dB).
+
+        Raises:
+            RuntimeError with a human-readable message if the FIR would cause
+            clipping, including the worst-case frequency and gain.
+        """
+        import numpy as np
+
+        if not fir_taps:
+            return
+
+        taps = np.asarray(fir_taps, dtype=np.float64)
+        min_n_fft = max(4096, int(2 ** np.ceil(np.log2(max(len(taps) * 2, 4096)))))
+        n_fft = int(2 ** np.ceil(np.log2(max(min_n_fft, len(taps)))))
+        H = np.fft.rfft(taps, n=n_fft)
+        mag = np.abs(H)
+        freqs = np.fft.rfftfreq(n_fft, d=1.0 / sample_rate)
+
+        max_gain = float(np.max(mag))
+        peak_freq = float(freqs[int(np.argmax(mag))])
+        peak_out = sweep_amplitude * max_gain
+        limit = 10 ** (-headroom_db / 20.0)  # e.g. -3 dB headroom → 0.708
+
+        if peak_out > limit:
+            peak_db = 20.0 * np.log10(max_gain)
+            raise RuntimeError(
+                f"FIR sweep-safety check failed: the active FIR has "
+                f"+{peak_db:.1f} dB frequency-domain gain at {peak_freq:.1f} Hz "
+                f"(likely an anti-pulse Gabor). A calibration sweep at amplitude "
+                f"{sweep_amplitude:.3f} would produce {peak_out:.1f}× full scale "
+                f"at that frequency, causing DAC clipping and invalid measurements. "
+                f"Switch to the calibration FIR preset before sweeping: "
+                f"call restore_listening_mode(mode='cal') or clear_fir()."
+            )
+
     def _check_hpf_present(self, filters: list[FilterSpec]) -> ValidationResult:
         """Verify a HPF at or below the profile's HPF frequency is present.
 

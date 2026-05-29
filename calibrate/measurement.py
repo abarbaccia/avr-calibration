@@ -1327,6 +1327,119 @@ class MeasurementEngine:
         y = recording.timeSignal[:, 0]
         return self._compute_fr_arrays(np, x, y, freq_min, freq_max, sample_rate, cal_curve=cal_curve)
 
+    async def measure_impulse_ir(
+        self,
+        n_averages: int = 64,
+        record_duration_s: float = 2.5,
+        impulse_amplitude: float = 0.9,
+    ) -> list[float]:
+        """Measure room impulse response using averaged impulse excitation.
+
+        Unlike a log sweep, a single-sample impulse does NOT coherently
+        accumulate energy at any frequency.  The DAC output is bounded by:
+
+            peak_output = max(|FIR_taps|) × impulse_amplitude
+
+        For a Gabor anti-pulse FIR (peak_tap ≈ 0.40) this gives
+        0.40 × 0.9 = 0.36 — well within DAC limits regardless of the
+        FIR's +52 dB frequency-domain gain.  This makes impulse IR
+        measurement safe to run with the listening FIR (anti-pulse) loaded.
+
+        Returns the averaged impulse response as a list of floats.
+        Suitable input for ``analyze_decay()`` to compare T60 before/after
+        applying the anti-pulse T60 correction.
+
+        ``n_averages``: number of impulse shots to average (default 64,
+            ~2.5 minutes).  More averages → better SNR.
+        ``record_duration_s``: recording window per shot (default 2.5 s,
+            enough to capture 600 ms T60 decay with margin).
+        ``impulse_amplitude``: amplitude of the impulse sample (0-1).
+            Set below 1.0 so the master gain + FIR don't clip DAC.
+        """
+        import asyncio
+        import subprocess
+        import time as _time
+        import numpy as np
+
+        cfg = self.config.measurement
+        sample_rate = int(cfg.get("sample_rate", 48000))
+        usb_pw_node = cfg.get("usb_pipewire_node") or None
+        mic_pw_node = cfg.get("mic_pipewire_node") or None
+        if not usb_pw_node:
+            raise RuntimeError(
+                "measure_impulse_ir requires measurement.usb_pipewire_node in config"
+            )
+        if not mic_pw_node:
+            raise RuntimeError(
+                "measure_impulse_ir requires measurement.mic_pipewire_node in config"
+            )
+
+        rec_samples = int(record_duration_s * sample_rate)
+        # Build s16 PCM for a single stereo impulse (2 channels, 1 sample hot)
+        pre_silence = int(0.2 * sample_rate)  # 200 ms pre-silence
+        frame = np.zeros(rec_samples, dtype=np.int16)
+        frame[pre_silence] = int(impulse_amplitude * 32767)
+        pcm_stereo = np.stack([frame, np.zeros(rec_samples, dtype=np.int16)], axis=1)
+        pcm_bytes = pcm_stereo.tobytes()
+
+        pw_play_cmd = [
+            "pw-cat", "--playback",
+            "--target", usb_pw_node,
+            "--channels", "2",
+            "--rate", str(sample_rate),
+            "--format", "s16",
+            "-",
+        ]
+        pw_rec_cmd = [
+            "pw-record",
+            "--target", mic_pw_node,
+            "--channels", "1",
+            "--rate", str(sample_rate),
+            "--format", "f32",
+            "-",
+        ]
+
+        accumulated = np.zeros(rec_samples, dtype=np.float64)
+
+        async with _MEASURE_LOCK:
+            for shot in range(n_averages):
+                # Start recorder
+                rec_proc = subprocess.Popen(
+                    pw_rec_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                _time.sleep(0.05)  # brief settle before impulse
+
+                # Play impulse
+                play_proc = subprocess.Popen(
+                    pw_play_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                try:
+                    play_proc.communicate(input=pcm_bytes, timeout=record_duration_s + 5)
+                except subprocess.TimeoutExpired:
+                    play_proc.kill()
+                    play_proc.communicate()
+
+                # Collect recording
+                _time.sleep(record_duration_s - (pcm_bytes and 0))
+                rec_proc.kill()
+                raw = rec_proc.stdout.read() if rec_proc.stdout else b""
+                rec_proc.communicate()
+
+                if raw:
+                    rec_f32 = np.frombuffer(raw, dtype=np.float32)
+                    n = min(len(rec_f32), rec_samples)
+                    accumulated[:n] += rec_f32[:n].astype(np.float64)
+
+                await asyncio.sleep(0.1)  # brief gap between shots
+
+        averaged = (accumulated / n_averages).tolist()
+        return averaged
+
 
 def _xcorr_delay_ms(
     np,

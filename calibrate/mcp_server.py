@@ -153,6 +153,10 @@ _fir_design_cache: dict[int, list[float]] = {}
 # right ``intent`` to SafetyValidator (e.g., ``modal_cancel`` for FIRs from
 # ``design_modal_fir`` to admit their intentionally hot modal-band gain).
 _fir_design_intent: dict[int, str] = {}
+# Outputs with anti-pulse (Gabor) FIRs loaded — sweeping while these are
+# active causes DAC clipping.  Set by apply_fir when intent=modal_cancel;
+# cleared by clear_fir.  Checked at the start of every measure() call.
+_sweep_blocked_outputs: set[int] = set()
 
 
 def _default_dsp_name() -> str | None:
@@ -5421,6 +5425,25 @@ async def _tool_trigger_measurement(
             )
 
         engine = MeasurementEngine(cfg)
+
+        # FIR sweep-safety guard — refuse to sweep if any output has an
+        # anti-pulse (Gabor) FIR loaded.  These FIRs have +50 dB frequency-
+        # domain gain at the mode frequency; a log sweep coherently accumulates
+        # 428× there, clips the DAC, and produces garbage measurements.
+        # _sweep_blocked_outputs is a module-level set maintained by apply_fir
+        # / clear_fir.  Survives within a session; cleared on server restart
+        # (safe: FIR presets must be re-applied after restart anyway).
+        if _sweep_blocked_outputs:
+            return _err(
+                f"Sweep refused: outputs {sorted(_sweep_blocked_outputs)} have "
+                "anti-pulse FIR loaded (listening preset). This FIR has "
+                "+50 dB gain at the mode frequency — a log sweep would clip "
+                "the DAC and produce invalid measurements. "
+                "Switch to calibration preset first: "
+                "restore_listening_mode(mode='cal') "
+                "or call clear_fir() on those outputs."
+            )
+
         if direct_path_window_ms is not None and direct_path_window_ms > 0:
             engine.direct_path_window_ms = float(direct_path_window_ms)
 
@@ -5692,6 +5715,52 @@ async def _tool_measure_spl_pink(
     except Exception as exc:
         log.exception("measure_spl_pink failed")
         return _err(f"measure_spl_pink error: {exc}")
+
+
+async def _tool_measure_impulse_ir(
+    n_averages: int = 64,
+    record_duration_s: float = 2.5,
+    impulse_amplitude: float = 0.9,
+) -> dict:
+    """Measure room impulse response via averaged impulse shots.
+
+    Unlike a log sweep, a single impulse does NOT coherently accumulate energy
+    at any frequency — DAC output is bounded by max(|FIR_taps|)×amplitude ≈ 0.36
+    for a Gabor anti-pulse FIR with peak_tap=0.40.  Safe to run with the
+    listening FIR (anti-pulse modal correction) loaded.
+
+    Use this to verify T60 improvement from the anti-pulse FIR:
+    1. Load cal FIR → measure baseline IR → analyze_decay → baseline T60
+    2. Load listening FIR (anti-pulse) → measure_impulse_ir() → analyze_decay
+    3. Compare T60 at 23.4 Hz and 46.9 Hz — expect ~50% reduction
+
+    Returns the averaged impulse response as a list of floats.
+    Pass to analyze_decay() for T60 extraction.
+
+    ``n_averages``: impulse shots to average (default 64 ≈ ~3 min).
+    ``record_duration_s``: recording window per shot (default 2.5 s).
+    ``impulse_amplitude``: impulse sample amplitude 0-1 (default 0.9).
+    """
+    try:
+        cfg = _config()
+        engine = MeasurementEngine(cfg)
+        ir = await engine.measure_impulse_ir(
+            n_averages=n_averages,
+            record_duration_s=record_duration_s,
+            impulse_amplitude=impulse_amplitude,
+        )
+        return _ok(
+            impulse_response=ir,
+            n_samples=len(ir),
+            sample_rate=int(cfg.measurement.get("sample_rate", 48000)),
+            n_averages=n_averages,
+            note=(
+                f"Averaged impulse IR: {n_averages} shots × {record_duration_s}s. "
+                "Pass impulse_response to analyze_decay() for T60 at 23.4 Hz / 46.9 Hz."
+            ),
+        )
+    except Exception as exc:
+        return _err(f"measure_impulse_ir failed: {exc}")
 
 
 async def _tool_assign_headroom_tones(
@@ -7132,6 +7201,14 @@ async def _tool_apply_fir(
     except Exception as exc:
         return _err(f"apply_fir error: {exc}")
 
+    # Track sweep safety: anti-pulse Gabor FIRs (intent=modal_cancel) have
+    # large frequency-domain gain and cannot be active during log-sweep
+    # measurements.  _sweep_blocked_outputs prevents measure() from running.
+    if intent == "modal_cancel":
+        _sweep_blocked_outputs.add(int(output_index))
+    else:
+        _sweep_blocked_outputs.discard(int(output_index))
+
     # Persist so a CamillaDSP rebuild (triggered by any later apply_*/set_* call)
     # or MCP-server restart rehydrates the FIR back into the shadow state.
     from .storage import dsp_output_key
@@ -7300,6 +7377,9 @@ async def _tool_clear_fir(output_index: int) -> dict:
         return _err(str(exc))
     except Exception as exc:
         return _err(f"clear_fir error: {exc}")
+
+    # Clear sweep-block: output no longer has an anti-pulse FIR.
+    _sweep_blocked_outputs.discard(int(output_index))
 
     # Mirror the clear to persisted state so a rehydrate after restart doesn't
     # resurrect a stale FIR that was just cleared.
@@ -12333,6 +12413,37 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="measure_impulse_ir",
+        description=(
+            "Measure room impulse response via averaged impulse shots — safe with anti-pulse FIR active. "
+            "Unlike a log sweep, a single impulse does not coherently accumulate energy at any "
+            "frequency, so DAC output is bounded by max(|FIR_taps|)×amplitude (≈0.36 for a Gabor "
+            "FIR), not |H(f)|×amplitude (428× at 23 Hz). Use this to verify T60 improvement from "
+            "the anti-pulse modal FIR: (1) measure baseline IR with cal FIR → analyze_decay, "
+            "(2) load listening FIR → measure_impulse_ir → analyze_decay, compare T60 at 23/47 Hz."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "n_averages": {
+                    "type": "integer",
+                    "description": "Impulse shots to average for SNR (default 64 ≈ ~3 min).",
+                    "default": 64,
+                },
+                "record_duration_s": {
+                    "type": "number",
+                    "description": "Recording window per shot in seconds (default 2.5).",
+                    "default": 2.5,
+                },
+                "impulse_amplitude": {
+                    "type": "number",
+                    "description": "Impulse amplitude 0-1 (default 0.9). Peak DAC output = FIR_peak × amplitude.",
+                    "default": 0.9,
+                },
+            },
+        },
+    ),
+    Tool(
         name="assign_headroom_tones",
         description=(
             "Assign non-overlapping multitone clusters to speakers for headroom testing. "
@@ -12937,6 +13048,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             weighting=str(arguments.get("weighting", "C")),
             n_output_channels=int(arguments.get("n_output_channels", 6)),
             integration_time_s=float(arguments.get("integration_time_s", 1.0)),
+        )
+    elif name == "measure_impulse_ir":
+        result = await _tool_measure_impulse_ir(
+            n_averages=int(arguments.get("n_averages", 64)),
+            record_duration_s=float(arguments.get("record_duration_s", 2.5)),
+            impulse_amplitude=float(arguments.get("impulse_amplitude", 0.9)),
         )
     elif name == "assign_headroom_tones":
         result = await _tool_assign_headroom_tones(
