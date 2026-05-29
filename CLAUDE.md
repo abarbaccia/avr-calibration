@@ -1,19 +1,20 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # avr-calibration
 
-AI-first home theater calibration — closed-loop bass optimization for Denon X3800H + miniDSP 2x4 HD + SVS PB12-NSD.
+AI-first home theater calibration — closed-loop bass optimization for Denon X3800H + Focusrite Scarlett 18i20 + CamillaDSP + SVS PB12-NSD subs.
 
 ## Operating mode — be aggressive
 
-There is a real deadline. Push forward on real problems; do not wrap up
-sessions with "let's pick this up tomorrow" language. When you hit a wall:
+There is a real deadline. Push forward on real problems; do not wrap up sessions with "let's pick this up tomorrow" language. When you hit a wall:
 
 1. Propose the next concrete diagnostic / fix, with specifics.
 2. Rank by likelihood and blast radius.
 3. Pick the highest-leverage one and execute.
 
-Recovery paths exist (push_avr_speaker_layout, MultEQ Editor, .ady backups,
-PSMULTEQ:OFF). Don't stop at the first AVR crash — recover and push on.
-The user prefers honest failures + retries over premature wrap-ups.
+Recovery paths exist (push_avr_speaker_layout, MultEQ Editor, .ady backups, PSMULTEQ:OFF). Don't stop at the first AVR crash — recover and push on. The user prefers honest failures + retries over premature wrap-ups.
 
 When in doubt: keep going, take action, course-correct on user feedback.
 
@@ -21,12 +22,9 @@ When in doubt: keep going, take action, course-correct on user feedback.
 
 **Core principle: Claude Code drives calibration, not Python.**
 
-Python provides MCP tool primitives (measure, apply EQ, mute/unmute, set delay).
-Claude reads human-readable recipe files and calls those tools in a loop.
+Python provides MCP tool primitives (measure, apply EQ, mute/unmute, set delay). Claude reads human-readable recipe files and calls those tools in a loop.
 
-**Do NOT build Python orchestrators, phase runners, or loop state machines.**
-If you're writing a `for` loop in Python that calls measure→analyze→apply→repeat,
-STOP — that logic belongs in a Claude skill or recipe, not in Python code.
+**Do NOT build Python orchestrators, phase runners, or loop state machines.** If you're writing a `for` loop in Python that calls measure→analyze→apply→repeat, STOP — that logic belongs in a Claude skill or recipe, not in Python code.
 
 ```
 [ Claude Code ]  ←── reads recipe, drives calibration loop
@@ -34,19 +32,11 @@ STOP — that logic belongs in a Claude skill or recipe, not in Python code.
        | MCP tool calls (high-level actions)
        ▼
 [ Pi 5 @ 192.168.1.117 — Docker (arm64) ]
-  ├── MCP server (thin facade)
-  │     ├── measure             take a sweep, return FR data
-  │     ├── apply_eq            write PEQ filters (SafetyValidator enforced)
-  │     ├── mute/unmute_output  per-output muting for solo measurement
-  │     ├── set_delay           per-output delay for time alignment
-  │     ├── set_polarity        per-output polarity inversion
-  │     ├── get_state           combined hardware state
-  │     ├── check_system        preflight all hardware
-  │     └── fetch_recipe        load recipe text
-  │           |
+  ├── MCP server (thin facade) — calibrate/mcp_server.py (~900 tool handlers)
   │     Plugin drivers (Claude never sees these directly)
   │     ├── DenonDriver         AVR volume, input, sweep context
-  │     ├── MinidspDriver       DSP EQ, mute, delay, polarity
+  │     ├── CamillaDSP driver   DSP EQ, mute, delay, polarity, FIR (primary sub path)
+  │     ├── MinidspDriver       Legacy: miniDSP 2x4 HD (kept for regression)
   │     ├── MeasurementEngine   UMIK + PyTTa sweep/deconvolution
   │     └── SafetyValidator     hard limits, NEVER bypassed
   ├── Web UI            ← browser dashboard (read-only)
@@ -55,103 +45,31 @@ STOP — that logic belongs in a Claude skill or recipe, not in Python code.
 
 ### What belongs where
 
-| Concern | Where | Example |
-|---------|-------|---------|
-| Loop logic (measure→analyze→adjust→repeat) | Claude skill / recipe | `/avr:calibrate` reads recipe, calls MCP tools |
-| Decision-making (what to adjust next) | Claude | "subs are 3ms apart, increase delay on sub 1" |
-| Filter design (which freqs, PEQ vs FIR) | Claude | "45Hz is min-phase, cut it; 55Hz is cancellation, skip" |
-| Numerical computation (FFT, biquad math) | MCP tools | `simulate_eq`, `optimize_q`, `design_fir` |
-| Analytics (phase, coherence, fixability) | MCP tools | `analyze_phase`, coherence in FR data |
-| Hardware protocol (ordering, cleanup) | Plugin drivers | DenonSweepContext sets input before play, restores after |
-| Hardware I/O | MCP tools → plugin drivers | `measure` → DenonDriver + MeasurementEngine + UMIK |
-| Safety enforcement | SafetyValidator (code) | Max boost, HPF, frequency limits — NEVER in prompts only |
-| Recipes | Markdown files in `recipes/core/` | Human-readable English instructions |
-| Hardware config | `config.yaml` | Output slot types, IP addresses, mic name |
+| Concern | Where |
+|---------|-------|
+| Loop logic (measure→analyze→adjust→repeat) | Claude skill / recipe |
+| Decision-making (what to adjust next) | Claude |
+| Filter design (which freqs, PEQ vs FIR) | Claude |
+| Numerical computation (FFT, biquad math) | MCP tools |
+| Analytics (phase, coherence, fixability) | MCP tools |
+| Hardware protocol (ordering, cleanup) | Plugin drivers |
+| Safety enforcement | SafetyValidator (code) — `calibrate/safety.py` |
+| Recipes | Markdown files in `recipes/core/` |
+| Hardware config | `config.yaml` |
 
 ### MCP tool design principle
-Claude sees **actions** ("measure", "apply EQ"), not **hardware** ("set Denon input",
-"POST to minidsp-rs"). The MCP server is a thin facade. Each tool handler is ~5 lines
-delegating to a plugin driver. Hardware protocol complexity stays in the drivers.
-
-### Lessons system — capture goal + learnings
-
-Each calibration run carries three short prose fields and produces ≤2 lessons.
-Avoids rediscovering documented issues across runs.
-
-| When | Tool | What |
-|---|---|---|
-| Run start | `save_calibration_run(goal, hypothesis)` | concrete measurable target + why this run should achieve it |
-| Phase start | `get_relevant_lessons(category, tags)` | pull prior lessons before designing filters / starting alignment |
-| Run end | `update_calibration_run(outcome)` | prose comparing actual to hypothesis |
-| Run end | `record_lesson(claim, scope, invalidators)` | one or two falsifiable claims |
-
-**Triage — `scope='general'` vs `scope='room'`:**
-- **general** = universal acoustics / tooling rule. Apply in any room. *Must* also be
-  promoted: open an issue, fix the codebase, or write a `memory/` file, then call
-  `promote_lesson` to mark it dealt with. Don't let general lessons accumulate in the DB.
-- **room** = depends on this room/hardware/state. Stays in DB until invalidated. Always
-  attach `invalidators` so the lesson stales out automatically when conditions change:
-  - `{"kind": "event", "value": "sub_position_changed"}` — fires via `invalidate_lessons`
-  - `{"kind": "event", "value": "target_curve_changed"}`
-  - `{"kind": "state_hash", "value": "_"}` — fires on any DSP state change
-  - `{"kind": "code", "value": "calibrate.modal_fir.design_modal_fir"}` — when that module is fixed
-
-**When to call `invalidate_lessons`:** subs physically moved, target curve replaced,
-a code module that lessons depend on was edited (`codes=[...]`), or any structural
-hardware change (`state_changed=True`).
-
-**Discipline — cap lessons-per-run at ~2** with confidence ≥ 0.5. Over-recording
-drowns the next pre-flight query in noise. A lesson should be falsifiable and
-specific: "PEQ cuts at 45 Hz delivered 1.5 dB at MLP because adjacent-band T60 > 300 ms"
-not "EQ is hard."
+Claude sees **actions** ("measure", "apply EQ"), not **hardware** ("set Denon input", "POST to minidsp-rs"). The MCP server is a thin facade. Each tool handler is ~5 lines delegating to a plugin driver.
 
 ### LLM-first tool design — HARD RULE
 
 **Tools provide DATA and SIMULATION. The LLM provides JUDGMENT.**
 
-Never build deterministic solvers for decisions the LLM should make. If a tool
-contains `for` loops that decide *what* to correct, *where* to place filters, or
-*which* frequencies to target — STOP. That decision belongs to the LLM.
-
-Tools the LLM needs:
-- **Analytics** — compute derived data the LLM can't (FFT, min-phase decomposition,
-  coherence, FIR coefficients). Return the results; don't interpret them.
-- **Simulation** — "if I apply these filters, what would the FR look like?" Pure math.
-- **Optimization** — "I chose 45Hz/-5dB, what Q minimizes error?" Numerical search.
-- **Hardware I/O** — measure, apply EQ, set delay. Execute what the LLM decided.
-
-Tools the LLM does NOT need:
-- **Solvers** — "given this FR, suggest filters." That's the LLM's job.
-- **Optimizers that choose targets** — "find the best reference level." LLM decides.
-- **Auto-anything** — if it makes a calibration decision, it belongs in the recipe/LLM.
-
-The LLM's advantage over REW/Dirac is *contextual judgment*: it sees decay data,
-phase data, coherence, cross-sub interaction, user constraints, and room history
-simultaneously. A deterministic solver sees one number and optimizes it. Don't
-replace the LLM's judgment with a greedy algorithm.
+Never build deterministic solvers for decisions the LLM should make. Tools provide analytics (phase, coherence, fixability) and simulation (predicted FR). The LLM reasons about the full context and decides what to correct, where, and how.
 
 ```
 WRONG:  measure → suggest_filters() → apply     (Python decides)
 RIGHT:  measure → analyze_phase() → LLM reasons → simulate_eq() → LLM adjusts → apply
 ```
-
-## Hardware
-
-- **AVR:** Denon X3800H (denonavr library)
-- **DSP:** miniDSP 2x4 HD (minidsp-rs daemon → HTTP)
-- **Mic:** UMIK-1 or UMIK-2 (UMIK .cal correction applied)
-- **Measurement:** PyTTa (log sweep + deconvolution)
-- **Subs:** SVS PB12-NSD (ported, ~22Hz tuning)
-
-## Safety Limits (SVS PB12-NSD)
-
-These are enforced in `SafetyValidator` before any write to miniDSP:
-- Minimum boost frequency: **25Hz**
-- Max boost per EQ band: **+6 dB**
-- Max cumulative boost in any 1/3 octave: **+9 dB**
-- Max change per iteration: **+3 dB/band**
-- Mandatory infrasonic HPF: **18Hz, 4th-order Butterworth** (always on)
-- Cuts: no floor (cuts are always safe)
 
 ## Development
 
@@ -160,125 +78,146 @@ These are enforced in `SafetyValidator` before any write to miniDSP:
 uv venv .venv && source .venv/bin/activate
 uv sync --extra dev
 
-# Run tests
+# Run all tests
 uv run python -m pytest tests/ -v
 
-# Run the CLI
-calibrate --help
-calibrate check
-calibrate measure [--label TEXT]
+# Run a single test file
+uv run python -m pytest tests/test_modal_fir.py -v
+
+# Run with coverage
+uv run python -m pytest tests/ --cov --cov-report=term-missing
 ```
 
-## Testing
+## Testing conventions (from TESTING.md)
 
-100% test coverage is the goal — tests make vibe coding safe.
-
-- Run: `pytest tests/ -v`
-- Test files: `tests/test_*.py`
-- See `TESTING.md` for conventions
-
-When writing new functions, write a corresponding test.
-When fixing a bug, write a regression test.
-When adding error handling, write a test that triggers the error.
-When adding a conditional, write tests for BOTH branches.
-Never commit code that makes existing tests fail.
+- `tests/test_{module}.py` mirrors `calibrate/{module}.py`
+- `sounddevice` and `pytta` are injected into `sys.modules` via session-scoped fixtures in `conftest.py` — never need real audio hardware in tests
+- Async tests: `pytest-asyncio` mode=auto (set in `pyproject.toml`)
+- miniDSP CLI: patch `calibrate.adapters.minidsp._run_minidsp_cli` (AsyncMock)
+- Denon: patch `denonavr.DenonAVR` with AsyncMock
+- When a new function is added, cover happy path + each error branch + edge cases
 
 ## Deployment
 
-- Docker image built by GitHub Actions on every branch push
-- Branch push → `ghcr.io/abarbaccia/avr-calibration:<branch-name>`
-- Main push → also tagged `:latest`
+- Docker image built by GitHub Actions on every push to `main` → `:latest`
 - arm64 cross-compiled in CI; no compilation on the Pi
 - Source installed at `/opt/venv/lib/python3.11/site-packages/calibrate/` inside container
 - Pi 5 at `192.168.1.117` (user `pi`)
 
-**Primary workflow:** hotfix first, pipeline second.
+**Primary workflow: hotfix first, pipeline second.**
 
-```
-SSH hotfix → validate → git push → CI build → pull latest image → validate → merge
-```
-
-**SSH hotfix (seconds, no rebuild):**
 ```bash
 ./deploy/hotfix.sh                    # auto-detects modified calibrate/ files
 ./deploy/hotfix.sh calibrate/web.py   # specific file
-```
 
-**Pull latest image after CI build completes:**
-```bash
+# After CI build completes:
 ssh pi@192.168.1.117 "sudo docker pull ghcr.io/abarbaccia/avr-calibration:latest && sudo systemctl restart avr-calibration"
 ```
 
-## Calibration Knowledge (for Claude driving calibration)
+**PipeWire state after Pi restart:** The Docker container shares the host's PipeWire socket via `/run/user/1000`. After reboots or multiple rapid container restarts, the PW session inside the container can become stale — `pw-cat` hangs with exit 124. The fix is a full Pi reboot (not just container restart) so the host PipeWire daemon reinitializes cleanly.
 
-### Signal chain
-Pi (sweep via HDMI LFE) → Denon X3800H → miniDSP 2x4 HD → subs/shakers → room → UMIK mic → Pi (recording)
+**Audio mode:** Run `/usr/local/sbin/audio-mode set cal` before measurements. Modes: `listening`, `cal`, `karaoke`. CamillaDSP owns the Scarlett directly in cal mode.
 
-### How to interpret frequency response
-- **Room modes**: Large peaks/nulls in 30-80Hz are room modes. Cut peaks (always safe). Nulls cannot be filled with EQ — they're cancellation.
-- **Port tuning**: SVS PB12-NSD tuned ~22Hz. Output rolls off steeply below port frequency. Do not boost below 25Hz.
-- **Fixable with EQ**: Broad humps, gentle slopes, peaks from room modes (cut them)
-- **NOT fixable with EQ**: Deep nulls (cancellation), frequencies below sub capability, anything above sub crossover
+## Key modules
 
-### Data-driven decision making
-Use the analytics pipeline to inform every EQ/FIR decision:
-- **`analyze_phase`**: Check fixability before designing any filter. Minimum-phase errors are correctable; excess-phase errors (cancellation) are not. Don't waste a PEQ slot on an unfixable problem.
-- **Coherence** (in FR data): Low coherence (<0.8) means the measurement is unreliable at that frequency. Don't design precise corrections based on noisy data.
-- **`simulate_eq`**: Verify every proposed filter set before applying to hardware. Iterate in simulation until satisfied, then apply once.
-- **`compare_sub_phase`**: Before alignment, check per-frequency phase relationship between subs. Know where they reinforce vs cancel before deciding on delay/polarity.
-- **`design_fir`**: For time-domain problems (long T60 decay), FIR shortens the ringing. PEQ only reduces the peak — the mode still rings. Use `analyze_decay` to identify candidates, then `design_fir` to compute coefficients.
+| Module | Purpose |
+|--------|---------|
+| `calibrate/mcp_server.py` | All MCP tool handlers (~900 tools). Each handler is ~5 lines; business logic is in the modules below. |
+| `calibrate/measurement.py` | PyTTa sweep + deconvolution. `MeasurementEngine._compute_fr_arrays()` is the core. IR gate: 500ms, with optional `direct_path_window_ms` for time-windowed analysis above Schroeder frequency. |
+| `calibrate/decay.py` | T60 analysis via spectrogram + Schroeder integration. scipy.signal pre-imported at module level for fast first call. |
+| `calibrate/modal_fir.py` | `ModalAwareFIRDesigner` + `design_anti_pulse()`. Anti-pulses use Gabor wavelets; default `n_cycles=1` (CRITICAL: higher values truncate trailing half and flip phase from −π to 0, amplifying modes instead of cancelling). |
+| `calibrate/multi_fir.py` | `design_multi_input_fir()` — regularized Wiener inverse for N-sub coherent FIR design. `design_fir_multi_modal()` — combines Wiener magnitude correction with anti-pulse T60 correction in a single FIR buffer. |
+| `calibrate/safety.py` | `SafetyValidator` — hard limits enforced before every EQ/FIR write. Profile-based. |
+| `calibrate/drivers/camilladsp.py` | CamillaDSP driver. Owns the PipeWire routing, FIR application, per-output state. Config rebuilt and pushed on every state change. |
+| `calibrate/drivers/playback.py` | `HDMIPwCatPlayback` for USB/PipeWire sub sweeps. Uses `pw-cat --target avr_cal_sweep` piped PCM stdin. |
+| `calibrate/graph.py` | Signal graph: maps transducer names → output indices → DSP processor. Used by restore_listening_mode and routing tools. |
+| `calibrate/storage.py` | SQLite: sessions, FR data, calibration runs, lessons. |
 
-### Sub alignment procedure
-1. Mute all subs except one. Measure. Repeat for each sub.
-2. Compare IR peak times — the difference is the travel-time delay between subs.
-3. Apply delay to earlier-arriving subs so all peaks align.
-4. Check polarity — if one sub's IR peak is inverted relative to others, flip it.
-5. Level-match — adjust gains so all subs have equal SPL at the mic.
-6. Re-measure to verify alignment. Repeat if needed.
+## Hardware (current production setup)
 
-### Sub crawl procedure
-1. Place the sub at the primary listening position (on/near the seat).
-2. Place the mic at each candidate sub position.
-3. Measure at each position. Compare FR smoothness across 20-80Hz.
-4. Choose the position with the smoothest response (fewest/shallowest nulls).
-5. For multiple subs, crawl each independently, then measure combined.
+- **AVR:** Denon X3800H — denonavr library, TCP port 1256 for Audyssey
+- **DSP:** CamillaDSP via PipeWire → Focusrite Scarlett 18i20
+  - Sub outputs: Scarlett lines 5/6/7 (direct-PCM, not via monitor bus)
+  - Sub cal signal path: `pw-cat → avr_cal_sweep PW null sink → camilladsp_capture:input_3 (loopback ref) → CamillaDSP → Scarlett → subs`
+- **Mic:** UMIK-1 or UMIK-2 (UMIK .cal correction applied)
+- **Subs:** SVS PB12-NSD (ported, ~22Hz tuning), output indices 5 and 6
+- **Shaker:** Earthquake MQB-1 on Behringer NX3000, output index 7 — **ALWAYS muted during calibration measurements**
 
-### Harman bass target (relative to 80Hz reference)
-| Hz  | Target |
-|-----|--------|
-| 25  | +5 dB  |
-| 31  | +4 dB  |
-| 40  | +3 dB  |
-| 50  | +2 dB  |
-| 63  | +1 dB  |
-| 80  | 0 dB   |
+## Signal chain (USB sub calibration)
 
-## Safety Limits (SVS PB12-NSD) — Code-Enforced, Non-Negotiable
+```
+pw-cat → avr_cal_sweep (PW null sink)
+       → camilladsp_capture:input_3  [loopback reference]
+       → CamillaDSP lfe_source mixer
+       → output_router → outputs 5, 6, 7
+       → Scarlett 18i20 line outputs
+       → subs → room
+       → UMIK mic → Scarlett capture → camilladsp_capture:input_1
+```
 
-These are enforced in `SafetyValidator` before any write to miniDSP.
-They exist in Python code, not just in prompts. Never bypass them.
+The loopback reference (`avr_cal_sweep:monitor_FL → camilladsp_capture:input_3`) captures the sweep signal pre-CamillaDSP, used for deconvolution. Without this loopback, coherence collapses.
 
-- Minimum boost frequency: **25Hz**
+**Sub-only measurements bypass the Denon** — inject sweep via Pi → CamillaDSP → Scarlett → subs directly. Never route sub cal sweeps through the Denon LFE pre-out (Audyssey/MultEQ corrupt the stimulus).
+
+## Safety limits (SVS PB12-NSD) — code-enforced
+
+Enforced in `SafetyValidator` before every write. Never bypass.
+
+- Minimum boost frequency: **25 Hz**
 - Max boost per EQ band: **+6 dB**
 - Max cumulative boost in any 1/3 octave: **+9 dB**
 - Max change per iteration: **+3 dB/band**
-- Mandatory infrasonic HPF: **18Hz, 4th-order Butterworth** (always on)
-- Cuts: no floor (cuts are always safe)
+- Mandatory infrasonic HPF: **18 Hz, 4th-order Butterworth** (always on)
+- Cuts: no floor
 
-## Key design decisions
+## FIR design — critical invariants
 
-- **Claude Code is the orchestrator** — reads recipes, drives calibration loop, makes decisions
-- **LLM designs filters, tools do math** — never build deterministic solvers for decisions the LLM should make. Tools provide analytics (phase, coherence, fixability) and simulation (predicted FR). The LLM reasons about the full context and decides what to correct, where, and how.
-- **Python provides MCP primitives** — measure, apply EQ, mute/unmute, set delay (no orchestration)
-- **Rich analytics pipeline** — mic-corrected FR, minimum-phase decomposition, coherence, group delay, cross-sub phase analysis. The LLM's judgment is only as good as the data it sees.
-- **Recipes are English markdown** — human-readable instructions in `recipes/core/`
-- **PyTTa** replaces REW as the measurement engine (free, sufficient for bass calibration)
-- **minidsp-rs** daemon handles USB control of the 2x4 HD; Python speaks HTTP to it
-- **denonavr** library handles Denon X3800H control
-- **SQLite** for measurement history storage
-- **Harman target curve** as the default optimization target
+**`design_fir` normalization:** Only normalize FIR taps when `peak > 1.0`. Unconditionally dividing by peak when `peak < 1.0` amplifies attenuating filters and inverts the correction direction (cuts become boosts).
+
+**`design_modal_fir` Gabor n_cycles:** Default is `n_cycles=1`. For `n_cycles ≥ 2`, the Gabor trailing half extends past `pre_samples` and gets hard-clipped, breaking the −π cancellation phase and amplifying modes by tens of dB instead of cancelling them. The floor formula `(0.5 + 0.5 * n_cycles) * T` ensures leading-edge safety; n_cycles=1 also ensures trailing-edge safety.
+
+**`design_fir_multi` regularization_lambda:** Signal levels in this setup are typically −28 to −16 dBFS (linear 0.04–0.16). The default λ=0.1 exceeds the signal level and suppresses everything. Use λ=0.01 for this hardware.
+
+**`design_fir_multi_modal` anti-pulse + Wiener:** Anti-pulses must be placed BEFORE the Wiener main impulse in the same FIR time-domain buffer (using `ModalAwareFIRDesigner` with the Wiener FIR as `base_correction`). Convolving anti-pulse and Wiener as separate FIRs fails — the Gabor's Fourier spectrum (+52 dB at mode frequency) is normalized by ModalAwareFIRDesigner's adjacent-band cap, making the combined FIR effectively mute the sub.
+
+**`design_fir` prediction with pre-ringing (mixed phase):** The mixed-phase FIR adds pre-ringing (e.g., 40 ms). The loopback reference is pre-CamillaDSP; the measurement deconvolution sees the pre-ring as apparent early energy. Use `phase_mode='minimum'` for sub measurements where the loopback timing is inconsistent.
+
+## Measurement reliability
+
+**Baseline requires PEQ pre-conditioning:** The SVS port resonance (+15 dBFS at 20 Hz without cuts) saturates the measurement chain and collapses coherence at 63–80 Hz. Always apply HPF + cuts at 20–36 Hz (e.g., 22 Hz/−10 dB, 28 Hz/−8 dB) before taking a FIR baseline.
+
+**Loopback timing consistency:** `loopback_xcorr_peak_ms` must be stable across compared sessions. When it varies significantly (e.g., 3.0 vs 4.979 ms), the measurements cannot be directly compared — the deconvolution reference has shifted.
+
+**Time-windowed IR (`direct_path_window_ms`):** For verifying FIR effects above the Schroeder frequency (~150 Hz in this room), use `measure(direct_path_window_ms='100')`. This applies a 100 ms Hanning window around the IR peak, isolating the direct path. **Do NOT use for sub-bass calibration** (20–80 Hz) — room modes need the full 500 ms gate to establish; the short gate shows 10–15 dB lower than listening level.
+
+**Minimum-phase FIR at <50 Hz:** FIR group delay (100–200 ms at 31–40 Hz) shifts room mode phases and can increase measured level even while attenuating. Verify FIR effects at sub-bass via tap frequency-response analysis, not 1/3-octave room comparison.
+
+## Lessons system
+
+Each calibration run carries three short prose fields and produces ≤2 lessons.
+
+| When | Tool | What |
+|---|---|---|
+| Run start | `save_calibration_run(goal, hypothesis)` | concrete measurable target + why this run should achieve it |
+| Phase start | `get_relevant_lessons(category, tags)` | pull prior lessons before designing filters |
+| Run end | `update_calibration_run(outcome)` | prose comparing actual to hypothesis |
+| Run end | `record_lesson(claim, scope, invalidators)` | one or two falsifiable claims |
+
+- `scope='general'` = universal acoustics/tooling rule — must be promoted (fix codebase or write memory file), don't let accumulate in DB
+- `scope='room'` = this room/hardware — provide `invalidators` so it stales automatically
+- Cap at ~2 lessons per run with confidence ≥ 0.5
+
+## Harman bass target (relative to 80 Hz reference)
+
+| Hz | Target |
+|----|--------|
+| 25 | +5 dB  |
+| 31 | +4 dB  |
+| 40 | +3 dB  |
+| 50 | +2 dB  |
+| 63 | +1 dB  |
+| 80 | 0 dB   |
 
 ## Skill routing
 
-gstack skills are disabled for this repo. Do NOT auto-invoke ship, review, investigate,
-or other gstack skills. Handle all requests directly without routing to skills.
+gstack skills are disabled for this repo. Do NOT auto-invoke ship, review, investigate, or other gstack skills. Handle all requests directly without routing to skills.
