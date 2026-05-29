@@ -600,3 +600,218 @@ def design_fir_multi_modal(
         # intent="modal_cancel" so SafetyValidator uses the 60 dB cap.
         "apply_intent": "modal_cancel",
     }
+
+
+# ---------------------------------------------------------------------------
+# Trinnov-style wideband decay correction
+# ---------------------------------------------------------------------------
+
+def _compute_trinnov_precausal(
+    ir: "np.ndarray",
+    sample_rate: int,
+    pre_delay_samples: int,
+    target_t60_ms: float,
+    freq_min: float,
+    freq_max: float,
+    bands_per_octave: int,
+    cancel_strength: float,
+) -> tuple["np.ndarray", list[dict]]:
+    """Compute a continuous pre-causal decay correction from a measured room IR.
+
+    Unlike per-mode Gabor anti-pulses (which collide when modes are <0.5 oct
+    apart), this approach:
+      1. Bandpass-filters the measured IR at each 1/bands_per_octave band.
+      2. Computes measured T60 via Schroeder integration.
+      3. For bands where T60 > target, time-reverses the post-direct ringing
+         and scales by cancel_strength × excess_fraction.
+      4. Sums ALL band corrections into one continuous pre-causal waveform.
+
+    Closely-spaced modes are handled naturally because their contributions are
+    summed in the time domain — no Gabor interference because there are no
+    per-mode Gabors.
+
+    The pre-causal waveform is truncated to pre_delay_samples. For long-decay
+    modes this is a partial correction (most energy is near the main impulse
+    so the truncation loss is modest).
+
+    Returns (pre_causal, band_reports) where band_reports lists each band's
+    measured T60 and correction status.
+    """
+    import numpy as np
+    from scipy.signal import butter, sosfilt
+
+    peak_idx = int(np.argmax(np.abs(ir)))
+    pre_causal = np.zeros(pre_delay_samples, dtype=np.float64)
+    band_reports: list[dict] = []
+
+    # Build 1/bands_per_octave centre frequencies
+    n_octaves = math.log2(freq_max / freq_min)
+    n_bands = max(1, int(round(n_octaves * bands_per_octave)) + 1)
+    centre_freqs = [freq_min * 2 ** (i / bands_per_octave) for i in range(n_bands)]
+    nyq = sample_rate / 2.0
+
+    for f_c in centre_freqs:
+        # Band edges at ±½ step on a log scale
+        f_lo = f_c / 2 ** (0.5 / bands_per_octave)
+        f_hi = f_c * 2 ** (0.5 / bands_per_octave)
+        if f_lo < 5.0 or f_hi >= nyq:
+            continue
+
+        try:
+            sos = butter(4, [f_lo / nyq, f_hi / nyq], btype="band", output="sos")
+        except Exception:
+            continue
+
+        bp_ir = sosfilt(sos, ir)
+
+        # Schroeder integration on ringing (after direct path peak)
+        ringing = bp_ir[peak_idx:]
+        if len(ringing) < 64:
+            continue
+
+        energy_rev = np.cumsum(ringing[::-1] ** 2)[::-1]
+        peak_e = energy_rev[0]
+        if peak_e < 1e-20:
+            continue
+
+        schroeder_db = 10.0 * np.log10(energy_rev / peak_e + 1e-30)
+        # T60: first index where Schroeder crosses −60 dB
+        below = np.where(schroeder_db < -60.0)[0]
+        t60_ms = (below[0] if len(below) else len(ringing)) / sample_rate * 1000.0
+
+        if t60_ms <= target_t60_ms:
+            band_reports.append({"freq_hz": round(f_c, 1), "t60_ms": round(t60_ms), "corrected": False})
+            continue
+
+        excess_fraction = min(1.0, (t60_ms - target_t60_ms) / (t60_ms + 1e-9))
+        scale = cancel_strength * excess_fraction
+
+        # Pre-causal correction: time-reversed ringing, truncated to budget
+        # Place so the highest-amplitude end aligns with t=0 (main impulse).
+        ringing_trunc = ringing[:pre_delay_samples]
+        anti = -ringing_trunc[::-1] * scale
+
+        pre_causal[: len(anti)] += anti
+        band_reports.append({
+            "freq_hz": round(f_c, 1),
+            "t60_ms": round(t60_ms),
+            "excess_ms": round(t60_ms - target_t60_ms),
+            "scale": round(scale, 3),
+            "corrected": True,
+        })
+
+    return pre_causal, band_reports
+
+
+def design_fir_trinnov(
+    room_ir: list[float],
+    measurements: "Sequence[SubMeasurement]",
+    target_points: "Sequence[tuple[float, float]]",
+    *,
+    sample_rate: int = 48000,
+    num_taps: int = 24576,
+    phase_mode: str = "minimum",
+    regularization_lambda: float = 0.01,
+    freq_focus_hz: tuple[float, float] | None = None,
+    target_t60_ms: float = 200.0,
+    pre_delay_ms: float = 50.0,
+    freq_min: float = 20.0,
+    freq_max: float = 120.0,
+    bands_per_octave: int = 6,
+    cancel_strength: float = 0.5,
+) -> dict:
+    """Trinnov-style wideband decay correction + Wiener magnitude correction.
+
+    Architecture:
+      fir[0 .. pre_samples-1]  = continuous pre-causal anti-ringing (all bands)
+      fir[pre_samples ..]      = min-phase Wiener magnitude correction
+
+    The pre-causal section is derived directly from the measured room IR — it
+    is the time-reversed, scaled ringing at each 1/bands_per_octave band where
+    T60 exceeds target_t60_ms.  Because there are no per-mode Gabors, closely-
+    spaced modes (e.g. 64/72/80 Hz) are handled naturally: their band
+    contributions simply add in the time domain with no interference artefacts.
+
+    Parameters
+    ----------
+    room_ir          : averaged impulse response from measure_impulse_ir()
+    measurements     : per-sub solo FR sessions (for Wiener design)
+    target_points    : target magnitude curve [(freq_hz, spl_db), ...]
+    target_t60_ms    : desired T60 across the band (default 200 ms)
+    pre_delay_ms     : pre-causal budget; 50 ms is a good default — captures
+                       the most energetic portion of the anti-ringing even for
+                       long-decay modes (exponential decay means energy peaks
+                       nearest the main impulse)
+    freq_min/max     : frequency range for decay correction
+    bands_per_octave : filter bank resolution (default 6 = 1/6-octave)
+    cancel_strength  : 0–1 scaling for pre-causal correction (default 0.5)
+    """
+    import numpy as np
+
+    pre_samples = int(math.ceil(pre_delay_ms / 1000.0 * sample_rate))
+    mag_taps = num_taps - pre_samples
+    if mag_taps < 512:
+        raise ValueError(
+            f"pre_delay_ms={pre_delay_ms} leaves only {mag_taps} taps for Wiener "
+            f"(num_taps={num_taps}). Reduce pre_delay_ms or increase num_taps."
+        )
+
+    ir = np.asarray(room_ir, dtype=np.float64)
+
+    # Step 1 — pre-causal decay correction from room IR
+    pre_causal, band_reports = _compute_trinnov_precausal(
+        ir, sample_rate, pre_samples,
+        target_t60_ms=target_t60_ms,
+        freq_min=freq_min, freq_max=freq_max,
+        bands_per_octave=bands_per_octave,
+        cancel_strength=cancel_strength,
+    )
+
+    corrected_bands = [b for b in band_reports if b.get("corrected")]
+    skipped_bands = [b for b in band_reports if not b.get("corrected")]
+
+    # Step 2 — per-sub Wiener magnitude FIRs
+    wiener = design_multi_input_fir(
+        measurements, target_points,
+        sample_rate=sample_rate, num_taps=mag_taps,
+        phase_mode=phase_mode, regularization_lambda=regularization_lambda,
+        freq_focus_hz=freq_focus_hz,
+    )
+
+    # Step 3 — combine: build full FIR buffer, insert Wiener at pre_samples
+    combined_firs: list[list[float]] = []
+    for wiener_taps in wiener["firs"]:
+        fir = np.zeros(num_taps, dtype=np.float64)
+        fir[:pre_samples] = pre_causal
+        w = np.asarray(wiener_taps, dtype=np.float64)
+        fir[pre_samples: pre_samples + len(w)] += w
+
+        # Normalise only if peak exceeds 1.0 (same rule as design_multi_input_fir)
+        peak = float(np.max(np.abs(fir)))
+        if peak > 1.0:
+            fir /= peak
+
+        combined_firs.append(fir.tolist())
+
+    # Peak of pre-causal section (sanity check — should be < 1)
+    pre_peak = float(np.max(np.abs(pre_causal))) if len(pre_causal) else 0.0
+
+    return {
+        "firs": combined_firs,
+        "num_subs": wiener["num_subs"],
+        "num_taps": num_taps,
+        "sample_rate": sample_rate,
+        "phase_mode": phase_mode,
+        "regularization_lambda": regularization_lambda,
+        "predicted_combined": wiener["predicted_combined"],
+        "predicted_per_sub": wiener["predicted_per_sub"],
+        "per_sub_peak_boost_db": wiener["per_sub_peak_boost_db"],
+        "output_gain_db": wiener.get("output_gain_db", 0.0),
+        "latency_ms": round(pre_samples / sample_rate * 1000, 2),
+        "pre_delay_ms": round(pre_delay_ms, 2),
+        "pre_causal_peak": round(pre_peak, 4),
+        "corrected_bands": corrected_bands,
+        "skipped_bands": skipped_bands,
+        "n_corrected": len(corrected_bands),
+        "apply_intent": "modal_cancel",
+    }

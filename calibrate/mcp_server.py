@@ -157,6 +157,10 @@ _fir_design_intent: dict[int, str] = {}
 # active causes DAC clipping.  Set by apply_fir when intent=modal_cancel;
 # cleared by clear_fir.  Checked at the start of every measure() call.
 _sweep_blocked_outputs: set[int] = set()
+# Cached room IRs from measure_impulse_ir, keyed by ir_session_id.
+# Used by design_fir_trinnov to avoid re-measuring.
+_ir_cache: dict[int, list[float]] = {}
+_ir_cache_counter: list[int] = [0]
 
 
 def _default_dsp_name() -> str | None:
@@ -4315,6 +4319,144 @@ async def _tool_design_fir_multi_modal(
         return _err(f"design_fir_multi_modal failed: {exc}")
 
 
+async def _tool_design_fir_trinnov(
+    ir_session_id: int,
+    measurements: list[dict],
+    target_curve: dict,
+    *,
+    num_taps: int = 24576,
+    phase_mode: str = "minimum",
+    regularization_lambda: float = 0.01,
+    freq_focus_hz: list[float] | None = None,
+    target_t60_ms: float = 200.0,
+    pre_delay_ms: float = 50.0,
+    freq_min: float = 20.0,
+    freq_max: float = 120.0,
+    bands_per_octave: int = 6,
+    cancel_strength: float = 0.5,
+    return_coefficients: bool = False,
+) -> dict:
+    """Trinnov-style wideband decay correction + Wiener magnitude correction.
+
+    Unlike design_fir_multi_modal (per-mode Gabor anti-pulses), this tool
+    derives the pre-causal correction directly from the measured room IR at
+    every 1/bands_per_octave frequency band.  Closely-spaced modes (e.g. the
+    64/72/80 Hz cluster) are corrected naturally — their band contributions
+    simply sum in the time domain with no Gabor interference.
+
+    Workflow:
+      1. measure_impulse_ir(n_averages=64) → returns ir_session_id
+      2. design_fir_trinnov(ir_session_id, measurements, target_curve, ...)
+      3. apply_fir(output_index, design_session_id)  ×  n_subs
+
+    Parameters
+    ----------
+    ir_session_id    : from measure_impulse_ir
+    measurements     : [{session_id, output_index, label}, ...] per-sub FR sessions
+    target_curve     : {points: [{freq, spl}, ...]} magnitude target
+    target_t60_ms    : T60 target; bands above this get corrected (default 200 ms)
+    pre_delay_ms     : pre-causal budget in ms (default 50 ms)
+    freq_min/max     : frequency range for decay correction
+    bands_per_octave : filter bank resolution (default 6 = 1/6-octave)
+    cancel_strength  : 0–1 pre-causal amplitude scale (default 0.5)
+    """
+    try:
+        import numpy as np
+        from .multi_fir import SubMeasurement, design_fir_trinnov
+
+        # Retrieve cached IR
+        if ir_session_id not in _ir_cache:
+            return _err(
+                f"ir_session_id={ir_session_id} not found in cache. "
+                "Run measure_impulse_ir() first (cache is reset on container restart)."
+            )
+        room_ir = _ir_cache[ir_session_id]
+
+        # Load measurements from session store
+        from .storage import SessionStore
+        store = SessionStore()
+        sub_measurements = []
+        for m in measurements:
+            session_id = int(m["session_id"])
+            output_index = int(m["output_index"])
+            label = str(m.get("label", f"sub_{output_index}"))
+            session = store.get_session(session_id)
+            if session is None:
+                return _err(f"session_id={session_id} not found in session store")
+            fr = session.start_fr
+            if not fr or not fr.frequencies:
+                return _err(f"session_id={session_id} has no FR data")
+            if not fr.phase:
+                return _err(f"session_id={session_id} has no phase data — re-measure with phase")
+            sub_measurements.append(SubMeasurement(
+                freqs=list(fr.frequencies),
+                spl_db=list(fr.spl),
+                phase_rad=list(fr.phase),
+                label=label,
+            ))
+
+        # Parse target curve
+        points = target_curve.get("points", [])
+        target_points = [(float(p["freq"]), float(p["spl"])) for p in points]
+
+        focus = tuple(freq_focus_hz) if freq_focus_hz and len(freq_focus_hz) == 2 else None
+
+        result = design_fir_trinnov(
+            room_ir=room_ir,
+            measurements=sub_measurements,
+            target_points=target_points,
+            sample_rate=48000,
+            num_taps=num_taps,
+            phase_mode=phase_mode,
+            regularization_lambda=regularization_lambda,
+            freq_focus_hz=focus,
+            target_t60_ms=target_t60_ms,
+            pre_delay_ms=pre_delay_ms,
+            freq_min=freq_min,
+            freq_max=freq_max,
+            bands_per_octave=bands_per_octave,
+            cancel_strength=cancel_strength,
+        )
+
+        # Cache FIRs
+        apply_intent = result.get("apply_intent", "modal_cancel")
+        cache_ids = []
+        for fir_taps, m in zip(result["firs"], measurements):
+            output_index = int(m["output_index"])
+            session_id = int(m["session_id"])
+            cache_id = session_id * 1000 + output_index
+            _fir_design_cache[cache_id] = fir_taps
+            _fir_design_intent[cache_id] = apply_intent
+            cache_ids.append({"output_index": output_index, "design_session_id": cache_id})
+
+        response = {
+            "num_subs": result["num_subs"],
+            "num_taps": num_taps,
+            "phase_mode": phase_mode,
+            "regularization_lambda": regularization_lambda,
+            "latency_ms": result["latency_ms"],
+            "pre_delay_ms": result["pre_delay_ms"],
+            "pre_causal_peak": result["pre_causal_peak"],
+            "n_corrected_bands": result["n_corrected"],
+            "corrected_bands": result["corrected_bands"],
+            "predicted_combined": result["predicted_combined"],
+            "predicted_per_sub": result["predicted_per_sub"],
+            "per_sub_peak_boost_db": result["per_sub_peak_boost_db"],
+            "cache_ids": cache_ids,
+            "note": (
+                f"Trinnov-style FIR: {result['num_subs']} subs, {num_taps} taps, "
+                f"{pre_delay_ms} ms pre-causal, {result['n_corrected']} bands corrected "
+                f"(target T60={target_t60_ms} ms). "
+                f"Apply via apply_fir(output_index, design_session_id)."
+            ),
+        }
+        if return_coefficients:
+            response["firs"] = result["firs"]
+        return _ok(**response)
+    except Exception as exc:
+        return _err(f"design_fir_trinnov failed: {exc}")
+
+
 async def _tool_design_modal_fir(
     session_id: int,
     intents: list[dict] | None = None,
@@ -5742,6 +5884,7 @@ async def _tool_measure_impulse_ir(
     ``impulse_amplitude``: impulse sample amplitude 0-1 (default 0.9).
     """
     try:
+        from .measurement import MeasurementEngine
         cfg = _config()
         engine = MeasurementEngine(cfg)
         ir = await engine.measure_impulse_ir(
@@ -5749,14 +5892,19 @@ async def _tool_measure_impulse_ir(
             record_duration_s=record_duration_s,
             impulse_amplitude=impulse_amplitude,
         )
+        # Cache IR for design_fir_trinnov (avoids re-measuring)
+        _ir_cache_counter[0] += 1
+        ir_session_id = _ir_cache_counter[0]
+        _ir_cache[ir_session_id] = ir
         return _ok(
-            impulse_response=ir,
+            ir_session_id=ir_session_id,
             n_samples=len(ir),
             sample_rate=int(cfg.measurement.get("sample_rate", 48000)),
             n_averages=n_averages,
             note=(
                 f"Averaged impulse IR: {n_averages} shots × {record_duration_s}s. "
-                "Pass impulse_response to analyze_decay() for T60 at 23.4 Hz / 46.9 Hz."
+                f"ir_session_id={ir_session_id} — pass to design_fir_trinnov() for "
+                "wideband decay correction, or analyze_decay() for T60 diagnostics."
             ),
         )
     except Exception as exc:
@@ -11810,6 +11958,50 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="design_fir_trinnov",
+        description=(
+            "Trinnov-style WIDEBAND decay correction + Wiener magnitude correction. "
+            "Unlike design_fir_multi_modal (per-mode Gabor anti-pulses that collide when modes "
+            "are <0.5 oct apart), this derives the pre-causal correction directly from the "
+            "measured room IR at every 1/6-octave band — closely-spaced modes (e.g. 64/72/80 Hz "
+            "cluster) are handled naturally with no Gabor interference artefacts. "
+            "Workflow: (1) measure_impulse_ir → ir_session_id, "
+            "(2) design_fir_trinnov(ir_session_id, measurements, target_curve, ...), "
+            "(3) apply_fir per sub."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "ir_session_id": {
+                    "type": "integer",
+                    "description": "IR cache ID returned by measure_impulse_ir().",
+                },
+                "measurements": {
+                    "type": "array",
+                    "description": "Solo FR sessions per sub: [{session_id, output_index, label?}].",
+                    "items": {"type": "object", "properties": {"session_id": {"type": "integer"}, "output_index": {"type": "integer"}, "label": {"type": "string"}}, "required": ["session_id", "output_index"]},
+                },
+                "target_curve": {
+                    "type": "object",
+                    "description": "Magnitude target: {points: [{freq, spl}]}.",
+                    "properties": {"points": {"type": "array", "items": {"type": "object", "properties": {"freq": {"type": "number"}, "spl": {"type": "number"}}}}},
+                },
+                "target_t60_ms": {"type": "number", "description": "Target T60; bands above this get pre-causal correction. Default 200 ms.", "default": 200.0},
+                "pre_delay_ms": {"type": "number", "description": "Pre-causal budget ms. Default 50 ms.", "default": 50.0},
+                "freq_min": {"type": "number", "description": "Low edge of decay-correction band. Default 20 Hz.", "default": 20.0},
+                "freq_max": {"type": "number", "description": "High edge of decay-correction band. Default 120 Hz.", "default": 120.0},
+                "bands_per_octave": {"type": "integer", "description": "Filter bank resolution. Default 6 (1/6-octave).", "default": 6},
+                "cancel_strength": {"type": "number", "description": "Pre-causal amplitude scale 0–1. Default 0.5.", "default": 0.5},
+                "num_taps": {"type": "integer", "description": "Total taps per FIR. Default 24576.", "default": 24576},
+                "phase_mode": {"type": "string", "enum": ["minimum", "linear", "mixed"], "description": "Wiener phase mode. Default minimum.", "default": "minimum"},
+                "regularization_lambda": {"type": "number", "description": "Wiener regularization. Default 0.01.", "default": 0.01},
+                "freq_focus_hz": {"type": "array", "items": {"type": "number"}, "description": "[lo, hi] Wiener correction band."},
+                "return_coefficients": {"type": "boolean", "description": "Include FIR coefficients in response. Default false.", "default": False},
+            },
+            "required": ["ir_session_id", "measurements", "target_curve"],
+        },
+    ),
+    Tool(
         name="design_modal_fir",
         description=(
             "Active modal-cancellation FIR. Places anti-pulses one half-wavelength before the "
@@ -12939,6 +13131,23 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             regularization_lambda=float(arguments.get("regularization_lambda", 0.01)),
             freq_focus_hz=arguments.get("freq_focus_hz"),
             gabor_n_cycles=int(arguments.get("gabor_n_cycles", 1)),
+            return_coefficients=bool(arguments.get("return_coefficients", False)),
+        )
+    elif name == "design_fir_trinnov":
+        result = await _tool_design_fir_trinnov(
+            ir_session_id=int(arguments["ir_session_id"]),
+            measurements=arguments["measurements"],
+            target_curve=arguments["target_curve"],
+            num_taps=int(arguments.get("num_taps", 24576)),
+            phase_mode=arguments.get("phase_mode", "minimum"),
+            regularization_lambda=float(arguments.get("regularization_lambda", 0.01)),
+            freq_focus_hz=arguments.get("freq_focus_hz"),
+            target_t60_ms=float(arguments.get("target_t60_ms", 200.0)),
+            pre_delay_ms=float(arguments.get("pre_delay_ms", 50.0)),
+            freq_min=float(arguments.get("freq_min", 20.0)),
+            freq_max=float(arguments.get("freq_max", 120.0)),
+            bands_per_octave=int(arguments.get("bands_per_octave", 6)),
+            cancel_strength=float(arguments.get("cancel_strength", 0.5)),
             return_coefficients=bool(arguments.get("return_coefficients", False)),
         )
     elif name == "design_fir_multi":
