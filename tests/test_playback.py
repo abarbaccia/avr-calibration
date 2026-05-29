@@ -243,8 +243,8 @@ class TestHDMIPwCatPlayback:
         assert cmd[cmd.index("--format") + 1] == "s16"
         assert cmd[-1] == "-"  # stdin
 
-        # Two Popen calls: first is the warmup burst, second is the sweep.
-        assert MockPopen.call_count == 2
+        # Three Popen calls: stale-stream cleanup (pw-cli ls Node), warmup burst, sweep.
+        assert MockPopen.call_count == 3
         sweep_kwargs = proc.communicate.call_args.kwargs
         assert "input" in sweep_kwargs
         pcm_bytes = sweep_kwargs["input"]

@@ -572,6 +572,12 @@ def design_fir_multi_modal(
             base_correction=wiener_taps,
             intents=mode_intents,
             gabor_n_cycles=gabor_n_cycles,
+            # skip_freq_domain_norm: the Wiener FIR is already an attenuation
+            # filter (gain < 1). The Gabor's Fourier integral (+52 dB at mode
+            # freq) is a transient artifact — normalizing by it kills the
+            # Wiener correction 400×. SafetyValidator's modal_cancel cap (60 dB
+            # for SVS PB12-NSD) correctly permits transient Gabor content.
+            skip_freq_domain_norm=True,
         )
         combined_firs.append(fir_taps)
         modal_notes.extend(summary.notes)
@@ -590,4 +596,7 @@ def design_fir_multi_modal(
         "latency_ms": round(pre_samples / sample_rate * 1000, 2),
         "modal_pre_delay_ms": round(min_needed_ms, 2),
         "modal_notes": modal_notes,
+        # FIRs contain Gabor anti-pulse pre-ring; apply_fir must use
+        # intent="modal_cancel" so SafetyValidator uses the 60 dB cap.
+        "apply_intent": "modal_cancel",
     }

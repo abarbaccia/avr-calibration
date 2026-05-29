@@ -4273,11 +4273,16 @@ async def _tool_design_fir_multi_modal(
         )
 
         primary_sid = int(measurements[0]["session_id"])
+        apply_intent = result.get("apply_intent", "general")
         cache_ids = []
         for i, (m, fir) in enumerate(zip(measurements, result["firs"])):
             out_idx = int(m.get("output_index", i))
             cache_id = primary_sid * 1000 + out_idx
             _fir_design_cache[cache_id] = fir
+            # Tag with modal_cancel so apply_fir uses the looser 60 dB cap
+            # (Gabor anti-pulse has large frequency-domain integral but is
+            # transient — SafetyValidator's modal_cancel cap correctly permits it)
+            _fir_design_intent[cache_id] = apply_intent
             cache_ids.append({"output_index": out_idx, "design_session_id": cache_id})
 
         response = {
@@ -4295,7 +4300,8 @@ async def _tool_design_fir_multi_modal(
             "note": (
                 f"Combined Wiener+modal FIR: {result['num_subs']} subs, "
                 f"{num_taps} taps, {result['modal_pre_delay_ms']:.1f} ms anti-pulse pre-ring. "
-                "Apply each via apply_fir(output_index, design_session_id)."
+                f"Apply each via apply_fir(output_index, design_session_id). "
+                f"FIRs tagged intent={apply_intent!r} for SafetyValidator."
             ),
         }
         if return_coefficients:

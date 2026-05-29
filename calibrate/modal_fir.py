@@ -268,6 +268,7 @@ class ModalAwareFIRDesigner:
                 modal_cancel_max_boost_db: float | None = None,
                 compensation_notch: bool = False,
                 gabor_n_cycles: int = 1,
+                skip_freq_domain_norm: bool = False,
                 ) -> tuple[list[float], DesignSummary]:
         """Generate a modal-aware mixed-phase FIR.
 
@@ -530,12 +531,24 @@ class ModalAwareFIRDesigner:
         # 7. Normalize so max |H(f)| ≤ 1.0 (prevents gain pump from anti-pulse
         # constructive interference — time-domain peak normalization is insufficient
         # for mixed-phase FIRs with pre-ring where peak=1.0 from identity seed).
+        #
+        # SKIP when skip_freq_domain_norm=True (set by design_fir_multi_modal):
+        # the Wiener base_correction is already an attenuation filter (gain < 1).
+        # The Gabor anti-pulse's large spectral integral (~52 dB at mode freq)
+        # is a Fourier artifact, not acoustic gain — normalizing by it kills the
+        # Wiener correction by 400-500×. The SafetyValidator's modal_cancel cap
+        # (60 dB for SVS PB12-NSD) correctly permits the transient Gabor content.
         n_fft = max(len(fir) * 2, 8192)
         H = np.fft.rfft(fir, n=n_fft)
         max_freq_gain = float(np.max(np.abs(H)))
-        if max_freq_gain > 1.0:
+        if max_freq_gain > 1.0 and not skip_freq_domain_norm:
             fir = fir / max_freq_gain
             summary.notes.append(f"freq-domain normalized: max gain {max_freq_gain:.3f} → 1.0")
+        elif skip_freq_domain_norm and max_freq_gain > 1.0:
+            summary.notes.append(
+                f"freq-domain norm SKIPPED (Wiener+anti-pulse mode): "
+                f"max gain {max_freq_gain:.3f} dB — SafetyValidator modal_cancel cap applies"
+            )
         summary.peak_amplitude = float(np.max(np.abs(fir)))
 
         return fir.tolist(), summary

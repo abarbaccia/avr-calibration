@@ -1368,15 +1368,11 @@ def _xcorr_delay_ms(
     if len(env_window) == 0 or float(np.max(env_window)) == 0.0:
         return None
 
-    global_peak = float(np.max(env_window))
-    above = env_window > 0.10 * global_peak
-    if np.any(above):
-        rel_idx = int(np.argmax(above))
-        refine_lo = max(0, rel_idx - int(0.002 * sample_rate))
-        refine_hi = min(len(env_window), rel_idx + int(0.002 * sample_rate))
-        rel_idx = refine_lo + int(np.argmax(env_window[refine_lo:refine_hi]))
-    else:
-        rel_idx = int(np.argmax(env_window))
+    # Use the absolute peak of the bandpass envelope — more stable than onset
+    # detection (first-above-threshold) which can latch onto different early
+    # noise bursts between runs and shift loopback_xcorr_peak_ms by 1-2 ms.
+    # The absolute peak position of a clean sweep xcorr is deterministic.
+    rel_idx = int(np.argmax(env_window))
 
     peak_idx = lo_idx + rel_idx
     return round(peak_idx / sample_rate * 1000.0, 3)

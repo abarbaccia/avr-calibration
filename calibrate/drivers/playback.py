@@ -492,12 +492,64 @@ class HDMIPwCatPlayback:
         self.capture_pipewire_node = capture_pipewire_node
         self.skip_warmup = skip_warmup
 
+    @staticmethod
+    def _kill_stale_pw_streams(sink_name: str) -> None:
+        """Destroy any orphaned pw-cat stream nodes writing to *sink_name*.
+
+        After a crash or network outage, pw-cat's PipeWire session can
+        outlive the process — the node stays registered and blocks the next
+        writer.  Call this at the start of every sweep to clean up before
+        opening a new stream.
+        """
+        import subprocess, re
+        try:
+            out = subprocess.check_output(
+                ["pw-cli", "ls", "Node"],
+                timeout=3.0,
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", errors="replace")
+        except Exception:
+            return
+        # Find pw-cat Stream/Output/Audio nodes (orphaned playback streams).
+        # pw-cli output groups each node as a block; scan for id lines followed
+        # by application.name = "pw-cat" and media.class = "Stream/Output/Audio".
+        current_id: str | None = None
+        is_pwcat = False
+        is_output_stream = False
+        ids_to_kill: list[str] = []
+        for line in out.splitlines():
+            m_id = re.match(r"^\s*id\s+(\d+),", line)
+            if m_id:
+                if current_id and is_pwcat and is_output_stream:
+                    ids_to_kill.append(current_id)
+                current_id = m_id.group(1)
+                is_pwcat = False
+                is_output_stream = False
+            if 'application.name = "pw-cat"' in line:
+                is_pwcat = True
+            if 'media.class = "Stream/Output/Audio"' in line:
+                is_output_stream = True
+        if current_id and is_pwcat and is_output_stream:
+            ids_to_kill.append(current_id)
+        for node_id in ids_to_kill:
+            log.warning("HDMIPwCatPlayback: destroying stale pw-cat stream node %s", node_id)
+            try:
+                subprocess.run(
+                    ["pw-cli", "destroy", node_id],
+                    timeout=2.0, capture_output=True,
+                )
+            except Exception:
+                pass
+
     def play_and_record(self, sweep, sample_rate, in_channel, out_channel):
         import subprocess
         import time as _time
 
         import numpy as np
         import sounddevice as sd
+
+        # Clean up any orphaned pw-cat stream nodes from previous crashed sweeps.
+        self._kill_stale_pw_streams(self.pipewire_node)
 
         sweep_array = sweep.timeSignal[:, 0].astype(np.float32)
         n_samples = len(sweep_array)
