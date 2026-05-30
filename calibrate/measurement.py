@@ -533,6 +533,12 @@ class MeasurementEngine:
 
     def __init__(self, config: Config) -> None:
         self.config = config
+        # Configurable xcorr search window — increase when long FIRs push
+        # CamillaDSP processing latency beyond the default 200 ms ceiling.
+        # measurement.xcorr_search_window_ms in config.yaml overrides the default.
+        self._xcorr_search_window_ms = float(
+            config._data.get("measurement", {}).get("xcorr_search_window_ms", 200.0)
+        )
         # Use the module-level _MEASURE_LOCK, not an instance lock — MeasurementEngine
         # is created fresh per MCP tool call, so an instance lock would not serialize
         # concurrent callers. The module lock is shared across all instances.
@@ -1214,7 +1220,12 @@ class MeasurementEngine:
         # Floor at 3 ms (≈1 m acoustic) — skip ALSA stream-startup transients
         # that consistently produce a spurious argmax peak at lag ≈ 0.
         lo_idx = max(1, int(0.003 * sample_rate))
-        hi_idx = min(n, int(0.200 * sample_rate))
+        # Upper bound: configurable via measurement.xcorr_search_window_ms.
+        # Default 200 ms covers standard setups (CamillaDSP chunksize=256).
+        # Increase to 400+ ms when long FIRs push CamillaDSP latency beyond
+        # 200 ms (e.g. 8192-tap FIR → CamillaDSP quantum = 341 ms latency).
+        _xcorr_hi_ms = getattr(self, "_xcorr_search_window_ms", 200.0)
+        hi_idx = min(n, int(_xcorr_hi_ms / 1000.0 * sample_rate))
         if hi_idx <= lo_idx:
             hi_idx = min(n, lo_idx + 1)
         # ── First-arrival onset detection (2026-05-08 fix) ─────────────
