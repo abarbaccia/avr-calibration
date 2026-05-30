@@ -7585,7 +7585,7 @@ async def _tool_apply_fir_identity(output_index: int, num_taps: int = 8192) -> d
     identity[0] = 1.0
 
     try:
-        await _dsp.set_fir(output_index, identity, intent="standard")  # type: ignore[union-attr]
+        await _dsp.apply_fir(output_index, identity, intent="standard")  # type: ignore[union-attr]
     except DriverError as exc:
         return _err(str(exc))
     except Exception as exc:
