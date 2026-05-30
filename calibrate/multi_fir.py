@@ -168,8 +168,8 @@ def design_multi_input_fir(
     import numpy as np
 
     n_subs = len(measurements)
-    if n_subs < 2:
-        raise ValueError("multi-input FIR requires ≥ 2 measurements")
+    if n_subs < 1:
+        raise ValueError("multi-input FIR requires ≥ 1 measurement")
     if phase_mode not in ("minimum", "linear", "mixed"):
         raise ValueError(f"phase_mode must be minimum/linear/mixed, got {phase_mode!r}")
 
@@ -615,24 +615,25 @@ def _compute_trinnov_precausal(
     freq_max: float,
     bands_per_octave: int,
     cancel_strength: float,
+    band_t60s: "dict[float, float] | None" = None,
 ) -> tuple["np.ndarray", list[dict]]:
     """Compute a continuous pre-causal decay correction from a measured room IR.
 
     Unlike per-mode Gabor anti-pulses (which collide when modes are <0.5 oct
     apart), this approach:
       1. Bandpass-filters the measured IR at each 1/bands_per_octave band.
-      2. Computes measured T60 via Schroeder integration.
+      2. Computes measured T60 via Schroeder integration using a wider
+         (≤ 1/3-octave) bandpass filter to reduce filter-ringing contamination.
+         When band_t60s is provided, those values are used directly instead.
       3. For bands where T60 > target, time-reverses the post-direct ringing
          and scales by cancel_strength × excess_fraction.
       4. Sums ALL band corrections into one continuous pre-causal waveform.
 
-    Closely-spaced modes are handled naturally because their contributions are
-    summed in the time domain — no Gabor interference because there are no
-    per-mode Gabors.
-
-    The pre-causal waveform is truncated to pre_delay_samples. For long-decay
-    modes this is a partial correction (most energy is near the main impulse
-    so the truncation loss is modest).
+    band_t60s : optional dict mapping centre_freq_hz → measured_t60_ms.
+        When supplied (e.g. from analyze_decay), the internal Schroeder T60
+        estimate is bypassed for bands that match.  Use this for more accurate
+        T60 estimates — the internal Schroeder method can be unreliable when
+        the filter's own ringdown approaches the room T60.
 
     Returns (pre_causal, band_reports) where band_reports lists each band's
     measured T60 and correction status.
@@ -650,34 +651,58 @@ def _compute_trinnov_precausal(
     centre_freqs = [freq_min * 2 ** (i / bands_per_octave) for i in range(n_bands)]
     nyq = sample_rate / 2.0
 
+    # T60 analysis uses at most 1/3-octave wide bands to avoid narrow-band
+    # Butterworth ringing contaminating the T60 estimate.  A 1/6-octave
+    # Butterworth at 47 Hz (Q≈8.5) rings for ~500 ms — far too close to
+    # the room's own T60 for reliable estimation.  With ≤ 1/3-octave (Q≈4)
+    # the filter T60 drops to ~95 ms, well below typical room T60 of 300+ ms.
+    t60_bpo = min(bands_per_octave, 3)
+
     for f_c in centre_freqs:
-        # Band edges at ±½ step on a log scale
+        # Narrow band edges for anti-ringing generation (full resolution)
         f_lo = f_c / 2 ** (0.5 / bands_per_octave)
         f_hi = f_c * 2 ** (0.5 / bands_per_octave)
         if f_lo < 5.0 or f_hi >= nyq:
             continue
 
+        # Wider band edges for T60 estimation (low-ringing filter)
+        f_lo_t60 = f_c / 2 ** (0.5 / t60_bpo)
+        f_hi_t60 = min(f_c * 2 ** (0.5 / t60_bpo), nyq * 0.99)
+        if f_lo_t60 < 5.0:
+            f_lo_t60 = 5.0
+
         try:
-            sos = butter(4, [f_lo / nyq, f_hi / nyq], btype="band", output="sos")
+            sos_narrow = butter(4, [f_lo / nyq, f_hi / nyq], btype="band", output="sos")
+            sos_wide = butter(2, [f_lo_t60 / nyq, f_hi_t60 / nyq], btype="band", output="sos")
         except Exception:
             continue
 
-        bp_ir = sosfilt(sos, ir)
-
-        # Schroeder integration on ringing (after direct path peak)
-        ringing = bp_ir[peak_idx:]
-        if len(ringing) < 64:
-            continue
-
-        energy_rev = np.cumsum(ringing[::-1] ** 2)[::-1]
-        peak_e = energy_rev[0]
-        if peak_e < 1e-20:
-            continue
-
-        schroeder_db = 10.0 * np.log10(energy_rev / peak_e + 1e-30)
-        # T60: first index where Schroeder crosses −60 dB
-        below = np.where(schroeder_db < -60.0)[0]
-        t60_ms = (below[0] if len(below) else len(ringing)) / sample_rate * 1000.0
+        # T60 decision: use externally-provided value if available (more accurate),
+        # otherwise estimate from the wider-band filtered IR.
+        if band_t60s is not None:
+            # Find closest provided frequency within ±1/4 octave of band centre.
+            best_key = min(band_t60s, key=lambda f: abs(math.log2(f / f_c)), default=None)
+            if best_key is not None and abs(math.log2(best_key / f_c)) < 0.25:
+                t60_ms = band_t60s[best_key]
+            else:
+                t60_ms = 0.0  # no external data → skip band
+        else:
+            # Internal Schroeder T60 on wider-band filtered IR.
+            # Note: narrow-band (1/6-oct) Butterworth rings for 200-500ms at sub
+            # frequencies; using ≤ 1/3-oct here keeps filter T60 under ~100ms,
+            # but is still unreliable for room T60s close to the IR window length.
+            # For precise T60-driven correction, pass band_t60s from analyze_decay.
+            bp_ir_wide = sosfilt(sos_wide, ir)
+            ringing_wide = bp_ir_wide[peak_idx:]
+            if len(ringing_wide) < 64:
+                continue
+            energy_rev = np.cumsum(ringing_wide[::-1] ** 2)[::-1]
+            peak_e = energy_rev[0]
+            if peak_e < 1e-20:
+                continue
+            schroeder_db = 10.0 * np.log10(energy_rev / peak_e + 1e-30)
+            below = np.where(schroeder_db < -60.0)[0]
+            t60_ms = (below[0] if len(below) else len(ringing_wide)) / sample_rate * 1000.0
 
         if t60_ms <= target_t60_ms:
             band_reports.append({"freq_hz": round(f_c, 1), "t60_ms": round(t60_ms), "corrected": False})
@@ -686,9 +711,12 @@ def _compute_trinnov_precausal(
         excess_fraction = min(1.0, (t60_ms - target_t60_ms) / (t60_ms + 1e-9))
         scale = cancel_strength * excess_fraction
 
-        # Pre-causal correction: time-reversed ringing, truncated to budget
-        # Place so the highest-amplitude end aligns with t=0 (main impulse).
-        ringing_trunc = ringing[:pre_delay_samples]
+        # Anti-ringing waveform from narrow-band filtered IR (full resolution).
+        # Time-reversed, negated, and scaled to create pre-causal destructive
+        # interference at the mode frequency.
+        bp_ir_narrow = sosfilt(sos_narrow, ir)
+        ringing_narrow = bp_ir_narrow[peak_idx:]
+        ringing_trunc = ringing_narrow[:pre_delay_samples]
         anti = -ringing_trunc[::-1] * scale
 
         pre_causal[: len(anti)] += anti
@@ -719,6 +747,7 @@ def design_fir_trinnov(
     freq_max: float = 120.0,
     bands_per_octave: int = 6,
     cancel_strength: float = 0.5,
+    band_t60s: "list[dict] | None" = None,
 ) -> dict:
     """Trinnov-style wideband decay correction + Wiener magnitude correction.
 
@@ -745,6 +774,12 @@ def design_fir_trinnov(
     freq_min/max     : frequency range for decay correction
     bands_per_octave : filter bank resolution (default 6 = 1/6-octave)
     cancel_strength  : 0–1 scaling for pre-causal correction (default 0.5)
+    band_t60s        : optional list of dicts with 'freq_hz' and 't60_ms'.
+                       When supplied (e.g. from analyze_decay output), T60
+                       values override the internal Schroeder estimate for
+                       matching bands.  Recommended for accurate correction —
+                       the internal estimate can be unreliable for room T60s
+                       close to the IR window length or filter ringdown time.
     """
     import numpy as np
 
@@ -758,6 +793,15 @@ def design_fir_trinnov(
 
     ir = np.asarray(room_ir, dtype=np.float64)
 
+    # Build freq→T60 lookup from band_t60s if provided.
+    band_t60_lookup: "dict[float, float] | None" = None
+    if band_t60s:
+        band_t60_lookup = {
+            float(b["freq_hz"]): float(b["t60_ms"])
+            for b in band_t60s
+            if "freq_hz" in b and "t60_ms" in b
+        }
+
     # Step 1 — pre-causal decay correction from room IR
     pre_causal, band_reports = _compute_trinnov_precausal(
         ir, sample_rate, pre_samples,
@@ -765,6 +809,7 @@ def design_fir_trinnov(
         freq_min=freq_min, freq_max=freq_max,
         bands_per_octave=bands_per_octave,
         cancel_strength=cancel_strength,
+        band_t60s=band_t60_lookup,
     )
 
     corrected_bands = [b for b in band_reports if b.get("corrected")]

@@ -91,6 +91,8 @@ $SSH "sudo docker run -d \
     --ipc=host \
     --privileged \
     -e PYTHONDONTWRITEBYTECODE=1 \
+    -e OPENBLAS_NUM_THREADS=4 \
+    -e OMP_NUM_THREADS=4 \
     -v /run/user/1000:/run/user/1000 \
     -e XDG_RUNTIME_DIR=/run/user/1000 \
     -e PIPEWIRE_RUNTIME_DIR=/run/user/1000 \

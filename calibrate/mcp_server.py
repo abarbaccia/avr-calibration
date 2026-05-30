@@ -4334,6 +4334,7 @@ async def _tool_design_fir_trinnov(
     freq_max: float = 120.0,
     bands_per_octave: int = 6,
     cancel_strength: float = 0.5,
+    band_t60s: list[dict] | None = None,
     return_coefficients: bool = False,
 ) -> dict:
     """Trinnov-style wideband decay correction + Wiener magnitude correction.
@@ -4346,8 +4347,10 @@ async def _tool_design_fir_trinnov(
 
     Workflow:
       1. measure_impulse_ir(n_averages=64) → returns ir_session_id
-      2. design_fir_trinnov(ir_session_id, measurements, target_curve, ...)
-      3. apply_fir(output_index, design_session_id)  ×  n_subs
+      2. (optional) analyze_decay(session_id) → band T60 values
+      3. design_fir_trinnov(ir_session_id, measurements, target_curve,
+                            band_t60s=[{"freq_hz":47,"t60_ms":634}, ...])
+      4. apply_fir(output_index, design_session_id)  ×  n_subs
 
     Parameters
     ----------
@@ -4359,6 +4362,10 @@ async def _tool_design_fir_trinnov(
     freq_min/max     : frequency range for decay correction
     bands_per_octave : filter bank resolution (default 6 = 1/6-octave)
     cancel_strength  : 0–1 pre-causal amplitude scale (default 0.5)
+    band_t60s        : optional per-band T60 overrides from analyze_decay output.
+                       Pass as [{freq_hz, t60_ms}, ...]. When provided, these
+                       values replace the internal Schroeder estimate for matching
+                       bands and yield more accurate T60-driven corrections.
     """
     try:
         import numpy as np
@@ -4416,6 +4423,7 @@ async def _tool_design_fir_trinnov(
             freq_max=freq_max,
             bands_per_octave=bands_per_octave,
             cancel_strength=cancel_strength,
+            band_t60s=band_t60s,
         )
 
         # Cache FIRs
@@ -11996,6 +12004,11 @@ _TOOLS: list[Tool] = [
                 "phase_mode": {"type": "string", "enum": ["minimum", "linear", "mixed"], "description": "Wiener phase mode. Default minimum.", "default": "minimum"},
                 "regularization_lambda": {"type": "number", "description": "Wiener regularization. Default 0.01.", "default": 0.01},
                 "freq_focus_hz": {"type": "array", "items": {"type": "number"}, "description": "[lo, hi] Wiener correction band."},
+                "band_t60s": {
+                    "type": "array",
+                    "description": "Per-band T60 overrides from analyze_decay: [{freq_hz, t60_ms}, ...]. Recommended for accurate correction — bypasses unreliable internal Schroeder estimate.",
+                    "items": {"type": "object", "properties": {"freq_hz": {"type": "number"}, "t60_ms": {"type": "number"}}, "required": ["freq_hz", "t60_ms"]},
+                },
                 "return_coefficients": {"type": "boolean", "description": "Include FIR coefficients in response. Default false.", "default": False},
             },
             "required": ["ir_session_id", "measurements", "target_curve"],
