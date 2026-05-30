@@ -1042,22 +1042,44 @@ class MeasurementEngine:
         # Cross-correlating two RECORDED signals (mic and ref) under the same
         # PipeWire scheduling regime cancels common-mode jitter.
         # See LoopbackRefPlayback docstring (drivers/playback.py:521-527).
+        # Detect ALSA-direct reference mode: loopback captured by sounddevice
+        # (not PipeWire pw-record).  In this case the reference is on the ALSA
+        # hardware clock — NOT the same PipeWire timing domain as the mic.
+        # Common-mode PW jitter cancellation does NOT apply.  We still use the
+        # loopback for deconvolution (H = mic / hw_ref captures CamillaDSP FIR
+        # effects), but we use the analytical sweep for xcorr window timing so
+        # the IR gate doesn't shift when the PW quantum changes.
+        _alsa_direct_ref = bool(loopback_ref_device) and not loopback_ref_pw_node
+
         if ref_1d is not None and not np.all(ref_1d == 0):
             n_aligned = min(len(ref_1d), len(rec_1d))
             deconv_x = ref_1d[:n_aligned].astype(np.float64)
             deconv_y = rec_1d[:n_aligned].astype(np.float64)
-            log.info(
-                "deconvolution: using recorded loopback ref (n=%d) as X — "
-                "PipeWire jitter common-mode cancels",
-                n_aligned,
-            )
+            if _alsa_direct_ref:
+                log.info(
+                    "deconvolution: ALSA hw loopback ref (n=%d) — "
+                    "using analytical sweep for timing, hw ref for H(f)",
+                    n_aligned,
+                )
+            else:
+                log.info(
+                    "deconvolution: using recorded loopback ref (n=%d) as X — "
+                    "PipeWire jitter common-mode cancels",
+                    n_aligned,
+                )
         else:
             deconv_x = sweep_for_deconv
             deconv_y = rec_for_deconv
+            _alsa_direct_ref = False
+
+        # For ALSA direct reference: use analytical sweep for xcorr timing
+        # (consistent IR window placement independent of PW quantum).
+        _timing_array = sweep_1d if _alsa_direct_ref else None
 
         frequencies, spl, ir_samples, phase, coherence, xcorr_peak_ms = self._compute_fr_arrays(
             np, deconv_x, deconv_y, freq_min, freq_max, sample_rate,
             cal_curve=cal_curve,
+            timing_array=_timing_array,
         )
 
         loopback_xcorr_peak_ms: Optional[float] = None
@@ -1107,12 +1129,13 @@ class MeasurementEngine:
     def _compute_fr_arrays(
         self,
         np,
-        sweep_array,   # 1-D float64 ndarray
+        sweep_array,   # 1-D float64 ndarray — used for deconvolution AND timing (unless timing_array)
         rec_array,     # 1-D float64 ndarray
         freq_min: int,
         freq_max: int,
         sample_rate: int,
         cal_curve: list[tuple[float, float]] | None = None,
+        timing_array=None,  # optional separate 1-D float64 for xcorr timing only
     ) -> tuple[list[float], list[float], list[float], list[float], list[float] | None, float]:
         """
         Core deconvolution on raw numpy arrays.
@@ -1166,7 +1189,17 @@ class MeasurementEngine:
         if bp_hi <= bp_lo + 50.0:
             bp_lo = max(30.0, float(freq_min))
             bp_hi = min(sample_rate * 0.4, float(freq_max))
-        C_full = np.fft.irfft(np.conj(X) * Y, n=n)
+        # Use a separate timing array if provided (e.g. analytical sweep when
+        # the deconvolution reference is a hardware loopback with non-flat FR).
+        # This decouples window placement (stable xcorr with analytical sweep)
+        # from deconvolution (accurate H via the loopback reference).
+        if timing_array is not None:
+            n_t = min(len(timing_array), len(rec_array))
+            T = np.fft.rfft(timing_array[:n_t], n=n_t)
+            Y_t = np.fft.rfft(rec_array[:n_t], n=n_t)
+            C_full = np.fft.irfft(np.conj(T) * Y_t, n=n_t)
+        else:
+            C_full = np.fft.irfft(np.conj(X) * Y, n=n)
         try:
             from scipy.signal import butter, sosfiltfilt, hilbert
             sos = butter(4, [bp_lo, bp_hi], btype="band", fs=sample_rate, output="sos")
