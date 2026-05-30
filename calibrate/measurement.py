@@ -1072,9 +1072,12 @@ class MeasurementEngine:
             deconv_y = rec_for_deconv
             _alsa_direct_ref = False
 
-        # For ALSA direct reference: use analytical sweep for xcorr timing
-        # (consistent IR window placement independent of PW quantum).
-        _timing_array = sweep_1d if _alsa_direct_ref else None
+        # For ALSA direct reference: use the pre-padded sweep_for_deconv for xcorr
+        # timing (consistent IR window placement independent of PW quantum).
+        # Must use sweep_for_deconv (not sweep_1d): the pre-pad aligns the
+        # sweep template to the recording so the xcorr peak lands within the
+        # [3ms, 200ms] acoustic-arrival search window.
+        _timing_array = sweep_for_deconv if _alsa_direct_ref else None
 
         frequencies, spl, ir_samples, phase, coherence, xcorr_peak_ms = self._compute_fr_arrays(
             np, deconv_x, deconv_y, freq_min, freq_max, sample_rate,
