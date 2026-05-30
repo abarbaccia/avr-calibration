@@ -841,6 +841,13 @@ def design_fir_trinnov(
     # Peak of pre-causal section (sanity check — should be < 1)
     pre_peak = float(np.max(np.abs(pre_causal))) if len(pre_causal) else 0.0
 
+    # Use modal_cancel intent only when the pre-causal section is actually
+    # significant (Gabor-style large gain at mode frequency).  When pre-causal
+    # is negligible (< 0.01 peak amplitude) the FIR is effectively a standard
+    # magnitude-correction filter; modal_cancel would falsely trigger the
+    # log-sweep guard and block post-FIR verification measurements.
+    apply_intent = "modal_cancel" if pre_peak >= 0.01 else "standard"
+
     return {
         "firs": combined_firs,
         "num_subs": wiener["num_subs"],
@@ -858,5 +865,5 @@ def design_fir_trinnov(
         "corrected_bands": corrected_bands,
         "skipped_bands": skipped_bands,
         "n_corrected": len(corrected_bands),
-        "apply_intent": "modal_cancel",
+        "apply_intent": apply_intent,
     }
