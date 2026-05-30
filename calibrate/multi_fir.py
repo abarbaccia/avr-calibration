@@ -289,7 +289,17 @@ def design_multi_input_fir(
     for H_i in H_complex:
         H_mag_sq = np.abs(H_i) ** 2
         K_i = T_per_sub * np.conj(H_i) / (H_mag_sq + regularization_lambda ** 2)
-        K_i_full = np.where(in_band, K_i, 0.0 + 0j)
+        # Outside the focus band: use passthrough (identity per sub, K = 1/n_subs)
+        # rather than zero. Setting K=0 outside the band gives the minimum-phase
+        # reconstruction of a bandpass, which creates steep high-pass/low-pass
+        # roll-offs that apply huge unintended attenuation at adjacent frequencies.
+        # Passthrough outside the band ensures the filter only corrects within
+        # the focus band and is flat everywhere else.
+        if freq_focus_hz:
+            K_passthrough = (T_per_sub / (T_per_sub + 1e-30)).real * 0 + 1.0 / n_subs
+            K_i_full = np.where(in_band, K_i, K_passthrough + 0j)
+        else:
+            K_i_full = K_i
         K_full_list.append(K_i_full)
         k_full_list.append(np.fft.irfft(K_i_full, n=n_fft))
 
