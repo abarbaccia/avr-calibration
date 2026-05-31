@@ -102,6 +102,16 @@ else
     cat /tmp/mcp-server.log >&2
 fi
 
+# ── PipeWire loopback reference link ─────────────────────────────────────────
+# The measurement engine captures loopback_ref as the deconvolution reference.
+# sub_front_right (output_index=5) routes to CamillaDSP pipeline channel 5,
+# which maps to PipeWire port output_6 (1-indexed). Retry loop handles
+# CamillaDSP startup ordering.
+( for i in 2 4 6 8 10; do
+    sleep $i
+    pw-link camilladsp_playback:output_6 loopback_ref:playback_1 2>/dev/null && echo 'loopback_ref linked' && break
+  done ) &
+
 # ── uvicorn (web dashboard) ──────────────────────────────────────────────────
 # Run in background so we can wait on it and forward signals via the trap.
 # Using exec would bypass the trap handler.
