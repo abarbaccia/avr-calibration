@@ -1055,7 +1055,12 @@ class MeasurementEngine:
         # loopback for deconvolution (H = mic / hw_ref captures CamillaDSP FIR
         # effects), but we use the analytical sweep for xcorr window timing so
         # the IR gate doesn't shift when the PW quantum changes.
-        _alsa_direct_ref = bool(loopback_ref_device) and not loopback_ref_pw_node
+        # Also treat pre-CamillaDSP PW loopback (e.g. avr_cal_sweep:monitor_FL)
+        # as a "direct reference": use sweep_for_deconv for xcorr timing so the
+        # IR gate is placed at the correct acoustic arrival (~FIR_latency+acoustic),
+        # not at a spurious correlation peak that appears at low SNR.
+        _loopback_pre_camilla = bool(cfg.get("loopback_pre_camilla", False))
+        _alsa_direct_ref = (bool(loopback_ref_device) and not loopback_ref_pw_node) or _loopback_pre_camilla
 
         if ref_1d is not None and not np.all(ref_1d == 0):
             n_aligned = min(len(ref_1d), len(rec_1d))
