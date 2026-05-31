@@ -339,6 +339,15 @@ def design_multi_input_fir(
             mp_phase = _min_phase_from_magnitude(mag_db, np)
             K_min = np.abs(K_i_full) * np.exp(1j * mp_phase)
             k_td = np.fft.irfft(K_min, n=n_fft)[:mag_taps]
+            # Taper the tail to prevent abrupt-truncation spectral artifacts.
+            # Minimum-phase energy is front-loaded, so only taper the end.
+            # Without this, FIRs for strongly-resonant rooms (T60 >> num_taps/sr)
+            # develop deep (~30-40 dB) spectral notches at resonance frequencies.
+            taper_len = max(1, mag_taps // 16)
+            tail_window = np.ones(mag_taps)
+            tail_edge = 0.5 * (1 - np.cos(np.pi * np.arange(taper_len) / taper_len))
+            tail_window[-taper_len:] = tail_edge[::-1]
+            k_td = k_td * tail_window
         else:
             # linear / mixed: preserve K_i's complex phase.
             # Apply the SAME rotation across all subs (common_rotation,
