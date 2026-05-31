@@ -104,12 +104,14 @@ fi
 
 # ── PipeWire loopback reference link ─────────────────────────────────────────
 # The measurement engine captures loopback_ref as the deconvolution reference.
-# sub_front_right (output_index=5) routes to CamillaDSP pipeline channel 5,
-# which maps to PipeWire port output_6 (1-indexed). Retry loop handles
-# CamillaDSP startup ordering.
+# Using avr_cal_sweep:monitor_FL (pre-CamillaDSP) as the reference gives
+# H = H_acoustic × FIR × PEQ, so the FIR correction IS visible in measurements.
+# Using camilladsp_playback:output_6 (post-FIR) would normalize the FIR out,
+# making it impossible to verify Harman+4 compliance empirically.
+# xcorr timing with this reference: ~55 ms (50 ms FIR latency + 5 ms acoustic).
 ( for i in 2 4 6 8 10; do
     sleep $i
-    pw-link camilladsp_playback:output_6 loopback_ref:playback_1 2>/dev/null && echo 'loopback_ref linked' && break
+    pw-link avr_cal_sweep:monitor_FL loopback_ref:playback_1 2>/dev/null && echo 'loopback_ref linked (pre-CamillaDSP)' && break
   done ) &
 
 # ── uvicorn (web dashboard) ──────────────────────────────────────────────────
