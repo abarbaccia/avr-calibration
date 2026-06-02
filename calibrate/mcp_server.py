@@ -9296,7 +9296,7 @@ async def _tool_simulate_per_sub_fir(
                     samplerate=int(spec.get("samplerate", sample_rate or 48000)),
                     anchor=spec.get("anchor"),
                     compensation_notch=bool(spec.get("compensation_notch", False)),
-                    gabor_n_cycles=int(spec.get("gabor_n_cycles", 3)),
+                    gabor_n_cycles=int(spec.get("gabor_n_cycles", 1)),
                 )
             except ValueError as exc:
                 return _err(str(exc))
@@ -12009,8 +12009,8 @@ _TOOLS: list[Tool] = [
                     "type": "integer",
                     "default": 1,
                     "minimum": 1,
-                    "maximum": 6,
-                    "description": "Gabor envelope cycles for anti-pulses. Default 1 (no trailing truncation).",
+                    "maximum": 1,
+                    "description": "Gabor envelope cycles for anti-pulses. Must be 1. n_cycles≥2 clips the trailing Gabor half at pre_samples, flipping the cancellation phase from -π to 0 and amplifying modes by tens of dB instead of cancelling them.",
                 },
             },
             "required": ["measurements", "target_curve"],
@@ -12047,7 +12047,7 @@ _TOOLS: list[Tool] = [
                 "phase_mode": {"type": "string", "enum": ["minimum", "linear", "mixed"], "description": "Wiener FIR phase mode. Default minimum."},
                 "regularization_lambda": {"type": "number", "description": "Wiener damping. Default 0.01 for our signal levels.", "default": 0.01},
                 "freq_focus_hz": {"type": "array", "items": {"type": "number"}, "description": "[lo, hi] correction band."},
-                "gabor_n_cycles": {"type": "integer", "default": 1, "minimum": 1, "description": "Gabor cycles for anti-pulses. Default 1 (no trailing truncation)."},
+                "gabor_n_cycles": {"type": "integer", "default": 1, "minimum": 1, "maximum": 1, "description": "Gabor cycles for anti-pulses. Must be 1. n_cycles≥2 clips the trailing Gabor half, flipping cancellation phase and amplifying modes."},
                 "return_coefficients": {"type": "boolean", "description": "Return FIR coefficients in response. Default false."},
             },
             "required": ["measurements", "target_curve", "modal_intents"],
@@ -12203,10 +12203,10 @@ _TOOLS: list[Tool] = [
                 },
                 "gabor_n_cycles": {
                     "type": "integer",
-                    "description": "Gabor envelope cycles. Default 1 (recommended). n_cycles=1 avoids trailing truncation — the Gabor fits entirely before the main impulse. Higher values clip the trailing half, breaking the -π cancellation phase and amplifying modes instead of cancelling them.",
+                    "description": "Gabor envelope cycles. Must be 1. n_cycles≥2 clips the trailing Gabor half at pre_samples, flipping the cancellation phase from -π to 0 and amplifying modes by tens of dB instead of cancelling them.",
                     "default": 1,
                     "minimum": 1,
-                    "maximum": 6,
+                    "maximum": 1,
                 },
                 "skip_freqs_hz": {
                     "type": "array",
@@ -12863,7 +12863,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             distances_override_m=arguments.get("distances_override_m"),
             target_curves=arguments.get("target_curves"),
             samplerates_hz=arguments.get("samplerates_hz"),
-            inter_packet_delay_ms=float(arguments.get("inter_packet_delay_ms", 5.0)),
+            inter_packet_delay_ms=float(arguments.get("inter_packet_delay_ms", 25.0)),
             commit_fin=bool(arguments.get("commit_fin", True)),
             abort_fin_on_nack=bool(arguments.get("abort_fin_on_nack", True)),
             allow_partial=bool(arguments.get("allow_partial", False)),
