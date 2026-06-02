@@ -881,8 +881,13 @@ class LoopbackRefPlayback:
                         all_ch = np.frombuffer(raw, dtype=np.float32).reshape(-1, self.ref_pw_channels)
                         ref_full = all_ch[:, self.ref_channel_index - 1].astype(np.float64)
                         # Drop HDMI_WARMUP_S leading samples so ref aligns with mic_1d.
-                        warmup_s = getattr(self.base, "HDMI_WARMUP_S", 0.0)
-                        warmup_n = int(warmup_s * sample_rate)
+                        # When skip_warmup=True (USB/null-sink path), no warmup was played;
+                        # using the class-level HDMI_WARMUP_S would discard 5s of real data.
+                        _actual_warmup_s = (
+                            0.0 if getattr(self.base, "skip_warmup", False)
+                            else getattr(self.base, "HDMI_WARMUP_S", 0.0)
+                        )
+                        warmup_n = int(_actual_warmup_s * sample_rate)
                         ref_aligned = ref_full[warmup_n:]
                         # Trim both to the same length.
                         n = min(len(ref_aligned), len(mic_1d))

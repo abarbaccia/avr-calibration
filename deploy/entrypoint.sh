@@ -102,16 +102,31 @@ else
     cat /tmp/mcp-server.log >&2
 fi
 
-# ── PipeWire loopback reference link ─────────────────────────────────────────
-# The measurement engine captures loopback_ref as the deconvolution reference.
-# Using avr_cal_sweep:monitor_FL (pre-CamillaDSP) as the reference gives
-# H = H_acoustic × FIR × PEQ, so the FIR correction IS visible in measurements.
-# Using camilladsp_playback:output_6 (post-FIR) would normalize the FIR out,
-# making it impossible to verify Harman+4 compliance empirically.
-# xcorr timing with this reference: ~55 ms (50 ms FIR latency + 5 ms acoustic).
+# ── PipeWire loopback reference links (fallback) ──────────────────────────────
+# avr-cal-sweep-link.service is the primary mechanism for these links.
+# This block is a belt-and-suspenders fallback: if the host service is missing
+# or fails, the container still establishes the two critical paths.
+#
+# Link 1: avr_cal_sweep:monitor_FL → camilladsp_capture:input_2
+#   Sweep enters CamillaDSP LFE mixer so audio reaches the subs.
+#
+# Link 2: avr_cal_sweep:monitor_FL → loopback_ref:playback_1
+#   Pre-CamillaDSP reference for measurement deconvolution.
+#   H = H_acoustic × FIR × PEQ (FIR corrections ARE visible in measurements).
+#
+# "File exists" means the host service already set the link — treat as success.
+_pw_link() {
+    result=$(pw-link "$1" "$2" 2>&1) && return 0
+    echo "$result" | grep -q 'File exists' && return 0
+    return 1
+}
 ( for i in 2 4 6 8 10; do
     sleep $i
-    pw-link avr_cal_sweep:monitor_FL loopback_ref:playback_1 2>/dev/null && echo 'loopback_ref linked (pre-CamillaDSP)' && break
+    r=0
+    _pw_link avr_cal_sweep:monitor_FL camilladsp_capture:input_2 || r=1
+    _pw_link avr_cal_sweep:monitor_FR camilladsp_capture:input_2 || r=1
+    _pw_link avr_cal_sweep:monitor_FL loopback_ref:playback_1   || r=1
+    [ "$r" = "0" ] && echo 'PipeWire cal-sweep links established' && break
   done ) &
 
 # ── uvicorn (web dashboard) ──────────────────────────────────────────────────
