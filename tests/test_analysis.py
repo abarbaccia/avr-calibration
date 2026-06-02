@@ -9,6 +9,8 @@ from calibrate.analysis import (
     HarmanTarget,
     make_flat_target,
     per_band_deviation,
+    per_freq_boost_effectiveness,
+    optimal_anchor_reference_spl,
     rms_deviation,
     _propose_mock,
 )
@@ -301,3 +303,167 @@ def test_min_rms_equals_max_safe_for_harman_shaped():
     min_rms = min_rms_reference_spl(fr)
     # Should be very close — Harman-shaped measurement needs no correction
     assert abs(max_safe - min_rms) < 2.0
+
+
+# ── per_freq_boost_effectiveness ─────────────────────────────────────────────
+
+def _make_fr_with_coherence(
+    spl_value: float = 75.0,
+    coherence_value: float = 0.9,
+    n_points: int = 200,
+) -> FrequencyResponse:
+    freqs = np.logspace(np.log10(20.0), np.log10(200.0), n_points).tolist()
+    return FrequencyResponse(
+        frequencies=freqs,
+        spl=[spl_value] * n_points,
+        coherence=[coherence_value] * n_points,
+        sample_rate=48000,
+        sweep_duration=3.0,
+        timestamp="2026-06-01T00:00:00Z",
+    )
+
+
+def test_per_freq_effectiveness_below_port_is_zero():
+    fr = _make_fr_with_coherence()
+    result = per_freq_boost_effectiveness(fr, port_tune_hz=30.0, band=(20.0, 200.0))
+    for freq, eff in result.items():
+        if freq < 30.0:
+            assert eff == 0.0, f"expected 0 below port at {freq} Hz, got {eff}"
+
+
+def test_per_freq_effectiveness_geometry_null_is_zero():
+    fr = _make_fr_with_coherence()
+    geometry_ranges = [(45.0, 55.0)]
+    result = per_freq_boost_effectiveness(
+        fr, geometry_ranges=geometry_ranges, port_tune_hz=25.0, band=(20.0, 200.0)
+    )
+    for freq, eff in result.items():
+        if 45.0 <= freq < 55.0:
+            assert eff == 0.0, f"expected 0 in geometry null at {freq} Hz, got {eff}"
+
+
+def test_per_freq_effectiveness_long_t60_reduces_base():
+    fr = _make_fr_with_coherence(coherence_value=1.0)
+    # Single mode at 47 Hz with T60 700 ms
+    t60_data = [(47.0, 700.0)]
+    result = per_freq_boost_effectiveness(
+        fr, t60_data=t60_data, port_tune_hz=25.0, band=(20.0, 200.0)
+    )
+    # 47 Hz should have low effectiveness (long T60, base=0.20)
+    eff_at_47 = result.get(min(result, key=lambda f: abs(f - 47.0)), 1.0)
+    assert eff_at_47 <= 0.25, f"expected low effectiveness at 47 Hz, got {eff_at_47}"
+    # 100 Hz (far from mode, no T60 data) should have high effectiveness
+    eff_at_100 = result.get(min(result, key=lambda f: abs(f - 100.0)), 0.0)
+    assert eff_at_100 >= 0.6, f"expected high effectiveness at 100 Hz, got {eff_at_100}"
+
+
+def test_per_freq_effectiveness_short_t60_high_coherence():
+    fr = _make_fr_with_coherence(coherence_value=0.95)
+    t60_data = [(80.0, 150.0)]
+    result = per_freq_boost_effectiveness(
+        fr, t60_data=t60_data, port_tune_hz=25.0, band=(20.0, 200.0)
+    )
+    eff_at_80 = result.get(min(result, key=lambda f: abs(f - 80.0)), 0.0)
+    assert eff_at_80 >= 0.75, f"expected high effectiveness at 80 Hz, got {eff_at_80}"
+
+
+def test_per_freq_effectiveness_keyed_at_native_resolution():
+    """Result keys should be at measurement frequencies, not 1/3-oct centres."""
+    fr = _make_fr_with_coherence(n_points=200)
+    result = per_freq_boost_effectiveness(fr, port_tune_hz=25.0, band=(20.0, 200.0))
+    # Should have many more entries than 1/3-oct would give (~10 bands 20-200 Hz)
+    assert len(result) > 30
+
+
+# ── optimal_anchor_reference_spl ─────────────────────────────────────────────
+
+_HARMAN_OFFSETS = [
+    {"freq_hz": 25.0, "offset_db": 5.0},
+    {"freq_hz": 31.5, "offset_db": 4.0},
+    {"freq_hz": 40.0, "offset_db": 3.0},
+    {"freq_hz": 50.0, "offset_db": 2.0},
+    {"freq_hz": 63.0, "offset_db": 1.0},
+    {"freq_hz": 80.0, "offset_db": 0.0},
+    {"freq_hz": 100.0, "offset_db": 0.0},
+    {"freq_hz": 125.0, "offset_db": 0.0},
+]
+
+
+def test_optimal_anchor_flat_response_returns_balanced():
+    """Flat measurement + uniform high effectiveness → balanced anchor."""
+    fr = _make_fr_with_coherence(spl_value=75.0)
+    effectiveness = {f: 0.85 for f in fr.frequencies}
+    ref, score, breakdown = optimal_anchor_reference_spl(
+        fr, _HARMAN_OFFSETS, effectiveness, band=(25.0, 125.0), max_boost_db=6.0
+    )
+    assert 60.0 <= ref <= 82.0, f"unexpected reference_spl {ref}"
+    assert len(breakdown) > 0
+
+
+def test_optimal_anchor_hump_avoids_anchor_at_hump():
+    """Modal hump with low effectiveness → anchor should NOT sit at hump peak."""
+    # Flat at 75 dB except +8 dB hump at 50 Hz with very low effectiveness
+    fr = _make_fr_with_coherence(spl_value=75.0, coherence_value=0.9)
+    # Override SPL near 50 Hz manually
+    freqs = list(fr.frequencies)
+    spl = list(fr.spl)
+    for i, f in enumerate(freqs):
+        if 45.0 <= f <= 55.0:
+            spl[i] = 83.0  # +8 dB hump
+    fr_hump = FrequencyResponse(
+        frequencies=freqs, spl=spl, coherence=fr.coherence,
+        sample_rate=48000, sweep_duration=3.0, timestamp="2026-06-01T00:00:00Z",
+    )
+    # Low effectiveness at hump frequencies
+    effectiveness = {f: 0.85 for f in freqs}
+    for f in freqs:
+        if 45.0 <= f <= 55.0:
+            effectiveness[f] = 0.15  # nearly ineffective — deep mode
+    ref, score, breakdown = optimal_anchor_reference_spl(
+        fr_hump, _HARMAN_OFFSETS, effectiveness, band=(25.0, 125.0), max_boost_db=6.0
+    )
+    # If anchored at hump (~83 dB), everything else needs large boosts.
+    # Optimal should prefer lower reference where hump is a cut, not anchor.
+    assert ref < 82.0, f"anchor sat on hump: ref={ref}"
+
+
+def test_optimal_anchor_prefers_boost_when_effective():
+    """When effectiveness is high, a boost is better than sacrificing headroom."""
+    fr = _make_fr_with_coherence(spl_value=75.0, coherence_value=0.95)
+    # All high effectiveness → balanced anchor (boosts are fine)
+    effectiveness = {f: 0.90 for f in fr.frequencies}
+    ref_high_eff, _, _ = optimal_anchor_reference_spl(
+        fr, _HARMAN_OFFSETS, effectiveness, band=(25.0, 125.0),
+        max_boost_db=6.0, headroom_lambda=0.3,
+    )
+    # All low effectiveness → prefers cuts (higher reference_spl)
+    effectiveness_low = {f: 0.15 for f in fr.frequencies}
+    ref_low_eff, _, _ = optimal_anchor_reference_spl(
+        fr, _HARMAN_OFFSETS, effectiveness_low, band=(25.0, 125.0),
+        max_boost_db=6.0, headroom_lambda=0.3,
+    )
+    # Low effectiveness → anchor pushed higher to prefer cuts
+    assert ref_low_eff >= ref_high_eff, (
+        f"expected low-eff anchor higher, got high_eff={ref_high_eff} low_eff={ref_low_eff}"
+    )
+
+
+def test_optimal_anchor_excludes_nulls():
+    """Deep null bands are excluded; anchor ignores them."""
+    fr = _make_fr_with_coherence(spl_value=75.0)
+    freqs = list(fr.frequencies)
+    spl = list(fr.spl)
+    # Deep null at 63 Hz: -20 dB
+    for i, f in enumerate(freqs):
+        if 60.0 <= f <= 67.0:
+            spl[i] = 55.0
+    fr_null = FrequencyResponse(
+        frequencies=freqs, spl=spl, coherence=fr.coherence,
+        sample_rate=48000, sweep_duration=3.0, timestamp="2026-06-01T00:00:00Z",
+    )
+    effectiveness = {f: 0.85 for f in freqs}
+    # Should not raise and should return a sane reference
+    ref, score, breakdown = optimal_anchor_reference_spl(
+        fr_null, _HARMAN_OFFSETS, effectiveness, band=(25.0, 125.0), max_boost_db=6.0
+    )
+    assert 55.0 <= ref <= 90.0

@@ -289,6 +289,248 @@ def min_rms_reference_spl(
     return float(best_ref)
 
 
+def per_freq_boost_effectiveness(
+    fr: FrequencyResponse,
+    t60_data: list[tuple[float, float]] | None = None,
+    geometry_ranges: list[tuple[float, float]] | None = None,
+    port_tune_hz: float = 28.0,
+    band: tuple[float, float] = (20.0, 200.0),
+) -> dict[float, float]:
+    """Estimate boost correction effectiveness at each measurement frequency bin.
+
+    Returns a dict mapping freq_hz → effectiveness in [0.0, 1.0] at the
+    measurement's native resolution — not snapped to 1/3-octave centres.
+    Modal peaks are a few Hz wide (Q > 5); 1/3-octave binning dilutes them.
+
+    Effectiveness is the fraction of a requested boost that manifests at the
+    listening position:
+
+      - 0.0: physically impossible (geometry null, below port rolloff)
+      - 0.2: deeply modal (T60 > 600 ms) — room ringing masks the added energy
+      - 0.85: short T60 + high coherence — boost lands as expected
+
+    t60_data: list of (freq_hz, t60_ms) pairs from analyze_decay. The decay
+    analysis covers only modes above the detection threshold; frequencies with
+    no nearby data default to moderate effectiveness (0.75).
+
+    T60 is interpolated with inverse-log-distance weighting across all data
+    points within ±half-octave (frequency ratio ≤ √2). This lets a sharp mode
+    at 47 Hz suppress effectiveness at 46–48 Hz without polluting 40 Hz.
+    """
+    geometry_ranges = geometry_ranges or []
+    t60_data = t60_data or []
+
+    if not fr.frequencies:
+        return {}
+
+    freq_arr = np.array(fr.frequencies)
+    coh_arr = (
+        np.array(fr.coherence)
+        if fr.coherence and len(fr.coherence) == len(fr.frequencies)
+        else np.full(len(fr.frequencies), 0.8)
+    )
+
+    # Pre-sort T60 data by frequency for fast windowed lookup
+    t60_sorted: list[tuple[float, float]] = sorted(t60_data, key=lambda x: x[0])
+    t60_freqs = np.array([f for f, _ in t60_sorted]) if t60_sorted else np.array([])
+    t60_vals = np.array([t for _, t in t60_sorted]) if t60_sorted else np.array([])
+
+    result: dict[float, float] = {}
+    for i, freq in enumerate(freq_arr):
+        if not (band[0] <= freq <= band[1]):
+            continue
+
+        if freq < port_tune_hz:
+            result[float(freq)] = 0.0
+            continue
+        if any(lo <= freq < hi for lo, hi in geometry_ranges):
+            result[float(freq)] = 0.0
+            continue
+
+        # T60 estimate: inverse-log-distance weighted average of data points
+        # within ±half-octave (ratio ≤ √2 ≈ 1.414).
+        t60_ms: float | None = None
+        if len(t60_freqs) > 0:
+            log_dists = np.abs(np.log(t60_freqs / max(freq, 1e-6)))
+            half_oct = math.log(2.0) / 2.0  # log(√2)
+            mask = log_dists <= half_oct
+            if mask.any():
+                weights = 1.0 / (log_dists[mask] + 1e-6)
+                t60_ms = float(np.average(t60_vals[mask], weights=weights))
+
+        if t60_ms is None:
+            base = 0.75
+        elif t60_ms > 600.0:
+            base = 0.20
+        elif t60_ms > 400.0:
+            base = 0.35
+        elif t60_ms > 200.0:
+            base = 0.55
+        else:
+            base = 0.85
+
+        # Coherence scaling: low coherence = measurement unreliable = boost
+        # may not be real. Clamp to [0.2, 1.0] so noisy bins don't zero out.
+        coh = float(coh_arr[i])
+        coherence_scale = max(0.2, min(1.0, coh))
+
+        result[float(freq)] = round(base * coherence_scale, 3)
+
+    return result
+
+
+def optimal_anchor_reference_spl(
+    fr: FrequencyResponse,
+    target_offsets: list[dict],
+    effectiveness: dict[float, float],
+    band: tuple[float, float] = (20.0, 200.0),
+    max_boost_db: float = 6.0,
+    null_threshold_db: float = 15.0,
+    headroom_lambda: float = 0.3,
+    sweep_step_db: float = 0.25,
+) -> tuple[float, float, list[dict]]:
+    """Find the reference_spl that maximises achievable compliance across the band.
+
+    Operates at the measurement's native frequency resolution (dense grid from
+    the FR object), not snapped to 1/3-octave. The effectiveness map must match
+    — use per_freq_boost_effectiveness() to build it.
+
+    For each candidate reference_spl, scores the expected correction quality
+    per frequency bin:
+
+      - Cut needed: residual = 0 (always achievable)
+      - Boost needed B with effectiveness e: residual = B × (1 − e)
+      - Boost exceeding max_boost_db: capped correction + uncapped residual
+
+    Minimises mean squared residual with a λ-weighted penalty for the gain
+    increase implied by setting reference_spl above the balanced (all-boost) floor.
+
+    headroom_lambda: penalty per dB above balanced anchor. Higher = prefer cuts.
+
+    Returns:
+        (reference_spl, score, per_band_breakdown)
+        per_band_breakdown is at 1/3-octave resolution for readability — the
+        scoring uses the full grid internally.
+    """
+    if not fr.frequencies or not fr.spl:
+        return 0.0, 0.0, []
+
+    offsets_sorted = sorted(target_offsets, key=lambda p: p["freq_hz"])
+    off_freqs = [p["freq_hz"] for p in offsets_sorted]
+    off_vals = [p["offset_db"] for p in offsets_sorted]
+
+    def _interp_offset(freq_hz: float) -> float | None:
+        if freq_hz < off_freqs[0] or freq_hz > off_freqs[-1]:
+            return None
+        for i in range(len(off_freqs) - 1):
+            f0, v0 = off_freqs[i], off_vals[i]
+            f1, v1 = off_freqs[i + 1], off_vals[i + 1]
+            if f0 <= freq_hz <= f1:
+                t = math.log(freq_hz / f0) / math.log(f1 / f0) if f1 != f0 else 0.0
+                return v0 + t * (v1 - v0)
+        return off_vals[-1]
+
+    freqs_arr = np.array(fr.frequencies)
+    spl_arr = np.array(fr.spl)
+    band_mask = (freqs_arr >= band[0]) & (freqs_arr <= band[1])
+    band_avg = float(np.mean(spl_arr[band_mask])) if band_mask.any() else 0.0
+
+    # Build dense valid points from native measurement grid
+    valid_points: list[tuple[float, float, float, float]] = []
+    for i, freq in enumerate(freqs_arr):
+        if not (band[0] <= freq <= band[1]):
+            continue
+        offset = _interp_offset(float(freq))
+        if offset is None:
+            continue
+        measured = float(spl_arr[i])
+        if measured < band_avg - null_threshold_db:
+            continue
+        eff = effectiveness.get(float(freq), 0.75)
+        if eff <= 0.0:
+            continue
+        valid_points.append((float(freq), measured, offset, eff))
+
+    if not valid_points:
+        return 0.0, 0.0, []
+
+    headrooms = [m - o for _, m, o, _ in valid_points]
+    ref_min = min(headrooms) + max_boost_db
+    ref_max = max(headrooms)
+
+    # Vectorised scoring over the full dense grid
+    vf = np.array([p[0] for p in valid_points])
+    vm = np.array([p[1] for p in valid_points])
+    vo = np.array([p[2] for p in valid_points])
+    ve = np.array([p[3] for p in valid_points])
+
+    def _score_candidate(ref: float) -> float:
+        correction = (ref + vo) - vm        # positive = boost, negative = cut
+        boost = np.clip(correction, 0.0, max_boost_db)
+        residual = boost * (1.0 - ve)
+        # Uncorrectable portion beyond safety cap
+        over_cap = np.maximum(correction - max_boost_db, 0.0)
+        residual += over_cap
+        mean_sq = float(np.mean(residual ** 2))
+        gain_penalty = headroom_lambda * max(0.0, ref - ref_min)
+        return -(mean_sq + gain_penalty)
+
+    best_ref = ref_min
+    best_score = _score_candidate(ref_min)
+    ref = ref_min + sweep_step_db
+    while ref <= ref_max + sweep_step_db:
+        s = _score_candidate(ref)
+        if s > best_score:
+            best_score = s
+            best_ref = ref
+        ref += sweep_step_db
+
+    # Build 1/3-octave breakdown at the chosen anchor for readability
+    breakdown: list[dict] = []
+    for centre in THIRD_OCTAVE_CENTRES_HZ:
+        if not (band[0] <= centre <= band[1]):
+            continue
+        offset = _interp_offset(centre)
+        if offset is None:
+            continue
+        idx = int(np.argmin(np.abs(freqs_arr - centre)))
+        measured = float(spl_arr[idx])
+        eff = effectiveness.get(float(freqs_arr[idx]), 0.75)
+        correction = (best_ref + offset) - measured
+        if correction <= 0.0:
+            strategy = "cut"
+            residual = 0.0
+        else:
+            boost = min(correction, max_boost_db)
+            residual = boost * (1.0 - eff)
+            if correction > max_boost_db:
+                residual += correction - max_boost_db
+            strategy = "boost"
+        breakdown.append({
+            "freq_hz": centre,
+            "correction_db": round(correction, 2),
+            "strategy": strategy,
+            "effectiveness": round(eff, 3),
+            "residual_db": round(residual, 2),
+        })
+
+    return round(best_ref, 2), round(best_score, 4), breakdown
+
+    best_ref = ref_min
+    best_score, best_breakdown = _score_candidate(ref_min)
+
+    ref = ref_min + sweep_step_db
+    while ref <= ref_max + sweep_step_db:
+        score, breakdown = _score_candidate(ref)
+        if score > best_score:
+            best_score = score
+            best_ref = ref
+            best_breakdown = breakdown
+        ref += sweep_step_db
+
+    return round(best_ref, 2), round(best_score, 4), best_breakdown
+
+
 def harman_rms(
     fr: FrequencyResponse,
     band: tuple[float, float] = (20.0, 200.0),

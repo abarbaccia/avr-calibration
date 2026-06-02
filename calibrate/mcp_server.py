@@ -1241,6 +1241,51 @@ async def _tool_anchor_target(
         )
         reference_spl = min_headroom + max_boost_db
 
+        # ── optimal anchor: per-frequency effectiveness model. Sweeps
+        # reference_spl from balanced floor to all-cuts ceiling and picks the
+        # candidate that minimises mean-squared residual error, accounting for
+        # boost effectiveness (T60 + coherence) and a headroom penalty λ that
+        # discourages raising gain when boosts would work just as well.
+        optimal_breakdown: list[dict] = []
+        optimal_score: float | None = None
+        if direction == "optimal":
+            from .decay import analyze_decay
+            from .analysis import per_freq_boost_effectiveness, optimal_anchor_reference_spl
+
+            # Build T60 data from session IR as (freq_hz, t60_ms) pairs
+            t60_data: list[tuple[float, float]] = []
+            ir = session.impulse_response
+            if ir:
+                try:
+                    sr = getattr(fr, "sample_rate", None) or 48000
+                    modes = analyze_decay(
+                        impulse_response=ir,
+                        sample_rate=sr,
+                        t60_threshold_ms=100.0,  # low threshold — capture all bands
+                    )
+                    t60_data = [(float(m.freq_hz), float(m.t60_ms)) for m in modes]
+                except Exception as exc:
+                    log.warning("anchor_target optimal: decay analysis failed: %s", exc)
+
+            effectiveness = per_freq_boost_effectiveness(
+                fr=fr,
+                t60_data=t60_data,
+                geometry_ranges=geometry_ranges_at,
+                port_tune_hz=port_rolloff_hz,
+                band=(band_lo, band_hi),
+            )
+
+            reference_spl, optimal_score, optimal_breakdown = optimal_anchor_reference_spl(
+                fr=fr,
+                target_offsets=target_offsets,
+                effectiveness=effectiveness,
+                band=(band_lo, band_hi),
+                max_boost_db=max_boost_db,
+                null_threshold_db=null_threshold_db,
+                headroom_lambda=0.3,
+            )
+            limiting_freq = reference_spl  # no single limiting freq in this mode
+
         # ── cuts_only anchor: pick LOWEST-frequency anchor where every band
         # above has positive gap (measured-relative ≥ target-relative). This
         # yields a target that's pure cuts above the anchor — useful for
@@ -1361,6 +1406,8 @@ async def _tool_anchor_target(
                 round(anchor_freq_used, 1) if anchor_freq_used is not None else None
             ),
             residual_boost_band_hz=residual_boost_band_hz,
+            optimal_score=optimal_score,
+            optimal_breakdown=optimal_breakdown,
         )
     except Exception as exc:
         return _err(f"anchor_target failed: {exc}")
@@ -11567,8 +11614,8 @@ _TOOLS: list[Tool] = [
                 },
                 "direction": {
                     "type": "string",
-                    "enum": ["balanced", "cuts_only"],
-                    "description": "balanced (default): reference at min(headroom)+max_boost. cuts_only: lowest anchor where all bands above are cuts-only — prefer for deep-bass-priority cal.",
+                    "enum": ["balanced", "cuts_only", "optimal"],
+                    "description": "balanced (default): reference at min(headroom)+max_boost. cuts_only: lowest anchor where all bands above are cuts-only. optimal: sweeps reference_spl and scores each candidate by per-frequency boost effectiveness (T60+coherence+geometry), minimising expected residual error; balances cuts vs. boosts rather than forcing either globally.",
                     "default": "balanced",
                 },
             },
