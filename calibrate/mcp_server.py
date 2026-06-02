@@ -4475,9 +4475,9 @@ async def _tool_design_modal_fir(
     short_loud_peak_db: float = 12.0,
     long_ringy_t60_factor: float = 2.0,
     anti_pulse_cancel_strength: float = 0.6,
-    num_taps: int = 24576,
+    num_taps: int = 4096,
     max_pre_ring_ms: float = 25.0,
-    samplerate: int = 48000,
+    samplerate: int = 8000,
     return_coefficients: bool = False,
     anchor: dict | None = None,
     compensation_notch: bool = False,
@@ -12170,7 +12170,7 @@ _TOOLS: list[Tool] = [
                 },
                 "num_taps": {
                     "type": "integer",
-                    "description": "FIR length. Default 4096 at 8 kHz = 512 ms span.",
+                    "description": "FIR length reference at the default 8 kHz rate (4096 = 512 ms span). With auto_samplerate=True (default), this is scaled proportionally to the live CamillaDSP processing rate — e.g. 4096 at 8 kHz → 49152 at 96 kHz, preserving the 512 ms window. Only override if you need a different window length.",
                     "default": 4096,
                 },
                 "max_pre_ring_ms": {
@@ -12180,7 +12180,7 @@ _TOOLS: list[Tool] = [
                 },
                 "samplerate": {
                     "type": "integer",
-                    "description": "FIR sample rate — must match CamillaDSP processing rate. Default 8000. Use 48000 for native 48 kHz (needs num_taps=24576).",
+                    "description": "Reference sample rate for auto-scaling. With auto_samplerate=True (default), the live CamillaDSP processing rate is detected and both samplerate and num_taps are scaled proportionally. Default 8000 (reference). Do not change unless disabling auto_samplerate.",
                     "default": 8000,
                 },
                 "return_coefficients": {
@@ -13288,7 +13288,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             anti_pulse_cancel_strength=float(arguments.get("anti_pulse_cancel_strength", 0.6)),
             num_taps=int(arguments.get("num_taps", 4096)),
             max_pre_ring_ms=float(arguments.get("max_pre_ring_ms", 25.0)),
-            samplerate=int(arguments.get("samplerate", 48000)),
+            samplerate=int(arguments.get("samplerate", 8000)),
             return_coefficients=bool(arguments.get("return_coefficients", False)),
             anchor=arguments.get("anchor"),
             gabor_n_cycles=int(arguments.get("gabor_n_cycles", 1)),
