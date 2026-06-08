@@ -992,12 +992,18 @@ async def _tool_compute_deviation(
                     fr.sample_rate if getattr(fr, "sample_rate", None) else 48000
                 )
                 try:
-                    decoded_modes = _analyze_decay_inline(
-                        ir_inline,
-                        sample_rate=sample_rate_inline,
-                        t60_threshold_ms=300.0,
-                        freq_min=20.0,
-                        freq_max=200.0,
+                    import asyncio as _asyncio, functools as _functools
+                    _loop = _asyncio.get_running_loop()
+                    decoded_modes = await _loop.run_in_executor(
+                        None,
+                        _functools.partial(
+                            _analyze_decay_inline,
+                            ir_inline,
+                            sample_rate=sample_rate_inline,
+                            t60_threshold_ms=300.0,
+                            freq_min=20.0,
+                            freq_max=200.0,
+                        ),
                     )
                     decay_modes_inline = [
                         {
@@ -8202,15 +8208,14 @@ async def _tool_analyze_decay(
 
     try:
         store = SessionStore()
-        sessions = store.list_sessions()
-        if not sessions:
-            return _err("no measurements found — run measure first")
-
         if session_id is not None:
-            session = next((s for s in sessions if s.id == session_id), None)
+            session = store.get_session(session_id)
             if session is None:
                 return _err(f"session {session_id} not found")
         else:
+            sessions = store.list_sessions(limit=1)
+            if not sessions:
+                return _err("no measurements found — run measure first")
             session = sessions[0]
 
         ir = session.impulse_response
@@ -8221,13 +8226,19 @@ async def _tool_analyze_decay(
             )
 
         sample_rate = session.start_fr.sample_rate if session.start_fr else 48000
-        modes = _analyze_decay(
-            ir,
-            sample_rate=sample_rate,
-            t60_threshold_ms=t60_threshold_ms,
-            freq_min=freq_min,
-            freq_max=freq_max,
-            bands_per_octave=bands_per_octave,
+        import asyncio as _asyncio, functools as _functools
+        loop = _asyncio.get_running_loop()
+        modes = await loop.run_in_executor(
+            None,
+            _functools.partial(
+                _analyze_decay,
+                ir,
+                sample_rate=sample_rate,
+                t60_threshold_ms=t60_threshold_ms,
+                freq_min=freq_min,
+                freq_max=freq_max,
+                bands_per_octave=bands_per_octave,
+            ),
         )
 
         return _ok(
@@ -13141,6 +13152,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             t60_threshold_ms=float(arguments.get("t60_threshold_ms", 300.0)),
             freq_min=float(arguments.get("freq_min", 20.0)),
             freq_max=float(arguments.get("freq_max", 200.0)),
+            bands_per_octave=int(arguments["bands_per_octave"]) if "bands_per_octave" in arguments else None,
         )
     elif name == "recommend_fir_phase":
         result = await _tool_recommend_fir_phase(

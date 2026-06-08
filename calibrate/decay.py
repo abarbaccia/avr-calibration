@@ -195,7 +195,7 @@ def _analyze_decay_bandpass(
     freq_min: float,
     freq_max: float,
     bands_per_octave: int,
-    min_peak_db: float = 3.0,
+    min_peak_db: float = -6.0,
 ) -> list[DecayMode]:
     """High-resolution T60 analysis using a bandpass filter bank.
 
@@ -204,7 +204,7 @@ def _analyze_decay_bandpass(
     Uses 4th-order Butterworth bandpass + Schroeder integration per band.
     """
     import numpy as np
-    from scipy.signal import butter, sosfiltfilt
+    from scipy.signal import butter, sosfiltfilt, decimate
 
     ir = np.array(impulse_response, dtype=np.float64)
 
@@ -212,6 +212,18 @@ def _analyze_decay_bandpass(
         raise ValueError("impulse_response is empty")
     if np.all(ir == 0):
         raise ValueError("impulse_response is all zeros")
+
+    # Downsample so freq_min sits at ≥5 % of Nyquist — near-DC Butterworth is
+    # numerically degenerate and sosfiltfilt initial-conditions grow enormous,
+    # making it ~100× slower or hang.  Mirror the spectrogram path's strategy.
+    target_rate = max(int(freq_max * 10), 1600)
+    decim_factor = max(1, sample_rate // target_rate)
+    if decim_factor > 1:
+        try:
+            ir = decimate(ir, decim_factor, zero_phase=True).astype(np.float64)
+            sample_rate = sample_rate // decim_factor
+        except Exception:
+            pass  # fall back to full-rate on any error
 
     nyquist = sample_rate / 2.0
     times = np.arange(len(ir)) / sample_rate
@@ -266,8 +278,10 @@ def _analyze_decay_bandpass(
     for fc, filtered, band_rms in band_results:
         peak_db = 20.0 * np.log10(band_rms / mean_band_rms)
 
-        # Reject bands at or below the mean — filter ringing artifacts are near 0 dB
-        # relative to the mean while real modes stand 3+ dB above it.
+        # Reject bands far below the mean — guards against pure noise bands.
+        # Default -6 dB is permissive: sub sweeps energize the entire passband
+        # uniformly so modes don't stand out >3 dB above the mean.  T60 is the
+        # primary criterion; this gate only removes total-noise outliers.
         if peak_db < min_peak_db:
             continue
 
