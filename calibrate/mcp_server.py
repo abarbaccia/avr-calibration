@@ -4388,6 +4388,7 @@ async def _tool_design_fir_trinnov(
     bands_per_octave: int = 6,
     cancel_strength: float = 0.5,
     band_t60s: list[dict] | None = None,
+    sweep_session_id: int | None = None,
     return_coefficients: bool = False,
 ) -> dict:
     """Trinnov-style wideband decay correction + Wiener magnitude correction.
@@ -4419,6 +4420,11 @@ async def _tool_design_fir_trinnov(
                        Pass as [{freq_hz, t60_ms}, ...]. When provided, these
                        values replace the internal Schroeder estimate for matching
                        bands and yield more accurate T60-driven corrections.
+    sweep_session_id : session_id of a log-sweep measurement whose stored
+                       impulse_response is used for anti-pulse AMPLITUDE sizing.
+                       Impulse IR (ir_session_id) is still used for T60/Schroeder.
+                       Use this when pre_causal_peak is negligible (~0.0003) due to
+                       poor sub-bass excitation in the impulse IR.
     """
     try:
         import numpy as np
@@ -4461,6 +4467,19 @@ async def _tool_design_fir_trinnov(
 
         focus = tuple(freq_focus_hz) if freq_focus_hz and len(freq_focus_hz) == 2 else None
 
+        # Load sweep IR for amplitude extraction when provided.
+        amplitude_ir: list[float] | None = None
+        if sweep_session_id is not None:
+            sweep_sess = store.get_session(sweep_session_id)
+            if sweep_sess is None:
+                return _err(f"sweep_session_id={sweep_session_id} not found in session store")
+            if not sweep_sess.impulse_response:
+                return _err(
+                    f"sweep_session_id={sweep_session_id} has no stored impulse_response. "
+                    "Re-measure with a log-sweep session to populate it."
+                )
+            amplitude_ir = sweep_sess.impulse_response
+
         result = design_fir_trinnov(
             room_ir=room_ir,
             measurements=sub_measurements,
@@ -4477,6 +4496,7 @@ async def _tool_design_fir_trinnov(
             bands_per_octave=bands_per_octave,
             cancel_strength=cancel_strength,
             band_t60s=band_t60s,
+            amplitude_ir=amplitude_ir,
         )
 
         # Cache FIRs
@@ -12130,6 +12150,17 @@ _TOOLS: list[Tool] = [
                     "description": "Per-band T60 overrides from analyze_decay: [{freq_hz, t60_ms}, ...]. Recommended for accurate correction — bypasses unreliable internal Schroeder estimate.",
                     "items": {"type": "object", "properties": {"freq_hz": {"type": "number"}, "t60_ms": {"type": "number"}}, "required": ["freq_hz", "t60_ms"]},
                 },
+                "sweep_session_id": {
+                    "type": "integer",
+                    "description": (
+                        "Session ID of a log-sweep measurement (from measure()) whose stored "
+                        "impulse_response is used for anti-pulse AMPLITUDE sizing instead of the "
+                        "impulse IR. Fixes negligible pre_causal_peak (~0.0003) caused by poor "
+                        "sub-bass excitation in the impulse IR. T60 estimation still uses "
+                        "ir_session_id. Pass one of the FR session IDs from measurements[] or any "
+                        "recent combined sweep session."
+                    ),
+                },
                 "return_coefficients": {"type": "boolean", "description": "Include FIR coefficients in response. Default false.", "default": False},
             },
             "required": ["ir_session_id", "measurements", "target_curve"],
@@ -13274,6 +13305,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return_coefficients=bool(arguments.get("return_coefficients", False)),
         )
     elif name == "design_fir_trinnov":
+        _sweep_sid = arguments.get("sweep_session_id")
         result = await _tool_design_fir_trinnov(
             ir_session_id=int(arguments["ir_session_id"]),
             measurements=arguments["measurements"],
@@ -13288,6 +13320,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             freq_max=float(arguments.get("freq_max", 120.0)),
             bands_per_octave=int(arguments.get("bands_per_octave", 6)),
             cancel_strength=float(arguments.get("cancel_strength", 0.5)),
+            band_t60s=arguments.get("band_t60s"),
+            sweep_session_id=int(_sweep_sid) if _sweep_sid is not None else None,
             return_coefficients=bool(arguments.get("return_coefficients", False)),
         )
     elif name == "design_fir_multi":

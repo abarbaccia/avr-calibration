@@ -1306,8 +1306,25 @@ class CamillaDSPDriver(DSPDriver):
             raise DriverError(str(exc))
 
         async with self._lock:
+            n_taps = len(coefficients)
             prev = list(self._fir_state.get(output_index, []))
+            prev_peers: dict[int, list[float]] = {}
+            # Impulse at tap 0 — zero-delay passthrough for peer outputs.
+            identity = [0.0] * n_taps
+            identity[0] = 1.0
+
             self._fir_state[int(output_index)] = [float(c) for c in coefficients]
+            # Pad all routed peer outputs to the same tap count so CamillaDSP
+            # uses a uniform FFT buffer size on every Conv-capable channel.
+            # Mixed tap counts (e.g. 8192 on subs, 0 on shaker) shift the
+            # PipeWire loopback xcorr timing and corrupt sweep deconvolution.
+            for peer in self._routed_outputs:
+                if peer == int(output_index):
+                    continue
+                existing = self._fir_state.get(peer, [])
+                if len(existing) != n_taps:
+                    prev_peers[int(peer)] = list(existing)
+                    self._fir_state[int(peer)] = list(identity)
             try:
                 await self._push_config_locked()
             except DriverError:
@@ -1315,13 +1332,30 @@ class CamillaDSPDriver(DSPDriver):
                     self._fir_state[output_index] = prev
                 else:
                     self._fir_state.pop(output_index, None)
+                for peer, old_coeffs in prev_peers.items():
+                    if old_coeffs:
+                        self._fir_state[peer] = old_coeffs
+                    else:
+                        self._fir_state.pop(peer, None)
                 raise
 
     async def clear_fir(self, output_index: int) -> None:
         """Clear FIR coefficients on a single output (filter removed from pipeline)."""
         async with self._lock:
             prev = list(self._fir_state.get(output_index, []))
-            self._fir_state[int(output_index)] = []
+            # Find the max tap count across remaining routed peers.
+            max_peer_taps = max(
+                (len(c) for p, c in self._fir_state.items()
+                 if p in self._routed_outputs and p != int(output_index) and c),
+                default=0,
+            )
+            if max_peer_taps > 0:
+                # Keep a matching-length identity FIR so the quantum stays stable.
+                identity = [0.0] * max_peer_taps
+                identity[0] = 1.0
+                self._fir_state[int(output_index)] = identity
+            else:
+                self._fir_state[int(output_index)] = []
             try:
                 await self._push_config_locked()
             except DriverError:

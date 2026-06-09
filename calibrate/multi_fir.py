@@ -635,6 +635,7 @@ def _compute_trinnov_precausal(
     bands_per_octave: int,
     cancel_strength: float,
     band_t60s: "dict[float, float] | None" = None,
+    amplitude_ir: "np.ndarray | None" = None,
 ) -> tuple["np.ndarray", list[dict]]:
     """Compute a continuous pre-causal decay correction from a measured room IR.
 
@@ -653,6 +654,11 @@ def _compute_trinnov_precausal(
         estimate is bypassed for bands that match.  Use this for more accurate
         T60 estimates — the internal Schroeder method can be unreliable when
         the filter's own ringdown approaches the room T60.
+    amplitude_ir : optional room IR with better sub-bass SNR (e.g. from a
+        log-sweep session) used ONLY for anti-pulse amplitude extraction.
+        `ir` is still used for Schroeder T60 estimation and peak alignment.
+        When None, `ir` is used for both.  Pass a sweep session IR here when
+        the impulse IR has poor sub-bass excitation (pre_causal_peak ≈ 0).
 
     Returns (pre_causal, band_reports) where band_reports lists each band's
     measured T60 and correction status.
@@ -661,6 +667,10 @@ def _compute_trinnov_precausal(
     from scipy.signal import butter, sosfilt
 
     peak_idx = int(np.argmax(np.abs(ir)))
+    # Use amplitude_ir for anti-pulse amplitude extraction when provided.
+    # Sweep session IRs have 0.96-0.99 coherence at sub-bass; impulse IRs do not.
+    _amp_ir = amplitude_ir if amplitude_ir is not None else ir
+    _amp_peak_idx = int(np.argmax(np.abs(_amp_ir)))
     pre_causal = np.zeros(pre_delay_samples, dtype=np.float64)
     band_reports: list[dict] = []
 
@@ -730,11 +740,10 @@ def _compute_trinnov_precausal(
         excess_fraction = min(1.0, (t60_ms - target_t60_ms) / (t60_ms + 1e-9))
         scale = cancel_strength * excess_fraction
 
-        # Anti-ringing waveform from narrow-band filtered IR (full resolution).
-        # Time-reversed, negated, and scaled to create pre-causal destructive
-        # interference at the mode frequency.
-        bp_ir_narrow = sosfilt(sos_narrow, ir)
-        ringing_narrow = bp_ir_narrow[peak_idx:]
+        # Anti-ringing waveform: use amplitude_ir when available for better
+        # sub-bass SNR.  Time-reversed, negated, scaled → pre-causal cancellation.
+        bp_ir_narrow = sosfilt(sos_narrow, _amp_ir)
+        ringing_narrow = bp_ir_narrow[_amp_peak_idx:]
         ringing_trunc = ringing_narrow[:pre_delay_samples]
         anti = -ringing_trunc[::-1] * scale
 
@@ -767,6 +776,7 @@ def design_fir_trinnov(
     bands_per_octave: int = 6,
     cancel_strength: float = 0.5,
     band_t60s: "list[dict] | None" = None,
+    amplitude_ir: "list[float] | None" = None,
 ) -> dict:
     """Trinnov-style wideband decay correction + Wiener magnitude correction.
 
@@ -799,6 +809,10 @@ def design_fir_trinnov(
                        matching bands.  Recommended for accurate correction —
                        the internal estimate can be unreliable for room T60s
                        close to the IR window length or filter ringdown time.
+    amplitude_ir     : optional room IR with better sub-bass SNR (e.g. from a
+                       sweep session) used solely for anti-pulse amplitude
+                       extraction.  When omitted, room_ir is used for both T60
+                       estimation and amplitude extraction.
     """
     import numpy as np
 
@@ -811,6 +825,7 @@ def design_fir_trinnov(
         )
 
     ir = np.asarray(room_ir, dtype=np.float64)
+    amp_ir_np = np.asarray(amplitude_ir, dtype=np.float64) if amplitude_ir is not None else None
 
     # Build freq→T60 lookup from band_t60s if provided.
     band_t60_lookup: "dict[float, float] | None" = None
@@ -829,6 +844,7 @@ def design_fir_trinnov(
         bands_per_octave=bands_per_octave,
         cancel_strength=cancel_strength,
         band_t60s=band_t60_lookup,
+        amplitude_ir=amp_ir_np,
     )
 
     corrected_bands = [b for b in band_reports if b.get("corrected")]
