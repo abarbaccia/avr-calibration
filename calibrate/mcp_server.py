@@ -4499,8 +4499,10 @@ async def _tool_design_fir_trinnov(
             amplitude_ir=amplitude_ir,
         )
 
-        # Cache FIRs
-        apply_intent = result.get("apply_intent", "modal_cancel")
+        # Cache FIRs — Trinnov uses "correction" (not "modal_cancel") so
+        # apply_fir doesn't add outputs to _sweep_blocked_outputs.  Trinnov
+        # pre-causal peaks are small (< 0.02) and safe to sweep through.
+        apply_intent = result.get("apply_intent", "correction")
         cache_ids = []
         for fir_taps, m in zip(result["firs"], measurements):
             output_index = int(m["output_index"])
