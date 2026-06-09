@@ -1482,6 +1482,8 @@ class MeasurementEngine:
 
         accumulated = np.zeros(rec_samples, dtype=np.float64)
 
+        loop = asyncio.get_event_loop()
+
         async with _MEASURE_LOCK:
             for shot in range(n_averages):
                 # Start recorder
@@ -1490,9 +1492,9 @@ class MeasurementEngine:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                 )
-                _time.sleep(0.05)  # brief settle before impulse
+                await asyncio.sleep(0.05)  # brief settle before impulse
 
-                # Play impulse
+                # Play impulse — run in executor so event loop stays live
                 play_proc = subprocess.Popen(
                     pw_play_cmd,
                     stdin=subprocess.PIPE,
@@ -1500,16 +1502,22 @@ class MeasurementEngine:
                     stderr=subprocess.DEVNULL,
                 )
                 try:
-                    play_proc.communicate(input=pcm_bytes, timeout=record_duration_s + 5)
+                    await loop.run_in_executor(
+                        None,
+                        lambda: play_proc.communicate(input=pcm_bytes, timeout=record_duration_s + 5),
+                    )
                 except subprocess.TimeoutExpired:
                     play_proc.kill()
-                    play_proc.communicate()
+                    await loop.run_in_executor(None, play_proc.communicate)
 
-                # Collect recording
-                _time.sleep(record_duration_s - (pcm_bytes and 0))
+                # Wait for reverb tail without blocking event loop
+                await asyncio.sleep(record_duration_s)
                 rec_proc.kill()
-                raw = rec_proc.stdout.read() if rec_proc.stdout else b""
-                rec_proc.communicate()
+                raw = await loop.run_in_executor(
+                    None,
+                    lambda: rec_proc.stdout.read() if rec_proc.stdout else b"",
+                )
+                await loop.run_in_executor(None, rec_proc.communicate)
 
                 if raw:
                     rec_f32 = np.frombuffer(raw, dtype=np.float32)
