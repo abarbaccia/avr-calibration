@@ -93,9 +93,6 @@ $SSH "sudo docker run -d \
     -e PYTHONDONTWRITEBYTECODE=1 \
     -e OPENBLAS_NUM_THREADS=4 \
     -e OMP_NUM_THREADS=4 \
-    -v /run/user/1000:/run/user/1000 \
-    -e XDG_RUNTIME_DIR=/run/user/1000 \
-    -e PIPEWIRE_RUNTIME_DIR=/run/user/1000 \
     -v \$HOME/.avr-calibration:/data/.avr-calibration \
     -v \$HOME/.avr-calibration/entrypoint.sh:/entrypoint.sh:ro \
     -v /etc/asound.conf:/etc/asound.conf:ro \
@@ -104,6 +101,9 @@ $SSH "sudo docker run -d \
     ${IMAGE} \
     -c 'find /opt/venv/lib/python3.11/site-packages/calibrate -name __pycache__ -exec rm -rf {} + 2>/dev/null; exec /entrypoint.sh' \
     && echo 'Container started.'"
+
+# Also restart measurement service to pick up any calibrate/ changes
+$SSH "sudo systemctl restart avr-measurement || true"
 
 # ── Follow logs ───────────────────────────────────────────────────────────────
 

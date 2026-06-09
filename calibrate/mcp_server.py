@@ -5590,23 +5590,26 @@ async def _tool_trigger_measurement(
     behavior (silently honoring the config flag) was a foot-gun.
     """
     try:
-        import sounddevice as sd
-        devices = sd.query_devices()
-        from .measurement import _find_umik_device
+        from .measurement_client import MeasurementServiceClient, MeasurementServiceError
         cfg = _config()
         mic_name = cfg.mic.get("name", "UMIK")
-        if _find_umik_device(devices, name_substring=mic_name) is None:
+        _meas_client = MeasurementServiceClient()
+        _idx, _dev = await _meas_client.find_umik_device(name_substring=mic_name)
+        if _idx is None:
             return _err(
-                f"trigger_measurement requires {mic_name} microphone — none found. "
-                "Check USB connection."
+                f"trigger_measurement requires {mic_name} microphone — none found on Pi host. "
+                "Check USB connection and that avr-measurement.service is running."
             )
+    except MeasurementServiceError as exc:
+        return _err(str(exc))
     except Exception as exc:
         return _err(
-            f"trigger_measurement requires sounddevice — audio device enumeration failed: {exc}"
+            f"trigger_measurement: avr-measurement service check failed: {exc}"
         )
 
     try:
-        from .measurement import MeasurementEngine, compute_session_metadata
+        from .measurement_client import MeasurementServiceClient
+        from .measurement import compute_session_metadata
         from .measurement_profiles import resolve_measurement_chain
         from .storage import SessionStore
 
@@ -5627,7 +5630,7 @@ async def _tool_trigger_measurement(
                 target, route,
             )
 
-        engine = MeasurementEngine(cfg)
+        meas_client = MeasurementServiceClient()
 
         # FIR sweep-safety guard — refuse to sweep if any output has an
         # anti-pulse (Gabor) FIR loaded.  These FIRs have +50 dB frequency-
@@ -5647,8 +5650,7 @@ async def _tool_trigger_measurement(
                 "or call clear_fir() on those outputs."
             )
 
-        if direct_path_window_ms is not None and direct_path_window_ms > 0:
-            engine.direct_path_window_ms = float(direct_path_window_ms)
+        # direct_path_window_ms is forwarded to the measurement service in the measure() call.
 
         # Resolve sweep range from explicit args / target / config defaults.
         resolved_min, resolved_max, sweep_range_source = _resolve_sweep_range(
@@ -5682,10 +5684,11 @@ async def _tool_trigger_measurement(
             # contexts (Denon + CamillaDSP). Mains sweeps bypass this path
             # because CamillaDSP's sweep context is not part of the mains chain.
             async with graph.sweep_context_for_route(route, targets, cfg, _drivers):
-                fr = await engine.measure(
+                fr = await meas_client.measure(
                     freq_min=resolved_min,
                     freq_max=resolved_max,
                     route=route,
+                    direct_path_window_ms=direct_path_window_ms,
                 )
         elif route == "hdmi":
             # Per-channel mains sweep (resolved_out_channel set) or legacy path.
@@ -5699,18 +5702,20 @@ async def _tool_trigger_measurement(
             )
             if denon_ctx:
                 async with denon_ctx:
-                    fr = await engine.measure(
+                    fr = await meas_client.measure(
                         freq_min=resolved_min,
                         freq_max=resolved_max,
                         out_channel_override=resolved_out_channel,
                         route=route,
+                        direct_path_window_ms=direct_path_window_ms,
                     )
             else:
-                fr = await engine.measure(
+                fr = await meas_client.measure(
                     freq_min=resolved_min,
                     freq_max=resolved_max,
                     out_channel_override=resolved_out_channel,
                     route=route,
+                    direct_path_window_ms=direct_path_window_ms,
                 )
         else:
             # USB route: enter the DSP sweep context per-measurement so any
@@ -5721,12 +5726,18 @@ async def _tool_trigger_measurement(
             if _dsp is not None:
                 sweep_ctx = _dsp.sweep_context(cfg)
                 async with sweep_ctx:
-                    fr = await engine.measure(
+                    fr = await meas_client.measure(
+                        freq_min=resolved_min,
+                        freq_max=resolved_max,
                         route=route,
+                        direct_path_window_ms=direct_path_window_ms,
                     )
             else:
-                fr = await engine.measure(
+                fr = await meas_client.measure(
+                    freq_min=resolved_min,
+                    freq_max=resolved_max,
                     route=route,
+                    direct_path_window_ms=direct_path_window_ms,
                 )
 
         # Compute IR-derived metadata at capture time. Query the DSP for the
@@ -5798,23 +5809,17 @@ async def _tool_play_and_measure_fft(
     fft_size: int = 8192,
 ) -> dict:
     """Synthesize multitone, play via HDMI, record from UMIK, return FFT analysis."""
-    import numpy as np
-
     try:
-        from .headroom import analyze_fft, build_multichannel_buffer
-        from .drivers.playback import MultichannelPlayback
-        from .measurement import _find_umik_device
+        from .measurement_client import MeasurementServiceClient
 
         cfg = _config()
         sample_rate = cfg.measurement.get("sample_rate", 48000)
 
         # Parse channel_assignments: keys may be strings from JSON
         parsed: dict[int, list[float]] = {}
-        all_freqs: list[float] = []
         for ch_str, freqs in channel_assignments.items():
             ch = int(ch_str)
             parsed[ch] = [float(f) for f in freqs]
-            all_freqs.extend(parsed[ch])
 
         if not parsed:
             return _err("channel_assignments is empty")
@@ -5824,51 +5829,17 @@ async def _tool_play_and_measure_fft(
         standard_counts = [2, 6, 8]
         n_channels = next(c for c in standard_counts if c >= n_channels)
 
-        buf = build_multichannel_buffer(
-            parsed, duration_s, sample_rate, amplitude, n_channels,
-        )
-
-        # Device detection
-        import sounddevice as sd
-        devices = sd.query_devices()
-
-        mic_idx = cfg.measurement.get("mic_device_index")
-        if mic_idx is None:
-            mic_name = cfg.mic.get("name", "UMIK")
-            mic_idx = _find_umik_device(devices, name_substring=mic_name)
-        if mic_idx is None:
-            return _err("UMIK microphone not found — check USB connection")
-
-        hdmi_idx = cfg.measurement.get("hdmi_device_index")
-        if hdmi_idx is None:
-            # Auto-detect HDMI output
-            candidates = [
-                (i, d) for i, d in enumerate(devices)
-                if d["max_output_channels"] > 0 and "hdmi" in d["name"].lower()
-            ]
-            candidates.sort(key=lambda x: (x[1]["name"].lower() != "hdmi", len(x[1]["name"])))
-            if candidates:
-                hdmi_idx = candidates[0][0]
-        if hdmi_idx is None:
-            return _err("No HDMI output device found")
-
-        player = MultichannelPlayback()
-        recording, n_recorded = await asyncio.get_event_loop().run_in_executor(
-            None, player.play_and_record, buf, sample_rate, mic_idx, hdmi_idx,
-        )
-
-        if len(recording) == 0:
-            return _err("Recording is empty — no audio captured")
-
-        result = analyze_fft(recording, sample_rate, all_freqs, fft_size)
-
-        peak_dbfs = 20.0 * np.log10(np.max(np.abs(recording)) + 1e-12)
-        return _ok(
+        client = MeasurementServiceClient()
+        result = await client.play_and_measure_fft(
+            channel_assignments=parsed,
             duration_s=duration_s,
+            amplitude=amplitude,
+            fft_size=fft_size,
+            n_channels=n_channels,
             sample_rate=sample_rate,
-            recording_peak_dbfs=round(float(peak_dbfs), 1),
-            **result,
         )
+
+        return _ok(**result)
 
     except Exception as exc:
         log.exception("play_and_measure_fft failed")
@@ -5894,25 +5865,20 @@ async def _tool_measure_spl_pink(
     85 dB C-slow on LFE bus per Dolby/THX.
     """
     try:
-        from .measurement import measure_pink_spl
+        from .measurement_client import MeasurementServiceClient
 
         cfg = _config()
-        sample_rate = int(cfg.measurement.get("sample_rate", 48000))
         cal_path = cfg._data.get("mic", {}).get("cal_file")
 
-        # Run the blocking play+capture in an executor.
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: measure_pink_spl(
-                duration_s=duration_s,
-                level_dbfs=level_dbfs,
-                sample_rate=sample_rate,
-                weighting=weighting,
-                output_channel=channel,
-                n_output_channels=n_output_channels,
-                umik_cal_path=cal_path,
-                integration_time_s=integration_time_s,
-            ),
+        client = MeasurementServiceClient()
+        result = await client.measure_spl_pink(
+            channel=channel,
+            duration_s=duration_s,
+            level_dbfs=level_dbfs,
+            weighting=weighting,
+            n_output_channels=n_output_channels,
+            integration_time_s=integration_time_s,
+            cal_path=cal_path,
         )
         return _ok(channel=channel, **result)
     except Exception as exc:
@@ -5945,10 +5911,10 @@ async def _tool_measure_impulse_ir(
     ``impulse_amplitude``: impulse sample amplitude 0-1 (default 0.9).
     """
     try:
-        from .measurement import MeasurementEngine
+        from .measurement_client import MeasurementServiceClient
         cfg = _config()
-        engine = MeasurementEngine(cfg)
-        ir = await engine.measure_impulse_ir(
+        client = MeasurementServiceClient()
+        ir, sample_rate = await client.measure_impulse_ir(
             n_averages=n_averages,
             record_duration_s=record_duration_s,
             impulse_amplitude=impulse_amplitude,
@@ -5960,7 +5926,7 @@ async def _tool_measure_impulse_ir(
         return _ok(
             ir_session_id=ir_session_id,
             n_samples=len(ir),
-            sample_rate=int(cfg.measurement.get("sample_rate", 48000)),
+            sample_rate=sample_rate,
             n_averages=n_averages,
             note=(
                 f"Averaged impulse IR: {n_averages} shots × {record_duration_s}s. "

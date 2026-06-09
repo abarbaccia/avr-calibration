@@ -1,0 +1,19 @@
+[Unit]
+Description=AVR Calibration — bare-metal measurement engine
+After=network.target pipewire.service camilladsp.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+User=pi
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PIPEWIRE_RUNTIME_DIR=/run/user/1000
+Environment=HOME=/home/pi
+ExecStart=/opt/avr-measurement/venv/bin/python -m calibrate.measurement_service
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

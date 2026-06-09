@@ -335,7 +335,44 @@ if [ -x /usr/local/sbin/audio-mode ]; then
     sudo /usr/local/sbin/audio-mode set listening || true
 fi
 
-# ── 8. Done ───────────────────────────────────────────────────────────────
+# ── 8. Bare-metal measurement service ─────────────────────────────────────
+#
+# Installs the avr-measurement systemd service which runs MeasurementEngine
+# natively (with host PipeWire access), eliminating the need for the Docker
+# container to mount /run/user/1000.
+
+echo ""
+echo "--- Installing avr-measurement service ---"
+
+# Install uv if not present
+if ! command -v uv &>/dev/null; then
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    source "$HOME/.local/bin/env" 2>/dev/null || export PATH="$HOME/.local/bin:$PATH"
+fi
+
+MEAS_DIR=/opt/avr-measurement
+sudo mkdir -p "$MEAS_DIR/src"
+sudo chown pi:pi "$MEAS_DIR"
+
+# Sync the calibrate package source and project metadata
+rsync -a --delete calibrate/ "$MEAS_DIR/src/calibrate/"
+cp pyproject.toml uv.lock "$MEAS_DIR/src/"
+
+# Create venv and install
+cd "$MEAS_DIR/src"
+uv venv "$MEAS_DIR/venv"
+UV_PROJECT_ENVIRONMENT="$MEAS_DIR/venv" uv sync --no-dev --extra measurement --no-editable
+cd -
+
+# Install systemd service
+if [ -f "$SCRIPT_DIR/avr-measurement.service" ]; then
+    sudo cp "$SCRIPT_DIR/avr-measurement.service" /etc/systemd/system/avr-measurement.service
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now avr-measurement.service
+    echo "Installed + enabled: avr-measurement.service"
+fi
+
+# ── 9. Done ───────────────────────────────────────────────────────────────
 
 echo ""
 echo "=== Setup complete ==="

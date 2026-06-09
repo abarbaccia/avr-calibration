@@ -593,32 +593,27 @@ async def test_set_volume_legacy_alias_set_denon_volume(mock_avr, mock_hdmi_conf
 @pytest.mark.asyncio
 async def test_trigger_measurement_no_umik() -> None:
     """No UMIK found → error."""
-    mock_sd = sys.modules.get("sounddevice")
-    if mock_sd:
-        mock_sd.query_devices.return_value = [
-            {"name": "USB Audio", "max_input_channels": 2}
-        ]
-    result = await _tool_trigger_measurement()
+    mock_client = AsyncMock()
+    mock_client.find_umik_device = AsyncMock(return_value=(None, None))
+    with patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client):
+        result = await _tool_trigger_measurement()
     assert not result["ok"]
     assert "UMIK" in result["error"]
 
 
 @pytest.mark.asyncio
 async def test_trigger_measurement_success() -> None:
-    """UMIK found → engine.measure() called directly → session saved."""
-    mock_sd = MagicMock()
-    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
-
+    """UMIK found → measurement service called → session saved."""
     mock_fr = MagicMock()
-    mock_engine = MagicMock()
-    mock_engine.measure = AsyncMock(return_value=mock_fr)
+    mock_client = AsyncMock()
+    mock_client.find_umik_device = AsyncMock(return_value=(0, {"name": "UMIK-1"}))
+    mock_client.measure = AsyncMock(return_value=mock_fr)
 
     mock_store = MagicMock()
     mock_store.save_measurement.return_value = 7
 
     with (
-        patch.dict(sys.modules, {"sounddevice": mock_sd}),
-        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client),
         patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
@@ -630,21 +625,18 @@ async def test_trigger_measurement_success() -> None:
 
     assert result["ok"]
     assert result["session_id"] == 7
-    mock_engine.measure.assert_called_once()
+    mock_client.measure.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_trigger_measurement_engine_error() -> None:
-    """engine.measure() raises → error returned."""
-    mock_sd = MagicMock()
-    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
-
-    mock_engine = MagicMock()
-    mock_engine.measure = AsyncMock(side_effect=RuntimeError("Audio device error"))
+    """measurement service raises → error returned."""
+    mock_client = AsyncMock()
+    mock_client.find_umik_device = AsyncMock(return_value=(0, {"name": "UMIK-1"}))
+    mock_client.measure = AsyncMock(side_effect=RuntimeError("Audio device error"))
 
     with (
-        patch.dict(sys.modules, {"sounddevice": mock_sd}),
-        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client),
         patch.object(sut, "DenonSweepContext") as MockCtx,
         patch("calibrate.drivers.minidsp.MinidspSweepContext") as MockMinidspCtx,
     ):
@@ -658,15 +650,13 @@ async def test_trigger_measurement_engine_error() -> None:
 
 @pytest.mark.asyncio
 async def test_trigger_measurement_with_denon_context() -> None:
-    """HDMI route → DenonSweepContext wraps engine.measure()."""
+    """HDMI route → DenonSweepContext wraps measurement service call."""
     from calibrate.config import Config, DEFAULT_CONFIG
 
-    mock_sd = MagicMock()
-    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
-
     mock_fr = MagicMock()
-    mock_engine = MagicMock()
-    mock_engine.measure = AsyncMock(return_value=mock_fr)
+    mock_client = AsyncMock()
+    mock_client.find_umik_device = AsyncMock(return_value=(0, {"name": "UMIK-1"}))
+    mock_client.measure = AsyncMock(return_value=mock_fr)
 
     mock_store = MagicMock()
     mock_store.save_measurement.return_value = 3
@@ -686,8 +676,7 @@ async def test_trigger_measurement_with_denon_context() -> None:
                                      "playback_route": "hdmi"}
 
     with (
-        patch.dict(sys.modules, {"sounddevice": mock_sd}),
-        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client),
         patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
@@ -706,20 +695,17 @@ async def test_trigger_measurement_with_denon_context() -> None:
 @pytest.mark.asyncio
 async def test_trigger_measurement_stores_explicit_target_curve() -> None:
     """target_curve passed explicitly by calibration engine is stored with the session."""
-    mock_sd = MagicMock()
-    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
-
     mock_fr = MagicMock()
-    mock_engine = MagicMock()
-    mock_engine.measure = AsyncMock(return_value=mock_fr)
+    mock_client = AsyncMock()
+    mock_client.find_umik_device = AsyncMock(return_value=(0, {"name": "UMIK-1"}))
+    mock_client.measure = AsyncMock(return_value=mock_fr)
 
     tc = {"type": "harman", "reference_spl": 72.5, "band": [20, 200]}
     mock_store = MagicMock()
     mock_store.save_measurement.return_value = 5
 
     with (
-        patch.dict(sys.modules, {"sounddevice": mock_sd}),
-        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client),
         patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
@@ -737,19 +723,16 @@ async def test_trigger_measurement_stores_explicit_target_curve() -> None:
 @pytest.mark.asyncio
 async def test_trigger_measurement_no_target_for_raw_capture() -> None:
     """Standalone/diagnostic measurement stores target_curve=None — no delta shown."""
-    mock_sd = MagicMock()
-    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
-
     mock_fr = MagicMock()
-    mock_engine = MagicMock()
-    mock_engine.measure = AsyncMock(return_value=mock_fr)
+    mock_client = AsyncMock()
+    mock_client.find_umik_device = AsyncMock(return_value=(0, {"name": "UMIK-1"}))
+    mock_client.measure = AsyncMock(return_value=mock_fr)
 
     mock_store = MagicMock()
     mock_store.save_measurement.return_value = 6
 
     with (
-        patch.dict(sys.modules, {"sounddevice": mock_sd}),
-        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client),
         patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
@@ -1231,11 +1214,19 @@ async def test_get_device_state_dsp_generic_exception(mock_avr, mock_dsp) -> Non
 
 @pytest.mark.asyncio
 async def test_trigger_measurement_sounddevice_unavailable() -> None:
-    """sounddevice not available → error."""
-    with patch.dict(sys.modules, {"sounddevice": None}):
+    """avr-measurement service unreachable → error."""
+    from calibrate.measurement_client import MeasurementServiceError
+    mock_client = AsyncMock()
+    mock_client.find_umik_device = AsyncMock(
+        side_effect=MeasurementServiceError(
+            "avr-measurement service unreachable at http://localhost:8767 — "
+            "is avr-measurement.service running on the Pi?"
+        )
+    )
+    with patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client):
         result = await _tool_trigger_measurement()
     assert not result["ok"]
-    assert "sounddevice" in result["error"] or "audio" in result["error"].lower()
+    assert "avr-measurement" in result["error"] or "unreachable" in result["error"]
 
 
 # ── MCP handler dispatch (call_tool for all branches) ─────────────────────────
@@ -1275,17 +1266,27 @@ async def test_call_tool_apply_eq(mock_dsp, valid_filters) -> None:
 @pytest.mark.asyncio
 async def test_call_tool_measure_dispatch() -> None:
     from calibrate.mcp_server import call_tool
-    with patch.dict(sys.modules, {"sounddevice": None}):
+    from calibrate.measurement_client import MeasurementServiceError
+    mock_client = AsyncMock()
+    mock_client.find_umik_device = AsyncMock(
+        side_effect=MeasurementServiceError("avr-measurement service unreachable at http://localhost:8767")
+    )
+    with patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client):
         texts = await call_tool("measure", {})
     data = json.loads(texts[0].text)
-    assert not data["ok"]  # no UMIK on CI → degraded mode
+    assert not data["ok"]  # service unreachable on CI → degraded mode
 
 
 @pytest.mark.asyncio
 async def test_call_tool_trigger_measurement_legacy_alias() -> None:
     """Legacy trigger_measurement name still dispatches."""
     from calibrate.mcp_server import call_tool
-    with patch.dict(sys.modules, {"sounddevice": None}):
+    from calibrate.measurement_client import MeasurementServiceError
+    mock_client = AsyncMock()
+    mock_client.find_umik_device = AsyncMock(
+        side_effect=MeasurementServiceError("avr-measurement service unreachable at http://localhost:8767")
+    )
+    with patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client):
         texts = await call_tool("trigger_measurement", {})
     data = json.loads(texts[0].text)
     assert not data["ok"]
@@ -3457,19 +3458,16 @@ async def test_call_tool_compare_sessions_dispatch() -> None:
 @pytest.mark.asyncio
 async def test_measure_label_dedup_no_double_position() -> None:
     """label='foo @ MLP' with position='MLP' → 'foo @ MLP' (not 'foo @ MLP @ MLP')."""
-    mock_sd = MagicMock()
-    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
-
     mock_fr = MagicMock()
-    mock_engine = MagicMock()
-    mock_engine.measure = AsyncMock(return_value=mock_fr)
+    mock_client = AsyncMock()
+    mock_client.find_umik_device = AsyncMock(return_value=(0, {"name": "UMIK-1"}))
+    mock_client.measure = AsyncMock(return_value=mock_fr)
 
     mock_store = MagicMock()
     mock_store.save_measurement.return_value = 10
 
     with (
-        patch.dict(sys.modules, {"sounddevice": mock_sd}),
-        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client),
         patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
@@ -3489,19 +3487,16 @@ async def test_measure_label_dedup_no_double_position() -> None:
 @pytest.mark.asyncio
 async def test_measure_label_appends_position_when_missing() -> None:
     """label='foo' with position='MLP' → 'foo @ MLP'."""
-    mock_sd = MagicMock()
-    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
-
     mock_fr = MagicMock()
-    mock_engine = MagicMock()
-    mock_engine.measure = AsyncMock(return_value=mock_fr)
+    mock_client = AsyncMock()
+    mock_client.find_umik_device = AsyncMock(return_value=(0, {"name": "UMIK-1"}))
+    mock_client.measure = AsyncMock(return_value=mock_fr)
 
     mock_store = MagicMock()
     mock_store.save_measurement.return_value = 11
 
     with (
-        patch.dict(sys.modules, {"sounddevice": mock_sd}),
-        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client),
         patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
@@ -3523,13 +3518,11 @@ async def test_measure_label_appends_position_when_missing() -> None:
 @pytest.mark.asyncio
 async def test_measure_response_downsamples_group_delay() -> None:
     """The measure tool response includes group_delay downsampled to 1/3-octave."""
-    mock_sd = MagicMock()
-    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
-
     mock_fr = MagicMock()
     mock_fr.coherence = None
-    mock_engine = MagicMock()
-    mock_engine.measure = AsyncMock(return_value=mock_fr)
+    mock_client = AsyncMock()
+    mock_client.find_umik_device = AsyncMock(return_value=(0, {"name": "UMIK-1"}))
+    mock_client.measure = AsyncMock(return_value=mock_fr)
 
     mock_store = MagicMock()
     mock_store.save_measurement.return_value = 12
@@ -3541,8 +3534,7 @@ async def test_measure_response_downsamples_group_delay() -> None:
     }
 
     with (
-        patch.dict(sys.modules, {"sounddevice": mock_sd}),
-        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client),
         patch("calibrate.measurement.compute_session_metadata", return_value=full_metadata),
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
@@ -6111,11 +6103,10 @@ async def test_trigger_measurement_hdmi_uses_graph_sweep_context() -> None:
 
     # Legacy shim synthesises denon+minidsp processor names, so the registry
     # keyed on those names is what the graph will look up.
-    mock_sd = MagicMock()
-    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
     mock_fr = MagicMock()
-    mock_engine = MagicMock()
-    mock_engine.measure = AsyncMock(return_value=mock_fr)
+    mock_client = AsyncMock()
+    mock_client.find_umik_device = AsyncMock(return_value=(0, {"name": "UMIK-1"}))
+    mock_client.measure = AsyncMock(return_value=mock_fr)
     mock_store = MagicMock()
     mock_store.save_measurement.return_value = 42
 
@@ -6126,8 +6117,7 @@ async def test_trigger_measurement_hdmi_uses_graph_sweep_context() -> None:
     test_data["measurement"] = {**DEFAULT_CONFIG["measurement"], "playback_route": "hdmi"}
 
     with (
-        patch.dict(sys.modules, {"sounddevice": mock_sd}),
-        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client),
         patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "_drivers", registry),
@@ -6151,12 +6141,10 @@ async def test_trigger_measurement_sweep_channel_forces_hdmi_route() -> None:
     """
     from calibrate.config import Config, DEFAULT_CONFIG
 
-    mock_sd = MagicMock()
-    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
-
     mock_fr = MagicMock()
-    mock_engine = MagicMock()
-    mock_engine.measure = AsyncMock(return_value=mock_fr)
+    mock_client = AsyncMock()
+    mock_client.find_umik_device = AsyncMock(return_value=(0, {"name": "UMIK-1"}))
+    mock_client.measure = AsyncMock(return_value=mock_fr)
 
     mock_store = MagicMock()
     mock_store.save_measurement.return_value = 7
@@ -6176,8 +6164,7 @@ async def test_trigger_measurement_sweep_channel_forces_hdmi_route() -> None:
     cfg_data["denon"] = {**cfg_data.get("denon", {}), "host": "192.168.1.209"}
 
     with (
-        patch.dict(sys.modules, {"sounddevice": mock_sd}),
-        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client),
         patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
@@ -6193,7 +6180,7 @@ async def test_trigger_measurement_sweep_channel_forces_hdmi_route() -> None:
     MockCtx.from_config.assert_called_once()
     mock_ctx_instance.__aenter__.assert_called_once()
     # measure() received the resolved HDMI channel index for FL (=1).
-    measure_kwargs = mock_engine.measure.await_args.kwargs
+    measure_kwargs = mock_client.measure.await_args.kwargs
     assert measure_kwargs["out_channel_override"] == 1
     # Route is plumbed through to engine.measure() — engine no longer reads
     # cfg.playback_route which would have given "usb" here.
@@ -6205,12 +6192,10 @@ async def test_trigger_measurement_hdmi_sweep_channel_routes_correctly() -> None
     """HDMI sweep with sweep_channel=FL goes through DenonSweepContext with route=hdmi."""
     from calibrate.config import Config, DEFAULT_CONFIG
 
-    mock_sd = MagicMock()
-    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
-
     mock_fr = MagicMock()
-    mock_engine = MagicMock()
-    mock_engine.measure = AsyncMock(return_value=mock_fr)
+    mock_client = AsyncMock()
+    mock_client.find_umik_device = AsyncMock(return_value=(0, {"name": "UMIK-1"}))
+    mock_client.measure = AsyncMock(return_value=mock_fr)
 
     mock_store = MagicMock()
     mock_store.save_measurement.return_value = 99
@@ -6229,8 +6214,7 @@ async def test_trigger_measurement_hdmi_sweep_channel_routes_correctly() -> None
     cfg_data["denon"] = {**cfg_data.get("denon", {}), "host": "192.168.1.209"}
 
     with (
-        patch.dict(sys.modules, {"sounddevice": mock_sd}),
-        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client),
         patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
@@ -6241,7 +6225,7 @@ async def test_trigger_measurement_hdmi_sweep_channel_routes_correctly() -> None
         result = await sut._tool_trigger_measurement(sweep_channel="FL")
 
     assert result["ok"], result
-    measure_kwargs = mock_engine.measure.await_args.kwargs
+    measure_kwargs = mock_client.measure.await_args.kwargs
     assert measure_kwargs["route"] == "hdmi"
 
 
@@ -6250,12 +6234,10 @@ async def test_trigger_measurement_does_not_pass_sound_mode_to_denon_context() -
     """measure() no longer touches AVR sound mode — that's set_avr_mode's job."""
     from calibrate.config import Config, DEFAULT_CONFIG
 
-    mock_sd = MagicMock()
-    mock_sd.query_devices.return_value = [{"name": "UMIK-1", "max_input_channels": 1}]
-
     mock_fr = MagicMock()
-    mock_engine = MagicMock()
-    mock_engine.measure = AsyncMock(return_value=mock_fr)
+    mock_client = AsyncMock()
+    mock_client.find_umik_device = AsyncMock(return_value=(0, {"name": "UMIK-1"}))
+    mock_client.measure = AsyncMock(return_value=mock_fr)
 
     mock_store = MagicMock()
     mock_store.save_measurement.return_value = 11
@@ -6269,8 +6251,7 @@ async def test_trigger_measurement_does_not_pass_sound_mode_to_denon_context() -
     hdmi_cfg["measurement"] = {**hdmi_cfg["measurement"], "playback_route": "hdmi"}
 
     with (
-        patch.dict(sys.modules, {"sounddevice": mock_sd}),
-        patch("calibrate.measurement.MeasurementEngine", return_value=mock_engine),
+        patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client),
         patch("calibrate.measurement.compute_session_metadata", return_value={"ir": {}}),
         patch("calibrate.storage.SessionStore", return_value=mock_store),
         patch.object(sut, "DenonSweepContext") as MockCtx,
