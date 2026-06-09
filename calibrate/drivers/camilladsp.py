@@ -1343,19 +1343,38 @@ class CamillaDSPDriver(DSPDriver):
         """Clear FIR coefficients on a single output (filter removed from pipeline)."""
         async with self._lock:
             prev = list(self._fir_state.get(output_index, []))
-            # Find the max tap count across remaining routed peers.
-            max_peer_taps = max(
+            prev_peers: dict[int, list[float]] = {}
+
+            def _is_identity(taps: list[float]) -> bool:
+                return bool(taps) and taps[0] == 1.0 and all(t == 0.0 for t in taps[1:])
+
+            # A peer has an "active correction" only when its FIR is non-empty and
+            # not a passthrough identity pad (taps[0]=1, rest=0).
+            active_peer_taps = max(
                 (len(c) for p, c in self._fir_state.items()
-                 if p in self._routed_outputs and p != int(output_index) and c),
+                 if p in self._routed_outputs and p != int(output_index)
+                 and c and not _is_identity(c)),
                 default=0,
             )
-            if max_peer_taps > 0:
-                # Keep a matching-length identity FIR so the quantum stays stable.
-                identity = [0.0] * max_peer_taps
+
+            if active_peer_taps > 0:
+                # At least one peer still has a real correction FIR.
+                # Keep a matching-length identity so the PW quantum stays stable.
+                identity = [0.0] * active_peer_taps
                 identity[0] = 1.0
                 self._fir_state[int(output_index)] = identity
             else:
+                # No active corrections remain on any routed output.
+                # Fully remove this output's filter and clean up any orphaned
+                # identity pads on peer outputs so they don't linger.
                 self._fir_state[int(output_index)] = []
+                for peer in self._routed_outputs:
+                    if peer == int(output_index):
+                        continue
+                    peer_taps = self._fir_state.get(peer, [])
+                    if peer_taps and _is_identity(peer_taps):
+                        prev_peers[peer] = list(peer_taps)
+                        self._fir_state[peer] = []
             try:
                 await self._push_config_locked()
             except DriverError:
@@ -1363,4 +1382,9 @@ class CamillaDSPDriver(DSPDriver):
                     self._fir_state[output_index] = prev
                 else:
                     self._fir_state.pop(output_index, None)
+                for peer, old_coeffs in prev_peers.items():
+                    if old_coeffs:
+                        self._fir_state[peer] = old_coeffs
+                    else:
+                        self._fir_state.pop(peer, None)
                 raise
