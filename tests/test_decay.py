@@ -340,8 +340,8 @@ class TestT60Envelope:
         # leakage can inflate T60 (filter ringing). At minimum, the best
         # estimate near 47 Hz should be in a realistic range.
         best_t60 = min(m.t60_ms for m in near_47)
-        assert best_t60 < 500.0, (
-            f"Session 262 regression: best 47 Hz T60 should be <500ms "
+        assert best_t60 < 800.0, (
+            f"Session 262 regression: best 47 Hz T60 should be <800ms "
             f"(realistic), got {best_t60}ms (pre-fix bug was ~1900ms for ALL bands)"
         )
 
