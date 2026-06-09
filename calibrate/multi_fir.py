@@ -656,9 +656,12 @@ def _compute_trinnov_precausal(
         the filter's own ringdown approaches the room T60.
     amplitude_ir : optional room IR with better sub-bass SNR (e.g. from a
         log-sweep session) used ONLY for anti-pulse amplitude extraction.
-        `ir` is still used for Schroeder T60 estimation and peak alignment.
-        When None, `ir` is used for both.  Pass a sweep session IR here when
-        the impulse IR has poor sub-bass excitation (pre_causal_peak ≈ 0).
+        `ir` is still used for Schroeder T60 estimation.  The bandpass peak
+        of each band is found in amplitude_ir (not the broadband peak) so
+        the full modal ringing amplitude is captured — the narrowband filter
+        has ~80-160 ms group delay at sub-bass that would otherwise place the
+        broadband peak index in the filter's ramp-up phase (near-zero).
+        When None, `ir` is used for both (same bandpass-peak behaviour).
 
     Returns (pre_causal, band_reports) where band_reports lists each band's
     measured T60 and correction status.
@@ -669,8 +672,13 @@ def _compute_trinnov_precausal(
     peak_idx = int(np.argmax(np.abs(ir)))
     # Use amplitude_ir for anti-pulse amplitude extraction when provided.
     # Sweep session IRs have 0.96-0.99 coherence at sub-bass; impulse IRs do not.
-    _amp_ir = amplitude_ir if amplitude_ir is not None else ir
-    _amp_peak_idx = int(np.argmax(np.abs(_amp_ir)))
+    # Normalise to unit peak so the extracted ringing is dimensionless (0–1
+    # scale). Without this, the raw IR amplitude (~0.001–0.003 for a typical
+    # sub-to-mic path) makes anti-pulse peaks 60+ dB below the Wiener section,
+    # rendering them acoustically ineffective.
+    _amp_ir_raw = amplitude_ir if amplitude_ir is not None else ir
+    _amp_peak = float(np.max(np.abs(_amp_ir_raw)))
+    _amp_ir = _amp_ir_raw / _amp_peak if _amp_peak > 1e-12 else _amp_ir_raw
     pre_causal = np.zeros(pre_delay_samples, dtype=np.float64)
     band_reports: list[dict] = []
 
@@ -741,9 +749,13 @@ def _compute_trinnov_precausal(
         scale = cancel_strength * excess_fraction
 
         # Anti-ringing waveform: use amplitude_ir when available for better
-        # sub-bass SNR.  Time-reversed, negated, scaled → pre-causal cancellation.
+        # sub-bass SNR.  Find the BANDPASS peak (not broadband) as the starting
+        # point for ringing extraction — the narrowband filter has ~80-160 ms
+        # group delay at sub-bass, so the broadband peak index lands in the
+        # filter's ramp-up phase where the signal is near-zero.
         bp_ir_narrow = sosfilt(sos_narrow, _amp_ir)
-        ringing_narrow = bp_ir_narrow[_amp_peak_idx:]
+        bp_amp_peak_idx = int(np.argmax(np.abs(bp_ir_narrow)))
+        ringing_narrow = bp_ir_narrow[bp_amp_peak_idx:]
         ringing_trunc = ringing_narrow[:pre_delay_samples]
         anti = -ringing_trunc[::-1] * scale
 
