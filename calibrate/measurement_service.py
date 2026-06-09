@@ -27,6 +27,16 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
+# scipy 1.13+ removed scipy.signal.hanning (use scipy.signal.windows.hann).
+# pytta.generate still calls it; patch the alias at import time.
+try:
+    import scipy.signal as _ss
+    if not hasattr(_ss, "hanning"):
+        import scipy.signal.windows as _ssw
+        _ss.hanning = _ssw.hann
+except Exception:
+    pass
+
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
 
@@ -83,7 +93,7 @@ class PlayAndMeasureFftRequest(BaseModel):
 def _cfg():
     """Load config from the pi-user's config directory."""
     from .config import Config
-    return Config()
+    return Config.load()
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
