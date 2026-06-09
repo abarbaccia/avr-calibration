@@ -339,6 +339,41 @@ class TestMeasure:
             with pytest.raises(RuntimeError, match="numpy is required"):
                 await engine.measure()
 
+    @pytest.mark.asyncio
+    async def test_flat_response_with_loopback_raises_quality_error(self):
+        """When loopback is present and deconvolved FR is flat (< 2 dB std),
+        measure() raises MeasurementQualityError — the mic captured the
+        reference directly rather than the acoustic output."""
+        from calibrate.measurement import MeasurementQualityError
+        engine, _, mock_sweep, mock_recording = self._make_engine_with_mocks()
+        # Build a mic signal = ref signal so deconvolution gives flat ~0 dBFS.
+        sweep_1d = mock_sweep.timeSignal[:, 0]
+        flat_mic = sweep_1d.copy()  # mic ≈ reference → H(f) ≈ 1 everywhere
+        flat_ref = sweep_1d.copy()
+        mock_strategy = MagicMock()
+        # Return 3-tuple (sweep, mic, ref) — signals presence of loopback.
+        mock_strategy.play_and_record.return_value = (sweep_1d, flat_mic, flat_ref)
+        with patch("calibrate.drivers.playback.playback_for_route", return_value=mock_strategy):
+            with pytest.raises(MeasurementQualityError) as exc_info:
+                await engine.measure()
+        assert exc_info.value.check == "flat_response"
+
+    @pytest.mark.asyncio
+    async def test_non_flat_response_with_loopback_does_not_raise(self):
+        """A loopback measurement with natural FR variation (> 2 dB std) passes."""
+        engine, _, mock_sweep, mock_recording = self._make_engine_with_mocks()
+        import numpy as _np
+        rng = _np.random.default_rng(7)
+        n = len(mock_sweep.timeSignal[:, 0])
+        sweep_1d = mock_sweep.timeSignal[:, 0]
+        acoustic_mic = rng.standard_normal(n).astype(_np.float32)
+        ref = sweep_1d.copy()
+        mock_strategy = MagicMock()
+        mock_strategy.play_and_record.return_value = (sweep_1d, acoustic_mic, ref)
+        with patch("calibrate.drivers.playback.playback_for_route", return_value=mock_strategy):
+            fr = await engine.measure()
+        assert isinstance(fr, FrequencyResponse)
+
 
 # ── MeasurementEngine._compute_fr() ──────────────────────────────────────────
 
@@ -1562,6 +1597,26 @@ class TestXcorrDelayMs:
         result = _xcorr_delay_ms(np, ref, delayed, sr, lo_ms=3.0, hi_ms=200.0)
         assert result is not None
         assert 3.0 <= result <= 200.0
+
+    def test_prefers_direct_path_over_stronger_reflection(self):
+        """First-onset logic must return the direct-path arrival (~5 ms) even
+        when a room reflection at ~15 ms has higher xcorr amplitude.
+        Previously (argmax) this would jump to the reflection, causing
+        loopback_xcorr_peak_ms to vary by 10+ ms between identical runs."""
+        import numpy as np
+        sr = 48000
+        n = int(0.5 * sr)
+        ref = np.zeros(n)
+        direct_samples = int(0.005 * sr)   # 5 ms direct path
+        reflect_samples = int(0.015 * sr)  # 15 ms reflection
+        ref[direct_samples] = 1.0
+        delayed = np.zeros(n)
+        delayed[direct_samples] = 0.6   # direct: weaker
+        delayed[reflect_samples] = 1.0  # reflection: stronger (argmax would pick this)
+        result = _xcorr_delay_ms(np, ref, delayed, sr, lo_ms=3.0, hi_ms=200.0)
+        assert result is not None
+        # First-onset must find the direct path (≤ 12 ms), not the reflection (15 ms).
+        assert result < 12.0, f"Expected direct path < 12 ms, got {result} ms"
 
 
 # ── FrequencyResponse loopback fields ─────────────────────────────────────────

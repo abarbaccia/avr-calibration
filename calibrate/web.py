@@ -25,7 +25,8 @@ from pydantic import BaseModel
 from .config import Config, CONFIG_PATH
 from .drivers.registry import load_drivers_from_graph
 from .graph import default_display_name
-from .measurement import FrequencyResponse, _find_umik_device
+from .measurement import FrequencyResponse
+from .measurement_client import MeasurementServiceClient
 from .storage import SessionStore
 
 app = FastAPI(title="avr-calibration")
@@ -2049,18 +2050,15 @@ async def system_status() -> dict:
                 "detail": _format_processor_detail(proc.kind, state),
             })
 
-    # UMIK
+    # UMIK — query via bare-metal measurement service (Docker has no PipeWire access)
     try:
-        import sounddevice as sd
-        devs = sd.query_devices()
         mic_name = cfg.mic.get("name", "UMIK")
-        umik_idx = _find_umik_device(devs, name_substring=mic_name)
-        if umik_idx is not None:
-            devices.append({"name": f"UMIK ({mic_name})", "connected": True, "detail": str(devs[umik_idx].get("name", ""))})
+        meas_client = MeasurementServiceClient()
+        _idx, _dev = await meas_client.find_umik_device(name_substring=mic_name)
+        if _idx is not None and _dev is not None:
+            devices.append({"name": f"UMIK ({mic_name})", "connected": True, "detail": str(_dev.get("name", ""))})
         else:
             devices.append({"name": f"UMIK ({mic_name})", "connected": False, "detail": "Not found"})
-    except ImportError:
-        devices.append({"name": "UMIK", "connected": False, "detail": "sounddevice not available"})
     except Exception as e:
         devices.append({"name": "UMIK", "connected": False, "detail": str(e)})
 

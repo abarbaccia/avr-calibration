@@ -6005,10 +6005,10 @@ async def _tool_calibrate_level(
     USB mode: adjusts miniDSP master gain.
     HDMI mode: adjusts AVR volume.
     """
-    from .measurement import MeasurementEngine, MeasurementQualityError, parse_umik_sensitivity
+    from .measurement import MeasurementQualityError, parse_umik_sensitivity
+    from .measurement_client import MeasurementServiceClient, MeasurementServiceError
     from .config import update_config
     import math as _math
-    import numpy as _np
 
     cfg = _config()
 
@@ -6033,7 +6033,8 @@ async def _tool_calibrate_level(
         if fr.recording_rms_dbfs is not None:
             return float(round(fr.recording_rms_dbfs + _mic_offset, 1))
         return float(round(fr.recording_peak_dbfs + _mic_offset, 1))
-    engine = MeasurementEngine(cfg)
+
+    meas_client = MeasurementServiceClient()
     route = cfg.measurement.get("playback_route", "usb")
 
     # Gain limits
@@ -6058,7 +6059,9 @@ async def _tool_calibrate_level(
             await _dsp.set_master_gain(probe_gain)  # type: ignore[union-attr]
             await asyncio.sleep(0.3)
             try:
-                probe_fr = await engine.measure()
+                probe_fr = await meas_client.measure(route=route)
+            except MeasurementServiceError as exc:
+                return _err(f"calibrate_level probe failed (measurement service): {exc}")
             except MeasurementQualityError as exc:
                 return _err(
                     f"USB sweep SNR too low at {probe_gain:.0f} dB ({exc.detail}). "
@@ -6084,7 +6087,9 @@ async def _tool_calibrate_level(
             await _dsp.set_master_gain(computed_gain)  # type: ignore[union-attr]
             await asyncio.sleep(0.3)
             try:
-                verify_fr = await engine.measure()
+                verify_fr = await meas_client.measure(route=route)
+            except MeasurementServiceError as exc:
+                return _err(f"calibrate_level verify failed (measurement service): {exc}")
             except MeasurementQualityError as exc:
                 return _err(
                     f"USB sweep failed at computed gain {computed_gain:.1f} dB ({exc.detail}). "
@@ -6144,7 +6149,9 @@ async def _tool_calibrate_level(
         await _avr.set_volume(probe_vol)  # type: ignore[union-attr]
         await asyncio.sleep(0.5)
         try:
-            probe_fr = await engine.measure()
+            probe_fr = await meas_client.measure(route=route)
+        except MeasurementServiceError as exc:
+            return _err(f"calibrate_level probe failed (measurement service): {exc}")
         except MeasurementQualityError as exc:
             if exc.check in ("snr", "sweep_capture"):
                 return _err(
@@ -6172,7 +6179,9 @@ async def _tool_calibrate_level(
         await _avr.set_volume(computed_vol)  # type: ignore[union-attr]
         await asyncio.sleep(0.5)
         try:
-            verify_fr = await engine.measure()
+            verify_fr = await meas_client.measure(route=route)
+        except MeasurementServiceError as exc:
+            return _err(f"calibrate_level verify failed (measurement service): {exc}")
         except MeasurementQualityError as exc:
             if exc.check in ("snr", "sweep_capture"):
                 return _err(

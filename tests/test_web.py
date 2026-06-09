@@ -576,39 +576,38 @@ class TestSystemStatus:
         assert len(disconnected) >= 1
 
     def test_status_no_sounddevice(self, db_store: SessionStore, client: TestClient) -> None:
-        """When sounddevice is not installed, UMIK shows as unavailable."""
+        """When measurement service is unreachable, UMIK shows as unavailable."""
+        from calibrate.measurement_client import MeasurementServiceError
+
         cfg = _make_config()
         denonavr_mock = MagicMock()
         denonavr_mock.DenonAVR.side_effect = Exception("offline")
 
-        # Make sounddevice import fail
-        original_sd = sys.modules.get("sounddevice")
-        sys.modules["sounddevice"] = None  # type: ignore[assignment]
+        mock_meas_client = AsyncMock()
+        mock_meas_client.find_umik_device = AsyncMock(
+            side_effect=MeasurementServiceError(
+                "avr-measurement service unreachable at http://localhost:8767"
+            )
+        )
 
-        try:
-            with (
-                patch.dict(sys.modules, {"denonavr": denonavr_mock}),
-                patch("calibrate.web._load_config", return_value=cfg),
-                patch("calibrate.web.SessionStore", return_value=db_store),
-                patch("calibrate.web.httpx.AsyncClient") as httpx_cls,
-            ):
-                httpx_instance = AsyncMock()
-                httpx_instance.get.side_effect = Exception("offline")
-                httpx_cls.return_value.__aenter__ = AsyncMock(return_value=httpx_instance)
-                httpx_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        with (
+            patch.dict(sys.modules, {"denonavr": denonavr_mock}),
+            patch("calibrate.web._load_config", return_value=cfg),
+            patch("calibrate.web.SessionStore", return_value=db_store),
+            patch("calibrate.web.httpx.AsyncClient") as httpx_cls,
+            patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_meas_client),
+        ):
+            httpx_instance = AsyncMock()
+            httpx_instance.get.side_effect = Exception("offline")
+            httpx_cls.return_value.__aenter__ = AsyncMock(return_value=httpx_instance)
+            httpx_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
-                resp = client.get("/api/status")
-        finally:
-            if original_sd is not None:
-                sys.modules["sounddevice"] = original_sd
-            else:
-                sys.modules.pop("sounddevice", None)
+            resp = client.get("/api/status")
 
         data = resp.json()
         umik_devices = [d for d in data["devices"] if "UMIK" in d["name"]]
         assert len(umik_devices) == 1
         assert umik_devices[0]["connected"] is False
-        assert "sounddevice" in umik_devices[0]["detail"]
 
     def test_status_with_last_run(self, db_store: SessionStore, client: TestClient) -> None:
         """When a run exists, last_run is populated."""

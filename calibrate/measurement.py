@@ -1096,6 +1096,35 @@ class MeasurementEngine:
             timing_array=_timing_array,
         )
 
+        # Flat-response check (loopback path only): a real acoustic measurement
+        # in a room deconvolved against a captured loopback reference has at
+        # least 6 dB of spectral variation. If the response is nearly flat
+        # (< 2 dB std), the mic almost certainly captured the reference signal
+        # directly — this happened when pw-record connected to the wrong
+        # PipeWire node during a graph reconfiguration (e.g. after
+        # clock.force-quantum was set). Skip when ref_1d is absent: without a
+        # loopback, deconvolution is against the analytical sweep, which is
+        # intentionally flat.
+        _has_ref = ref_1d is not None and not np.all(ref_1d == 0)
+        if _has_ref and len(spl) >= 4:
+            spl_std = float(np.std(spl))
+            if spl_std < 2.0:
+                raise MeasurementQualityError(
+                    check="flat_response",
+                    detail=(
+                        f"Deconvolved frequency response is suspiciously flat "
+                        f"(std={spl_std:.2f} dB across {len(spl)} bands). "
+                        "Mic likely captured the sweep reference directly rather "
+                        "than the acoustic output."
+                    ),
+                    suggestion=(
+                        "Retry the measurement. If it persists, check that "
+                        "loopback_ref_pipewire_node and mic_pipewire_node in "
+                        "config.yaml point to distinct PipeWire nodes, and that "
+                        "no pw-metadata force-quantum is active."
+                    ),
+                )
+
         loopback_xcorr_peak_ms: Optional[float] = None
         avr_processing_ms: Optional[float] = None
         if ref_1d is not None and not np.all(ref_1d == 0):
@@ -1533,13 +1562,29 @@ def _xcorr_delay_ms(
     if len(env_window) == 0 or float(np.max(env_window)) == 0.0:
         return None
 
-    # Use the absolute peak of the bandpass envelope — more stable than onset
-    # detection (first-above-threshold) which can latch onto different early
-    # noise bursts between runs and shift loopback_xcorr_peak_ms by 1-2 ms.
-    # The absolute peak position of a clean sweep xcorr is deterministic.
-    rel_idx = int(np.argmax(env_window))
+    # Use first-onset-above-threshold rather than argmax. argmax finds the
+    # globally loudest xcorr peak, which can be a room reflection at 14–19 ms
+    # rather than the direct acoustic arrival at ~5 ms — the two can swap
+    # amplitude between runs, causing loopback_xcorr_peak_ms to jump by 10+ ms
+    # across otherwise identical measurements and break inter-session
+    # phase comparisons for joint FIR design.
+    #
+    # 5 % threshold: robust to early noise bursts (typically < 1 % of peak)
+    # while consistently latching onto the first significant arrival.
+    # Variation is ±1–2 ms (acceptable — loopback_xcorr is diagnostic only).
+    max_env = float(np.max(env_window))
+    threshold = 0.05 * max_env
+    above = np.where(env_window >= threshold)[0]
+    if len(above) == 0:
+        return None
+    # Find local peak within 10 ms of first threshold crossing so we report
+    # the crest of the direct-path arrival, not just the onset sample.
+    first_cross = int(above[0])
+    local_window = int(0.010 * sample_rate)
+    end = min(first_cross + local_window, len(env_window))
+    local_peak = first_cross + int(np.argmax(env_window[first_cross:end]))
 
-    peak_idx = lo_idx + rel_idx
+    peak_idx = lo_idx + local_peak
     return round(peak_idx / sample_rate * 1000.0, 3)
 
 
