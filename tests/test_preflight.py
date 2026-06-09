@@ -5,12 +5,16 @@ Coverage diagram:
   ├── check_hidraw()
   │   ├── [TESTED] /dev/hidraw0 exists → passes with path in detail
   │   └── [TESTED] /dev/hidraw0 missing → fails with OTG adapter hint
+  ├── check_measurement_service()
+  │   ├── [TESTED] Service healthy → passes with URL in detail
+  │   ├── [TESTED] Service unreachable → fails with systemctl hint
+  │   └── [TESTED] Unexpected status → fails gracefully
   ├── check_mic()
   │   ├── [TESTED] UMIK found by name match → passes with device detail
   │   ├── [TESTED] Name match is case-insensitive
   │   ├── [TESTED] No UMIK but other inputs exist → fails, shows available
   │   ├── [TESTED] No input devices at all → fails, generic message
-  │   └── [TESTED] sounddevice raises → fails gracefully with error text
+  │   ├── [TESTED] MeasurementServiceError → fails with service-unreachable message
   │   └── [TESTED] Detail includes device index and sample rate
   ├── check_minidsp()
   │   ├── [TESTED] Device found → passes with product name + host:port
@@ -37,10 +41,10 @@ Coverage diagram:
   │   ├── [TESTED] Denon passes, USB route, device missing → fails with playback error
   │   └── [TESTED] Denon fails → propagates failure without running playback check
   └── run_all()
-      ├── [TESTED] All pass → 4 passed results (Config, miniDSP, Denon AVR, Signal Path)
+      ├── [TESTED] All pass → 10 passed results (Config, Measurement service, Microphone, …)
       ├── [TESTED] Unhandled exception → captured as failed result
       ├── [TESTED] Results named correctly even when exceptions occur
-      └── [TESTED] Partial failure (1 fail, 3 pass)
+      └── [TESTED] Partial failure (1 fail, rest pass)
 """
 
 import asyncio
@@ -74,52 +78,92 @@ class TestHidrawCheck:
         assert "micro-USB" in result.error
 
 
+_MEAS_CLIENT = "calibrate.measurement_client.MeasurementServiceClient"
+
+
+# ── Measurement service checks ───────────────────────────────────────────────
+
+class TestMeasurementServiceCheck:
+    async def test_service_healthy(self, config):
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.health = AsyncMock(return_value={"status": "ok"})
+            MockClient.return_value.base_url = "http://localhost:8767"
+            result = await PreflightChecker(config).check_measurement_service()
+        assert result.passed
+        assert "8767" in result.detail
+
+    async def test_service_unreachable(self, config):
+        from calibrate.measurement_client import MeasurementServiceError
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.health = AsyncMock(
+                side_effect=MeasurementServiceError("avr-measurement service unreachable")
+            )
+            result = await PreflightChecker(config).check_measurement_service()
+        assert not result.passed
+        assert "unreachable" in result.error
+
+    async def test_unexpected_status(self, config):
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.health = AsyncMock(return_value={"status": "degraded"})
+            MockClient.return_value.base_url = "http://localhost:8767"
+            result = await PreflightChecker(config).check_measurement_service()
+        assert not result.passed
+        assert "systemctl" in result.error
+
+
 # ── Microphone checks ────────────────────────────────────────────────────────
-# sounddevice is mocked via sys.modules["sounddevice"] (see conftest.py).
-# Each test configures query_devices() return value on the session-scoped mock.
+# MeasurementServiceClient.list_devices() is mocked — audio checks now delegate
+# to the bare-metal service instead of querying sounddevice inside Docker.
 
 class TestMicCheck:
     async def test_umik_found(self, config):
-        sys.modules["sounddevice"].query_devices.return_value = [make_input_device("miniDSP UMIK-1")]
-        result = await PreflightChecker(config).check_mic()
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.list_devices = AsyncMock(return_value=[make_input_device("miniDSP UMIK-1")])
+            result = await PreflightChecker(config).check_mic()
         assert result.passed
         assert "UMIK-1" in result.detail
         assert result.error is None
 
     async def test_umik_found_case_insensitive(self, config):
-        sys.modules["sounddevice"].query_devices.return_value = [make_input_device("minidsp umik-2")]
-        result = await PreflightChecker(config).check_mic()
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.list_devices = AsyncMock(return_value=[make_input_device("minidsp umik-2")])
+            result = await PreflightChecker(config).check_mic()
         assert result.passed
 
     async def test_no_umik_but_other_inputs_present(self, config):
-        sys.modules["sounddevice"].query_devices.return_value = [
-            make_input_device("Built-in Microphone"),
-            make_output_device("Speakers"),
-        ]
-        result = await PreflightChecker(config).check_mic()
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.list_devices = AsyncMock(return_value=[
+                make_input_device("Built-in Microphone"),
+                make_output_device("Speakers"),
+            ])
+            result = await PreflightChecker(config).check_mic()
         assert not result.passed
         assert "Built-in Microphone" in result.detail
         assert result.error is not None
 
     async def test_no_input_devices_at_all(self, config):
-        sys.modules["sounddevice"].query_devices.return_value = [make_output_device("Speakers")]
-        result = await PreflightChecker(config).check_mic()
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.list_devices = AsyncMock(return_value=[make_output_device("Speakers")])
+            result = await PreflightChecker(config).check_mic()
         assert not result.passed
         assert "No audio input" in result.detail
 
-    async def test_sounddevice_raises(self, config):
-        sys.modules["sounddevice"].query_devices.side_effect = RuntimeError("portaudio error")
-        result = await PreflightChecker(config).check_mic()
+    async def test_measurement_service_error(self, config):
+        from calibrate.measurement_client import MeasurementServiceError
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.list_devices = AsyncMock(
+                side_effect=MeasurementServiceError("service unreachable")
+            )
+            result = await PreflightChecker(config).check_mic()
         assert not result.passed
-        assert "portaudio error" in result.error
-        # Reset side_effect for other tests
-        sys.modules["sounddevice"].query_devices.side_effect = None
+        assert "unreachable" in result.error
 
     async def test_detail_includes_device_index_and_sample_rate(self, config):
-        sys.modules["sounddevice"].query_devices.return_value = [
-            make_input_device("miniDSP UMIK-1", sample_rate=48000.0)
-        ]
-        result = await PreflightChecker(config).check_mic()
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.list_devices = AsyncMock(return_value=[
+                make_input_device("miniDSP UMIK-1", sample_rate=48000.0)
+            ])
+            result = await PreflightChecker(config).check_mic()
         assert result.passed
         assert "48000" in result.detail
         assert "device 0" in result.detail
@@ -337,6 +381,7 @@ class TestRunAll:
         checker = PreflightChecker(config)
         with (
             patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
+            patch.object(checker, "check_measurement_service", return_value=CheckResult("Measurement service", True, "healthy")),
             patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1 (device 0, 48000Hz)")),
             patch.object(checker, "check_minidsp_combined", return_value=CheckResult("miniDSP", True, "2x4HD; /dev/hidraw0 present")),
             patch.object(checker, "check_denon_and_playback", return_value=CheckResult("Denon AVR", True, "X3800H; USB: miniDSP")),
@@ -348,12 +393,13 @@ class TestRunAll:
         ):
             results = await checker.run_all()
         assert all(r.passed for r in results)
-        assert len(results) == 9
+        assert len(results) == 10
 
     async def test_unhandled_exception_becomes_failed_result(self, config):
         checker = PreflightChecker(config)
         with (
             patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
+            patch.object(checker, "check_measurement_service", return_value=CheckResult("Measurement service", True, "healthy")),
             patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1")),
             patch.object(checker, "check_minidsp_combined", side_effect=RuntimeError("boom")),
             patch.object(checker, "check_denon_and_playback", return_value=CheckResult("Denon AVR", True, "X3800H")),
@@ -369,6 +415,7 @@ class TestRunAll:
         checker = PreflightChecker(config)
         with (
             patch.object(checker, "check_config", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_measurement_service", side_effect=RuntimeError("err")),
             patch.object(checker, "check_mic", side_effect=RuntimeError("err")),
             patch.object(checker, "check_minidsp_combined", side_effect=RuntimeError("err")),
             patch.object(checker, "check_denon_and_playback", side_effect=RuntimeError("err")),
@@ -379,11 +426,9 @@ class TestRunAll:
             patch.object(checker, "check_loopback_reference", side_effect=RuntimeError("err")),
         ):
             results = await checker.run_all()
-        # DSP label now comes from the configured driver — "miniDSP 2x4 HD" for
-        # dsp_driver: minidsp (the test fixture default).
         assert [r.name for r in results] == [
-            "Config", "Microphone", "miniDSP 2x4 HD", "Denon AVR", "Signal Path",
-            "Output routing", "Audio stack", "DSP persisted state",
+            "Config", "Measurement service", "Microphone", "miniDSP 2x4 HD", "Denon AVR",
+            "Signal Path", "Output routing", "Audio stack", "DSP persisted state",
             "Loopback reference",
         ]
 
@@ -393,18 +438,20 @@ class TestRunAll:
         checker = PreflightChecker(config)
         with (
             patch.object(checker, "check_config", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_measurement_service", side_effect=RuntimeError("err")),
             patch.object(checker, "check_mic", side_effect=RuntimeError("err")),
             patch.object(checker, "check_minidsp_combined", side_effect=RuntimeError("err")),
             patch.object(checker, "check_denon_and_playback", side_effect=RuntimeError("err")),
             patch.object(checker, "check_signal_path_sync", side_effect=RuntimeError("err")),
         ):
             results = await checker.run_all()
-        assert results[2].name == "CamillaDSP"
+        assert results[3].name == "CamillaDSP"
 
     async def test_partial_failure(self, config):
         checker = PreflightChecker(config)
         with (
             patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
+            patch.object(checker, "check_measurement_service", return_value=CheckResult("Measurement service", True, "healthy")),
             patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1")),
             patch.object(checker, "check_minidsp_combined", return_value=CheckResult("miniDSP", False, "", "start minidspd")),
             patch.object(checker, "check_denon_and_playback", return_value=CheckResult("Denon AVR", True, "X3800H")),
@@ -412,10 +459,11 @@ class TestRunAll:
         ):
             results = await checker.run_all()
         assert results[0].passed       # Config
-        assert results[1].passed       # Microphone
-        assert not results[2].passed   # miniDSP
-        assert results[3].passed       # Denon AVR
-        assert results[4].passed       # Signal Path
+        assert results[1].passed       # Measurement service
+        assert results[2].passed       # Microphone
+        assert not results[3].passed   # miniDSP
+        assert results[4].passed       # Denon AVR
+        assert results[5].passed       # Signal Path
 
 
 # ── Playback route checks ─────────────────────────────────────────────────────
@@ -424,22 +472,18 @@ class TestPlaybackRouteCheck:
     async def test_usb_device_found(self, config):
         config._data.setdefault("measurement", {})["playback_route"] = "usb"
         config._data["measurement"]["playback_device"] = "miniDSP"
-        from tests.conftest import make_output_device
-        sys.modules["sounddevice"].query_devices.return_value = [
-            make_output_device("miniDSP USB"),
-        ]
-        result = await PreflightChecker(config).check_playback_route()
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.list_devices = AsyncMock(return_value=[make_output_device("miniDSP USB")])
+            result = await PreflightChecker(config).check_playback_route()
         assert result.passed
         assert "USB" in result.detail
 
     async def test_usb_device_not_found(self, config):
         config._data.setdefault("measurement", {})["playback_route"] = "usb"
         config._data["measurement"]["playback_device"] = "miniDSP"
-        from tests.conftest import make_input_device
-        sys.modules["sounddevice"].query_devices.return_value = [
-            make_input_device("Built-in Mic"),
-        ]
-        result = await PreflightChecker(config).check_playback_route()
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.list_devices = AsyncMock(return_value=[make_input_device("Built-in Mic")])
+            result = await PreflightChecker(config).check_playback_route()
         assert not result.passed
         assert "miniDSP" in result.detail
 
@@ -476,13 +520,16 @@ class TestPlaybackRouteCheck:
             result = await PreflightChecker(config).check_playback_route()
         assert not result.passed
 
-    async def test_usb_sounddevice_raises_captured(self, config):
+    async def test_usb_measurement_service_error(self, config):
+        from calibrate.measurement_client import MeasurementServiceError
         config._data.setdefault("measurement", {})["playback_route"] = "usb"
-        sys.modules["sounddevice"].query_devices.side_effect = RuntimeError("portaudio error")
-        result = await PreflightChecker(config).check_playback_route()
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.list_devices = AsyncMock(
+                side_effect=MeasurementServiceError("service unreachable")
+            )
+            result = await PreflightChecker(config).check_playback_route()
         assert not result.passed
-        assert "portaudio error" in result.error
-        sys.modules["sounddevice"].query_devices.side_effect = None
+        assert "unreachable" in result.error
 
 
 # ── Signal path sync check ────────────────────────────────────────────────────

@@ -65,13 +65,14 @@ class PreflightChecker:
         """Run all hardware checks concurrently. Never raises — errors become failed results.
 
         Equipment checks:
-            [Config]  [Microphone]  [miniDSP (USB+daemon)]  [Denon AVR + Playback]  [Signal Path]
+            [Config]  [Measurement service]  [Microphone]  [miniDSP (USB+daemon)]  [Denon AVR + Playback]  [Signal Path]
         """
         dsp_label = _DSP_DISPLAY_NAMES.get(
             self.config.dsp_driver_name, self.config.dsp_driver_name
         )
         checks = [
             ("Config", self.check_config()),
+            ("Measurement service", self.check_measurement_service()),
             ("Microphone", self.check_mic()),
             (dsp_label, self.check_minidsp_combined()),
             ("Denon AVR", self.check_denon_and_playback()),
@@ -124,24 +125,56 @@ class PreflightChecker:
             ),
         )
 
-    async def check_mic(self) -> CheckResult:
-        """Check that the UMIK (or configured mic) is visible as an audio input device."""
+    async def check_measurement_service(self) -> CheckResult:
+        """Check that the bare-metal avr-measurement service is reachable."""
+        from .measurement_client import MeasurementServiceClient, MeasurementServiceError
+        client = MeasurementServiceClient()
         try:
-            import sounddevice as sd  # lazy: only needs PortAudio at runtime
-            devices = sd.query_devices()
-            mic_name = self.config.mic.get("name", "UMIK")
+            health = await client.health()
+            if health.get("status") == "ok":
+                return CheckResult(
+                    name="Measurement service",
+                    passed=True,
+                    detail=f"avr-measurement service healthy at {client.base_url}",
+                )
+            return CheckResult(
+                name="Measurement service",
+                passed=False,
+                detail=f"unexpected health response: {health}",
+                error="avr-measurement.service may not be running — check: systemctl status avr-measurement",
+            )
+        except MeasurementServiceError as exc:
+            return CheckResult(
+                name="Measurement service",
+                passed=False,
+                detail="",
+                error=str(exc),
+            )
+        except Exception as exc:
+            return CheckResult(
+                name="Measurement service",
+                passed=False,
+                detail="",
+                error=f"Unexpected error: {exc}",
+            )
 
-            # Find first input device matching the configured name substring
+    async def check_mic(self) -> CheckResult:
+        """Check that the UMIK (or configured mic) is visible on the bare-metal measurement service."""
+        from .measurement_client import MeasurementServiceClient, MeasurementServiceError
+        mic_name = self.config.mic.get("name", "UMIK")
+        try:
+            client = MeasurementServiceClient()
+            devices = await client.list_devices()
+
             for idx, dev in enumerate(devices):
-                if dev["max_input_channels"] > 0 and mic_name.lower() in dev["name"].lower():
+                if dev.get("max_input_channels", 0) > 0 and mic_name.lower() in dev["name"].lower():
                     return CheckResult(
                         name="Microphone",
                         passed=True,
-                        detail=f'{dev["name"]} (device {idx}, {int(dev["default_samplerate"])}Hz)',
+                        detail=f'{dev["name"]} (device {idx}, {int(dev.get("default_samplerate", 0))}Hz)',
                     )
 
-            # No match — show what inputs ARE available to help the user debug
-            available_inputs = [d["name"] for d in devices if d["max_input_channels"] > 0]
+            available_inputs = [d["name"] for d in devices if d.get("max_input_channels", 0) > 0]
             if available_inputs:
                 shown = ", ".join(available_inputs[:3])
                 ellipsis = "…" if len(available_inputs) > 3 else ""
@@ -157,6 +190,13 @@ class PreflightChecker:
                 passed=False,
                 detail="No audio input devices found",
                 error="Connect your measurement microphone and retry",
+            )
+        except MeasurementServiceError as exc:
+            return CheckResult(
+                name="Microphone",
+                passed=False,
+                detail="measurement service unreachable — mic check skipped",
+                error=str(exc),
             )
         except Exception as exc:
             return CheckResult(
@@ -387,19 +427,20 @@ class PreflightChecker:
                 error=denon_result.error,
             )
 
-        # USB route: verify playback device is visible
+        # USB route: verify playback device via the bare-metal measurement service
+        from .measurement_client import MeasurementServiceClient, MeasurementServiceError
+        device_name = self.config.measurement.get("playback_device", "miniDSP")
         try:
-            import sounddevice as sd  # lazy: only needs PortAudio at runtime
-            devices = sd.query_devices()
-            device_name = self.config.measurement.get("playback_device", "miniDSP")
+            client = MeasurementServiceClient()
+            devices = await client.list_devices()
             for idx, dev in enumerate(devices):
-                if dev["max_output_channels"] > 0 and device_name.lower() in dev["name"].lower():
+                if dev.get("max_output_channels", 0) > 0 and device_name.lower() in dev["name"].lower():
                     return CheckResult(
                         name="Playback Route",
                         passed=True,
                         detail=f'USB: {dev["name"]} (device {idx})',
                     )
-            available_outputs = [d["name"] for d in devices if d["max_output_channels"] > 0]
+            available_outputs = [d["name"] for d in devices if d.get("max_output_channels", 0) > 0]
             shown = ", ".join(available_outputs[:3])
             ellipsis = "…" if len(available_outputs) > 3 else ""
             return CheckResult(
@@ -407,6 +448,13 @@ class PreflightChecker:
                 passed=False,
                 detail=f'USB: no "{device_name}" found. Available outputs: {shown}{ellipsis}',
                 error=f"Connect {device_name} via USB or set measurement.playback_device",
+            )
+        except MeasurementServiceError as exc:
+            return CheckResult(
+                name="Playback Route",
+                passed=False,
+                detail="measurement service unreachable — playback check skipped",
+                error=str(exc),
             )
         except Exception as exc:
             return CheckResult(

@@ -26,6 +26,7 @@ sudo apt-get install -y -qq \
     ca-certificates \
     gnupg \
     inotify-tools \
+    libportaudio2 \
     pipewire \
     pipewire-alsa \
     wireplumber
