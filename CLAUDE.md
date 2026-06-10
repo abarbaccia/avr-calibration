@@ -138,8 +138,8 @@ ssh pi@192.168.1.117 "sudo docker pull ghcr.io/abarbaccia/avr-calibration:latest
 - **AVR:** Denon X3800H — denonavr library, TCP port 1256 for Audyssey
 - **DSP:** CamillaDSP via PipeWire → Focusrite Scarlett 18i20
   - Sub outputs: Scarlett lines 5/6/7 (direct-PCM, not via monitor bus)
-  - Sub cal signal path: `pw-cat → avr_cal_sweep PW null sink → camilladsp_capture:input_2 (LFE mixer input) → CamillaDSP → Scarlett → subs`. Loopback ref is tapped pre-DSP via `avr_cal_sweep:monitor_FL → loopback_ref` (a dedicated PW null-sink node), NOT a camilladsp_capture port.
-- **Mic:** UMIK-1 or UMIK-2 (UMIK .cal correction applied). The UMIK is its **own USB device** (own clock), captured directly by the measurement engine — not routed through the Scarlett. PipeWire async-resamples it to the 48 kHz graph clock; `resample.quality=14` (WirePlumber rule) mitigates the dual-clock jitter.
+  - Sub cal signal path: `pw-cat → avr_cal_sweep PW null sink → camilladsp_capture:input_3 (loopback ref) → CamillaDSP → Scarlett → subs`
+- **Mic:** UMIK-1 or UMIK-2 (UMIK .cal correction applied)
 - **Subs:** SVS PB12-NSD (ported, ~22Hz tuning), output indices 5 and 6
 - **Shaker:** Earthquake MQB-1 on Behringer NX3000, output index 7 — **ALWAYS muted during calibration measurements**
 
@@ -147,17 +147,15 @@ ssh pi@192.168.1.117 "sudo docker pull ghcr.io/abarbaccia/avr-calibration:latest
 
 ```
 pw-cat → avr_cal_sweep (PW null sink)
-   ├─ monitor_FL/FR → camilladsp_capture:input_2   [LFE mixer input → CamillaDSP]
-   │                    → CamillaDSP HPF+PEQ+FIR (lfe_source mixer)
-   │                    → outputs 5, 6 (subs) / 7 (shaker, muted)
-   │                    → Scarlett 18i20 line outputs → subs → room
-   └─ monitor_FL → loopback_ref:playback_1          [pre-DSP deconvolution reference X]
-
-UMIK-1 (its own USB device) → captured directly by the measurement engine (pw-record)   [mic Y]
-Deconvolution:  H = Y(mic) / X(loopback_ref)
+       → camilladsp_capture:input_3  [loopback reference]
+       → CamillaDSP lfe_source mixer
+       → output_router → outputs 5, 6, 7
+       → Scarlett 18i20 line outputs
+       → subs → room
+       → UMIK mic → Scarlett capture → camilladsp_capture:input_1
 ```
 
-The loopback reference (`avr_cal_sweep:monitor_FL → loopback_ref:playback_1`, a dedicated PW null-sink node created by `/etc/pipewire/pipewire.conf.d/11-loopback-ref.conf`) captures the sweep pre-CamillaDSP and is the deconvolution `X`. The mic is captured directly from the UMIK USB node — NOT through the Scarlett, and NOT via `camilladsp_capture`. The sweep enters CamillaDSP on `input_2` (the LFE mixer input); the canonical links are established by the `avr-cal-sweep-link.service` **user** service. A leftover link to `camilladsp_capture:input_3` (channel 2, unread by `cal_matrix` which is `in:2`) is pre-`2e772a0` cruft and should be torn down. Without the loopback ref, coherence collapses.
+The loopback reference (`avr_cal_sweep:monitor_FL → camilladsp_capture:input_3`) captures the sweep signal pre-CamillaDSP, used for deconvolution. Without this loopback, coherence collapses.
 
 **Sub-only measurements bypass the Denon** — inject sweep via Pi → CamillaDSP → Scarlett → subs directly. Never route sub cal sweeps through the Denon LFE pre-out (Audyssey/MultEQ corrupt the stimulus).
 
