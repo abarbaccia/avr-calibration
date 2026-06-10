@@ -622,154 +622,8 @@ def design_fir_multi_modal(
 
 
 # ---------------------------------------------------------------------------
-# Trinnov-style wideband decay correction
+# Trinnov-style coherent multi-sub correction
 # ---------------------------------------------------------------------------
-
-def _compute_trinnov_precausal(
-    ir: "np.ndarray",
-    sample_rate: int,
-    pre_delay_samples: int,
-    target_t60_ms: float,
-    freq_min: float,
-    freq_max: float,
-    bands_per_octave: int,
-    cancel_strength: float,
-    band_t60s: "dict[float, float] | None" = None,
-    amplitude_ir: "np.ndarray | None" = None,
-) -> tuple["np.ndarray", list[dict]]:
-    """Compute a continuous pre-causal decay correction from a measured room IR.
-
-    Unlike per-mode Gabor anti-pulses (which collide when modes are <0.5 oct
-    apart), this approach:
-      1. Bandpass-filters the measured IR at each 1/bands_per_octave band.
-      2. Computes measured T60 via Schroeder integration using a wider
-         (≤ 1/3-octave) bandpass filter to reduce filter-ringing contamination.
-         When band_t60s is provided, those values are used directly instead.
-      3. For bands where T60 > target, time-reverses the post-direct ringing
-         and scales by cancel_strength × excess_fraction.
-      4. Sums ALL band corrections into one continuous pre-causal waveform.
-
-    band_t60s : optional dict mapping centre_freq_hz → measured_t60_ms.
-        When supplied (e.g. from analyze_decay), the internal Schroeder T60
-        estimate is bypassed for bands that match.  Use this for more accurate
-        T60 estimates — the internal Schroeder method can be unreliable when
-        the filter's own ringdown approaches the room T60.
-    amplitude_ir : optional room IR with better sub-bass SNR (e.g. from a
-        log-sweep session) used ONLY for anti-pulse amplitude extraction.
-        `ir` is still used for Schroeder T60 estimation.  The bandpass peak
-        of each band is found in amplitude_ir (not the broadband peak) so
-        the full modal ringing amplitude is captured — the narrowband filter
-        has ~80-160 ms group delay at sub-bass that would otherwise place the
-        broadband peak index in the filter's ramp-up phase (near-zero).
-        When None, `ir` is used for both (same bandpass-peak behaviour).
-
-    Returns (pre_causal, band_reports) where band_reports lists each band's
-    measured T60 and correction status.
-    """
-    import numpy as np
-    from scipy.signal import butter, sosfilt
-
-    peak_idx = int(np.argmax(np.abs(ir)))
-    # Use amplitude_ir for anti-pulse amplitude extraction when provided.
-    # Sweep session IRs have 0.96-0.99 coherence at sub-bass; impulse IRs do not.
-    # Normalise to unit peak so the extracted ringing is dimensionless (0–1
-    # scale). Without this, the raw IR amplitude (~0.001–0.003 for a typical
-    # sub-to-mic path) makes anti-pulse peaks 60+ dB below the Wiener section,
-    # rendering them acoustically ineffective.
-    _amp_ir_raw = amplitude_ir if amplitude_ir is not None else ir
-    _amp_peak = float(np.max(np.abs(_amp_ir_raw)))
-    _amp_ir = _amp_ir_raw / _amp_peak if _amp_peak > 1e-12 else _amp_ir_raw
-    pre_causal = np.zeros(pre_delay_samples, dtype=np.float64)
-    band_reports: list[dict] = []
-
-    # Build 1/bands_per_octave centre frequencies
-    n_octaves = math.log2(freq_max / freq_min)
-    n_bands = max(1, int(round(n_octaves * bands_per_octave)) + 1)
-    centre_freqs = [freq_min * 2 ** (i / bands_per_octave) for i in range(n_bands)]
-    nyq = sample_rate / 2.0
-
-    # T60 analysis uses at most 1/3-octave wide bands to avoid narrow-band
-    # Butterworth ringing contaminating the T60 estimate.  A 1/6-octave
-    # Butterworth at 47 Hz (Q≈8.5) rings for ~500 ms — far too close to
-    # the room's own T60 for reliable estimation.  With ≤ 1/3-octave (Q≈4)
-    # the filter T60 drops to ~95 ms, well below typical room T60 of 300+ ms.
-    t60_bpo = min(bands_per_octave, 3)
-
-    for f_c in centre_freqs:
-        # Narrow band edges for anti-ringing generation (full resolution)
-        f_lo = f_c / 2 ** (0.5 / bands_per_octave)
-        f_hi = f_c * 2 ** (0.5 / bands_per_octave)
-        if f_lo < 5.0 or f_hi >= nyq:
-            continue
-
-        # Wider band edges for T60 estimation (low-ringing filter)
-        f_lo_t60 = f_c / 2 ** (0.5 / t60_bpo)
-        f_hi_t60 = min(f_c * 2 ** (0.5 / t60_bpo), nyq * 0.99)
-        if f_lo_t60 < 5.0:
-            f_lo_t60 = 5.0
-
-        try:
-            sos_narrow = butter(4, [f_lo / nyq, f_hi / nyq], btype="band", output="sos")
-            sos_wide = butter(2, [f_lo_t60 / nyq, f_hi_t60 / nyq], btype="band", output="sos")
-        except Exception:
-            continue
-
-        # T60 decision: use externally-provided value if available (more accurate),
-        # otherwise estimate from the wider-band filtered IR.
-        if band_t60s is not None:
-            # Find closest provided frequency within ±1/4 octave of band centre.
-            best_key = min(band_t60s, key=lambda f: abs(math.log2(f / f_c)), default=None)
-            if best_key is not None and abs(math.log2(best_key / f_c)) < 0.25:
-                t60_ms = band_t60s[best_key]
-            else:
-                t60_ms = 0.0  # no external data → skip band
-        else:
-            # Internal Schroeder T60 on wider-band filtered IR.
-            # Note: narrow-band (1/6-oct) Butterworth rings for 200-500ms at sub
-            # frequencies; using ≤ 1/3-oct here keeps filter T60 under ~100ms,
-            # but is still unreliable for room T60s close to the IR window length.
-            # For precise T60-driven correction, pass band_t60s from analyze_decay.
-            bp_ir_wide = sosfilt(sos_wide, ir)
-            ringing_wide = bp_ir_wide[peak_idx:]
-            if len(ringing_wide) < 64:
-                continue
-            energy_rev = np.cumsum(ringing_wide[::-1] ** 2)[::-1]
-            peak_e = energy_rev[0]
-            if peak_e < 1e-20:
-                continue
-            schroeder_db = 10.0 * np.log10(energy_rev / peak_e + 1e-30)
-            below = np.where(schroeder_db < -60.0)[0]
-            t60_ms = (below[0] if len(below) else len(ringing_wide)) / sample_rate * 1000.0
-
-        if t60_ms <= target_t60_ms:
-            band_reports.append({"freq_hz": round(f_c, 1), "t60_ms": round(t60_ms), "corrected": False})
-            continue
-
-        excess_fraction = min(1.0, (t60_ms - target_t60_ms) / (t60_ms + 1e-9))
-        scale = cancel_strength * excess_fraction
-
-        # Anti-ringing waveform: use amplitude_ir when available for better
-        # sub-bass SNR.  Find the BANDPASS peak (not broadband) as the starting
-        # point for ringing extraction — the narrowband filter has ~80-160 ms
-        # group delay at sub-bass, so the broadband peak index lands in the
-        # filter's ramp-up phase where the signal is near-zero.
-        bp_ir_narrow = sosfilt(sos_narrow, _amp_ir)
-        bp_amp_peak_idx = int(np.argmax(np.abs(bp_ir_narrow)))
-        ringing_narrow = bp_ir_narrow[bp_amp_peak_idx:]
-        ringing_trunc = ringing_narrow[:pre_delay_samples]
-        anti = -ringing_trunc[::-1] * scale
-
-        pre_causal[: len(anti)] += anti
-        band_reports.append({
-            "freq_hz": round(f_c, 1),
-            "t60_ms": round(t60_ms),
-            "excess_ms": round(t60_ms - target_t60_ms),
-            "scale": round(scale, 3),
-            "corrected": True,
-        })
-
-    return pre_causal, band_reports
-
 
 def design_fir_trinnov(
     room_ir: list[float],
@@ -778,125 +632,91 @@ def design_fir_trinnov(
     *,
     sample_rate: int = 48000,
     num_taps: int = 24576,
-    phase_mode: str = "minimum",
+    phase_mode: str = "mixed",
     regularization_lambda: float = 0.01,
     freq_focus_hz: tuple[float, float] | None = None,
-    target_t60_ms: float = 200.0,
-    pre_delay_ms: float = 50.0,
+    preringing_ms: float = 20.0,
     freq_min: float = 20.0,
     freq_max: float = 120.0,
     bands_per_octave: int = 6,
-    cancel_strength: float = 0.5,
-    band_t60s: "list[dict] | None" = None,
-    amplitude_ir: "list[float] | None" = None,
+    t60_threshold_ms: float = 300.0,
 ) -> dict:
-    """Trinnov-style wideband decay correction + Wiener magnitude correction.
+    """Trinnov-style coherent multi-sub correction via the complex Wiener inverse.
 
-    Architecture:
-      fir[0 .. pre_samples-1]  = continuous pre-causal anti-ringing (all bands)
-      fir[pre_samples ..]      = min-phase Wiener magnitude correction
+    This is a thin wrapper over :func:`design_multi_input_fir` in ``mixed``
+    phase mode, plus a baseline T60 report derived from the measured room IR.
 
-    The pre-causal section is derived directly from the measured room IR — it
-    is the time-reversed, scaled ringing at each 1/bands_per_octave band where
-    T60 exceeds target_t60_ms.  Because there are no per-mode Gabors, closely-
-    spaced modes (e.g. 64/72/80 Hz) are handled naturally: their band
-    contributions simply add in the time domain with no interference artefacts.
+    Why no separate "anti-ringing" section any more
+    -----------------------------------------------
+    Earlier revisions added a pre-causal section built from the time-reversed
+    room ringing, intended to shorten modal decay.  That is mathematically
+    unsound: the corrected response at the mic is ``C * h`` (the correction
+    FIR convolved with the sub→mic path).  Time-reversed mode ringing is a
+    *matched filter* for the mode — convolving it back through ``h`` re-excites
+    the mode, boosting its steady-state level by tens of dB while leaving T60
+    unchanged (verified empirically: +40 dB at the mode, T60 578→585 ms).
+
+    The ONLY correction that reduces a room mode in both magnitude and decay
+    is the regularised complex inverse, ``K_i = T_i·conj(H_i)/(|H_i|²+λ²)``,
+    realised with its phase preserved (``mixed``/``linear``).  ``minimum`` mode
+    inverts each sub's magnitude but discards the inter-sub phase, so subs with
+    different arrival times cancel acoustically at the listener (deep nulls).
+    ``mixed`` rotates every sub to a common target phase so they sum coherently
+    — which is exactly the multi-sub property this design exists to deliver.
 
     Parameters
     ----------
-    room_ir          : averaged impulse response from measure_impulse_ir()
-    measurements     : per-sub solo FR sessions (for Wiener design)
+    room_ir          : averaged impulse response from measure_impulse_ir().
+                       Used ONLY for the informational baseline T60 report;
+                       it does not shape the correction.
+    measurements     : per-sub solo FR sessions (magnitude + phase) — the
+                       inputs to the coherent Wiener design.
     target_points    : target magnitude curve [(freq_hz, spl_db), ...]
-    target_t60_ms    : desired T60 across the band (default 200 ms)
-    pre_delay_ms     : pre-causal budget; 50 ms is a good default — captures
-                       the most energetic portion of the anti-ringing even for
-                       long-decay modes (exponential decay means energy peaks
-                       nearest the main impulse)
-    freq_min/max     : frequency range for decay correction
-    bands_per_octave : filter bank resolution (default 6 = 1/6-octave)
-    cancel_strength  : 0–1 scaling for pre-causal correction (default 0.5)
-    band_t60s        : optional list of dicts with 'freq_hz' and 't60_ms'.
-                       When supplied (e.g. from analyze_decay output), T60
-                       values override the internal Schroeder estimate for
-                       matching bands.  Recommended for accurate correction —
-                       the internal estimate can be unreliable for room T60s
-                       close to the IR window length or filter ringdown time.
-    amplitude_ir     : optional room IR with better sub-bass SNR (e.g. from a
-                       sweep session) used solely for anti-pulse amplitude
-                       extraction.  When omitted, room_ir is used for both T60
-                       estimation and amplitude extraction.
+    phase_mode       : 'mixed' (default, coherent multi-sub), 'linear'
+                       (symmetric, highest latency), or 'minimum' (per-sub
+                       magnitude only — no inter-sub coherence; single-sub use).
+    preringing_ms    : pre-ring budget for mixed phase (≈ latency). Default 20.
+    freq_focus_hz    : optional (lo, hi) band to confine the correction to.
+    freq_min/max     : frequency range for the baseline T60 report.
+    bands_per_octave : filter-bank resolution for the baseline T60 report.
+    t60_threshold_ms : modes with baseline T60 above this are listed in the
+                       returned ``ringing_modes`` report (informational).
     """
-    import numpy as np
-
-    pre_samples = int(math.ceil(pre_delay_ms / 1000.0 * sample_rate))
-    mag_taps = num_taps - pre_samples
-    if mag_taps < 512:
-        raise ValueError(
-            f"pre_delay_ms={pre_delay_ms} leaves only {mag_taps} taps for Wiener "
-            f"(num_taps={num_taps}). Reduce pre_delay_ms or increase num_taps."
-        )
-
-    ir = np.asarray(room_ir, dtype=np.float64)
-    amp_ir_np = np.asarray(amplitude_ir, dtype=np.float64) if amplitude_ir is not None else None
-
-    # Build freq→T60 lookup from band_t60s if provided.
-    band_t60_lookup: "dict[float, float] | None" = None
-    if band_t60s:
-        band_t60_lookup = {
-            float(b["freq_hz"]): float(b["t60_ms"])
-            for b in band_t60s
-            if "freq_hz" in b and "t60_ms" in b
-        }
-
-    # Step 1 — pre-causal decay correction from room IR
-    pre_causal, band_reports = _compute_trinnov_precausal(
-        ir, sample_rate, pre_samples,
-        target_t60_ms=target_t60_ms,
-        freq_min=freq_min, freq_max=freq_max,
-        bands_per_octave=bands_per_octave,
-        cancel_strength=cancel_strength,
-        band_t60s=band_t60_lookup,
-        amplitude_ir=amp_ir_np,
-    )
-
-    corrected_bands = [b for b in band_reports if b.get("corrected")]
-    skipped_bands = [b for b in band_reports if not b.get("corrected")]
-
-    # Step 2 — per-sub Wiener magnitude FIRs
     wiener = design_multi_input_fir(
         measurements, target_points,
-        sample_rate=sample_rate, num_taps=mag_taps,
+        sample_rate=sample_rate, num_taps=num_taps,
         phase_mode=phase_mode, regularization_lambda=regularization_lambda,
-        freq_focus_hz=freq_focus_hz,
+        freq_focus_hz=freq_focus_hz, preringing_ms=preringing_ms,
     )
 
-    # Step 3 — combine: build full FIR buffer, insert Wiener at pre_samples
-    combined_firs: list[list[float]] = []
-    for wiener_taps in wiener["firs"]:
-        fir = np.zeros(num_taps, dtype=np.float64)
-        fir[:pre_samples] = pre_causal
-        w = np.asarray(wiener_taps, dtype=np.float64)
-        fir[pre_samples: pre_samples + len(w)] += w
-
-        # Normalise only if peak exceeds 1.0 (same rule as design_multi_input_fir)
-        peak = float(np.max(np.abs(fir)))
-        if peak > 1.0:
-            fir /= peak
-
-        combined_firs.append(fir.tolist())
-
-    # Peak of pre-causal section (sanity check — should be < 1)
-    pre_peak = float(np.max(np.abs(pre_causal))) if len(pre_causal) else 0.0
-
-    # Use modal_cancel intent only when the pre-causal section is actually
-    # significant (Gabor-style large gain at mode frequency).  When pre-causal
-    # is negligible (< 0.01 peak amplitude) the FIR is effectively a standard
-    # magnitude-correction filter; modal_cancel would falsely trigger the
-    # log-sweep guard and block post-FIR verification measurements.
-    apply_intent = "modal_cancel" if pre_peak >= 0.01 else "standard"
+    # Informational baseline decay report from the measured room IR. This is a
+    # report only — the correction is the coherent Wiener inverse above. We
+    # reuse calibrate.decay.analyze_decay (the canonical Schroeder estimator)
+    # rather than re-implementing band T60 here.
+    ringing_modes: list[dict] = []
+    try:
+        from .decay import analyze_decay
+        modes = analyze_decay(
+            list(room_ir), sample_rate=sample_rate,
+            t60_threshold_ms=t60_threshold_ms,
+            freq_min=freq_min, freq_max=freq_max,
+            bands_per_octave=bands_per_octave,
+        )
+        ringing_modes = [
+            {
+                "freq_hz": round(m.freq_hz, 1),
+                "t60_ms": round(m.t60_ms),
+                "peak_db": round(m.peak_db, 1),
+            }
+            for m in modes
+        ]
+    except Exception:
+        # A bad/empty IR must never fail the design — the FIRs stand on their
+        # own; the T60 report is best-effort.
+        ringing_modes = []
 
     return {
-        "firs": combined_firs,
+        "firs": wiener["firs"],
         "num_subs": wiener["num_subs"],
         "num_taps": num_taps,
         "sample_rate": sample_rate,
@@ -906,11 +726,10 @@ def design_fir_trinnov(
         "predicted_per_sub": wiener["predicted_per_sub"],
         "per_sub_peak_boost_db": wiener["per_sub_peak_boost_db"],
         "output_gain_db": wiener.get("output_gain_db", 0.0),
-        "latency_ms": round(pre_samples / sample_rate * 1000, 2),
-        "pre_delay_ms": round(pre_delay_ms, 2),
-        "pre_causal_peak": round(pre_peak, 4),
-        "corrected_bands": corrected_bands,
-        "skipped_bands": skipped_bands,
-        "n_corrected": len(corrected_bands),
-        "apply_intent": apply_intent,
+        "latency_ms": wiener["latency_ms"],
+        "ringing_modes": ringing_modes,
+        "n_ringing_modes": len(ringing_modes),
+        # Pure magnitude/phase correction — strict thermal cap applies, and the
+        # FIR is safe to sweep through (no anti-pulse Gabor content).
+        "apply_intent": "correction",
     }

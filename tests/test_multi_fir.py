@@ -186,6 +186,35 @@ def _two_flat_measurements(freqs=None) -> list[SubMeasurement]:
     return [m1, m2]
 
 
+def _delayed_sub(delay_ms: float, label: str, freqs=None) -> SubMeasurement:
+    """A flat-magnitude sub with a pure propagation delay (linear phase)."""
+    if freqs is None:
+        freqs = np.linspace(20, 120, 80)
+    freqs = np.asarray(freqs, dtype=float)
+    phase = (-2 * np.pi * freqs * delay_ms / 1000.0).tolist()
+    return SubMeasurement(freqs=list(freqs), spl_db=[0.0] * len(freqs),
+                          phase_rad=phase, label=label)
+
+
+def _realized_combined_db(result, measurements, band_hz, sample_rate=48000):
+    """Independently realize Σ FIR_i · H_i and return mean dB in a 1/6-oct band."""
+    n_fft = 32768
+    fo = np.fft.rfftfreq(n_fft, d=1.0 / sample_rate)
+    H_sum = np.zeros(len(fo), dtype=complex)
+    for fir, m in zip(result["firs"], measurements):
+        f = np.asarray(fir)
+        F = np.zeros(n_fft)
+        F[: len(f)] = f
+        K = np.fft.rfft(F)
+        mag = 10 ** (np.interp(fo, m.freqs, m.spl_db) / 20.0)
+        ph = np.interp(fo, m.freqs, np.unwrap(m.phase_rad))
+        H_sum += K * mag * np.exp(1j * ph)
+    db = 20 * np.log10(np.abs(H_sum) + 1e-12)
+    lo, hi = band_hz / 2 ** (1 / 12), band_hz * 2 ** (1 / 12)
+    mask = (fo >= lo) & (fo < hi)
+    return float(np.mean(db[mask]))
+
+
 def test_trinnov_fir_shape_and_length():
     """Each returned FIR has exactly num_taps coefficients."""
     room_ir = _synth_room_ir_with_mode()
@@ -193,8 +222,8 @@ def test_trinnov_fir_shape_and_length():
     target = [(20, 0.0), (120, 0.0)]
     result = design_fir_trinnov(
         room_ir, measurements, target,
-        sample_rate=48000, num_taps=4096, pre_delay_ms=20.0,
-        freq_min=20.0, freq_max=120.0, target_t60_ms=200.0,
+        sample_rate=48000, num_taps=4096,
+        freq_min=20.0, freq_max=120.0,
     )
     assert result["num_subs"] == 2
     assert result["num_taps"] == 4096
@@ -203,121 +232,104 @@ def test_trinnov_fir_shape_and_length():
         assert len(fir) == 4096, f"expected 4096 taps, got {len(fir)}"
 
 
-def test_trinnov_corrected_bands_populated_for_long_t60():
-    """Bands where T60 > target_t60_ms must be listed as corrected=True."""
-    room_ir = _synth_room_ir_with_mode(mode_freq_hz=47.0, t60_ms=600.0)
-    measurements = _two_flat_measurements()
-    target = [(20, 0.0), (120, 0.0)]
-    result = design_fir_trinnov(
-        room_ir, measurements, target,
-        sample_rate=48000, num_taps=4096, pre_delay_ms=20.0,
-        freq_min=30.0, freq_max=80.0, target_t60_ms=200.0,
-    )
-    assert result["n_corrected"] > 0, "Expected at least one corrected band for T60=600ms"
-    # Bands near 47 Hz should be in the corrected list
-    corrected_freqs = {b["freq_hz"] for b in result["corrected_bands"]}
-    assert any(35 <= f <= 65 for f in corrected_freqs), (
-        f"No band near 47 Hz corrected; corrected: {sorted(corrected_freqs)}"
-    )
-
-
-def test_trinnov_no_correction_when_band_t60s_below_target():
-    """When explicit band_t60s are all below target_t60_ms, n_corrected == 0.
-
-    The internal Schroeder estimator is unreliable for room T60s near the
-    filter's own ringdown (~200-500ms at sub frequencies). band_t60s from
-    analyze_decay bypasses that estimator with reliable per-mode T60 values.
-    """
-    room_ir = _synth_room_ir_with_mode(mode_freq_hz=47.0, t60_ms=600.0)
-    measurements = _two_flat_measurements()
-    target = [(20, 0.0), (120, 0.0)]
-    # Provide explicit T60s all below target=200ms
-    band_t60s = [{"freq_hz": float(f), "t60_ms": 80.0}
-                 for f in [25, 31.5, 40, 50, 63, 80]]
-    result = design_fir_trinnov(
-        room_ir, measurements, target,
-        sample_rate=48000, num_taps=4096, pre_delay_ms=20.0,
-        freq_min=20.0, freq_max=120.0, target_t60_ms=200.0,
-        band_t60s=band_t60s,
-    )
-    assert result["n_corrected"] == 0, (
-        f"Expected 0 corrected bands when all band_t60s=80ms < target=200ms; "
-        f"got {result['n_corrected']}"
-    )
-
-
-def test_trinnov_pre_causal_peak_less_than_one():
-    """Pre-causal peak must be < 1.0 (never exceeds main Wiener impulse)."""
-    room_ir = _synth_room_ir_with_mode(t60_ms=600.0)
-    measurements = _two_flat_measurements()
-    target = [(20, 0.0), (120, 0.0)]
-    result = design_fir_trinnov(
-        room_ir, measurements, target,
-        sample_rate=48000, num_taps=4096, pre_delay_ms=20.0,
-        cancel_strength=0.5,
-    )
-    assert result["pre_causal_peak"] < 1.0, (
-        f"pre_causal_peak={result['pre_causal_peak']} should be < 1.0"
-    )
-
-
-def test_trinnov_tap_budget_error():
-    """Raises ValueError when pre_delay_ms leaves < 512 taps for Wiener."""
+def test_trinnov_default_phase_mode_is_mixed():
+    """Default phase_mode must be 'mixed' for coherent multi-sub summation."""
     room_ir = _synth_room_ir_with_mode()
     measurements = _two_flat_measurements()
-    target = [(20, 0.0), (120, 0.0)]
-    # num_taps=512, pre_delay_ms=500ms → pre_samples = 24000, mag_taps < 0
-    with pytest.raises(ValueError, match="pre_delay_ms"):
-        design_fir_trinnov(
-            room_ir, measurements, target,
-            sample_rate=48000, num_taps=512, pre_delay_ms=500.0,
-        )
+    result = design_fir_trinnov(
+        room_ir, measurements, [(20, 0.0), (120, 0.0)],
+        sample_rate=48000, num_taps=4096,
+    )
+    assert result["phase_mode"] == "mixed"
+    # Pure magnitude/phase correction → strict 'correction' safety intent,
+    # NOT 'modal_cancel' (which would relax the FIR boost cap).
+    assert result["apply_intent"] == "correction"
+
+
+def test_trinnov_mixed_beats_minimum_for_coherent_sum():
+    """The core property: with subs at different arrival times, 'mixed' phase
+    sums coherently near the target while 'minimum' phase produces a deep null.
+
+    This is the regression guard for the phase_mode='minimum' default bug:
+    minimum-phase discards inter-sub phase, so delayed subs cancel acoustically.
+    """
+    room_ir = _synth_room_ir_with_mode()
+    # 6 ms relative delay → near anti-phase around 80 Hz when summed.
+    subs = [_delayed_sub(3.0, "sub5"), _delayed_sub(9.0, "sub6")]
+    target = [(20, 0.0), (120, 0.0)]  # flat 0 dB target
+
+    res_min = design_fir_trinnov(room_ir, subs, target, sample_rate=48000,
+                                 num_taps=8192, phase_mode="minimum",
+                                 regularization_lambda=0.01, freq_focus_hz=(20, 120))
+    res_mix = design_fir_trinnov(room_ir, subs, target, sample_rate=48000,
+                                 num_taps=8192, phase_mode="mixed",
+                                 regularization_lambda=0.01, freq_focus_hz=(20, 120))
+
+    min_80 = _realized_combined_db(res_min, subs, 80.0)
+    mix_80 = _realized_combined_db(res_mix, subs, 80.0)
+
+    # minimum-phase falls into a deep null; mixed stays near the 0 dB target.
+    assert min_80 < -8.0, f"expected minimum-phase null at 80 Hz, got {min_80:.1f} dB"
+    assert abs(mix_80) < 4.0, f"expected mixed near 0 dB at 80 Hz, got {mix_80:.1f} dB"
+    assert mix_80 - min_80 > 8.0, (
+        f"mixed should beat minimum by >8 dB at the null; "
+        f"mixed={mix_80:.1f} minimum={min_80:.1f}"
+    )
+
+
+def test_trinnov_ringing_modes_reported_for_long_t60():
+    """A long-decay IR mode must appear in the informational ringing_modes report."""
+    room_ir = _synth_room_ir_with_mode(mode_freq_hz=47.0, t60_ms=800.0)
+    measurements = _two_flat_measurements()
+    result = design_fir_trinnov(
+        room_ir, measurements, [(20, 0.0), (120, 0.0)],
+        sample_rate=48000, num_taps=4096,
+        freq_min=30.0, freq_max=80.0, t60_threshold_ms=300.0, bands_per_octave=6,
+    )
+    assert result["n_ringing_modes"] > 0, "expected ≥1 ringing mode for T60=800ms"
+    freqs = [m["freq_hz"] for m in result["ringing_modes"]]
+    assert any(35 <= f <= 65 for f in freqs), (
+        f"no ringing mode near 47 Hz; got {sorted(freqs)}"
+    )
+
+
+def test_trinnov_no_ringing_modes_when_threshold_high():
+    """When t60_threshold_ms exceeds the IR's decay, ringing_modes is empty —
+    and the design still succeeds (the FIRs do not depend on the report)."""
+    room_ir = _synth_room_ir_with_mode(mode_freq_hz=47.0, t60_ms=400.0)
+    measurements = _two_flat_measurements()
+    result = design_fir_trinnov(
+        room_ir, measurements, [(20, 0.0), (120, 0.0)],
+        sample_rate=48000, num_taps=4096,
+        freq_min=20.0, freq_max=120.0, t60_threshold_ms=2000.0, bands_per_octave=6,
+    )
+    assert result["n_ringing_modes"] == 0
+    assert len(result["firs"]) == 2
 
 
 def test_trinnov_peak_normalized():
     """All FIR coefficients must satisfy |c| ≤ 1.0."""
     room_ir = _synth_room_ir_with_mode(t60_ms=600.0)
     measurements = _two_flat_measurements()
-    target = [(20, 0.0), (120, 0.0)]
     result = design_fir_trinnov(
-        room_ir, measurements, target,
-        sample_rate=48000, num_taps=4096, pre_delay_ms=20.0,
+        room_ir, measurements, [(20, 0.0), (120, 0.0)],
+        sample_rate=48000, num_taps=4096,
     )
     for i, fir in enumerate(result["firs"]):
         peak = max(abs(c) for c in fir)
         assert peak <= 1.0 + 1e-9, f"sub{i} FIR peak={peak:.4f} exceeds 1.0"
 
 
-def test_trinnov_latency_equals_pre_delay():
-    """latency_ms must equal pre_delay_ms (main Wiener impulse at pre_samples)."""
-    room_ir = _synth_room_ir_with_mode()
+def test_trinnov_bad_ir_does_not_fail_design():
+    """An empty/garbage IR must not break the design — the FIRs stand alone
+    and the ringing-mode report is best-effort."""
     measurements = _two_flat_measurements()
-    target = [(20, 0.0), (120, 0.0)]
     result = design_fir_trinnov(
-        room_ir, measurements, target,
-        sample_rate=48000, num_taps=4096, pre_delay_ms=30.0,
-        freq_min=20.0, freq_max=120.0, target_t60_ms=200.0,
+        [0.0] * 4096, measurements, [(20, 0.0), (120, 0.0)],
+        sample_rate=48000, num_taps=4096,
     )
-    assert abs(result["latency_ms"] - 30.0) < 1.0, (
-        f"latency_ms={result['latency_ms']}, expected ~30.0 ms"
-    )
-
-
-def test_trinnov_band_reports_cover_requested_range():
-    """Band reports should include frequencies across freq_min..freq_max."""
-    room_ir = _synth_room_ir_with_mode(mode_freq_hz=60.0, t60_ms=800.0)
-    measurements = _two_flat_measurements()
-    target = [(20, 0.0), (120, 0.0)]
-    result = design_fir_trinnov(
-        room_ir, measurements, target,
-        sample_rate=48000, num_taps=4096, pre_delay_ms=20.0,
-        freq_min=30.0, freq_max=90.0, target_t60_ms=100.0,
-    )
-    all_bands = result["corrected_bands"] + result["skipped_bands"]
-    assert len(all_bands) > 0
-    freqs = [b["freq_hz"] for b in all_bands]
-    assert min(freqs) >= 25.0
-    assert max(freqs) <= 100.0
+    assert len(result["firs"]) == 2
+    assert result["n_ringing_modes"] == 0
 
 
 def test_single_sub_wiener():
@@ -344,11 +356,10 @@ def test_single_sub_trinnov():
         freqs=np.linspace(20, 120, 60).tolist(),
         spl_db=[0.0]*60, phase_rad=[0.0]*60, label="sub_only"
     )]
-    target = [(20, 0.0), (120, 0.0)]
     result = design_fir_trinnov(
-        room_ir, measurements, target,
-        sample_rate=48000, num_taps=4096, pre_delay_ms=20.0,
-        freq_min=30.0, freq_max=80.0, target_t60_ms=200.0,
+        room_ir, measurements, [(20, 0.0), (120, 0.0)],
+        sample_rate=48000, num_taps=4096,
+        freq_min=30.0, freq_max=80.0,
     )
     assert result["num_subs"] == 1
     assert len(result["firs"]) == 1
