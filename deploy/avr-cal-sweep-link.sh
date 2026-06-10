@@ -54,6 +54,12 @@ up() {
     for _ in $(seq 1 15); do
         if ! ensure_sink; then sleep 1; continue; fi
 
+        # Self-heal: tear down the pre-2e772a0 stale link to input_3 (capture
+        # channel 2, unread by the in:2 cal_matrix). It persists on the permanent
+        # null sink across restarts and confuses the graph. Harmless but wrong.
+        pw-link -d "${SINK_NAME}:monitor_FL" "${CAM_CAPTURE}:input_3" 2>/dev/null || true
+        pw-link -d "${SINK_NAME}:monitor_FR" "${CAM_CAPTURE}:input_3" 2>/dev/null || true
+
         ok=1
         # CamillaDSP LFE input (port input_2 = 0-indexed channel 2 in PW).
         link_one "${SINK_NAME}:monitor_FL" "${CAM_CAPTURE}:input_2" || ok=0
@@ -76,6 +82,9 @@ down() {
     pw-link -d "${SINK_NAME}:monitor_FL" "${CAM_CAPTURE}:input_2" 2>/dev/null || true
     pw-link -d "${SINK_NAME}:monitor_FR" "${CAM_CAPTURE}:input_2" 2>/dev/null || true
     pw-link -d "${SINK_NAME}:monitor_FL" "${LOOPBACK_REF}:playback_1" 2>/dev/null || true
+    # Stale pre-2e772a0 links (see up()).
+    pw-link -d "${SINK_NAME}:monitor_FL" "${CAM_CAPTURE}:input_3" 2>/dev/null || true
+    pw-link -d "${SINK_NAME}:monitor_FR" "${CAM_CAPTURE}:input_3" 2>/dev/null || true
     exit 0
 }
 
