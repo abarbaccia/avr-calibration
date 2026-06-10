@@ -1,6 +1,14 @@
 # Trinnov-Style Decay Correction — Research Notes
 
-## What was implemented
+> **RESOLVED 2026-06-10.** The pre-causal time-reversed-ringing approach
+> described below was removed. It is mathematically unsound (a matched filter
+> that re-excites the very modes it targets). `design_fir_trinnov` is now a thin
+> wrapper over the regularised complex Wiener inverse (`design_multi_input_fir`)
+> in **mixed phase** — i.e. "Path to a correct implementation" option #1 below.
+> See **Resolution** at the bottom. The sections in between are kept as the
+> historical record of why the original approach failed.
+
+## What was implemented (HISTORICAL — removed)
 
 `design_fir_trinnov` in `calibrate/multi_fir.py` — a wideband pre-causal decay
 correction that derives the anti-ringing signal directly from the measured room IR
@@ -111,19 +119,60 @@ of estimating mode phase from frequency alone (Gabor assumes T/2 relationship), 
 the measured complex mode response to set the correct cancellation phase for each mode.
 This would handle closely-spaced modes without the dense-mode interference problem.
 
+## Resolution (2026-06-10)
+
+The pre-causal section was removed. `_compute_trinnov_precausal()` is deleted and
+`design_fir_trinnov()` now delegates to `design_multi_input_fir()` (the regularised
+complex Wiener inverse) in **mixed** phase, plus a best-effort baseline ringing-mode
+report from the IR via `analyze_decay`.
+
+**Why the pre-causal approach is unsalvageable (sharper than the original root cause).**
+The corrected response at the mic for an impulse input is exactly `C * h`, where `C`
+is the correction FIR and `h` is the sub→mic path. Adding time-reversed mode ringing
+to `C` makes `C` a *matched filter* for that mode; convolving a matched filter back
+through `h` is an autocorrelation, which **maximally reinforces** the mode. Measured in
+simulation against a single isolated 47 Hz mode (so there is no "dense-mode interference"
+excuse):
+
+| cancel_strength | T60 @ 47 Hz | steady-state level @ 47 Hz |
+|---|---|---|
+| 0.0 (pure Wiener) | 578 → **407 ms** | corrected toward target |
+| 0.5 | 578 → 585 ms | **+67 dB boost** |
+| 1.0 | 585 ms | +73 dB boost |
+
+The boost is sign-independent (matched filter), so the field result (57 Hz: 500→3457 ms)
+was not bad luck on phase — it is the systematic behaviour. The only filter that reduces
+a mode in both magnitude and decay is the regularised inverse itself.
+
+**Why `phase_mode` matters for multi-sub.** `K_i = T_i·conj(H_i)/(|H_i|²+λ²)` carries the
+phase needed to land every sub at a common target phase so they sum coherently. Realising
+it in `minimum` phase discards that — two subs at different arrival times then cancel at
+the listener (a −23 dB null at 80 Hz in simulation; ~+1.5 dB measured vs +6 dB predicted
+at 40 Hz on run 25). `mixed` preserves it and lands within ~1.5 dB of target. Default is
+now `mixed`; `minimum` remains available for single-sub magnitude-only work.
+
+**Safety.** The old path auto-tagged the FIR `modal_cancel` whenever the pre-causal peak
+exceeded 0.01, which raised the FIR boost cap from the strict 10 dB thermal limit to
+60 dB — exactly what let the +35 dB matched-filter boost through. The Wiener-only design
+is tagged `correction` (strict cap) and is safe to sweep through.
+
+What option #3 (per-mode complex cancellation via ESPRIT/Prony) was hoping to achieve is
+subsumed by the complex inverse: a sufficiently long mixed-phase Wiener filter inverts the
+mode's pole directly, no per-mode decomposition needed. Multi-position IR averaging
+(option #2) remains a worthwhile future robustness improvement, independent of this fix.
+
 ## Current state
 
-`design_fir_trinnov` is implemented and registered as an MCP tool. The algorithm
-produces partial results (eliminates low-frequency modes) but can worsen
-closely-spaced modes in the 50–90 Hz range. Do not use on live hardware without
-verifying T60 at all modes post-application.
+`design_fir_trinnov` = coherent mixed-phase Wiener inverse + informational T60 report.
+No anti-ringing/pre-causal section. Tagged `correction` (strict safety cap), sweep-safe.
 
-The production listening FIR remains the 2-pulse Gabor design (23.4 + 46.9 Hz) from
-`design_fir_multi_modal`, which is validated and stable.
+The legacy 2-pulse Gabor design (`design_fir_multi_modal`) is unchanged. Note that the
+`C * h` matched-filter argument applies to Gabor anti-pulses too; treat their measured
+T60 benefit with the same skepticism and verify per-mode before trusting it.
 
 ## References
 
-- `calibrate/multi_fir.py`: `_compute_trinnov_precausal()`, `design_fir_trinnov()`
+- `calibrate/multi_fir.py`: `design_fir_trinnov()` (wrapper), `design_multi_input_fir()`
 - `calibrate/mcp_server.py`: `_tool_design_fir_trinnov()`
-- Related: `design_fir_multi_modal()` (production Gabor approach)
+- Related: `design_fir_multi_modal()` (legacy Gabor approach)
 - Trinnov Altitude documentation (proprietary; community descriptions only)

@@ -4378,56 +4378,52 @@ async def _tool_design_fir_trinnov(
     target_curve: dict,
     *,
     num_taps: int = 24576,
-    phase_mode: str = "minimum",
+    phase_mode: str = "mixed",
     regularization_lambda: float = 0.01,
     freq_focus_hz: list[float] | None = None,
-    target_t60_ms: float = 200.0,
-    pre_delay_ms: float = 50.0,
+    preringing_ms: float = 20.0,
     freq_min: float = 20.0,
     freq_max: float = 120.0,
     bands_per_octave: int = 6,
-    cancel_strength: float = 0.5,
-    band_t60s: list[dict] | None = None,
-    sweep_session_id: int | None = None,
+    t60_threshold_ms: float = 300.0,
     return_coefficients: bool = False,
 ) -> dict:
-    """Trinnov-style wideband decay correction + Wiener magnitude correction.
+    """Trinnov-style coherent multi-sub correction (complex Wiener inverse).
 
-    Unlike design_fir_multi_modal (per-mode Gabor anti-pulses), this tool
-    derives the pre-causal correction directly from the measured room IR at
-    every 1/bands_per_octave frequency band.  Closely-spaced modes (e.g. the
-    64/72/80 Hz cluster) are corrected naturally — their band contributions
-    simply sum in the time domain with no Gabor interference.
+    Designs one FIR per sub so that, when the subs sum acoustically at the
+    listener, the combined response matches ``target_curve``.  The correction
+    is the regularised complex inverse ``K_i = T_i·conj(H_i)/(|H_i|²+λ²)``,
+    realised in ``mixed`` phase so every sub lands at a common target phase and
+    they sum coherently.  This is the only correction that reduces a room mode
+    in both magnitude AND decay; ``minimum`` phase loses inter-sub coherence and
+    is for single-sub magnitude-only work.
+
+    NOTE: there is no longer an "anti-ringing"/decay-cancellation section.  A
+    time-reversed-ringing pre-pulse is a matched filter — convolved back through
+    the sub→mic path it re-excites the mode (+tens of dB, no T60 benefit).  Use
+    the coherent Wiener inverse here, and ``analyze_decay`` for a decay report.
 
     Workflow:
-      1. measure_impulse_ir(n_averages=64) → returns ir_session_id
-      2. (optional) analyze_decay(session_id) → band T60 values
-      3. design_fir_trinnov(ir_session_id, measurements, target_curve,
-                            band_t60s=[{"freq_hz":47,"t60_ms":634}, ...])
+      1. measure each sub solo (FR + phase) → per-sub session_ids
+      2. measure_impulse_ir(n_averages=64) → ir_session_id (for the T60 report)
+      3. design_fir_trinnov(ir_session_id, measurements, target_curve)
       4. apply_fir(output_index, design_session_id)  ×  n_subs
 
     Parameters
     ----------
-    ir_session_id    : from measure_impulse_ir
+    ir_session_id    : from measure_impulse_ir — used ONLY for the baseline
+                       ringing-mode report, not to shape the correction.
     measurements     : [{session_id, output_index, label}, ...] per-sub FR sessions
     target_curve     : {points: [{freq, spl}, ...]} magnitude target
-    target_t60_ms    : T60 target; bands above this get corrected (default 200 ms)
-    pre_delay_ms     : pre-causal budget in ms (default 50 ms)
-    freq_min/max     : frequency range for decay correction
-    bands_per_octave : filter bank resolution (default 6 = 1/6-octave)
-    cancel_strength  : 0–1 pre-causal amplitude scale (default 0.5)
-    band_t60s        : optional per-band T60 overrides from analyze_decay output.
-                       Pass as [{freq_hz, t60_ms}, ...]. When provided, these
-                       values replace the internal Schroeder estimate for matching
-                       bands and yield more accurate T60-driven corrections.
-    sweep_session_id : session_id of a log-sweep measurement whose stored
-                       impulse_response is used for anti-pulse AMPLITUDE sizing.
-                       Impulse IR (ir_session_id) is still used for T60/Schroeder.
-                       Use this when pre_causal_peak is negligible (~0.0003) due to
-                       poor sub-bass excitation in the impulse IR.
+    phase_mode       : 'mixed' (default, coherent multi-sub), 'linear', or
+                       'minimum' (single-sub magnitude only — no coherence)
+    preringing_ms    : pre-ring budget for mixed phase (≈ latency, default 20)
+    freq_focus_hz    : optional [lo, hi] band to confine the correction to
+    freq_min/max     : frequency range for the baseline ringing-mode report
+    bands_per_octave : filter-bank resolution for the report (default 6)
+    t60_threshold_ms : modes above this T60 are listed in ringing_modes
     """
     try:
-        import numpy as np
         from .multi_fir import SubMeasurement, design_fir_trinnov
 
         # Retrieve cached IR
@@ -4467,19 +4463,6 @@ async def _tool_design_fir_trinnov(
 
         focus = tuple(freq_focus_hz) if freq_focus_hz and len(freq_focus_hz) == 2 else None
 
-        # Load sweep IR for amplitude extraction when provided.
-        amplitude_ir: list[float] | None = None
-        if sweep_session_id is not None:
-            sweep_sess = store.get_session(sweep_session_id)
-            if sweep_sess is None:
-                return _err(f"sweep_session_id={sweep_session_id} not found in session store")
-            if not sweep_sess.impulse_response:
-                return _err(
-                    f"sweep_session_id={sweep_session_id} has no stored impulse_response. "
-                    "Re-measure with a log-sweep session to populate it."
-                )
-            amplitude_ir = sweep_sess.impulse_response
-
         result = design_fir_trinnov(
             room_ir=room_ir,
             measurements=sub_measurements,
@@ -4489,19 +4472,16 @@ async def _tool_design_fir_trinnov(
             phase_mode=phase_mode,
             regularization_lambda=regularization_lambda,
             freq_focus_hz=focus,
-            target_t60_ms=target_t60_ms,
-            pre_delay_ms=pre_delay_ms,
+            preringing_ms=preringing_ms,
             freq_min=freq_min,
             freq_max=freq_max,
             bands_per_octave=bands_per_octave,
-            cancel_strength=cancel_strength,
-            band_t60s=band_t60s,
-            amplitude_ir=amplitude_ir,
+            t60_threshold_ms=t60_threshold_ms,
         )
 
-        # Cache FIRs — Trinnov uses "correction" (not "modal_cancel") so
-        # apply_fir doesn't add outputs to _sweep_blocked_outputs.  Trinnov
-        # pre-causal peaks are small (< 0.02) and safe to sweep through.
+        # Cache FIRs — Trinnov is a pure magnitude/phase correction tagged
+        # "correction", so apply_fir uses the strict thermal safety cap and
+        # the FIR is safe to sweep through (no anti-pulse Gabor content).
         apply_intent = result.get("apply_intent", "correction")
         cache_ids = []
         for fir_taps, m in zip(result["firs"], measurements):
@@ -4518,18 +4498,18 @@ async def _tool_design_fir_trinnov(
             "phase_mode": phase_mode,
             "regularization_lambda": regularization_lambda,
             "latency_ms": result["latency_ms"],
-            "pre_delay_ms": result["pre_delay_ms"],
-            "pre_causal_peak": result["pre_causal_peak"],
-            "n_corrected_bands": result["n_corrected"],
-            "corrected_bands": result["corrected_bands"],
+            "ringing_modes": result["ringing_modes"],
+            "n_ringing_modes": result["n_ringing_modes"],
             "predicted_combined": result["predicted_combined"],
             "predicted_per_sub": result["predicted_per_sub"],
             "per_sub_peak_boost_db": result["per_sub_peak_boost_db"],
+            "output_gain_db": result["output_gain_db"],
             "cache_ids": cache_ids,
             "note": (
-                f"Trinnov-style FIR: {result['num_subs']} subs, {num_taps} taps, "
-                f"{pre_delay_ms} ms pre-causal, {result['n_corrected']} bands corrected "
-                f"(target T60={target_t60_ms} ms). "
+                f"Trinnov coherent Wiener FIR: {result['num_subs']} subs, "
+                f"{num_taps} taps, phase_mode={phase_mode}, "
+                f"latency {result['latency_ms']} ms, "
+                f"{result['n_ringing_modes']} ringing modes in baseline IR. "
                 f"Apply via apply_fir(output_index, design_session_id)."
             ),
         }
@@ -5952,8 +5932,8 @@ async def _tool_measure_impulse_ir(
             n_averages=n_averages,
             note=(
                 f"Averaged impulse IR: {n_averages} shots × {record_duration_s}s. "
-                f"ir_session_id={ir_session_id} — pass to design_fir_trinnov() for "
-                "wideband decay correction, or analyze_decay() for T60 diagnostics."
+                f"ir_session_id={ir_session_id} — pass to design_fir_trinnov() for the "
+                "baseline ringing-mode report, or analyze_decay() for T60 diagnostics."
             ),
         )
     except Exception as exc:
@@ -12111,21 +12091,23 @@ _TOOLS: list[Tool] = [
     Tool(
         name="design_fir_trinnov",
         description=(
-            "Trinnov-style WIDEBAND decay correction + Wiener magnitude correction. "
-            "Unlike design_fir_multi_modal (per-mode Gabor anti-pulses that collide when modes "
-            "are <0.5 oct apart), this derives the pre-causal correction directly from the "
-            "measured room IR at every 1/6-octave band — closely-spaced modes (e.g. 64/72/80 Hz "
-            "cluster) are handled naturally with no Gabor interference artefacts. "
-            "Workflow: (1) measure_impulse_ir → ir_session_id, "
-            "(2) design_fir_trinnov(ir_session_id, measurements, target_curve, ...), "
-            "(3) apply_fir per sub."
+            "Trinnov-style COHERENT multi-sub correction via the regularised complex Wiener "
+            "inverse. Designs one FIR per sub so their acoustic sum at the listener matches "
+            "target_curve. Realised in 'mixed' phase so every sub lands at a common target phase "
+            "and they sum coherently — the only correction that reduces a room mode in both "
+            "magnitude AND decay. There is NO anti-ringing/decay-cancel section: a time-reversed "
+            "ringing pre-pulse is a matched filter that re-excites the mode (+tens of dB, no T60 "
+            "benefit) — use analyze_decay for a decay report instead. 'minimum' phase loses "
+            "inter-sub coherence (deep nulls between subs) and is for single-sub magnitude work. "
+            "Workflow: (1) measure each sub solo (FR+phase), (2) measure_impulse_ir → ir_session_id, "
+            "(3) design_fir_trinnov(ir_session_id, measurements, target_curve), (4) apply_fir per sub."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "ir_session_id": {
                     "type": "integer",
-                    "description": "IR cache ID returned by measure_impulse_ir().",
+                    "description": "IR cache ID from measure_impulse_ir(). Used ONLY for the baseline ringing-mode report, not to shape the correction.",
                 },
                 "measurements": {
                     "type": "array",
@@ -12137,32 +12119,15 @@ _TOOLS: list[Tool] = [
                     "description": "Magnitude target: {points: [{freq, spl}]}.",
                     "properties": {"points": {"type": "array", "items": {"type": "object", "properties": {"freq": {"type": "number"}, "spl": {"type": "number"}}}}},
                 },
-                "target_t60_ms": {"type": "number", "description": "Target T60; bands above this get pre-causal correction. Default 200 ms.", "default": 200.0},
-                "pre_delay_ms": {"type": "number", "description": "Pre-causal budget ms. Default 50 ms.", "default": 50.0},
-                "freq_min": {"type": "number", "description": "Low edge of decay-correction band. Default 20 Hz.", "default": 20.0},
-                "freq_max": {"type": "number", "description": "High edge of decay-correction band. Default 120 Hz.", "default": 120.0},
-                "bands_per_octave": {"type": "integer", "description": "Filter bank resolution. Default 6 (1/6-octave).", "default": 6},
-                "cancel_strength": {"type": "number", "description": "Pre-causal amplitude scale 0–1. Default 0.5.", "default": 0.5},
                 "num_taps": {"type": "integer", "description": "Total taps per FIR. Default 24576.", "default": 24576},
-                "phase_mode": {"type": "string", "enum": ["minimum", "linear", "mixed"], "description": "Wiener phase mode. Default minimum.", "default": "minimum"},
-                "regularization_lambda": {"type": "number", "description": "Wiener regularization. Default 0.01.", "default": 0.01},
-                "freq_focus_hz": {"type": "array", "items": {"type": "number"}, "description": "[lo, hi] Wiener correction band."},
-                "band_t60s": {
-                    "type": "array",
-                    "description": "Per-band T60 overrides from analyze_decay: [{freq_hz, t60_ms}, ...]. Recommended for accurate correction — bypasses unreliable internal Schroeder estimate.",
-                    "items": {"type": "object", "properties": {"freq_hz": {"type": "number"}, "t60_ms": {"type": "number"}}, "required": ["freq_hz", "t60_ms"]},
-                },
-                "sweep_session_id": {
-                    "type": "integer",
-                    "description": (
-                        "Session ID of a log-sweep measurement (from measure()) whose stored "
-                        "impulse_response is used for anti-pulse AMPLITUDE sizing instead of the "
-                        "impulse IR. Fixes negligible pre_causal_peak (~0.0003) caused by poor "
-                        "sub-bass excitation in the impulse IR. T60 estimation still uses "
-                        "ir_session_id. Pass one of the FR session IDs from measurements[] or any "
-                        "recent combined sweep session."
-                    ),
-                },
+                "phase_mode": {"type": "string", "enum": ["minimum", "linear", "mixed"], "description": "Wiener phase mode. Default 'mixed' (coherent multi-sub). 'minimum' = single-sub magnitude only (no inter-sub coherence). 'linear' = symmetric, highest latency.", "default": "mixed"},
+                "regularization_lambda": {"type": "number", "description": "Wiener regularization. Default 0.01 (tuned for this hardware's -28..-16 dBFS signal level).", "default": 0.01},
+                "preringing_ms": {"type": "number", "description": "Pre-ring budget for mixed phase (≈ latency, compensated via sub distance). Default 20.", "default": 20.0},
+                "freq_focus_hz": {"type": "array", "items": {"type": "number"}, "description": "[lo, hi] band to confine the correction to."},
+                "freq_min": {"type": "number", "description": "Low edge of baseline ringing-mode report. Default 20 Hz.", "default": 20.0},
+                "freq_max": {"type": "number", "description": "High edge of baseline ringing-mode report. Default 120 Hz.", "default": 120.0},
+                "bands_per_octave": {"type": "integer", "description": "Filter-bank resolution for the report. Default 6 (1/6-octave).", "default": 6},
+                "t60_threshold_ms": {"type": "number", "description": "Modes above this baseline T60 are listed in ringing_modes (report only). Default 300 ms.", "default": 300.0},
                 "return_coefficients": {"type": "boolean", "description": "Include FIR coefficients in response. Default false.", "default": False},
             },
             "required": ["ir_session_id", "measurements", "target_curve"],
@@ -13307,23 +13272,19 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return_coefficients=bool(arguments.get("return_coefficients", False)),
         )
     elif name == "design_fir_trinnov":
-        _sweep_sid = arguments.get("sweep_session_id")
         result = await _tool_design_fir_trinnov(
             ir_session_id=int(arguments["ir_session_id"]),
             measurements=arguments["measurements"],
             target_curve=arguments["target_curve"],
             num_taps=int(arguments.get("num_taps", 24576)),
-            phase_mode=arguments.get("phase_mode", "minimum"),
+            phase_mode=arguments.get("phase_mode", "mixed"),
             regularization_lambda=float(arguments.get("regularization_lambda", 0.01)),
             freq_focus_hz=arguments.get("freq_focus_hz"),
-            target_t60_ms=float(arguments.get("target_t60_ms", 200.0)),
-            pre_delay_ms=float(arguments.get("pre_delay_ms", 50.0)),
+            preringing_ms=float(arguments.get("preringing_ms", 20.0)),
             freq_min=float(arguments.get("freq_min", 20.0)),
             freq_max=float(arguments.get("freq_max", 120.0)),
             bands_per_octave=int(arguments.get("bands_per_octave", 6)),
-            cancel_strength=float(arguments.get("cancel_strength", 0.5)),
-            band_t60s=arguments.get("band_t60s"),
-            sweep_session_id=int(_sweep_sid) if _sweep_sid is not None else None,
+            t60_threshold_ms=float(arguments.get("t60_threshold_ms", 300.0)),
             return_coefficients=bool(arguments.get("return_coefficients", False)),
         )
     elif name == "design_fir_multi":
