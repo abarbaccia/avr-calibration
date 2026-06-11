@@ -8910,7 +8910,32 @@ async def _tool_check_system() -> dict:
             }
             for r in results
         ]
-        all_passed = all(r.passed for r in results)
+
+        # Verify DSP gain control is actually wired — set a value and read it back
+        # from the pipeline to catch the SetVolume-is-a-no-op class of bug.
+        gain_check = {"name": "dsp_gain_control", "passed": False, "detail": "", "error": None}
+        try:
+            dsp = _dsp()
+            test_gain = -33.0
+            await dsp.set_master_gain(test_gain)
+            state = await dsp.get_state()
+            reported = state.get("volume")
+            if reported is not None and abs(float(reported) - test_gain) < 0.5:
+                gain_check["passed"] = True
+                gain_check["detail"] = f"set_master_gain({test_gain}) confirmed in pipeline"
+            else:
+                gain_check["passed"] = False
+                gain_check["detail"] = (
+                    f"set_master_gain({test_gain}) returned volume={reported} — "
+                    "gain control may be broken (check cal_master_gain filter in pipeline)"
+                )
+            # Restore to configured sweep level
+            await dsp.set_master_gain(cfg.measurement.master_gain_db)
+        except Exception as exc:
+            gain_check["error"] = str(exc)
+        checks.append(gain_check)
+
+        all_passed = all(c["passed"] for c in checks)
         return _ok(all_passed=all_passed, checks=checks)
     except Exception as exc:
         return _err(f"check_system error: {exc}")

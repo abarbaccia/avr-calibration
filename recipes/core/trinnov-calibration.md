@@ -61,39 +61,78 @@ measurement at a different `loopback_xcorr_peak_ms` contaminates the design.
    check that validates the inter-sub phase property. `verify_fir_effect`
    checks magnitude only and cannot detect phase failures.
 
-## Phase 0 — Preflight
+## Phase 0 — Preflight (fully automated — execute without prompting)
+
+Run in order, no user confirmation needed for any step:
 
 ```
-check_system()
+1. check_system()
+   Abort if: loopback ref fails, CamillaDSP not Running, loopback timing std > 0.5 ms.
+
+2. mute_output(target='shaker')
+   Shaker is ALWAYS muted during all calibration measurements. No exceptions.
+
+3. clear_fir(output_index=5)
+   clear_fir(output_index=6)
+   Wipe any prior FIR state so Phase 2 measures the physical room, not a
+   pre-shaped response. If the user explicitly says "keep existing FIRs as
+   the baseline", skip this step — but that is the exception, not the default.
+
+4. calibrate_level()
+   Establishes the working sweep level. REQUIRED at every session start —
+   do not skip even if a level was found last session. The Gain block state
+   does not survive container restarts. calibrate_level sets master_gain_db
+   in config; record the returned calibrated_master_gain_db and
+   suggested_solo_gain_db for use in Phase 0.5.
+
+5. apply_eq(output_index=5, protective_peq)
+   apply_eq(output_index=6, protective_peq)
+   Apply protective PEQ to BOTH subs before any measurement:
+     HPF 18 Hz (4th-order Butterworth)
+     Peaking  22 Hz, −10 dB, Q=3
+     Peaking  28 Hz, −8 dB, Q=3
+   Port resonance without these cuts saturates the chain and collapses
+   coherence above 60 Hz. This is NOT optional.
 ```
 
-Abort if:
-- "Loopback timing stability" warns (xcorr range > 1 ms or std > 0.5 ms)
-- "Loopback reference" fails
-- CamillaDSP pipeline not Running
+If "DSP persisted state" shows active FIRs from a prior session (beyond the
+protective PEQ just applied), stop and confirm with the user before proceeding.
 
-If "DSP persisted state" shows active FIRs, ask the user whether those are
-the *current baseline* (intended, keep) or *prior calibration residue*
-(stale, clear). Stale FIRs mean the Trinnov design targets a pre-shaped
-response, not the physical room — the correction will be wrong.
+## Phase 0.5 — Sub hardware balance check (automated)
 
-## Phase 0.5 — Sub hardware balance check
+Run without prompting. Use suggested_solo_gain_db from calibrate_level above.
 
-Before measuring, do a quick sanity sweep:
+```
+1. mute_output(output_index=6); unmute_output(output_index=5)
+   set_config(measurement.master_gain_db = suggested_solo_gain_db)
+   measure(label='sub5-solo-balance', position='MLP', target='subs')
+   session_5 = last session_id
 
-1. Mute sub 6, measure sub 5 solo at calibration level
-2. Mute sub 5, measure sub 6 solo at calibration level
-3. `compare_sessions` — look at per-band SPL
+2. mute_output(output_index=5); unmute_output(output_index=6)
+   measure(label='sub6-solo-balance', position='MLP', target='subs')
+   session_6 = last session_id
 
-**Decision rule:**
-- If any band in 25–80 Hz shows >6 dB difference → the weaker sub is a
-  hardware problem. Do NOT proceed. Check amp gain knob, speaker cable,
-  and power/standby state. `design_fir_trinnov` will warn, but the Wiener
-  boost to compensate will be huge and will hit the safety cap.
+3. Unmute both: unmute_output([5, 6])
+   set_config(measurement.master_gain_db = calibrated_master_gain_db)
+```
+
+**Polarity check (auto-fix):**
+Compare `ir.peak_sign` from session_5 and session_6.
+- If signs differ → call `set_polarity(output_index=X, inverted=True)` on
+  whichever sub has peak_sign=−1 to match the positive sub. Do NOT ask the
+  user — just fix it and report what you did.
+- Verify: run a combined sweep and confirm coherence ≥ 0.85 at 25–80 Hz.
+  If combined coherence is low after the polarity fix, report this as an
+  anomaly (unexpected acoustic interference, may be placement/room issue).
+
+**Balance check:**
+Get FR for both solo sessions: `get_measurement_history(limit=2, min_hz=25, max_hz=80, smooth='third_octave')`
+
+- If any 1/3-octave band 25–80 Hz shows >6 dB difference → hardware imbalance.
+  Do NOT proceed. Report: which sub is weak, at which frequencies, by how much.
+  Likely causes: amp gain knob, cable polarity (but polarity was just fixed),
+  standby mode. User must investigate physically before Trinnov can run.
 - If all bands within 6 dB → proceed to Phase 1.
-
-Current known state: sub 6 is physically weak above 40 Hz (verified
-2026-06-10). Confirm this is resolved before running Trinnov.
 
 ## Phase 1 — Alignment (same as bass-calibration-fir.md)
 
