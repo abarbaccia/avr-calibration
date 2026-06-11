@@ -8934,7 +8934,7 @@ async def _tool_check_system() -> dict:
         # from the pipeline to catch the SetVolume-is-a-no-op class of bug.
         gain_check = {"name": "dsp_gain_control", "passed": False, "detail": "", "error": None}
         try:
-            dsp = _dsp()
+            dsp = _dsp
             test_gain = -33.0
             await dsp.set_master_gain(test_gain)
             state = await dsp.get_state()
