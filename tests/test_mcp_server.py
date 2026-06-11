@@ -933,6 +933,41 @@ async def test_calibrate_level_usb_probe_retries_on_low_snr() -> None:
 
 
 @pytest.mark.asyncio
+async def test_calibrate_level_usb_probe_retries_on_xcorr_service_error() -> None:
+    """USB mode: HTTP 500 with xcorr message treated as retriable SNR failure."""
+    from calibrate.measurement_client import MeasurementServiceError
+
+    mock_dsp = AsyncMock()
+    mock_dsp.sweep_context = MagicMock(return_value=None)
+
+    wake_fr = _make_fr(50.0)
+    probe_fr = _make_fr(68.0)
+    verify_fr = _make_fr(78.0)
+
+    xcorr_error = MeasurementServiceError(
+        "avr-measurement service error (500): Sweep not detected in recording (cross-correlation peak too low)"
+    )
+
+    mock_client = AsyncMock()
+    # wake OK, probe fails twice with xcorr error, succeeds on 3rd, verify OK
+    mock_client.measure = AsyncMock(
+        side_effect=[wake_fr, xcorr_error, xcorr_error, probe_fr, verify_fr]
+    )
+
+    with (
+        patch.object(sut, "_dsp", mock_dsp),
+        patch.object(sut, "_config", return_value=_make_usb_cfg()),
+        patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client),
+        patch("calibrate.config.update_config"),
+        patch("asyncio.sleep"),
+    ):
+        result = await _tool_calibrate_level(target_spl_db=78.0, start_db=-30.0)
+
+    assert result["ok"], result.get("error")
+    assert result["calibrated_master_gain_db"] == -10.0
+
+
+@pytest.mark.asyncio
 async def test_calibrate_level_usb_no_dsp() -> None:
     """USB mode with no DSP driver loaded → error."""
     with (

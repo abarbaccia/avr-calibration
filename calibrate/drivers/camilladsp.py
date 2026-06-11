@@ -21,7 +21,8 @@ Differences from MinidspDriver:
   enable matrix into a CamillaDSP Mixer stage.
 - **FIR is first-class** via inline Conv filters — no temp file, no shared
   tap pool, no 2048-tap ceiling.
-- **Master gain via SetVolume**, not a pipeline Gain block.
+- **Master gain via cal_master_gain Gain block** on the LFE intermediate channel.
+  SetVolume has no effect in CamillaDSP v4 without a statefile-backed Volume filter.
 
 CamillaDSP websocket protocol:
   Request  — bare string for no-arg commands ("GetVersion") or one-key object
@@ -368,6 +369,7 @@ class CamillaDSPDriver(DSPDriver):
             self._routing[0][int(out)] = True
 
         # Shadow state — each mutation rebuilds the pipeline from this.
+        self._master_gain_db: float = 0.0             # global output level (pre-output-router)
         self._output_eq: dict[int, list[dict]] = {}   # output_index → filter specs
         self._input_eq: dict[int, list[dict]] = {}    # input_index → filter specs
         self._input_gain: dict[int, float] = {}       # input_index → gain_db (flat make-up gain pre-mixer)
@@ -443,7 +445,6 @@ class CamillaDSPDriver(DSPDriver):
                 return {"connected": False, "host": self._host}
 
             state = await self._client.call("GetState")
-            volume = await self._client.call("GetVolume")
             mute = await self._client.call("GetMute")
             try:
                 cpu_load = await self._client.call("GetProcessingLoad")
@@ -454,7 +455,7 @@ class CamillaDSPDriver(DSPDriver):
                 "connected": True,
                 "host": self._host,
                 "state": state,
-                "volume": volume,
+                "volume": self._master_gain_db,  # shadow state; SetVolume is a no-op in v4
                 "mute": mute,
                 "cpu_load": cpu_load,
                 # Present for DSPDriver protocol compatibility — not meaningful
@@ -730,6 +731,18 @@ class CamillaDSPDriver(DSPDriver):
                 },
             }
 
+        # Global master gain on the LFE intermediate (channel 0, pre-output-router).
+        # SetVolume has no effect in CamillaDSP v4 without a statefile-backed Volume
+        # filter; this Gain block is the only reliable way to control sweep level.
+        filters["cal_master_gain"] = {
+            "type": "Gain",
+            "parameters": {
+                "gain": float(self._master_gain_db),
+                "inverted": False,
+                "mute": False,
+            },
+        }
+
         return filters
 
     def _build_capture_mixer(self) -> dict | None:
@@ -831,6 +844,9 @@ class CamillaDSPDriver(DSPDriver):
                 continue
             names = [f"cal_in{inp_idx}_peq_{i}" for i in range(len(specs))]
             steps.append({"type": "Filter", "channels": [inp_idx], "names": names})
+
+        # Global master gain (pre-router, channel 0 = LFE intermediate).
+        steps.append({"type": "Filter", "channels": [0], "names": ["cal_master_gain"]})
 
         # Routing mixer — always present so the router sees the channel count change.
         steps.append({"type": "Mixer", "name": "output_router"})
@@ -1170,13 +1186,15 @@ class CamillaDSPDriver(DSPDriver):
                 raise
 
     async def set_master_gain(self, gain_db: float) -> None:
-        """Set master output volume via the global SetVolume command.
+        """Set master output gain via the cal_master_gain pipeline Gain block.
 
-        CamillaDSP keeps master volume separate from pipeline gain — this goes
-        through `SetVolume` (dB), not a Gain block, so it survives config reloads.
+        Updates shadow state and pushes a new config. CamillaDSP v4 SetVolume
+        has no effect without a statefile-backed Volume filter, so the Gain
+        block is the only reliable mechanism.
         """
         async with self._lock:
-            await self._client.call("SetVolume", float(gain_db))
+            self._master_gain_db = float(gain_db)
+            await self._push_config_locked()
 
     def sweep_context(self, config):
         """Return an async context manager that prepares CamillaDSP for a sweep.

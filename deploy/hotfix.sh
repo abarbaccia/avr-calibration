@@ -4,15 +4,18 @@
 # Usage:
 #   ./deploy/hotfix.sh                          # auto-detects git-modified calibrate/ files
 #   ./deploy/hotfix.sh calibrate/web.py         # specific files
+#   ./deploy/hotfix.sh --clean                  # wipe accumulated hotfix files and restore image
 #   PI_HOST=192.168.1.50 ./deploy/hotfix.sh     # override Pi address
 #
 # How it works:
-#   Changed calibrate/*.py files are SCP'd to the Pi, then the container is
-#   started with each file bind-mounted over the installed package path inside
-#   the image. No rebuild required — takes effect in seconds.
+#   Files are accumulated in a stable directory on the Pi (/tmp/avr-hotfix/).
+#   Each new hotfix merges its files into that directory — so redeploying a
+#   second file does NOT lose the first file's changes. The container is started
+#   with bind-mounts for ALL files currently in the accumulation directory.
 #
 # To revert to the real image (after pipeline confirms the fix):
-#   ssh pi@avr-cal.local "sudo systemctl start avr-calibration"
+#   ssh pi@192.168.1.117 "sudo systemctl start avr-calibration"
+#   ./deploy/hotfix.sh --clean   (also wipes accumulated files)
 
 set -euo pipefail
 
@@ -22,8 +25,21 @@ CONTAINER="avr-calibration"
 IMAGE="${IMAGE:-ghcr.io/abarbaccia/avr-calibration:latest}"
 PKG_IN_CONTAINER="/opt/venv/lib/python3.11/site-packages/calibrate"
 SERVICE="avr-calibration"
+PI_HOTFIX_DIR="/tmp/avr-hotfix"
 
 SSH="ssh ${PI_USER}@${PI_HOST}"
+
+# ── --clean: wipe and restore ─────────────────────────────────────────────────
+
+if [ "${1:-}" = "--clean" ]; then
+    echo "Wiping hotfix dir and restoring stable image..."
+    $SSH "sudo docker stop ${CONTAINER} 2>/dev/null || true
+          sudo docker rm -f ${CONTAINER} 2>/dev/null || true
+          rm -rf ${PI_HOTFIX_DIR}
+          sudo systemctl start ${SERVICE}"
+    echo "Done. Stable image restored."
+    exit 0
+fi
 
 # ── Collect files ─────────────────────────────────────────────────────────────
 
@@ -44,37 +60,40 @@ fi
 
 echo "=== avr-calibration SSH hotfix ==="
 echo "Target : ${PI_USER}@${PI_HOST}"
-echo "Files  :"
+echo "New files:"
 for f in "${FILES[@]}"; do echo "  $f"; done
 echo ""
 
-# ── SCP files to Pi ───────────────────────────────────────────────────────────
-
-PI_TMP="/tmp/avr-hotfix-$$"
-$SSH "mkdir -p ${PI_TMP}"
+# ── Merge new files into stable accumulation dir ──────────────────────────────
 
 for f in "${FILES[@]}"; do
     if [ ! -f "$f" ]; then
         echo "ERROR: File not found: $f"
         exit 1
     fi
-    echo "Copying $f → ${PI_USER}@${PI_HOST}:${PI_TMP}/$(basename "$f")"
-    scp "$f" "${PI_USER}@${PI_HOST}:${PI_TMP}/$(basename "$f")"
-done
-
-# ── Build bind-mount args for docker run ──────────────────────────────────────
-
-MOUNT_ARGS=""
-for f in "${FILES[@]}"; do
-    basename_f="$(basename "$f")"
-    # calibrate/foo/bar.py → foo/bar.py (strip leading calibrate/)
     rel="${f#calibrate/}"
-    MOUNT_ARGS="${MOUNT_ARGS} -v ${PI_TMP}/${basename_f}:${PKG_IN_CONTAINER}/${rel}:ro"
+    subdir=$(dirname "$rel")
+    $SSH "mkdir -p ${PI_HOTFIX_DIR}/${subdir}"
+    echo "Copying $f → ${PI_USER}@${PI_HOST}:${PI_HOTFIX_DIR}/${rel}"
+    scp "$f" "${PI_USER}@${PI_HOST}:${PI_HOTFIX_DIR}/${rel}"
 done
+
+# ── Build bind-mount args from ALL accumulated files ──────────────────────────
+# Every file in PI_HOTFIX_DIR gets mounted over the installed package path.
+# A second hotfix automatically picks up files from the first.
+
+MOUNT_ARGS=$($SSH "find ${PI_HOTFIX_DIR} -type f 2>/dev/null | sort | while read -r p; do
+    rel=\${p#${PI_HOTFIX_DIR}/}
+    echo \" -v \${p}:${PKG_IN_CONTAINER}/\${rel}:ro\"
+done" | tr -d '\n')
+
+echo ""
+echo "All hotfixed files (accumulated):"
+$SSH "find ${PI_HOTFIX_DIR} -type f 2>/dev/null | sort | sed \"s|${PI_HOTFIX_DIR}/|  |\"" || true
+echo ""
 
 # ── Stop service, start hotfixed container ────────────────────────────────────
 
-echo ""
 echo "Stopping ${SERVICE} service on Pi..."
 $SSH "sudo systemctl stop ${SERVICE} 2>/dev/null || true
       sudo docker rm -f ${CONTAINER} 2>/dev/null || true"
@@ -111,11 +130,11 @@ echo ""
 echo "================================================================"
 echo " Hotfix active — following logs (Ctrl+C to stop tailing)"
 echo ""
-echo " Hotfixed files:"
-for f in "${FILES[@]}"; do echo "  $f"; done
+echo " Accumulated hotfix files in ${PI_HOTFIX_DIR}:"
+$SSH "find ${PI_HOTFIX_DIR} -type f 2>/dev/null | sort | sed \"s|${PI_HOTFIX_DIR}/|  |\"" || true
 echo ""
 echo " To revert to the stable image:"
-echo "   ssh ${PI_USER}@${PI_HOST} 'sudo systemctl start ${SERVICE}'"
+echo "   ./deploy/hotfix.sh --clean"
 echo "================================================================"
 echo ""
 
@@ -129,14 +148,12 @@ case "${yn:-Y}" in
     [Yy]*)
         $SSH "sudo docker stop ${CONTAINER} 2>/dev/null || true
               sudo docker rm ${CONTAINER} 2>/dev/null || true
+              rm -rf ${PI_HOTFIX_DIR}
               sudo systemctl start ${SERVICE}"
         echo "Stable image restored."
         ;;
     *)
-        echo "Left hotfix running. Restore manually with:"
-        echo "  ssh ${PI_USER}@${PI_HOST} 'sudo systemctl start ${SERVICE}'"
+        echo "Left hotfix running. Hotfix files persist in ${PI_HOTFIX_DIR}."
+        echo "Next hotfix will accumulate on top. To wipe: ./deploy/hotfix.sh --clean"
         ;;
 esac
-
-# Clean up temp files on Pi
-$SSH "rm -rf ${PI_TMP}" 2>/dev/null || true

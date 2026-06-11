@@ -6136,7 +6136,19 @@ async def _tool_calibrate_level(
                     log.info("calibrate_level: probe succeeded at %.1f dB", probe_gain)
                     break
                 except MeasurementServiceError as exc:
-                    return _err(f"calibrate_level probe failed (measurement service): {exc}")
+                    # Quality failures (xcorr/SNR) arrive as HTTP 500 MeasurementServiceError
+                    # from the bare-metal service. Retry louder; hard-fail on anything else.
+                    _msg = str(exc).lower()
+                    if "cross-correlation" in _msg or "snr" in _msg or "sweep not detected" in _msg:
+                        if probe_gain >= -0.1:
+                            return _err(
+                                f"USB sweep SNR too low even at 0 dB. "
+                                "Check that subs are powered on and the physical gain knob is up."
+                            )
+                        probe_gain = min(0.0, probe_gain + 5.0)
+                        log.info("calibrate_level: SNR too low, stepping probe up to %.1f dB", probe_gain)
+                    else:
+                        return _err(f"calibrate_level probe failed (measurement service): {exc}")
                 except MeasurementQualityError as exc:
                     if probe_gain >= -0.1:
                         return _err(
