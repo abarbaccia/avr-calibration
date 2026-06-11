@@ -901,6 +901,38 @@ async def test_calibrate_level_usb_snr_fail_on_probe() -> None:
 
 
 @pytest.mark.asyncio
+async def test_calibrate_level_usb_probe_retries_on_low_snr() -> None:
+    """USB mode: probe fails with MeasurementQualityError twice, succeeds on 3rd attempt."""
+    from calibrate.measurement import MeasurementQualityError
+
+    mock_dsp = AsyncMock()
+    mock_dsp.sweep_context = MagicMock(return_value=None)
+
+    wake_fr = _make_fr(50.0)
+    probe_fr = _make_fr(68.0)
+    verify_fr = _make_fr(78.0)
+
+    snr_error = MeasurementQualityError("snr_too_low", "SNR below threshold", "Turn up gain")
+
+    mock_client = AsyncMock()
+    # wake OK, probe fails twice (SNR), succeeds on 3rd attempt, verify OK
+    mock_client.measure = AsyncMock(side_effect=[wake_fr, snr_error, snr_error, probe_fr, verify_fr])
+
+    with (
+        patch.object(sut, "_dsp", mock_dsp),
+        patch.object(sut, "_config", return_value=_make_usb_cfg()),
+        patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_client),
+        patch("calibrate.config.update_config"),
+        patch("asyncio.sleep"),
+    ):
+        result = await _tool_calibrate_level(target_spl_db=78.0, start_db=-30.0)
+
+    assert result["ok"], result.get("error")
+    # probe succeeded at -20 dB (-30 + 5 + 5), correction = 78-68 = +10 → gain = -10
+    assert result["calibrated_master_gain_db"] == -10.0
+
+
+@pytest.mark.asyncio
 async def test_calibrate_level_usb_no_dsp() -> None:
     """USB mode with no DSP driver loaded → error."""
     with (

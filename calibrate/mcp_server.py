@@ -6122,21 +6122,31 @@ async def _tool_calibrate_level(
             except Exception:
                 pass  # standby subs may not produce valid data — that's fine
 
-            # ── Step 1: probe at safe starting level ──
+            # ── Step 1: probe at safe starting level, retry louder if SNR too low ──
+            # Default start_db=-30 can be too quiet after protective PEQ cuts and
+            # MLP distance. Step up by 5 dB per attempt until we get a valid probe
+            # or hit 0 dB (the ceiling).
             probe_gain = start_db
-            await _dsp.set_master_gain(probe_gain)  # type: ignore[union-attr]
-            await asyncio.sleep(0.3)
-            try:
-                probe_fr = await meas_client.measure(route=route)
-            except MeasurementServiceError as exc:
-                return _err(f"calibrate_level probe failed (measurement service): {exc}")
-            except MeasurementQualityError as exc:
-                return _err(
-                    f"USB sweep SNR too low at {probe_gain:.0f} dB ({exc.detail}). "
-                    "Turn up the sub's physical gain knob, then retry."
-                )
-            except Exception as exc:
-                return _err(f"calibrate_level probe failed: {exc}")
+            probe_fr = None
+            for _attempt in range(7):  # up to +30 dB headroom from start_db
+                await _dsp.set_master_gain(probe_gain)  # type: ignore[union-attr]
+                await asyncio.sleep(0.3)
+                try:
+                    probe_fr = await meas_client.measure(route=route)
+                    log.info("calibrate_level: probe succeeded at %.1f dB", probe_gain)
+                    break
+                except MeasurementServiceError as exc:
+                    return _err(f"calibrate_level probe failed (measurement service): {exc}")
+                except MeasurementQualityError as exc:
+                    if probe_gain >= -0.1:
+                        return _err(
+                            f"USB sweep SNR too low even at 0 dB ({exc.detail}). "
+                            "Check that subs are powered on and the physical gain knob is up."
+                        )
+                    probe_gain = min(0.0, probe_gain + 5.0)
+                    log.info("calibrate_level: SNR too low, stepping probe up to %.1f dB", probe_gain)
+            if probe_fr is None:
+                return _err("calibrate_level probe failed: no valid sweep after retries")
 
             probe_spl = _ir_spl(probe_fr)
 
