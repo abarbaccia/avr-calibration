@@ -131,8 +131,16 @@ class MeasurementServiceClient:
         route: str | None = None,
         out_channel_override: int | None = None,
         direct_path_window_ms: float | None = None,
+        fir_n_taps: int = 0,
     ):
-        """Run a log-sweep measurement. Returns FrequencyResponse."""
+        """Run a log-sweep measurement. Returns FrequencyResponse.
+
+        *fir_n_taps* is the maximum tap count of any active DSP FIR (0 = none).
+        When non-zero, the measurement service floors its xcorr search window to
+        cover the FIR's group delay (N/2 samples) plus headroom so that long
+        identity or correction FIRs don't clip the xcorr window and corrupt
+        peak_sign / coherence.
+        """
         from .measurement import FrequencyResponse
         data = await self._post("/measure", {
             "freq_min": freq_min,
@@ -140,6 +148,7 @@ class MeasurementServiceClient:
             "route": route,
             "out_channel_override": out_channel_override,
             "direct_path_window_ms": direct_path_window_ms,
+            "fir_n_taps": fir_n_taps if fir_n_taps else None,
         })
         return FrequencyResponse.from_json(data["result"])
 

@@ -582,14 +582,30 @@ class MeasurementEngine:
     output conversion.
     """
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, fir_n_taps: int = 0) -> None:
         self.config = config
         # Configurable xcorr search window — increase when long FIRs push
         # CamillaDSP processing latency beyond the default 200 ms ceiling.
         # measurement.xcorr_search_window_ms in config.yaml overrides the default.
-        self._xcorr_search_window_ms = float(
+        # fir_n_taps auto-floors the window so it always covers FIR latency
+        # (N/2 samples) plus up to 100 ms of acoustic travel + margin, preventing
+        # peak_sign flips and coherence collapse when a long identity or correction
+        # FIR is loaded.  Formula: FIR latency = n_taps / (2 * sample_rate);
+        # add 100 ms headroom for acoustic travel + rounding.
+        _config_window = float(
             config._data.get("measurement", {}).get("xcorr_search_window_ms", 200.0)
         )
+        if fir_n_taps > 0:
+            _sample_rate = float(
+                config._data.get("measurement", {}).get("sample_rate", 48000)
+            )
+            # FIR group delay (linear phase) = n_taps / 2 samples
+            _fir_latency_ms = (fir_n_taps / 2.0) / _sample_rate * 1000.0
+            # Add 100 ms for acoustic travel + startup jitter margin
+            _min_window = _fir_latency_ms + 100.0
+            self._xcorr_search_window_ms = max(_config_window, _min_window)
+        else:
+            self._xcorr_search_window_ms = _config_window
         # Use the module-level _MEASURE_LOCK, not an instance lock — MeasurementEngine
         # is created fresh per MCP tool call, so an instance lock would not serialize
         # concurrent callers. The module lock is shared across all instances.

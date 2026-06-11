@@ -61,6 +61,11 @@ class MeasureRequest(BaseModel):
     route: Optional[str] = None
     out_channel_override: Optional[int] = None
     direct_path_window_ms: Optional[float] = None
+    # Maximum FIR tap count currently active on any DSP output.  When non-zero,
+    # MeasurementEngine auto-floors the xcorr search window to cover the FIR's
+    # group delay (N/2 samples) plus headroom, preventing xcorr clipping that
+    # causes peak_sign flips and coherence collapse on long FIRs.
+    fir_n_taps: Optional[int] = None
 
 
 class MeasureSplPinkRequest(BaseModel):
@@ -127,7 +132,7 @@ async def measure(req: MeasureRequest):
     try:
         from .measurement import MeasurementEngine
         cfg = _cfg()
-        engine = MeasurementEngine(cfg)
+        engine = MeasurementEngine(cfg, fir_n_taps=int(req.fir_n_taps or 0))
         if req.direct_path_window_ms is not None and req.direct_path_window_ms > 0:
             engine.direct_path_window_ms = float(req.direct_path_window_ms)
         fr = await engine.measure(

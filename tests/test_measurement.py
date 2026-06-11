@@ -1691,3 +1691,54 @@ class TestFrequencyResponseLoopbackFields:
         fr = FrequencyResponse.from_json(json.dumps(data))
         assert fr.loopback_xcorr_peak_ms is None
         assert fr.avr_processing_ms is None
+
+
+# ── MeasurementEngine xcorr window auto-floor ─────────────────────────────────
+
+class TestXcorrWindowAutoFloor:
+    """MeasurementEngine must auto-floor _xcorr_search_window_ms when a long FIR
+    is loaded so that peak_sign flips and coherence collapse are prevented.
+
+    Root cause (2026-06-11): identity FIR at 24576 taps @ 96 kHz adds 128 ms of
+    group delay.  The default 200 ms window is only 72 ms above that — acoustic
+    travel (≥9 ms) + startup jitter can push the true xcorr peak outside the
+    window, causing the engine to latch on a noise artifact with the wrong
+    polarity (peak_sign flip) and corrupted coherence.
+    """
+
+    def test_no_fir_uses_config_window(self):
+        """When fir_n_taps=0, window is the config value unchanged."""
+        cfg = make_config(xcorr_search_window_ms=200.0)
+        engine = MeasurementEngine(cfg, fir_n_taps=0)
+        assert engine._xcorr_search_window_ms == 200.0
+
+    def test_short_fir_does_not_shrink_config_window(self):
+        """A short FIR (e.g. 512 taps @ 48 kHz → 5.3 ms latency) must not shrink
+        a manually configured large window."""
+        cfg = make_config(xcorr_search_window_ms=500.0)
+        engine = MeasurementEngine(cfg, fir_n_taps=512)
+        assert engine._xcorr_search_window_ms == 500.0
+
+    def test_long_fir_floors_window_above_default(self):
+        """24576-tap FIR @ 96 kHz → 128 ms latency → min window = 228 ms.
+        Default 200 ms must be raised to at least 228 ms."""
+        cfg = make_config(sample_rate=96_000)  # no xcorr override → default 200 ms
+        engine = MeasurementEngine(cfg, fir_n_taps=24576)
+        # FIR latency = 24576 / (2 * 96000) * 1000 = 128 ms; + 100 ms headroom = 228 ms
+        expected_min = (24576 / (2.0 * 96000)) * 1000.0 + 100.0
+        assert engine._xcorr_search_window_ms >= expected_min
+
+    def test_8192_tap_fir_at_96khz_floors_window(self):
+        """8192-tap FIR @ 96 kHz → 42.7 ms latency → min window = 142.7 ms.
+        Default 200 ms already exceeds this, so window stays at 200 ms."""
+        cfg = make_config(sample_rate=96_000)
+        engine = MeasurementEngine(cfg, fir_n_taps=8192)
+        # 8192 / (2 * 96000) * 1000 + 100 = 142.7 ms; config default 200 ms wins
+        assert engine._xcorr_search_window_ms == 200.0
+
+    def test_huge_fir_raises_window_proportionally(self):
+        """65536-tap FIR @ 48 kHz → 682 ms latency → min window = 782 ms."""
+        cfg = make_config(sample_rate=48_000)
+        engine = MeasurementEngine(cfg, fir_n_taps=65536)
+        expected_min = (65536 / (2.0 * 48_000)) * 1000.0 + 100.0
+        assert engine._xcorr_search_window_ms >= expected_min

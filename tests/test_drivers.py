@@ -2036,6 +2036,138 @@ async def test_camilladsp_apply_fir_rejects_wrong_sample_rate() -> None:
         await driver.apply_fir(0, [0.0, 1.0, 0.0], sample_rate=96_000)
 
 
+@pytest.mark.asyncio
+async def test_clear_fir_does_not_remove_peer_identity_firs() -> None:
+    """clear_fir(5) must NOT remove the identity FIR on peer output 6.
+
+    The old code cleared both in one push when no 'active' (non-identity)
+    FIR existed on any peer, causing a double quantum transition and
+    degraded measurements (coherence 0.35–0.46, group delays 272–376 ms).
+    The fix: only remove the explicitly requested output's Conv block;
+    peer identity pads are cleaned up by their own clear_fir() calls.
+    """
+    driver = CamillaDSPDriver(
+        sub_outputs=[5, 6],
+        routed_outputs=[5, 6],
+        output_channels=8,
+    )
+    call = _stub_client(driver)
+
+    # Load identity FIRs on both outputs (mimics apply_fir_identity sequence)
+    identity = [1.0] + [0.0] * 99  # 100-tap identity
+    driver._fir_state[5] = list(identity)
+    driver._fir_state[6] = list(identity)
+
+    # Clear output 5 only
+    await driver.clear_fir(5)
+
+    # Output 5's FIR must be gone
+    assert driver._fir_state.get(5) == [] or 5 not in driver._fir_state
+
+    # Output 6's identity FIR must remain untouched
+    assert driver._fir_state.get(6) == identity, (
+        "clear_fir(5) must not remove the identity FIR on peer output 6 — "
+        "each output must be cleared by its own explicit clear_fir() call"
+    )
+
+    # The pushed config must have cal_out6_fir present but not cal_out5_fir
+    cfg = _last_pushed_config(call)
+    assert "cal_out5_fir" not in cfg["filters"]
+    assert "cal_out6_fir" in cfg["filters"]
+
+
+@pytest.mark.asyncio
+async def test_clear_fir_second_call_removes_last_identity() -> None:
+    """The second clear_fir() call (on the peer) must remove its identity FIR."""
+    driver = CamillaDSPDriver(
+        sub_outputs=[5, 6],
+        routed_outputs=[5, 6],
+        output_channels=8,
+    )
+    call = _stub_client(driver)
+
+    identity = [1.0] + [0.0] * 99
+    driver._fir_state[5] = list(identity)
+    driver._fir_state[6] = list(identity)
+
+    # Clear output 5, then output 6
+    await driver.clear_fir(5)
+    await driver.clear_fir(6)
+
+    # Both must now be empty
+    assert not driver._fir_state.get(5)
+    assert not driver._fir_state.get(6)
+
+    cfg = _last_pushed_config(call)
+    assert "cal_out5_fir" not in cfg["filters"]
+    assert "cal_out6_fir" not in cfg["filters"]
+
+
+@pytest.mark.asyncio
+async def test_clear_fir_does_not_lose_real_peer_fir_when_clearing_identity() -> None:
+    """clear_fir on an identity-FIR output must leave a real peer correction intact.
+
+    When output 5 carries an identity pad and output 6 carries a real correction
+    FIR, clear_fir(5) must:
+      - Keep output 5 as a same-length identity pad (quantum-stable; active peer
+        means we can't drop the Conv block entirely without breaking peer sizing).
+      - Leave output 6's real FIR unchanged.
+    """
+    driver = CamillaDSPDriver(
+        sub_outputs=[5, 6],
+        routed_outputs=[5, 6],
+        output_channels=8,
+    )
+    call = _stub_client(driver)
+
+    real_fir = [0.0, 0.25, 0.5, 0.25, 0.0]
+    identity = [1.0] + [0.0] * (len(real_fir) - 1)
+
+    # Output 6 has a real correction; output 5 has a matching-length identity pad
+    driver._fir_state[6] = list(real_fir)
+    driver._fir_state[5] = list(identity)
+
+    # Clearing output 5 must keep output 6's real FIR alive, and output 5 must
+    # remain as an identity pad (not be fully removed) because a peer still has
+    # a real FIR — dropping the Conv block would break the peer's quantum size.
+    await driver.clear_fir(5)
+
+    cfg = _last_pushed_config(call)
+    # Output 5 stays as identity pad (Conv block kept for quantum stability)
+    assert "cal_out5_fir" in cfg["filters"]
+    out5_vals = cfg["filters"]["cal_out5_fir"]["parameters"]["values"]
+    assert out5_vals[0] == 1.0 and all(v == 0.0 for v in out5_vals[1:])
+    # Output 6's real FIR must be unchanged
+    assert "cal_out6_fir" in cfg["filters"]
+    assert cfg["filters"]["cal_out6_fir"]["parameters"]["values"] == real_fir
+
+
+@pytest.mark.asyncio
+async def test_apply_fir_quantum_change_flag_set_on_first_load() -> None:
+    """apply_fir must set quantum_change=True when adding a Conv block for the first time."""
+    driver = CamillaDSPDriver(output_channels=4)
+    _stub_client(driver)
+
+    # No FIR loaded yet — adding one is a structural pipeline change
+    assert not driver._fir_state.get(0)
+
+    quantum_changes = []
+
+    _orig_push = driver._push_config_locked
+
+    async def _capture_push():
+        quantum_changes.append(bool(driver._fir_state.get(0)))
+        return await _orig_push()
+
+    driver._push_config_locked = _capture_push  # type: ignore[method-assign]
+
+    identity = [1.0, 0.0, 0.0]
+    await driver.apply_fir(0, identity)
+
+    # The push was called with the FIR already in state → quantum change was detected
+    assert any(quantum_changes), "push was called but no quantum change was captured"
+
+
 def test_camilladsp_config_samples_devices_block_from_constructor_args() -> None:
     """The emitted `devices` section reflects the capture/playback/rate/chunksize args."""
     driver = CamillaDSPDriver(

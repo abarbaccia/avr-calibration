@@ -5724,6 +5724,20 @@ async def _tool_trigger_measurement(
         graph = cfg.signal_graph
         targets = tuple(graph.transducers_by_role("sub")) or graph.transducers
 
+        # Compute the longest active FIR tap count so the measurement service
+        # can auto-floor its xcorr search window.  A Conv FIR with N taps adds
+        # N/2 samples of group delay; the default 200 ms window is too narrow
+        # for FIRs ≥ ~16384 taps at 96 kHz (latency ~85 ms + acoustic travel).
+        _active_fir_n_taps = 0
+        try:
+            if _dsp is not None and hasattr(_dsp, "_fir_state"):
+                _active_fir_n_taps = max(
+                    (len(taps) for taps in _dsp._fir_state.values() if taps),
+                    default=0,
+                )
+        except Exception:
+            _active_fir_n_taps = 0
+
         if (
             route == "hdmi"
             and _drivers is not None
@@ -5739,6 +5753,7 @@ async def _tool_trigger_measurement(
                     freq_max=resolved_max,
                     route=route,
                     direct_path_window_ms=direct_path_window_ms,
+                    fir_n_taps=_active_fir_n_taps,
                 )
         elif route == "hdmi":
             # Per-channel mains sweep (resolved_out_channel set) or legacy path.
@@ -5758,6 +5773,7 @@ async def _tool_trigger_measurement(
                         out_channel_override=resolved_out_channel,
                         route=route,
                         direct_path_window_ms=direct_path_window_ms,
+                        fir_n_taps=_active_fir_n_taps,
                     )
             else:
                 fr = await meas_client.measure(
@@ -5766,6 +5782,7 @@ async def _tool_trigger_measurement(
                     out_channel_override=resolved_out_channel,
                     route=route,
                     direct_path_window_ms=direct_path_window_ms,
+                    fir_n_taps=_active_fir_n_taps,
                 )
         else:
             # USB route: enter the DSP sweep context per-measurement so any
@@ -5781,6 +5798,7 @@ async def _tool_trigger_measurement(
                         freq_max=resolved_max,
                         route=route,
                         direct_path_window_ms=direct_path_window_ms,
+                        fir_n_taps=_active_fir_n_taps,
                     )
             else:
                 fr = await meas_client.measure(
@@ -5788,6 +5806,7 @@ async def _tool_trigger_measurement(
                     freq_max=resolved_max,
                     route=route,
                     direct_path_window_ms=direct_path_window_ms,
+                    fir_n_taps=_active_fir_n_taps,
                 )
 
         # Compute IR-derived metadata at capture time. Query the DSP for the
