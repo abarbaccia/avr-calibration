@@ -6054,22 +6054,27 @@ async def _tool_calibrate_level(
     USB mode: adjusts miniDSP master gain.
     HDMI mode: adjusts AVR volume.
     """
-    from .measurement import MeasurementQualityError, parse_umik_sensitivity
+    from .measurement import MeasurementQualityError, resolve_dbfs_to_spl_offset
     from .measurement_client import MeasurementServiceClient, MeasurementServiceError
     from .config import update_config
     import math as _math
 
     cfg = _config()
 
-    # Load UMIK sensitivity offset: SPL = dBFS + offset
-    _mic_offset = 0.0
-    cal_path = cfg._data.get("mic", {}).get("cal_file")
-    if cal_path:
-        try:
-            _mic_offset = parse_umik_sensitivity(cal_path)
-            log.info("calibrate_level: UMIK sensitivity offset = %.1f dB", _mic_offset)
-        except Exception as exc:
-            log.warning("calibrate_level: failed to parse UMIK sensitivity: %s", exc)
+    # Resolve dBFS→SPL offset: SPL = dBFS + offset. Prefers the empirically-set
+    # config value mic.dbfs_to_spl_offset_db; falls back to a coarse cal-file
+    # estimate (±few dB). Anchor the config value against a known SPL reference
+    # (e.g. the AVR's Audyssey reference level during mains integration).
+    _mic_offset, _offset_src = resolve_dbfs_to_spl_offset(cfg._data)
+    if _offset_src == "config":
+        log.info("calibrate_level: dBFS→SPL offset = %.1f dB (config mic.dbfs_to_spl_offset_db)", _mic_offset)
+    elif _offset_src == "cal_estimate":
+        log.info(
+            "calibrate_level: dBFS→SPL offset = %.1f dB (ESTIMATE from cal file — "
+            "set mic.dbfs_to_spl_offset_db to anchor it)", _mic_offset,
+        )
+    else:
+        log.warning("calibrate_level: no dBFS→SPL offset available; SPL == dBFS (uncalibrated)")
 
     def _ir_spl(fr) -> float:
         """SPL estimate from recording RMS + UMIK sensitivity offset.

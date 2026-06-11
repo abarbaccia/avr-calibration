@@ -108,17 +108,38 @@ class FrequencyResponse:
         return self.frequencies[self.spl.index(peak)]
 
 
-def parse_umik_sensitivity(cal_path: str) -> float:
-    """Parse UMIK cal file and return dBFS-to-SPL offset.
+# UMIK-1 published full-scale handling: at 0 dB analog gain, digital full
+# scale (0 dBFS) corresponds to roughly this acoustic level. Used only as a
+# coarse fallback estimate — see parse_umik_sensitivity.
+UMIK1_MAX_SPL_AT_0DBFS_0GAIN = 133.0
 
-    The UMIK-1 cal file header looks like:
+
+def parse_umik_sensitivity(cal_path: str) -> float:
+    """ESTIMATE the dBFS→SPL offset for a UMIK-1 from its cal-file header.
+
+    ⚠️ This is an ESTIMATE, accurate to a few dB — not a true calibration.
+    The UMIK-1 .cal file does NOT contain the mic's absolute sensitivity:
+    "Sens Factor" is only a relative per-unit trim and the per-frequency rows
+    are the frequency-response correction. The real absolute dBFS↔SPL reference
+    comes from the mic's USB descriptor (what REW reads) or an SPL-meter
+    alignment. Prefer an empirically-set config value
+    (``mic.dbfs_to_spl_offset_db``) over this estimate — see
+    ``resolve_dbfs_to_spl_offset``.
+
+    Header looks like:
         "Sens Factor =1.725dB, AGain =18dB, SERNO: 7079831"
 
-    Base sensitivity at AGain=18dB is -18 dBFS/Pa (94 dB SPL produces -18 dBFS).
-    Effective sensitivity = -18 + sens_factor dBFS/Pa.
-    Offset = 94 - effective_sensitivity (to convert: SPL = dBFS + offset).
+    Model (SPL = dBFS + offset):
+        - 0 dBFS ≈ 133 dB SPL at 0 dB analog gain (UMIK-1 max-SPL spec).
+        - AGain dB of analog gain moves full scale ``AGain`` dB lower in SPL.
+        - A positive Sens Factor means the unit is more sensitive than nominal,
+          so full scale arrives at a slightly lower SPL (smaller offset).
 
-    Returns the offset such that: SPL_dB = peak_dBFS + offset
+        offset = 133 - AGain - sens_factor
+
+    For a typical UMIK-1 (AGain=18, Sens=+1.7) this is ~113 dB. The previous
+    implementation used a fabricated "-18 dBFS at 94 dB SPL" model that was
+    structurally wrong (at AGain=0 it implied 94 dB SPL = full scale).
     """
     import re
     from pathlib import Path
@@ -136,12 +157,36 @@ def parse_umik_sensitivity(cal_path: str) -> float:
     sens_factor = float(m_sens.group(1))
     analog_gain = float(m_gain.group(1))
 
-    # UMIK-1 base sensitivity: at AGain dB analog gain, 94 dB SPL (1 Pa)
-    # produces -(AGain) dBFS, adjusted by sens_factor.
-    effective_sens_dbfs = -analog_gain + sens_factor  # dBFS at 94 dB SPL
-    # SPL = dBFS - effective_sens + 94
-    offset = 94.0 - effective_sens_dbfs
+    offset = UMIK1_MAX_SPL_AT_0DBFS_0GAIN - analog_gain - sens_factor
     return offset
+
+
+def resolve_dbfs_to_spl_offset(
+    config_data: dict | None, cal_path: str | None = None
+) -> tuple[float, str]:
+    """Resolve the dBFS→SPL offset, preferring an empirically-set config value.
+
+    Order of precedence:
+      1. ``mic.dbfs_to_spl_offset_db`` in config — the empirically-anchored
+         value (set against an SPL reference). This is the source of truth.
+      2. A coarse estimate from the UMIK-1 cal-file header
+         (``parse_umik_sensitivity``) — accurate only to a few dB.
+      3. 0.0 (uncalibrated; SPL == dBFS) if neither is available.
+
+    Returns ``(offset_db, source)`` where source is one of
+    ``"config"`` | ``"cal_estimate"`` | ``"none"``.
+    """
+    mic = (config_data or {}).get("mic", {}) if config_data else {}
+    explicit = mic.get("dbfs_to_spl_offset_db")
+    if explicit is not None:
+        return float(explicit), "config"
+    path = cal_path or mic.get("cal_file")
+    if path:
+        try:
+            return parse_umik_sensitivity(path), "cal_estimate"
+        except (FileNotFoundError, ValueError):
+            pass
+    return 0.0, "none"
 
 
 def parse_umik_cal_curve(cal_path: str) -> list[tuple[float, float]]:
@@ -250,6 +295,7 @@ def measure_pink_spl(
     mic_device_index: int | None = None,
     hdmi_device_index: int | None = None,
     umik_cal_path: str | None = None,
+    spl_offset_db: float | None = None,
     integration_time_s: float = 1.0,
 ) -> dict:
     """Play pink noise on one channel, record from UMIK, return absolute SPL.
@@ -351,10 +397,15 @@ def measure_pink_spl(
         per_block_rms.append(rms)
     overall_rms = float(np.sqrt(np.mean(weighted ** 2)))
 
-    # Convert dBFS → dB SPL via UMIK calibration if available.
+    # Convert dBFS → dB SPL. Prefer an explicit, empirically-anchored offset
+    # (spl_offset_db, from config mic.dbfs_to_spl_offset_db); otherwise fall
+    # back to the coarse cal-file estimate.
     offset = 0.0
     calibrated = False
-    if umik_cal_path:
+    if spl_offset_db is not None:
+        offset = float(spl_offset_db)
+        calibrated = True
+    elif umik_cal_path:
         try:
             offset = parse_umik_sensitivity(umik_cal_path)
             calibrated = True

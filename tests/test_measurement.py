@@ -1470,9 +1470,8 @@ class TestParseUmikSensitivity:
             "20.0    -0.3\n"
         )
         offset = parse_umik_sensitivity(str(cal))
-        # effective_sens = -18 + 1.725 = -16.275
-        # offset = 94 - (-16.275) = 110.275
-        assert abs(offset - 110.275) < 0.01
+        # offset = 133 (UMIK-1 max SPL @ 0 dBFS, 0 gain) - AGain(18) - sens(1.725)
+        assert abs(offset - 113.275) < 0.01
 
     def test_missing_file_raises(self):
         from calibrate.measurement import parse_umik_sensitivity
@@ -1487,6 +1486,43 @@ class TestParseUmikSensitivity:
         cal.write_text("not a valid header\n20.0 -0.3\n")
         with pytest.raises(ValueError, match="Cannot parse"):
             parse_umik_sensitivity(str(cal))
+
+
+class TestResolveDbfsToSplOffset:
+    """Tests for resolve_dbfs_to_spl_offset precedence (config > cal estimate)."""
+
+    def _write_cal(self, tmp_path):
+        cal = tmp_path / "umik.cal"
+        cal.write_text(
+            '"Sens Factor =1.725dB, AGain =18dB, SERNO: 7079831"\n'
+            '"Auto-generated"\n20.0    -0.3\n'
+        )
+        return cal
+
+    def test_config_value_takes_precedence(self, tmp_path):
+        from calibrate.measurement import resolve_dbfs_to_spl_offset
+
+        cal = self._write_cal(tmp_path)
+        cfg = {"mic": {"cal_file": str(cal), "dbfs_to_spl_offset_db": 117.0}}
+        offset, source = resolve_dbfs_to_spl_offset(cfg)
+        assert offset == 117.0
+        assert source == "config"
+
+    def test_falls_back_to_cal_estimate(self, tmp_path):
+        from calibrate.measurement import resolve_dbfs_to_spl_offset
+
+        cal = self._write_cal(tmp_path)
+        cfg = {"mic": {"cal_file": str(cal)}}
+        offset, source = resolve_dbfs_to_spl_offset(cfg)
+        assert abs(offset - 113.275) < 0.01
+        assert source == "cal_estimate"
+
+    def test_none_when_no_offset_available(self):
+        from calibrate.measurement import resolve_dbfs_to_spl_offset
+
+        offset, source = resolve_dbfs_to_spl_offset({"mic": {}})
+        assert offset == 0.0
+        assert source == "none"
 
 
 class TestDetectIrOnsetWithFirPreDelay:
