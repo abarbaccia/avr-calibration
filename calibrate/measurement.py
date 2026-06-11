@@ -1587,7 +1587,7 @@ def _xcorr_delay_ms(
     delayed,     # 1-D float64 — the later-arriving signal
     sample_rate: int,
     lo_ms: float = 3.0,
-    hi_ms: float = 250.0,
+    hi_ms: float = 1000.0,
 ) -> Optional[float]:
     """FFT cross-correlation: return how many ms `delayed` lags behind `reference`.
 

@@ -11,12 +11,14 @@
 #   karaoke   : CamillaDSP stopped, pikaraoke container running. pikaraoke owns
 #               the Scarlett directly — no dmix, no buzz.
 #
-# State file: /run/audio-mode (single token: listening|cal|karaoke).
+# State file: /var/lib/audio-mode (single token: listening|cal|karaoke).
+# /var/lib survives reboots; /run (tmpfs) was wiped on every Pi restart, causing
+# audio-mode get to return "unknown" and requiring manual re-set after each reboot.
 # Read by camilladsp-watchdog.sh so it does NOT self-heal CamillaDSP during karaoke.
 
 set -u
 
-STATE_FILE="${STATE_FILE:-/run/audio-mode}"
+STATE_FILE="${STATE_FILE:-/var/lib/audio-mode}"
 CAMILLA_SVC="${CAMILLA_SVC:-camilladsp.service}"
 PIKARAOKE_CONTAINER="${PIKARAOKE_CONTAINER:-pikaraoke}"
 CAL_API_URL="${CAL_API_URL:-http://127.0.0.1:8000/api/cal-mode}"
@@ -30,7 +32,7 @@ commands:
   set <listening|cal|karaoke>
                             Transition to the named mode.
 
-state file: $STATE_FILE
+state file: $STATE_FILE  (persists across reboots)
 EOF
 }
 

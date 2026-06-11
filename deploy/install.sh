@@ -344,7 +344,13 @@ for svc in camilladsp-watchdog.service denon-watch.service; do
     fi
 done
 
-# Land in listening mode (sets /run/audio-mode so the watchdog behaves).
+# Ensure the audio-mode state file exists and is world-writable.
+# /var/lib/audio-mode persists across reboots (unlike the old /run/audio-mode
+# which was tmpfs and reset to "unknown" on every Pi restart).
+sudo touch /var/lib/audio-mode
+sudo chmod 666 /var/lib/audio-mode
+
+# Land in listening mode on fresh installs.
 if [ -x /usr/local/sbin/audio-mode ]; then
     sudo /usr/local/sbin/audio-mode set listening || true
 fi

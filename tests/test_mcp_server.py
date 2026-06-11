@@ -789,15 +789,16 @@ def _make_hdmi_cfg():
 async def test_calibrate_level_usb_predict_verify() -> None:
     """USB mode: probe IR peak = 58 dB SPL at -30 dB gain.
     Target 78 dB SPL. Correction = +20 → gain = -10.
-    Verify IR peak = 78 dB SPL. 2 sweeps."""
+    Verify IR peak = 78 dB SPL. 3 sweeps (wake + probe + verify)."""
     mock_dsp = AsyncMock()
     mock_dsp.sweep_context = MagicMock(return_value=None)
 
+    wake_fr = _make_fr(50.0)   # wake sweep at 0 dB — result ignored
     probe_fr = _make_fr(58.0)  # 58 dB SPL at -30 gain
     verify_fr = _make_fr(78.0)  # 78 dB SPL — on target
 
     mock_client = AsyncMock()
-    mock_client.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
+    mock_client.measure = AsyncMock(side_effect=[wake_fr, probe_fr, verify_fr])
 
     with (
         patch.object(sut, "_dsp", mock_dsp),
@@ -812,8 +813,8 @@ async def test_calibrate_level_usb_predict_verify() -> None:
     # correction = 78 - 58 = +20 → gain = -30 + 20 = -10
     assert result["calibrated_master_gain_db"] == -10.0
     assert result["estimated_spl_db"] == 78.0
-    assert mock_client.measure.call_count == 2
-    assert mock_dsp.set_master_gain.call_count == 2
+    assert mock_client.measure.call_count == 3  # wake + probe + verify
+    assert mock_dsp.set_master_gain.call_count == 3  # 0.0 (wake) + start_db + computed
     mock_update.assert_called_once_with({"measurement": {"master_gain_db": -10.0}})
 
 
@@ -823,11 +824,12 @@ async def test_calibrate_level_usb_verify_still_hot_backs_off() -> None:
     mock_dsp = AsyncMock()
     mock_dsp.sweep_context = MagicMock(return_value=None)
 
+    wake_fr = _make_fr(50.0)   # wake sweep — ignored
     probe_fr = _make_fr(90.0)  # 90 dB SPL
     verify_fr = _make_fr(85.0)  # 85 dB > 78+3 → backs off
 
     mock_client = AsyncMock()
-    mock_client.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
+    mock_client.measure = AsyncMock(side_effect=[wake_fr, probe_fr, verify_fr])
 
     with (
         patch.object(sut, "_dsp", mock_dsp),
@@ -842,8 +844,8 @@ async def test_calibrate_level_usb_verify_still_hot_backs_off() -> None:
     # probe: correction = 78 - 90 = -12 → computed gain = -10 + (-12) = -22
     # verify: 85 > 78+3 → overshoot = 85 - 78 = 7 → final = -22 - 7 = -29
     assert result["calibrated_master_gain_db"] == -29.0
-    # 3 set_master_gain calls: probe(-10), verify(-22), backoff(-29)
-    assert mock_dsp.set_master_gain.call_count == 3
+    # 4 set_master_gain calls: wake(0.0), probe(-10), verify(-22), backoff(-29)
+    assert mock_dsp.set_master_gain.call_count == 4
 
 
 @pytest.mark.asyncio
@@ -852,11 +854,12 @@ async def test_calibrate_level_usb_gain_clamped_to_zero() -> None:
     mock_dsp = AsyncMock()
     mock_dsp.sweep_context = MagicMock(return_value=None)
 
+    wake_fr = _make_fr(50.0)   # wake sweep — ignored
     probe_fr = _make_fr(40.0)  # very quiet
     verify_fr = _make_fr(70.0)
 
     mock_client = AsyncMock()
-    mock_client.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
+    mock_client.measure = AsyncMock(side_effect=[wake_fr, probe_fr, verify_fr])
 
     with (
         patch.object(sut, "_dsp", mock_dsp),
@@ -921,11 +924,12 @@ async def test_calibrate_level_usb_solo_gain_hint() -> None:
         if key == "output_slots" else default
     )
 
+    wake_fr = _make_fr(50.0)   # wake sweep — ignored
     probe_fr = _make_fr(68.0)
     verify_fr = _make_fr(78.0)
 
     mock_client = AsyncMock()
-    mock_client.measure = AsyncMock(side_effect=[probe_fr, verify_fr])
+    mock_client.measure = AsyncMock(side_effect=[wake_fr, probe_fr, verify_fr])
 
     with (
         patch.object(sut, "_dsp", mock_dsp),

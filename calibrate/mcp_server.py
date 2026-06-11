@@ -6109,6 +6109,19 @@ async def _tool_calibrate_level(
         _sub_count = max(1, sub_count)
 
         async def _usb_predict_verify() -> dict:
+            # ── Step 0: wake sleeping subs ──
+            # SVS auto-standby activates after ~15 min silence. The probe sweep
+            # at start_db is too quiet to rouse a sleeping sub, producing a
+            # near-zero SPL reading and a wildly wrong gain recommendation.
+            # Send one loud sweep at 0 dB first; ignore any measurement errors.
+            log.info("calibrate_level: sending wake sweep at 0 dB to rouse standby subs")
+            await _dsp.set_master_gain(0.0)  # type: ignore[union-attr]
+            await asyncio.sleep(0.3)
+            try:
+                await meas_client.measure(route=route)
+            except Exception:
+                pass  # standby subs may not produce valid data — that's fine
+
             # ── Step 1: probe at safe starting level ──
             probe_gain = start_db
             await _dsp.set_master_gain(probe_gain)  # type: ignore[union-attr]
