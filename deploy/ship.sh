@@ -53,18 +53,27 @@ else
     gh pr merge "$BRANCH" --squash --delete-branch
 fi
 
-# ── 3. Wait for the CI image build triggered by the merge ───────────────────────
-say "Waiting for CI build to register"
+# ── 3. Wait for the CI image build for THIS commit ──────────────────────────────
+# Select the run by headSha, NOT --limit 1. The most-recent run is usually the
+# PREVIOUS commit's already-finished build, so --limit 1 races: gh run watch
+# returns instantly on the stale run and step 4 pulls the OLD image while printing
+# "Shipped ✓". origin/main is the right SHA for both paths (direct push to main,
+# and the squash-merge commit created by the PR path).
+git fetch origin main -q || true
+TARGET_SHA="$(git rev-parse origin/main)"
+say "Waiting for CI build of ${TARGET_SHA:0:7} to register"
 RUN_ID=""
-for _ in $(seq 1 20); do
+for _ in $(seq 1 30); do
     RUN_ID="$(gh run list --workflow "$BUILD_WORKFLOW" --branch main --event push \
-              --limit 1 --json databaseId,status -q '.[0].databaseId' 2>/dev/null || true)"
-    [ -n "$RUN_ID" ] && break
+              --limit 15 --json databaseId,headSha \
+              -q "[.[] | select(.headSha==\"$TARGET_SHA\")][0].databaseId" 2>/dev/null || true)"
+    [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ] && break
+    RUN_ID=""
     sleep 3
 done
-[ -n "$RUN_ID" ] || { echo "ERROR: could not find a '$BUILD_WORKFLOW' run on main."; exit 1; }
+[ -n "$RUN_ID" ] || { echo "ERROR: no '$BUILD_WORKFLOW' run found for commit $TARGET_SHA on main."; exit 1; }
 
-say "Watching build run $RUN_ID (arm64, ~1-3 min)"
+say "Watching build run $RUN_ID for ${TARGET_SHA:0:7} (arm64, ~1-3 min)"
 gh run watch "$RUN_ID" --exit-status --interval 15
 
 # ── 4. Pull on the Pi + restart + health check ─────────────────────────────────
