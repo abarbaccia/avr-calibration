@@ -4463,10 +4463,11 @@ async def _tool_design_fir_trinnov(
 
         focus = tuple(freq_focus_hz) if freq_focus_hz and len(freq_focus_hz) == 2 else None
 
-        # Use the DSP's actual processing rate. CamillaDSP runs at 96 kHz; a FIR
-        # designed at 48 kHz and applied to a 96 kHz pipeline shifts every correction
-        # to double the intended frequency (47 Hz correction → lands at 94 Hz).
-        fir_sample_rate = 48000
+        # Always design at the DSP's actual processing rate (caps.fir_sample_rate_hz).
+        # The design rate MUST equal the live pipeline rate: any mismatch shifts every
+        # correction in frequency proportionally (e.g. a 48 kHz design on a 96 kHz
+        # pipeline lands at 2× — a 47 Hz correction at 94 Hz). Do not hardcode a rate.
+        fir_sample_rate = 48000  # fallback only when no DSP driver is loaded
         if _dsp is not None:
             fir_sample_rate = int(_dsp.capabilities.fir_sample_rate_hz or 48000)
 
@@ -4908,11 +4909,11 @@ async def _tool_design_modal_fir(
         except Exception:
             modal_cap_db = 14.0
 
-        # Auto-detect live DSP sample rate so coefficients land at the rate
-        # CamillaDSP runs at. Designing at 48 kHz when DSP processes at 96 kHz
-        # halves every modal frequency in the FIR (47 Hz → 23.5 Hz). Caller
-        # can opt out via auto_samplerate=False if they really need a specific
-        # design rate (e.g. offline analysis).
+        # Auto-detect the live DSP processing rate so coefficients land at the rate
+        # the pipeline actually runs. Designing at a rate that differs from the live
+        # rate scales every modal frequency by (design_rate / live_rate) — e.g. a
+        # 48 kHz design on a 96 kHz pipeline halves it (47 Hz → 23.5 Hz). Caller can
+        # opt out via auto_samplerate=False for a specific design rate (offline analysis).
         effective_samplerate = int(samplerate)
         effective_num_taps = int(num_taps)
         if auto_samplerate and _dsp is not None:

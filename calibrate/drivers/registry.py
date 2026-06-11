@@ -147,7 +147,11 @@ def _make_minidsp(config: Config) -> MinidspDriver:
     host, port = config.minidsp_host_port
     active_input = config.active_input
     usb_input = config.measurement.get("output_channel", 1) - 1
-    processing_rate = int(config.eq_capabilities.get("processing_rate", 96_000))
+    # miniDSP 2x4 HD runs its SHARC DSP at 96 kHz natively. Source the rate from
+    # the minidsp block (symmetric with camilladsp.samplerate) — NOT a global
+    # eq_capabilities key, which was a footgun: it looked like it set the FIR /
+    # CamillaDSP processing rate but only ever applied to this legacy driver.
+    processing_rate = int(config.minidsp.get("samplerate", 96_000))
     return MinidspDriver(
         host=host, port=port,
         sub_outputs=config.sub_outputs,

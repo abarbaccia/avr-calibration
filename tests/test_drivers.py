@@ -1146,7 +1146,7 @@ def _mock_config(avr_driver: str = "denon", dsp_driver: str = "minidsp",
     cfg.avr_driver_name = avr_driver
     cfg.dsp_driver_name = dsp_driver
     cfg.denon = {"host": "192.168.1.100"}
-    cfg.minidsp = {"host": "localhost", "port": 5380}
+    cfg.minidsp = {"host": "localhost", "port": 5380, "samplerate": processing_rate}
     cfg.minidsp_host_port = ("localhost", 5380)
     cfg.camilladsp = {
         "host": "127.0.0.1", "port": 1234,
@@ -1155,7 +1155,6 @@ def _mock_config(avr_driver: str = "denon", dsp_driver: str = "minidsp",
     }
     cfg.sub_outputs = [0, 1]
     cfg.measurement = {"output_channel": 1}
-    cfg.eq_capabilities = {"processing_rate": processing_rate}
 
     processors = []
     if avr_driver in {"denon"}:
@@ -1182,16 +1181,16 @@ def test_load_dsp_driver_minidsp() -> None:
 
 
 def test_load_dsp_driver_passes_processing_rate() -> None:
-    """Registry passes processing_rate from config.eq_capabilities to the driver."""
+    """Registry passes processing_rate from config.minidsp.samplerate to the driver."""
     cfg = _mock_config(dsp_driver="minidsp", processing_rate=48_000)
     driver = load_dsp_driver(cfg)
     assert driver._processing_rate == 48_000
 
 
 def test_load_dsp_driver_default_processing_rate() -> None:
-    """Default processing_rate is 96000 (miniDSP 2x4 HD)."""
+    """Default processing_rate is 96000 (miniDSP 2x4 HD) when minidsp.samplerate unset."""
     cfg = _mock_config(dsp_driver="minidsp")
-    cfg.eq_capabilities = {}  # no explicit processing_rate
+    cfg.minidsp = {"host": "localhost", "port": 5380}  # no explicit samplerate
     driver = load_dsp_driver(cfg)
     assert driver._processing_rate == 96_000
 
