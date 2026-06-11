@@ -272,6 +272,19 @@ if [ -f "$SCRIPT_DIR/pipewire-scarlett-clock.conf" ]; then
     echo "Installed: /etc/pipewire/pipewire.conf.d/10-scarlett-clock.conf"
 fi
 
+# Null-sink configs: avr_cal_sweep (calibration sweep injection) + loopback_ref
+# (deconvolution reference). Both pin session.suspend-timeout-seconds=0 — a null
+# sink that suspends on idle stops passing audio to its monitor, which silently
+# breaks the whole sub-cal measurement chain (see the conf-file comments).
+if [ -d "$SCRIPT_DIR/pi-config/pipewire.conf.d" ]; then
+    sudo install -d /etc/pipewire/pipewire.conf.d
+    for f in "$SCRIPT_DIR"/pi-config/pipewire.conf.d/*.conf; do
+        [ -f "$f" ] || continue
+        sudo install -m 0644 "$f" "/etc/pipewire/pipewire.conf.d/$(basename "$f")"
+        echo "Installed: /etc/pipewire/pipewire.conf.d/$(basename "$f")"
+    done
+fi
+
 # avr-cal-sweep PipeWire null sink + persistent link to camilladsp_capture.
 # Lets the container play the USB-route sweep into the PipeWire graph and
 # from there into CamillaDSP. Installed as a user systemd unit (same

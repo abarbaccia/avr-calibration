@@ -4463,11 +4463,52 @@ async def _tool_design_fir_trinnov(
 
         focus = tuple(freq_focus_hz) if freq_focus_hz and len(freq_focus_hz) == 2 else None
 
+        # Use the DSP's actual processing rate. CamillaDSP runs at 96 kHz; a FIR
+        # designed at 48 kHz and applied to a 96 kHz pipeline shifts every correction
+        # to double the intended frequency (47 Hz correction → lands at 94 Hz).
+        fir_sample_rate = 48000
+        if _dsp is not None:
+            fir_sample_rate = int(_dsp.capabilities.fir_sample_rate_hz or 48000)
+
+        # Per-sub level balance check: warn when one sub is >6 dB weaker than
+        # the reference sub in any 1/3-octave band within the focus range. A
+        # weakly-measured sub drives the Wiener filter to huge boosts that
+        # either hit the safety cap or overcorrect into noise.
+        balance_warnings: list[str] = []
+        if len(sub_measurements) >= 2:
+            lo_hz = focus[0] if focus else freq_min
+            hi_hz = focus[1] if focus else freq_max
+            ref_bands = _downsample_to_third_octave(
+                sub_measurements[0].freqs, sub_measurements[0].spl_db
+            )
+            ref_by_freq = {b["freq_hz"]: b["spl_db"] for b in ref_bands
+                           if lo_hz <= b["freq_hz"] <= hi_hz}
+            for other in sub_measurements[1:]:
+                other_bands = _downsample_to_third_octave(other.freqs, other.spl_db)
+                other_by_freq = {b["freq_hz"]: b["spl_db"] for b in other_bands
+                                 if lo_hz <= b["freq_hz"] <= hi_hz}
+                for freq in ref_by_freq:
+                    if freq not in other_by_freq:
+                        continue
+                    delta = other_by_freq[freq] - ref_by_freq[freq]
+                    if delta < -6.0:
+                        balance_warnings.append(
+                            f"{other.label} is {abs(delta):.1f} dB weaker than "
+                            f"{sub_measurements[0].label} at {freq} Hz — "
+                            "Wiener correction will require large boost; verify amp/cable/power"
+                        )
+                    elif delta > 6.0:
+                        balance_warnings.append(
+                            f"{sub_measurements[0].label} is {delta:.1f} dB weaker than "
+                            f"{other.label} at {freq} Hz — "
+                            "Wiener correction will require large boost; verify amp/cable/power"
+                        )
+
         result = design_fir_trinnov(
             room_ir=room_ir,
             measurements=sub_measurements,
             target_points=target_points,
-            sample_rate=48000,
+            sample_rate=fir_sample_rate,
             num_taps=num_taps,
             phase_mode=phase_mode,
             regularization_lambda=regularization_lambda,
@@ -4492,9 +4533,20 @@ async def _tool_design_fir_trinnov(
             _fir_design_intent[cache_id] = apply_intent
             cache_ids.append({"output_index": output_index, "design_session_id": cache_id})
 
+        note = (
+            f"Trinnov coherent Wiener FIR: {result['num_subs']} subs, "
+            f"{num_taps} taps @ {fir_sample_rate} Hz, phase_mode={phase_mode}, "
+            f"latency {result['latency_ms']} ms, "
+            f"{result['n_ringing_modes']} ringing modes in baseline IR. "
+            f"Apply via apply_fir(output_index, design_session_id)."
+        )
+        if balance_warnings:
+            note += " ⚠️ Sub balance warnings: " + "; ".join(balance_warnings)
+
         response = {
             "num_subs": result["num_subs"],
             "num_taps": num_taps,
+            "fir_sample_rate_hz": fir_sample_rate,
             "phase_mode": phase_mode,
             "regularization_lambda": regularization_lambda,
             "latency_ms": result["latency_ms"],
@@ -4504,14 +4556,9 @@ async def _tool_design_fir_trinnov(
             "predicted_per_sub": result["predicted_per_sub"],
             "per_sub_peak_boost_db": result["per_sub_peak_boost_db"],
             "output_gain_db": result["output_gain_db"],
+            "balance_warnings": balance_warnings,
             "cache_ids": cache_ids,
-            "note": (
-                f"Trinnov coherent Wiener FIR: {result['num_subs']} subs, "
-                f"{num_taps} taps, phase_mode={phase_mode}, "
-                f"latency {result['latency_ms']} ms, "
-                f"{result['n_ringing_modes']} ringing modes in baseline IR. "
-                f"Apply via apply_fir(output_index, design_session_id)."
-            ),
+            "note": note,
         }
         if return_coefficients:
             response["firs"] = result["firs"]
@@ -8539,6 +8586,144 @@ async def _tool_verify_fir_effect(
         return _err(f"verify_fir_effect failed: {exc}")
 
 
+async def _tool_verify_trinnov_coherence(
+    combined_session_id: int,
+    solo_session_ids: list[int],
+    min_hz: float = 20.0,
+    max_hz: float = 120.0,
+    destructive_threshold_db: float = 3.0,
+) -> dict:
+    """Verify that Trinnov FIRs produce coherent summation at the listening position.
+
+    After applying Trinnov FIRs, measure both subs combined and compare against
+    each sub's solo session. In a perfect coherent sum, combined SPL ≥ max(solo)
+    in every band. Destructive interference (combined < max(solo) - threshold)
+    means the FIRs are not summing coherently — either the phase alignment is
+    wrong, the sub geometry dominates, or one sub's FIR overcorrected into a null.
+
+    This is the only verification that catches the COHERENCE property that
+    distinguishes Trinnov from per-sub independent correction. verify_fir_effect
+    checks magnitude only; this tool checks the inter-sub phase relationship.
+
+    Arguments:
+      combined_session_id  — session taken with ALL subs + Trinnov FIRs active
+      solo_session_ids     — list of per-sub solo sessions (same FIRs loaded)
+      destructive_threshold_db — bands where combined < max(solo) - this value
+                                  are flagged as destructive. Default 3 dB.
+
+    Returns per-band comparison + summary of destructive/constructive/marginal bands.
+    """
+    from .storage import SessionStore
+    import math
+
+    try:
+        store = SessionStore()
+        combined = store.get_session(combined_session_id)
+        if combined is None:
+            return _err(f"combined_session_id {combined_session_id} not found")
+        if not combined.start_fr or not combined.start_fr.frequencies:
+            return _err(f"combined session {combined_session_id} has no FR data")
+
+        solos = []
+        for sid in solo_session_ids:
+            s = store.get_session(sid)
+            if s is None:
+                return _err(f"solo session_id {sid} not found")
+            if not s.start_fr or not s.start_fr.frequencies:
+                return _err(f"solo session {sid} has no FR data")
+            solos.append(s)
+
+        combined_bands = _downsample_to_third_octave(
+            combined.start_fr.frequencies, combined.start_fr.spl
+        )
+        combined_by_freq = {b["freq_hz"]: b["spl_db"] for b in combined_bands}
+
+        solo_bands_list = []
+        for s in solos:
+            bands = _downsample_to_third_octave(s.start_fr.frequencies, s.start_fr.spl)
+            solo_bands_list.append({b["freq_hz"]: b["spl_db"] for b in bands})
+
+        results = []
+        n_destructive = 0
+        n_constructive = 0
+        n_marginal = 0
+
+        for freq in sorted(combined_by_freq):
+            if freq < min_hz or freq > max_hz:
+                continue
+            solo_spls = [d[freq] for d in solo_bands_list if freq in d]
+            if not solo_spls:
+                continue
+            max_solo = max(solo_spls)
+            comb_spl = combined_by_freq[freq]
+            delta = comb_spl - max_solo
+
+            if delta >= 0:
+                status = "constructive"
+                n_constructive += 1
+            elif delta >= -destructive_threshold_db:
+                status = "marginal"
+                n_marginal += 1
+            else:
+                status = "destructive"
+                n_destructive += 1
+
+            results.append({
+                "freq_hz": freq,
+                "combined_spl_db": round(comb_spl, 1),
+                "max_solo_spl_db": round(max_solo, 1),
+                "per_solo_spl_db": [round(s, 1) for s in solo_spls],
+                "delta_db": round(delta, 1),
+                "status": status,
+            })
+
+        if not results:
+            return _err("no overlapping bands between combined and solo sessions in range")
+
+        n_total = len(results)
+        coherence_score = n_constructive / n_total
+
+        destructive_bands = [r for r in results if r["status"] == "destructive"]
+        worst_destructive = (
+            min(destructive_bands, key=lambda r: r["delta_db"])
+            if destructive_bands else None
+        )
+
+        if n_destructive == 0:
+            verdict = "pass — coherent summation in all bands"
+        elif n_destructive <= 2:
+            worst = worst_destructive
+            verdict = (
+                f"marginal — {n_destructive} destructive band(s); "
+                f"worst: {worst['freq_hz']} Hz ({worst['delta_db']:+.1f} dB vs max solo). "
+                "Likely room geometry at those frequencies — verify sub polarity and delay."
+            )
+        else:
+            verdict = (
+                f"fail — {n_destructive}/{n_total} bands destructive. "
+                "Trinnov FIRs are not summing coherently. Check: "
+                "(1) were both subs measured at same position with same FIRs? "
+                "(2) is loopback_xcorr_peak_ms consistent across sessions? "
+                "(3) try phase_mode='minimum' for single-sub magnitude verification."
+            )
+
+        return _ok(
+            combined_session_id=combined_session_id,
+            solo_session_ids=solo_session_ids,
+            n_bands=n_total,
+            n_constructive=n_constructive,
+            n_marginal=n_marginal,
+            n_destructive=n_destructive,
+            coherence_score=round(coherence_score, 3),
+            destructive_threshold_db=destructive_threshold_db,
+            worst_destructive_band=worst_destructive,
+            bands=results,
+            verdict=verdict,
+        )
+    except Exception as exc:
+        return _err(f"verify_trinnov_coherence failed: {exc}")
+
+
 async def _tool_verify_input_eq_effect(
     pre_session_id: int,
     post_session_id: int,
@@ -11354,6 +11539,42 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="verify_trinnov_coherence",
+        description=(
+            "Verify that Trinnov FIRs produce coherent summation at the listening position. "
+            "Compare combined (all subs) against each sub's solo session. In a good coherent "
+            "sum, combined SPL ≥ max(solo) in every band. Bands where combined < max(solo) - "
+            "threshold are flagged 'destructive' — the subs are cancelling instead of summing. "
+            "This is the ONLY check that validates the inter-sub phase property that makes "
+            "Trinnov different from per-sub independent correction. verify_fir_effect checks "
+            "magnitude only and cannot detect phase failures. "
+            "Call AFTER applying Trinnov FIRs and measuring both combined and per-sub solo "
+            "(with the FIRs active). 'verdict' summarises pass/marginal/fail."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "combined_session_id": {
+                    "type": "integer",
+                    "description": "Session ID of the combined (all subs) measurement with Trinnov FIRs active.",
+                },
+                "solo_session_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Per-sub solo session IDs, same FIRs loaded, same mic position.",
+                },
+                "min_hz": {"type": "number", "default": 20.0},
+                "max_hz": {"type": "number", "default": 120.0},
+                "destructive_threshold_db": {
+                    "type": "number",
+                    "default": 3.0,
+                    "description": "dB below max(solo) before a band is classified as 'destructive'. Default 3.",
+                },
+            },
+            "required": ["combined_session_id", "solo_session_ids"],
+        },
+    ),
+    Tool(
         name="verify_fir_effect",
         description=(
             "Compare a designed FIR's predicted effect (from design_fir's "
@@ -13157,6 +13378,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             tolerance_db=float(arguments.get("tolerance_db", 2.0)),
             min_hz=float(arguments.get("min_hz", 20.0)),
             max_hz=float(arguments.get("max_hz", 120.0)),
+        )
+    elif name == "verify_trinnov_coherence":
+        result = await _tool_verify_trinnov_coherence(
+            combined_session_id=int(arguments["combined_session_id"]),
+            solo_session_ids=[int(s) for s in arguments["solo_session_ids"]],
+            min_hz=float(arguments.get("min_hz", 20.0)),
+            max_hz=float(arguments.get("max_hz", 120.0)),
+            destructive_threshold_db=float(arguments.get("destructive_threshold_db", 3.0)),
         )
     elif name == "check_system":
         result = await _tool_check_system()

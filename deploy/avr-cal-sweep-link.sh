@@ -28,9 +28,12 @@ ensure_sink() {
     if pw-cli ls Node 2>/dev/null | grep -q "node.name = \"${SINK_NAME}\""; then
         return 0
     fi
+    # session.suspend-timeout-seconds=0 + node.pause-on-idle=false: a null sink has
+    # no hardware clock; if WirePlumber suspends it on idle its monitor stops passing
+    # audio (pw-cat plays in, monitor stays silent). Pin it hot. Matches 10-avr-cal-sweep.conf.
     pactl load-module module-null-sink \
         sink_name="${SINK_NAME}" \
-        sink_properties="device.description='AVR-Cal-Sweep'" \
+        sink_properties="device.description='AVR-Cal-Sweep' session.suspend-timeout-seconds=0 node.pause-on-idle=false" \
         media.class=Audio/Sink \
         channel_map=front-left,front-right \
         >/dev/null || return 1

@@ -390,10 +390,11 @@ class TestRunAll:
             patch.object(checker, "check_audio_stack_clean", return_value=CheckResult("Audio stack", True, "no PipeWire holders")),
             patch.object(checker, "check_dsp_persisted_state", return_value=CheckResult("DSP persisted state", True, "all defaults")),
             patch.object(checker, "check_loopback_reference", return_value=CheckResult("Loopback reference", True, "enabled")),
+            patch.object(checker, "check_loopback_xcorr_stability", return_value=CheckResult("Loopback timing stability", True, "stable")),
         ):
             results = await checker.run_all()
         assert all(r.passed for r in results)
-        assert len(results) == 10
+        assert len(results) == 11
 
     async def test_unhandled_exception_becomes_failed_result(self, config):
         checker = PreflightChecker(config)
@@ -424,12 +425,13 @@ class TestRunAll:
             patch.object(checker, "check_audio_stack_clean", side_effect=RuntimeError("err")),
             patch.object(checker, "check_dsp_persisted_state", side_effect=RuntimeError("err")),
             patch.object(checker, "check_loopback_reference", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_loopback_xcorr_stability", side_effect=RuntimeError("err")),
         ):
             results = await checker.run_all()
         assert [r.name for r in results] == [
             "Config", "Measurement service", "Microphone", "miniDSP 2x4 HD", "Denon AVR",
             "Signal Path", "Output routing", "Audio stack", "DSP persisted state",
-            "Loopback reference",
+            "Loopback reference", "Loopback timing stability",
         ]
 
     async def test_result_names_camilladsp_label(self, config):

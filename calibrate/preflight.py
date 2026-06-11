@@ -81,6 +81,7 @@ class PreflightChecker:
             ("Audio stack", self.check_audio_stack_clean()),
             ("DSP persisted state", self.check_dsp_persisted_state()),
             ("Loopback reference", self.check_loopback_reference()),
+            ("Loopback timing stability", self.check_loopback_xcorr_stability()),
         ]
         names = [name for name, _ in checks]
         coros = [coro for _, coro in checks]
@@ -917,4 +918,79 @@ class PreflightChecker:
                 "or end_sweep_session followed by a fresh calibration run."
             ),
         )
+
+    async def check_loopback_xcorr_stability(self) -> CheckResult:
+        """Check that the loopback timing (xcorr_peak_ms) is stable across recent sessions.
+
+        ``loopback_xcorr_peak_ms`` is the cross-correlation peak between the
+        deconvolution reference and the mic — it encodes CamillaDSP processing
+        latency + acoustic travel time. When this value drifts across sessions
+        (e.g. 3.0 ms vs 4.98 ms) the deconvolution reference has shifted: the
+        measured H(f) = mic / loopback_ref is not phase-comparable across those
+        sessions. For Trinnov FIR design this matters critically — the complex
+        K_i = T_i·conj(H_i)/(|H_i|²+λ²) uses per-session phase, and a 1-2 ms
+        shift at 47 Hz is a ~100° phase error (1/47s × 1e-3s × 360°/period ≈
+        17°/ms, so 2 ms ≈ 34° at 47 Hz — fully invalidating coherent summation).
+
+        Queries the 10 most recent sessions with xcorr data and warns if
+        range > 1.0 ms or stddev > 0.5 ms.
+        """
+        try:
+            from .storage import SessionStore
+            import math as _math
+
+            store = SessionStore()
+            sessions = await asyncio.to_thread(store.list_sessions, 50)
+            peaks = [
+                s.start_fr.loopback_xcorr_peak_ms
+                for s in sessions
+                if s.start_fr and s.start_fr.loopback_xcorr_peak_ms is not None
+            ][:10]
+
+            if not peaks:
+                return CheckResult(
+                    name="Loopback timing stability",
+                    passed=True,
+                    detail="no recent sessions with xcorr data — cannot assess (ok before first measurement)",
+                )
+
+            mean = sum(peaks) / len(peaks)
+            variance = sum((p - mean) ** 2 for p in peaks) / len(peaks)
+            std = _math.sqrt(variance)
+            rng = max(peaks) - min(peaks)
+
+            detail = (
+                f"last {len(peaks)} sessions: xcorr_peak_ms "
+                f"min={min(peaks):.2f} max={max(peaks):.2f} "
+                f"mean={mean:.2f} std={std:.2f} range={rng:.2f} ms"
+            )
+
+            if rng > 1.0 or std > 0.5:
+                return CheckResult(
+                    name="Loopback timing stability",
+                    passed=False,
+                    detail=detail,
+                    error=(
+                        f"Loopback xcorr_peak_ms has drifted {rng:.2f} ms across recent sessions "
+                        f"(std={std:.2f} ms). Sessions with different xcorr_peak_ms cannot be "
+                        "phase-compared — Trinnov FIR design using mixed sessions will produce "
+                        "wrong phase corrections. Common causes: (1) loopback_ref null sink was "
+                        "suspended and restarted (shifts PW quantum), (2) CamillaDSP pipeline "
+                        "restarted between sessions, (3) different FIR tap counts changing "
+                        "pipeline latency. Re-measure all subs in the same session to ensure "
+                        "consistent xcorr_peak_ms before designing Trinnov FIRs."
+                    ),
+                )
+
+            return CheckResult(
+                name="Loopback timing stability",
+                passed=True,
+                detail=detail,
+            )
+        except Exception as exc:
+            return CheckResult(
+                name="Loopback timing stability",
+                passed=True,
+                detail=f"could not inspect session history ({exc}); skipped",
+            )
 
