@@ -65,7 +65,7 @@ class PreflightChecker:
         """Run all hardware checks concurrently. Never raises — errors become failed results.
 
         Equipment checks:
-            [Config]  [Measurement service]  [Audio mode]  [Microphone]  [miniDSP (USB+daemon)]  [Denon AVR + Playback]  [Signal Path]
+            [Config]  [Measurement service]  [Service version]  [Audio mode]  [Microphone]  [miniDSP (USB+daemon)]  [Denon AVR + Playback]  [Signal Path]
         """
         dsp_label = _DSP_DISPLAY_NAMES.get(
             self.config.dsp_driver_name, self.config.dsp_driver_name
@@ -73,6 +73,7 @@ class PreflightChecker:
         checks = [
             ("Config", self.check_config()),
             ("Measurement service", self.check_measurement_service()),
+            ("Service version", self.check_version_skew()),
             ("Audio mode", self.check_audio_mode()),
             ("Microphone", self.check_mic()),
             (dsp_label, self.check_minidsp_combined()),
@@ -857,6 +858,101 @@ class PreflightChecker:
                 "To clear: set_polarity / set_output_gain / set_delay to defaults, "
                 "or end_sweep_session followed by a fresh calibration run."
             ),
+        )
+
+    async def check_version_skew(self) -> CheckResult:
+        """Detect when the host avr-measurement service runs different code than the container.
+
+        The measurement service exposes SHA-256 hashes of its own installed source
+        files in /health (``source_hashes`` dict, keyed by relative file name like
+        ``"measurement.py"``). This check computes the same hashes from the files
+        installed in the container and diffs them.
+
+        Behavior:
+          - All hashes match            → pass, detail notes "code in sync".
+          - Any mismatch                → FAIL listing differing files + deploy hint.
+          - ``source_hashes`` absent    → pass-with-warning (old service deployment,
+            predates this feature — graceful degradation).
+          - Service unreachable         → pass-with-warning (handled by the
+            measurement-service check; don't double-report).
+        """
+        import hashlib as _hashlib
+        from pathlib import Path as _Path
+        from .measurement_client import MeasurementServiceClient, MeasurementServiceError
+
+        client = MeasurementServiceClient()
+        try:
+            health = await client.health()
+        except MeasurementServiceError:
+            return CheckResult(
+                name="Service version",
+                passed=True,
+                detail="service version unknown (measurement service unreachable — see above)",
+            )
+        except Exception as exc:
+            return CheckResult(
+                name="Service version",
+                passed=True,
+                detail=f"service version unknown (health probe error: {exc})",
+            )
+
+        svc_hashes: dict[str, str] | None = health.get("source_hashes")
+        if svc_hashes is None:
+            return CheckResult(
+                name="Service version",
+                passed=True,
+                detail="service version unknown (predates skew check — update deploy/install.sh)",
+            )
+
+        # Compute hashes from this container's own installed files.
+        # __file__ resolves to the container's installed calibrate/ directory.
+        here = _Path(__file__).parent
+
+        def _sha256(path: _Path) -> str | None:
+            try:
+                return _hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                return None
+
+        candidates = {
+            "measurement.py": here / "measurement.py",
+            "drivers/playback.py": here / "drivers" / "playback.py",
+            "measurement_service.py": here / "measurement_service.py",
+        }
+        container_hashes = {
+            name: digest
+            for name, path in candidates.items()
+            if (digest := _sha256(path)) is not None
+        }
+
+        # Compare only files present in both sides.
+        mismatches: list[str] = []
+        for name, svc_digest in svc_hashes.items():
+            container_digest = container_hashes.get(name)
+            if container_digest is None:
+                continue  # file missing in container — skip (shouldn't happen)
+            if container_digest != svc_digest:
+                mismatches.append(name)
+
+        if mismatches:
+            joined = ", ".join(mismatches)
+            return CheckResult(
+                name="Service version",
+                passed=False,
+                detail=f"code skew detected — {len(mismatches)} file(s) differ: {joined}",
+                error=(
+                    "The bare-metal avr-measurement service is running different code "
+                    "than the Docker container. Measurement results may be inconsistent. "
+                    "Fix: run deploy/install.sh on the Pi and restart avr-measurement "
+                    "(sudo systemctl restart avr-measurement)."
+                ),
+            )
+
+        checked = ", ".join(sorted(container_hashes.keys() & svc_hashes.keys()))
+        return CheckResult(
+            name="Service version",
+            passed=True,
+            detail=f"code in sync ({checked})",
         )
 
     async def check_audio_mode(self) -> CheckResult:

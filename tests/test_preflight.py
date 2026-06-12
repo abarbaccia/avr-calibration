@@ -9,6 +9,13 @@ Coverage diagram:
   │   ├── [TESTED] Service healthy → passes with URL in detail
   │   ├── [TESTED] Service unreachable → fails with systemctl hint
   │   └── [TESTED] Unexpected status → fails gracefully
+  ├── check_version_skew()
+  │   ├── [TESTED] All hashes match → passes noting "code in sync"
+  │   ├── [TESTED] One file differs → FAIL listing the file + deploy hint
+  │   ├── [TESTED] Multiple files differ → FAIL listing all
+  │   ├── [TESTED] source_hashes absent (old svc) → pass-with-warning
+  │   ├── [TESTED] service unreachable → pass-with-warning (not double-reported)
+  │   └── [TESTED] health probe error → pass-with-warning
   ├── check_audio_mode()
   │   ├── [TESTED] mode='cal' → passes with detail
   │   ├── [TESTED] mode='listening' → FAIL with audio-mode set hint
@@ -48,7 +55,7 @@ Coverage diagram:
   │   ├── [TESTED] Denon passes, USB route, device missing → fails with playback error
   │   └── [TESTED] Denon fails → propagates failure without running playback check
   └── run_all()
-      ├── [TESTED] All pass → 11 passed results (Config, Measurement service, Audio mode, Microphone, …)
+      ├── [TESTED] All pass → 12 passed results (Config, Measurement service, Service version, Audio mode, …)
       ├── [TESTED] Unhandled exception → captured as failed result
       ├── [TESTED] Results named correctly even when exceptions occur
       └── [TESTED] Partial failure (1 fail, rest pass)
@@ -116,6 +123,148 @@ class TestMeasurementServiceCheck:
             result = await PreflightChecker(config).check_measurement_service()
         assert not result.passed
         assert "systemctl" in result.error
+
+
+# ── Version skew checks ──────────────────────────────────────────────────────
+
+class TestVersionSkewCheck:
+    """check_version_skew compares SHA-256 hashes from /health against container files.
+
+    Coverage:
+      - [TESTED] All hashes match          → passes noting "code in sync"
+      - [TESTED] One file differs          → FAIL listing the file + deploy hint
+      - [TESTED] Multiple files differ     → FAIL listing all
+      - [TESTED] source_hashes absent      → pass-with-warning (old deployment)
+      - [TESTED] service unreachable       → pass-with-warning (not double-reported)
+      - [TESTED] health probe error        → pass-with-warning
+    """
+
+    _FAKE_HASH_A = "a" * 64
+    _FAKE_HASH_B = "b" * 64
+    _FAKE_HASH_C = "c" * 64
+
+    def _health_with_hashes(self, hashes: dict) -> dict:
+        return {"status": "ok", "source_hashes": hashes}
+
+    async def test_all_match_passes(self, config):
+        """Service hashes == container hashes → pass with 'code in sync'."""
+        svc_hashes = {
+            "measurement.py": self._FAKE_HASH_A,
+            "drivers/playback.py": self._FAKE_HASH_B,
+            "measurement_service.py": self._FAKE_HASH_C,
+        }
+        import hashlib
+        from pathlib import Path
+
+        # Patch the container-side file reads to return the same hashes.
+        def fake_read_bytes(self_path):
+            name = self_path.name
+            if name == "measurement.py":
+                return b"measurement"
+            if name == "playback.py":
+                return b"playback"
+            if name == "measurement_service.py":
+                return b"service"
+            raise FileNotFoundError(name)
+
+        container_hashes = {
+            "measurement.py": hashlib.sha256(b"measurement").hexdigest(),
+            "drivers/playback.py": hashlib.sha256(b"playback").hexdigest(),
+            "measurement_service.py": hashlib.sha256(b"service").hexdigest(),
+        }
+        svc_hashes = dict(container_hashes)  # identical
+
+        with patch(_MEAS_CLIENT) as MockClient, \
+             patch("pathlib.Path.read_bytes", fake_read_bytes):
+            MockClient.return_value.health = AsyncMock(
+                return_value=self._health_with_hashes(svc_hashes)
+            )
+            result = await PreflightChecker(config).check_version_skew()
+        assert result.passed
+        assert "in sync" in result.detail
+
+    async def test_one_file_differs_fails(self, config):
+        """One hash mismatch → FAIL listing that file."""
+        import hashlib
+        from pathlib import Path
+
+        def fake_read_bytes(self_path):
+            name = self_path.name
+            if name == "measurement.py":
+                return b"container_measurement"
+            if name == "playback.py":
+                return b"same_playback"
+            if name == "measurement_service.py":
+                return b"same_service"
+            raise FileNotFoundError(name)
+
+        svc_hashes = {
+            "measurement.py": hashlib.sha256(b"host_measurement").hexdigest(),  # different
+            "drivers/playback.py": hashlib.sha256(b"same_playback").hexdigest(),
+            "measurement_service.py": hashlib.sha256(b"same_service").hexdigest(),
+        }
+
+        with patch(_MEAS_CLIENT) as MockClient, \
+             patch("pathlib.Path.read_bytes", fake_read_bytes):
+            MockClient.return_value.health = AsyncMock(
+                return_value=self._health_with_hashes(svc_hashes)
+            )
+            result = await PreflightChecker(config).check_version_skew()
+        assert not result.passed
+        assert "measurement.py" in result.detail
+        assert "install.sh" in result.error
+
+    async def test_multiple_files_differ_lists_all(self, config):
+        """Multiple hash mismatches → FAIL listing all differing files."""
+        import hashlib
+
+        def fake_read_bytes(self_path):
+            return b"container_version"
+
+        svc_hashes = {
+            "measurement.py": hashlib.sha256(b"host_version_1").hexdigest(),
+            "drivers/playback.py": hashlib.sha256(b"host_version_2").hexdigest(),
+            "measurement_service.py": hashlib.sha256(b"container_version").hexdigest(),
+        }
+
+        with patch(_MEAS_CLIENT) as MockClient, \
+             patch("pathlib.Path.read_bytes", fake_read_bytes):
+            MockClient.return_value.health = AsyncMock(
+                return_value=self._health_with_hashes(svc_hashes)
+            )
+            result = await PreflightChecker(config).check_version_skew()
+        assert not result.passed
+        assert "measurement.py" in result.detail
+        assert "drivers/playback.py" in result.detail
+
+    async def test_source_hashes_absent_passes_with_warning(self, config):
+        """Old service without source_hashes → pass (graceful degradation)."""
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.health = AsyncMock(
+                return_value={"status": "ok"}  # no source_hashes
+            )
+            result = await PreflightChecker(config).check_version_skew()
+        assert result.passed
+        assert "predates" in result.detail.lower() or "unknown" in result.detail.lower()
+
+    async def test_service_unreachable_passes_with_warning(self, config):
+        """Service unreachable → pass-with-warning (not double-reported)."""
+        from calibrate.measurement_client import MeasurementServiceError
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.health = AsyncMock(
+                side_effect=MeasurementServiceError("unreachable")
+            )
+            result = await PreflightChecker(config).check_version_skew()
+        assert result.passed
+        assert "unreachable" in result.detail.lower()
+
+    async def test_health_probe_error_passes_with_warning(self, config):
+        """Unexpected exception from health probe → pass-with-warning."""
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.health = AsyncMock(side_effect=RuntimeError("timeout"))
+            result = await PreflightChecker(config).check_version_skew()
+        assert result.passed
+        assert "unknown" in result.detail.lower()
 
 
 # ── Audio mode checks ────────────────────────────────────────────────────────
@@ -455,6 +604,7 @@ class TestRunAll:
         with (
             patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
             patch.object(checker, "check_measurement_service", return_value=CheckResult("Measurement service", True, "healthy")),
+            patch.object(checker, "check_version_skew", return_value=CheckResult("Service version", True, "code in sync")),
             patch.object(checker, "check_audio_mode", return_value=CheckResult("Audio mode", True, "audio-mode=cal")),
             patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1 (device 0, 48000Hz)")),
             patch.object(checker, "check_minidsp_combined", return_value=CheckResult("miniDSP", True, "2x4HD; /dev/hidraw0 present")),
@@ -467,13 +617,14 @@ class TestRunAll:
         ):
             results = await checker.run_all()
         assert all(r.passed for r in results)
-        assert len(results) == 11
+        assert len(results) == 12
 
     async def test_unhandled_exception_becomes_failed_result(self, config):
         checker = PreflightChecker(config)
         with (
             patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
             patch.object(checker, "check_measurement_service", return_value=CheckResult("Measurement service", True, "healthy")),
+            patch.object(checker, "check_version_skew", return_value=CheckResult("Service version", True, "code in sync")),
             patch.object(checker, "check_audio_mode", return_value=CheckResult("Audio mode", True, "audio-mode=cal")),
             patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1")),
             patch.object(checker, "check_minidsp_combined", side_effect=RuntimeError("boom")),
@@ -491,6 +642,7 @@ class TestRunAll:
         with (
             patch.object(checker, "check_config", side_effect=RuntimeError("err")),
             patch.object(checker, "check_measurement_service", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_version_skew", side_effect=RuntimeError("err")),
             patch.object(checker, "check_audio_mode", side_effect=RuntimeError("err")),
             patch.object(checker, "check_mic", side_effect=RuntimeError("err")),
             patch.object(checker, "check_minidsp_combined", side_effect=RuntimeError("err")),
@@ -503,8 +655,9 @@ class TestRunAll:
         ):
             results = await checker.run_all()
         assert [r.name for r in results] == [
-            "Config", "Measurement service", "Audio mode", "Microphone", "miniDSP 2x4 HD",
-            "Denon AVR", "Signal Path", "Output routing", "DSP persisted state",
+            "Config", "Measurement service", "Service version", "Audio mode",
+            "Microphone", "miniDSP 2x4 HD", "Denon AVR",
+            "Signal Path", "Output routing", "DSP persisted state",
             "Loopback reference", "Loopback timing stability",
         ]
 
@@ -515,6 +668,7 @@ class TestRunAll:
         with (
             patch.object(checker, "check_config", side_effect=RuntimeError("err")),
             patch.object(checker, "check_measurement_service", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_version_skew", side_effect=RuntimeError("err")),
             patch.object(checker, "check_audio_mode", side_effect=RuntimeError("err")),
             patch.object(checker, "check_mic", side_effect=RuntimeError("err")),
             patch.object(checker, "check_minidsp_combined", side_effect=RuntimeError("err")),
@@ -522,13 +676,14 @@ class TestRunAll:
             patch.object(checker, "check_signal_path_sync", side_effect=RuntimeError("err")),
         ):
             results = await checker.run_all()
-        assert results[4].name == "CamillaDSP"
+        assert results[5].name == "CamillaDSP"
 
     async def test_partial_failure(self, config):
         checker = PreflightChecker(config)
         with (
             patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
             patch.object(checker, "check_measurement_service", return_value=CheckResult("Measurement service", True, "healthy")),
+            patch.object(checker, "check_version_skew", return_value=CheckResult("Service version", True, "code in sync")),
             patch.object(checker, "check_audio_mode", return_value=CheckResult("Audio mode", True, "audio-mode=cal")),
             patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1")),
             patch.object(checker, "check_minidsp_combined", return_value=CheckResult("miniDSP", False, "", "start minidspd")),
@@ -538,11 +693,12 @@ class TestRunAll:
             results = await checker.run_all()
         assert results[0].passed       # Config
         assert results[1].passed       # Measurement service
-        assert results[2].passed       # Audio mode
-        assert results[3].passed       # Microphone
-        assert not results[4].passed   # miniDSP
-        assert results[5].passed       # Denon AVR
-        assert results[6].passed       # Signal Path
+        assert results[2].passed       # Service version
+        assert results[3].passed       # Audio mode
+        assert results[4].passed       # Microphone
+        assert not results[5].passed   # miniDSP
+        assert results[6].passed       # Denon AVR
+        assert results[7].passed       # Signal Path
 
 
 # ── Playback route checks ─────────────────────────────────────────────────────

@@ -22,10 +22,49 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import logging
+from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger(__name__)
+
+
+# ── Source file hashes (computed at import time) ───────────────────────────────
+# These are used by the preflight skew check to detect when the bare-metal
+# service is running different source code than the Docker container.
+# We hash the installed .py files (not .pyc) for the three files most likely
+# to diverge: measurement.py, drivers/playback.py, and this file itself.
+
+def _sha256_file(path: Path) -> str | None:
+    """Return hex SHA-256 of a file, or None if unreadable."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _compute_source_hashes() -> dict[str, str]:
+    """Compute SHA-256 hashes of the key measurement-path source files.
+
+    Files are resolved relative to this module's own __file__ so the path
+    is correct whether installed via pip (site-packages) or run from source.
+    """
+    here = Path(__file__).parent
+    candidates = {
+        "measurement.py": here / "measurement.py",
+        "drivers/playback.py": here / "drivers" / "playback.py",
+        "measurement_service.py": here / "measurement_service.py",
+    }
+    return {
+        name: digest
+        for name, path in candidates.items()
+        if (digest := _sha256_file(path)) is not None
+    }
+
+
+# Computed once at module import so the FastAPI startup is instant.
+_SOURCE_HASHES: dict[str, str] = _compute_source_hashes()
 
 # scipy 1.13+ removed scipy.signal.hanning (use scipy.signal.windows.hann).
 # pytta.generate still calls it; patch the alias at import time.
@@ -122,6 +161,8 @@ async def health():
     payload: dict = {"status": "ok"}
     if mode is not None:
         payload["audio_mode"] = mode
+    if _SOURCE_HASHES:
+        payload["source_hashes"] = _SOURCE_HASHES
     return payload
 
 
