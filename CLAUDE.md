@@ -137,6 +137,10 @@ ssh pi@192.168.1.117 "sudo docker pull ghcr.io/abarbaccia/avr-calibration:latest
 
 - **AVR:** Denon X3800H — denonavr library, TCP port 1256 for Audyssey
 - **DSP:** CamillaDSP via PipeWire → Focusrite Scarlett 18i20
+  - **Sample rate: 48 kHz everywhere.** PW graph clock = 48000/256 (pinned by
+    10-scarlett-clock.conf + wireplumber-scarlett.lua); CamillaDSP processes at
+    48000, chunksize 256 (verified via GetConfigJson 2026-06-12). FIR designs
+    read the rate from the active driver — never hardcode 96 kHz.
   - Sub outputs: Scarlett lines 5/6/7 (direct-PCM, not via monitor bus)
   - Sub cal signal path: `pw-cat → avr_cal_sweep PW null sink → camilladsp_capture:input_3 (LFE feed → CamillaDSP → Scarlett → subs)`. **⚠️ The `input_3` link is LOAD-BEARING — it is the feed that drives the subs. Do NOT remove it; tearing it down silences the subs (coherence ~0.5, mic SNR ~0; verified 2026-06-10). `input_2` alone does NOT drive the subs.** The deconvolution reference is a SEPARATE tap: `avr_cal_sweep:monitor_FL → loopback_ref` (its own PW null-sink node), NOT a camilladsp_capture port.
 - **Mic:** UMIK-1 or UMIK-2 (UMIK .cal correction applied)

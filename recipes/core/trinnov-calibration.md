@@ -217,8 +217,10 @@ design_fir_trinnov(
 ```
 
 **Inspect the response:**
-- `fir_sample_rate_hz` — must match CamillaDSP's processing rate (96000). If
-  it shows 48000, the DSP was unreachable when the tool ran. Stop and fix.
+- `fir_sample_rate_hz` — must match CamillaDSP's live processing rate (48000
+  on this rig — verified via GetConfigJson 2026-06-12; the graph and DSP both
+  run 48 kHz). The tool reads the rate from the active driver; a mismatch
+  means the DSP was unreachable when the tool ran. Stop and fix.
 - `per_sub_peak_boost_db` — if any sub exceeds +8 dB, the regularization is
   too small for that sub's signal level. Increase `regularization_lambda` to
   0.05 and redesign.
@@ -229,11 +231,11 @@ design_fir_trinnov(
   +20 ms distance. Conversion: 1 ms = 0.343 m = 1.125 ft.
 
 **Tap count rationale:**
-- 24576 taps @ 96 kHz = 256 ms impulse window
+- 24576 taps @ 48 kHz = 512 ms impulse window
 - T60s in this room are typically 400–800 ms at 47–70 Hz
-- 256 ms covers ~30–60% of the T60. Not ideal (2× T60 = ~800–1600 ms would
-  need 77000–154000 taps at 96 kHz, far beyond hardware limits). Accept the
-  partial coverage — it still reduces both magnitude and early-decay.
+- 512 ms covers ~65–100% of the T60. (2× T60 coverage would need up to
+  ~77000 taps at 48 kHz — beyond practical limits.) The partial coverage
+  still reduces both magnitude and early decay.
 
 ## Phase 5 — Apply FIRs
 
