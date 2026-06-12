@@ -112,17 +112,33 @@ write_status() {
 EOF
 }
 
+# audio-mode state file. /var/lib survives reboots — the watchdog previously
+# read /run/audio-mode, which audio-mode stopped writing when its state moved
+# to /var/lib (the stale path silently disabled karaoke-awareness).
+AUDIO_MODE_FILE="${AUDIO_MODE_FILE:-/var/lib/audio-mode}"
+
+read_audio_mode() {
+    [ -r "$AUDIO_MODE_FILE" ] && cat "$AUDIO_MODE_FILE" 2>/dev/null || echo "unknown"
+}
+
 log "starting (poll=${POLL_INTERVAL_S}s, stall-restart=${STALL_RESTART_THRESHOLD})"
 
 while true; do
     # audio-mode awareness: during karaoke, CamillaDSP is intentionally stopped.
     # Skip the probe + self-heal path so the watchdog does not fight the mode switch.
-    if [ -r /run/audio-mode ] && [ "$(cat /run/audio-mode 2>/dev/null)" = "karaoke" ]; then
+    if [ "$(read_audio_mode)" = "karaoke" ]; then
         camilla="karaoke"
         stall_count=0
     elif probe_camilladsp; then
         camilla="running"
         stall_count=0
+        # PW-graph self-heal: camilladsp_capture links die whenever the capture
+        # node's ports are recreated (CamillaDSP or WirePlumber restart), and
+        # WirePlumber never relinks them (node.autoconnect=false by design).
+        # audio-mode wire is idempotent and fast when links already exist.
+        # WIRE_RETRIES=1: in this healthy path the ports must already exist.
+        WIRE_RETRIES=1 /usr/local/sbin/audio-mode wire >/dev/null 2>&1 \
+            || log "audio-mode wire failed (will retry next poll)"
     else
         camilla="stalled"
         stall_count=$((stall_count + 1))
@@ -142,8 +158,7 @@ while true; do
         avr="down"
     fi
 
-    audio_mode="unknown"
-    [ -r /run/audio-mode ] && audio_mode="$(cat /run/audio-mode 2>/dev/null)"
+    audio_mode="$(read_audio_mode)"
 
     if [ "$camilla" = "stalled" ]; then
         led_state="camilla_stalled"

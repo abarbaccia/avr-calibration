@@ -271,14 +271,20 @@ if [ -d "$SCRIPT_DIR/pi-config/pipewire.conf.d" ]; then
     done
 fi
 
-# avr-cal-sweep PipeWire null sink + persistent link to camilladsp_capture.
-# Lets the container play the USB-route sweep into the PipeWire graph and
-# from there into CamillaDSP. Installed as a user systemd unit.
-if [ -f "$SCRIPT_DIR/avr-cal-sweep-link.sh" ]; then
-    sudo install -m 0755 "$SCRIPT_DIR/avr-cal-sweep-link.sh" \
-        /usr/local/sbin/avr-cal-sweep-link.sh
-    echo "Installed: /usr/local/sbin/avr-cal-sweep-link.sh"
+# camilladsp.service — system unit running CamillaDSP against the host
+# PipeWire session. ExecStartPost re-wires camilladsp_capture via
+# `audio-mode wire` on every (re)start.
+if [ -f "$SCRIPT_DIR/camilladsp.service" ]; then
+    sudo install -m 0644 "$SCRIPT_DIR/camilladsp.service" \
+        /etc/systemd/system/camilladsp.service
+    sudo systemctl daemon-reload
+    echo "Installed: /etc/systemd/system/camilladsp.service"
 fi
+
+# Boot-time camilladsp_capture wiring (user unit → audio-mode wire).
+# The old avr-cal-sweep-link.sh is retired; audio-mode wire is the single
+# wiring owner (mode-aware, idempotent, UMIK feedback-loop guard).
+sudo rm -f /usr/local/sbin/avr-cal-sweep-link.sh
 if [ -f "$SCRIPT_DIR/avr-cal-sweep-link.service" ] && [ -d /home/pi ]; then
     sudo install -d -o pi -g pi /home/pi/.config/systemd/user
     sudo install -m 0644 -o pi -g pi "$SCRIPT_DIR/avr-cal-sweep-link.service" \
