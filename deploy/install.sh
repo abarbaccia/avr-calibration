@@ -25,7 +25,6 @@ sudo apt-get install -y -qq \
     udev \
     ca-certificates \
     gnupg \
-    inotify-tools \
     libportaudio2 \
     pipewire \
     pipewire-alsa \
@@ -169,42 +168,25 @@ sudo systemctl enable "$SERVICE_NAME"
 sudo systemctl start "$SERVICE_NAME"
 echo "Service enabled and started"
 
-# ── 6. Auto-update timer ──────────────────────────────────────────────────
+# ── 6. Retire the auto-updater ────────────────────────────────────────────
 #
-# Registers avr-calibration-update.service (one-shot updater) and
-# avr-calibration-update.timer (fires daily at 3am) on the host.
-# The update service also watches for a trigger file written by the
-# in-container POST /api/upgrade endpoint.
+# The dashboard-triggered auto-updater (avr-calibration-update.service/.timer
+# + POST /api/upgrade) was removed 2026-06-12: a stale trigger file plus a
+# crash-before-cleanup bug put the container in a restart-every-minute loop.
+# Deploys go through CI + `docker pull` / hotfix.sh only.
 
 echo ""
-echo "--- Installing auto-update service and timer ---"
-
-UPDATE_SERVICE="/etc/systemd/system/avr-calibration-update.service"
-UPDATE_TIMER="/etc/systemd/system/avr-calibration-update.timer"
+echo "--- Retiring auto-update service and timer (if present) ---"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
-if [ -f "$SCRIPT_DIR/avr-calibration-update.service" ]; then
-    sudo cp "$SCRIPT_DIR/avr-calibration-update.service" "$UPDATE_SERVICE"
-    echo "Installed: $UPDATE_SERVICE"
-else
-    echo "WARNING: avr-calibration-update.service not found in $SCRIPT_DIR — skipping"
-fi
-
-if [ -f "$SCRIPT_DIR/avr-calibration-update.timer" ]; then
-    sudo cp "$SCRIPT_DIR/avr-calibration-update.timer" "$UPDATE_TIMER"
-    echo "Installed: $UPDATE_TIMER"
-else
-    echo "WARNING: avr-calibration-update.timer not found in $SCRIPT_DIR — skipping"
-fi
-
+sudo systemctl disable --now avr-calibration-update.timer 2>/dev/null || true
+sudo systemctl disable --now avr-calibration-update.service 2>/dev/null || true
+sudo rm -f /etc/systemd/system/avr-calibration-update.service \
+           /etc/systemd/system/avr-calibration-update.timer
+sudo rm -f "$DATA_DIR/upgrade-trigger" "$DATA_DIR/.upgrade-lock"
 sudo systemctl daemon-reload
-if [ -f "$UPDATE_TIMER" ]; then
-    sudo systemctl enable avr-calibration-update.timer
-    sudo systemctl start avr-calibration-update.timer
-    echo "Auto-update timer enabled and started"
-    echo "  Next run: $(systemctl show avr-calibration-update.timer --property=NextElapseUSecRealtime --value 2>/dev/null || echo 'unknown')"
-fi
+echo "Retired: avr-calibration-update.service / .timer"
 
 # ── 7. Audio stack (audio-mode + watchdog + pikaraoke bridge) ─────────────
 #

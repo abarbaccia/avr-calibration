@@ -4,7 +4,6 @@ Covers all endpoints:
   GET  /                     — HTML dashboard
   GET  /health               — health check
   GET  /api/version          — version info (mocked GHCR)
-  POST /api/upgrade          — trigger upgrade file
   POST /api/sessions/average — average multiple sessions
   GET  /api/sessions         — list sessions with harman_delta_db + run_context
   GET  /api/sessions/{id}    — session detail
@@ -200,39 +199,6 @@ class TestVersion:
         }):
             resp = client.get("/api/version")
         assert resp.json()["up_to_date"] is False
-
-
-# ── POST /api/upgrade ───────────────────────────────────────────────────────
-
-
-class TestUpgrade:
-    def test_upgrade_creates_trigger_file(self, tmp_path: Path, client: TestClient) -> None:
-        with patch("calibrate.web._DATA_DIR", tmp_path):
-            resp = client.post("/api/upgrade")
-        assert resp.status_code == 202
-        assert resp.json() == {"status": "upgrade_triggered"}
-        assert (tmp_path / "upgrade-trigger").exists()
-
-    def test_upgrade_conflict_if_trigger_exists(self, tmp_path: Path, client: TestClient) -> None:
-        trigger = tmp_path / "upgrade-trigger"
-        trigger.touch()
-        with patch("calibrate.web._DATA_DIR", tmp_path):
-            resp = client.post("/api/upgrade")
-        assert resp.status_code == 409
-
-    def test_upgrade_permission_error(self, tmp_path: Path, client: TestClient) -> None:
-        with patch("calibrate.web._DATA_DIR", tmp_path):
-            with patch.object(Path, "touch", side_effect=PermissionError("read-only")):
-                resp = client.post("/api/upgrade")
-        assert resp.status_code == 503
-        assert "not writable" in resp.json()["detail"]
-
-    def test_upgrade_disk_full(self, tmp_path: Path, client: TestClient) -> None:
-        with patch("calibrate.web._DATA_DIR", tmp_path):
-            with patch.object(Path, "touch", side_effect=OSError(28, "No space left")):
-                resp = client.post("/api/upgrade")
-        assert resp.status_code == 503
-        assert "disk full" in resp.json()["detail"]
 
 
 # ── POST /api/sessions/average ──────────────────────────────────────────────

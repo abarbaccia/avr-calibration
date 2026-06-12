@@ -343,7 +343,7 @@ _HTML = """<!DOCTYPE html>
   <!-- Header -->
   <div class="header">
     <h1><a href="/" style="color:inherit;text-decoration:none">AVR Calibration</a></h1>
-    <span id="versionChip" title="Running version" onclick="toggleVersionPopover()">...</span>
+    <span id="versionChip" title="Running version">...</span>
   </div>
 
   <!-- Hardware Status Bar -->
@@ -1355,7 +1355,7 @@ async function loadVersion() {
     if (d.up_to_date) {
       _setChip('v'+semver, 'up-to-date', 'Up to date');
     } else if (d.latest_sha) {
-      _setChip('v'+semver+' \u25b2', 'update-available', 'Update available \u2014 click to upgrade');
+      _setChip('v'+semver+' \u25b2', 'update-available', 'Update available \u2014 docker pull + restart via SSH');
     } else if (d.checking) {
       _setChip('v'+semver, null, 'Checking...');
       setTimeout(loadVersion, 8000);
@@ -1364,24 +1364,6 @@ async function loadVersion() {
     }
   } catch (e) {
     _setChip('\u2014', null, 'Version unavailable');
-  }
-}
-
-function toggleVersionPopover() {
-  const chip = document.getElementById('versionChip');
-  if (chip.classList.contains('update-available')) {
-    if (confirm('Restart to install update?')) {
-      chip.textContent = 'Upgrading...';
-      fetch('/api/upgrade', {method: 'POST'}).then(r => {
-        if (r.ok) {
-          toast('Upgrade triggered \u2014 reloading in 30s...');
-          setTimeout(() => window.location.reload(), 30000);
-        } else {
-          toast('Upgrade failed');
-          loadVersion();
-        }
-      }).catch(() => { toast('Upgrade request failed'); loadVersion(); });
-    }
   }
 }
 
@@ -1584,35 +1566,6 @@ async def api_version() -> dict:
         "semantic_version": _read_semantic_version(),
         "checking": checking,
     }
-
-
-@app.post("/api/upgrade", status_code=202)
-async def api_upgrade() -> dict:
-    """Trigger a host-side upgrade by writing a trigger file to the data volume.
-
-    The host avr-calibration-update.service watches for this file via inotifywait
-    and performs docker pull + health-check gated restart.
-    Returns 202 immediately. Returns 409 if an upgrade is already in progress.
-    """
-    trigger = _DATA_DIR / "upgrade-trigger"
-
-    if trigger.exists():
-        raise HTTPException(status_code=409, detail="Upgrade already in progress")
-
-    try:
-        _DATA_DIR.mkdir(parents=True, exist_ok=True)
-        trigger.touch()
-    except PermissionError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Upgrade unavailable: data volume not writable ({exc})",
-        )
-    except OSError as exc:
-        if exc.errno == 28:  # ENOSPC
-            raise HTTPException(status_code=503, detail="Upgrade unavailable: disk full")
-        raise HTTPException(status_code=503, detail=f"Upgrade unavailable: {exc}")
-
-    return {"status": "upgrade_triggered"}
 
 
 @app.post("/api/sessions/average")
