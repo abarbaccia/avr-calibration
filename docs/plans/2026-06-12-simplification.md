@@ -63,24 +63,17 @@ It is imported by nothing except its own test file (verified 2026-06-12:
   `optimize_sub_alignment` / `sweep_inter_sub_delay` MCP tools are unrelated
   (they live in mcp_server.py) — do not touch them.
 
-### 1.3 Remove dead storage features: `update_events` and `saved_states`
+### 1.3 Remove dead storage feature: `update_events`
 
-Verified 2026-06-12: `log_update_event`, `list_update_events`, `save_state` (the
-saved_states one at storage.py ~line 798, NOT `save_calibration_*`), and the
-saved_states list/get/delete methods have zero callers in calibrate/, deploy/,
-scripts/, or cli.py.
+CORRECTED 2026-06-12 during execution: `saved_states` is NOT dead — web.py uses
+`list_states`/`save_state`/`get_state`/`delete_state` (~lines 2093–2128, the
+dashboard snapshot feature). Only `update_events` has zero callers.
 
-- In `calibrate/storage.py`: remove the `update_events` (~line 159) and
-  `saved_states` (~line 202) CREATE TABLE statements and all methods that
-  reference those two tables (`log_update_event` ~530, `list_update_events` ~550,
-  `save_state` ~798, and the saved_states SELECT/DELETE methods ~830–865).
-- Do NOT drop tables from existing databases — removing the CREATE/usage is enough;
-  old DBs keep orphan tables harmlessly.
-- Re-verify zero callers before deleting each method:
-  `grep -rn "<method_name>" calibrate/ deploy/ scripts/ tests/`.
-  Delete any tests that only test the removed methods.
-- Leave `feedback`, `equipment`, `sessions`, `calibration_runs`,
-  `calibration_iterations`, `active_dsp_state*`, `lessons*` untouched.
+- In `calibrate/storage.py`: remove the `update_events` CREATE TABLE and the
+  `log_update_event` / `list_update_events` methods.
+- Do NOT drop tables from existing databases — removing the CREATE/usage is enough.
+- Delete tests that only test the removed methods.
+- Leave everything else untouched, including `saved_states`.
 
 ### 1.4 Merge the mains recipes
 
