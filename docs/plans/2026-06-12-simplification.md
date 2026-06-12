@@ -285,6 +285,75 @@ line-count delta vs `main` at the start of the plan.
 
 ---
 
+## Phase 4 — Formalize karaoke on PipeWire, retire the ALSA exclusion model
+
+### Background (verified 2026-06-12)
+
+Karaoke audio ALREADY flows through PipeWire: `pipewire-pulse` runs on the Pi and
+Chromium appears in the live PW graph (`Chromium:output_FL → Scarlett playback_AUX0`)
+— Chromium speaks the PulseAudio API, not ALSA. Consequences:
+
+- `deploy/asound.conf` (`karaoke_out`, `vc4hdmi_8ch` plugs) and
+  `deploy/home-pi.asoundrc` are bypassed; nothing in calibrate/, deploy/, or
+  scripts/ references those plug names.
+- The EBUSY mutual-exclusion described in those files' comments ("CamillaDSP holds
+  hw:USB,0,0 → Chromium open() fails → silent in listening mode") **no longer
+  functions**: PipeWire owns the ALSA device and mixes PW clients. Chromium audio
+  can leak into Scarlett Line 1/2 → Denon analog → mains during listening mode.
+- `audio-mode`'s `kill_kiosk` waits on `fuser /dev/snd/pcmC3D0p` — stale under PW.
+
+The Scarlett's internal hardware mixer matrix (Mix A/B summing mics + PCM 1/2,
+programmed via `amixer` in `fix-scarlett-routing.sh`) is hardware control, NOT
+ALSA PCM routing — it stays regardless.
+
+### 4.1 Verify the live karaoke path (read-only, on the Pi)
+
+- `audio-mode set karaoke`, play something in pikaraoke, then:
+  `pw-link -l | grep -i chrom` — record which Scarlett ports Chromium links to.
+- Confirm sound comes out of the mains (Mix A/B → Line 1/2 → Denon).
+- `audio-mode set listening` and confirm what happens to a playing kiosk stream
+  (does PW keep mixing it into the Scarlett? expected: yes — this is the hole).
+- **STOP CONDITION**: if karaoke audio does NOT flow via PW (no Chromium PW node
+  while playing), the background assumption is wrong — report findings, change
+  nothing.
+
+### 4.2 Replace implicit EBUSY exclusion with explicit PW policy
+
+Pick the simplest mechanism that restores the guarantee "kiosk is silent outside
+karaoke mode":
+
+- Preferred: a WirePlumber rule pinning Chromium/pikaraoke streams
+  (`application.name` or `node.name` match) to a dedicated `karaoke_sink` null sink
+  (created via a `context.objects` conf like 10-avr-cal-sweep.conf). `audio-mode
+  set karaoke` links `karaoke_sink:monitor_FL/FR → Scarlett playback_AUX0/AUX1`;
+  `set listening|cal` removes those links. Kiosk audio then dead-ends into the
+  null sink outside karaoke. This matches the existing avr_cal_sweep pattern —
+  same conf style, same link-script style.
+- In `audio-mode`: replace the `fuser /dev/snd/pcmC3D0p` wait with the link
+  add/remove; keep stopping/starting `camilladsp.service` and the pikaraoke
+  container exactly as today (that part works and also handles CPU/feature
+  concerns, not just device ownership).
+- Update the header comments in `audio-mode` to describe the PW model.
+
+### 4.3 Delete the dead ALSA configs
+
+Only after 4.1 confirms and 4.2 ships and a real karaoke session works:
+
+- Delete `deploy/asound.conf` and `deploy/home-pi.asoundrc`; remove their install
+  blocks in `deploy/install.sh` (~lines 242–252) and add a retirement block that
+  removes `/etc/asound.conf` and `/home/pi/.asoundrc` on upgraded Pis.
+  CAUTION: before removing `/etc/asound.conf` from the Pi, confirm nothing else on
+  the host uses the `vc4hdmi_8ch` plug: `grep -rn "vc4hdmi_8ch" /home/pi /etc 2>/dev/null`
+  and check HDMI sweep playback still works after removal (`measure` with
+  route=hdmi, or at minimum `speaker-test -D default:CARD=vc4hdmi0 -c2 -l1`).
+- Update Hard rule 1 of this plan: asound.conf/home-pi.asoundrc protection no
+  longer applies once this phase lands.
+- Acceptance: karaoke session works end-to-end; kiosk is inaudible in listening
+  mode while a video plays in the kiosk; calibration `measure` still passes
+  preflight + produces coherence ≥ 0.85.
+
+---
+
 ## Out of scope (do not touch)
 
 - `safety.py` limits and validator logic.
