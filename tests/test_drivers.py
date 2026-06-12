@@ -1525,20 +1525,16 @@ def _make_config_with_gain(gain_db):
     return cfg
 
 
-def _make_camilla_stub(gains_set, initial_volume=-20.0):
+def _make_camilla_stub(initial_volume=-20.0):
     """Return a side_effect callable that stubs the CamillaDSP WS protocol."""
     def _call(cmd, *args):
         if cmd == "GetState":
             return "Running"
-        if cmd == "GetVolume":
-            return initial_volume
         if cmd == "GetMute":
             return False
         if cmd == "GetProcessingLoad":
             return 0.0
-        if cmd == "SetVolume":
-            gains_set.append(args[0])
-            return None
+        # SetConfig is the real mechanism; just swallow it.
         return None
     return _call
 
@@ -1546,11 +1542,20 @@ def _make_camilla_stub(gains_set, initial_volume=-20.0):
 @pytest.mark.asyncio
 async def test_usb_sweep_context_sets_and_restores_master_gain() -> None:
     driver = CamillaDSPDriver()
-    gains_set = []
+    driver._master_gain_db = -20.0  # simulate the current operating gain
 
     driver._client._ws = object()  # mark as connected
-    driver._client.call = AsyncMock(side_effect=_make_camilla_stub(gains_set))
+    driver._client.call = AsyncMock(side_effect=_make_camilla_stub())
     cfg = _make_config_with_gain(-50.0)
+
+    gains_set: list[float] = []
+    _real_set_gain = driver.set_master_gain
+
+    async def _spy(gain_db: float) -> None:
+        gains_set.append(float(gain_db))
+        await _real_set_gain(gain_db)
+
+    driver.set_master_gain = _spy  # type: ignore[method-assign]
 
     ctx = _USBSweepContext(driver, cfg)
     async with ctx:
@@ -1564,11 +1569,20 @@ async def test_usb_sweep_context_sets_and_restores_master_gain() -> None:
 @pytest.mark.asyncio
 async def test_usb_sweep_context_restores_on_exception() -> None:
     driver = CamillaDSPDriver()
-    gains_set = []
+    driver._master_gain_db = -20.0  # simulate the current operating gain
 
     driver._client._ws = object()
-    driver._client.call = AsyncMock(side_effect=_make_camilla_stub(gains_set))
+    driver._client.call = AsyncMock(side_effect=_make_camilla_stub())
     cfg = _make_config_with_gain(-50.0)
+
+    gains_set: list[float] = []
+    _real_set_gain = driver.set_master_gain
+
+    async def _spy(gain_db: float) -> None:
+        gains_set.append(float(gain_db))
+        await _real_set_gain(gain_db)
+
+    driver.set_master_gain = _spy  # type: ignore[method-assign]
 
     ctx = _USBSweepContext(driver, cfg)
     try:
@@ -1740,9 +1754,13 @@ async def test_camilladsp_apply_eq_updates_shadow_and_pushes_pipeline() -> None:
     assert peq1["parameters"]["q"] == 3.0
 
     # Pipeline references the filter names on the right output channels.
+    # NOTE: there are two channel-0 Filter steps: the pre-router master-gain
+    # step and the per-output step.  Match on the one that owns cal_out0_* names.
     out0_step = next(
         s for s in cfg["pipeline"]
-        if s.get("type") == "Filter" and s.get("channels") == [0]
+        if s.get("type") == "Filter"
+        and s.get("channels") == [0]
+        and any(n.startswith("cal_out0_") for n in s.get("names", []))
     )
     assert "cal_out0_peq_0" in out0_step["names"]
     assert "cal_out0_peq_2" in out0_step["names"]
@@ -1960,14 +1978,16 @@ def test_camilladsp_default_routing_is_subs_only_not_broadcast() -> None:
 
 
 @pytest.mark.asyncio
-async def test_camilladsp_set_master_gain_does_not_push_pipeline() -> None:
-    """SetVolume bypasses the pipeline — no SetConfig call should be issued."""
+async def test_camilladsp_set_master_gain_pushes_config() -> None:
+    """set_master_gain updates shadow state and pushes SetConfig (SetVolume is a no-op in v4)."""
     driver = CamillaDSPDriver()
     call = _stub_client(driver)
     await driver.set_master_gain(-7.5)
-    cmds = [c.args[0] for c in call.await_args_list]
-    assert "SetVolume" in cmds
-    assert "SetConfig" not in cmds
+    assert driver._master_gain_db == -7.5
+    cfg = _last_pushed_config(call)
+    master = cfg["filters"]["cal_master_gain"]
+    assert master["type"] == "Gain"
+    assert master["parameters"]["gain"] == pytest.approx(-7.5)
 
 
 @pytest.mark.asyncio
@@ -1986,10 +2006,13 @@ async def test_camilladsp_apply_fir_writes_conv_filter_with_inline_values() -> N
     assert fir["parameters"]["type"] == "Values"
     assert fir["parameters"]["values"] == coeffs
 
-    # FIR name should appear in the per-output Filter step.
+    # FIR name should appear in the per-output Filter step (not the pre-router
+    # master-gain step, which also has channels=[0]).
     out0_step = next(
         s for s in cfg["pipeline"]
-        if s.get("type") == "Filter" and s.get("channels") == [0]
+        if s.get("type") == "Filter"
+        and s.get("channels") == [0]
+        and any(n.startswith("cal_out0_") for n in s.get("names", []))
     )
     assert "cal_out0_fir" in out0_step["names"]
 

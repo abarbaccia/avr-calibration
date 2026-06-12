@@ -1801,14 +1801,18 @@ async def test_check_system_all_pass() -> None:
         CheckResult(name="Denon AVR", passed=True, detail="online"),
         CheckResult(name="Signal Path", passed=True, detail="matches"),
     ]
-    with patch("calibrate.preflight.PreflightChecker") as MockChecker:
+    mock_dsp = AsyncMock()
+    mock_dsp.set_master_gain = AsyncMock()
+    mock_dsp.get_state = AsyncMock(return_value={"volume": -33.0})
+    with patch("calibrate.preflight.PreflightChecker") as MockChecker, \
+         patch("calibrate.mcp_server._dsp", mock_dsp):
         instance = AsyncMock()
         instance.run_all.return_value = mock_results
         MockChecker.return_value = instance
         result = await _tool_check_system()
     assert result["ok"]
     assert result["all_passed"] is True
-    assert len(result["checks"]) == 4
+    assert len(result["checks"]) == 5  # 4 preflight + dsp_gain_control
 
 
 @pytest.mark.asyncio
@@ -1818,7 +1822,11 @@ async def test_check_system_some_fail() -> None:
         CheckResult(name="Config", passed=True, detail="ok"),
         CheckResult(name="miniDSP", passed=False, detail="not found", error="USB disconnected"),
     ]
-    with patch("calibrate.preflight.PreflightChecker") as MockChecker:
+    mock_dsp = AsyncMock()
+    mock_dsp.set_master_gain = AsyncMock()
+    mock_dsp.get_state = AsyncMock(return_value={"volume": -33.0})
+    with patch("calibrate.preflight.PreflightChecker") as MockChecker, \
+         patch("calibrate.mcp_server._dsp", mock_dsp):
         instance = AsyncMock()
         instance.run_all.return_value = mock_results
         MockChecker.return_value = instance
@@ -1845,7 +1853,11 @@ async def test_call_tool_check_system_dispatch() -> None:
     mock_results = [
         CheckResult(name="Config", passed=True, detail="ok"),
     ]
-    with patch("calibrate.preflight.PreflightChecker") as MockChecker:
+    mock_dsp = AsyncMock()
+    mock_dsp.set_master_gain = AsyncMock()
+    mock_dsp.get_state = AsyncMock(return_value={"volume": -33.0})
+    with patch("calibrate.preflight.PreflightChecker") as MockChecker, \
+         patch("calibrate.mcp_server._dsp", mock_dsp):
         instance = AsyncMock()
         instance.run_all.return_value = mock_results
         MockChecker.return_value = instance
