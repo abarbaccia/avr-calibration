@@ -263,6 +263,55 @@ async def _safe_driver_state(driver: Any) -> dict:
         return {"connected": False, "error": str(exc)}
 
 
+class _ToolError(Exception):
+    """Raised by shared helper utilities to short-circuit a handler with an error result."""
+
+    def __init__(self, message: str) -> None:
+        self.result = _err(message)
+        super().__init__(message)
+
+
+def _load_session_fr(store, session_id: int, require_phase: bool = False):
+    """Load a session and its FR from the store.
+
+    Raises _ToolError with the canonical error strings so call sites can:
+        try:
+            session, fr = _load_session_fr(store, session_id)
+        except _ToolError as exc:
+            return exc.result
+    """
+    session = store.get_session(session_id)
+    if session is None:
+        raise _ToolError(f"session {session_id} not found")
+    fr = session.start_fr
+    if not fr or not fr.frequencies:
+        raise _ToolError(f"session {session_id} has no frequency response data")
+    if require_phase and not fr.phase:
+        raise _ToolError(
+            f"session {session_id} has no phase data — re-measure with phase"
+        )
+    return session, fr
+
+
+def _resolve_fir_rate() -> int:
+    """Return the active DSP's FIR processing rate (Hz), defaulting to 48000."""
+    if _dsp is None:
+        return 48000
+    return int(getattr(_dsp.capabilities, "fir_sample_rate_hz", None) or 48000)
+
+
+def _cache_fir_design(
+    session_id: int, output_index: int, taps: list[float], intent: str
+) -> int:
+    """Store FIR coefficients in the bounded design cache and return the cache_id."""
+    cache_id = int(session_id) * 1000 + int(output_index)
+    _fir_design_cache[cache_id] = taps
+    _fir_design_intent[cache_id] = intent
+    return cache_id
+
+
+
+
 def _persist_dsp_state(key: str, data: dict) -> None:
     """Save a DSP state entry to SQLite (fire-and-forget, never fails the caller)."""
     try:
@@ -799,13 +848,10 @@ async def _tool_compute_deviation(
         # materialises EVERY row, which OOM-kills the worker on the 4 GiB Pi
         # once a handful of full-band sessions accumulate. Same fix pattern as
         # PR #153 (analyze_per_sub_modal_contribution).
-        session = store.get_session(session_id)
-        if session is None:
-            return _err(f"session {session_id} not found")
-
-        fr = session.start_fr
-        if not fr or not fr.frequencies:
-            return _err(f"session {session_id} has no frequency response data")
+        try:
+            session, fr = _load_session_fr(store, session_id)
+        except _ToolError as exc:
+            return exc.result
 
         # Parse target curve points
         points = target_curve.get("points", [])
@@ -1175,13 +1221,10 @@ async def _tool_anchor_target(
 
     try:
         store = SessionStore()
-        session = store.get_session(session_id)
-        if session is None:
-            return _err(f"session {session_id} not found")
-
-        fr = session.start_fr
-        if not fr or not fr.frequencies:
-            return _err(f"session {session_id} has no frequency response data")
+        try:
+            session, fr = _load_session_fr(store, session_id)
+        except _ToolError as exc:
+            return exc.result
 
         if not target_offsets:
             return _err("target_offsets must be a non-empty list of {freq_hz, offset_db}")
@@ -1560,13 +1603,10 @@ async def _tool_simulate_eq(
 
     try:
         store = SessionStore()
-        session = store.get_session(session_id)
-        if session is None:
-            return _err(f"session {session_id} not found")
-
-        fr = session.start_fr
-        if not fr or not fr.frequencies:
-            return _err(f"session {session_id} has no frequency response data")
+        try:
+            session, fr = _load_session_fr(store, session_id)
+        except _ToolError as exc:
+            return exc.result
 
         def hpf_response(fc: float, order: int, freq: float) -> float:
             if fc <= 0 or freq <= 0:
@@ -1691,13 +1731,10 @@ async def _tool_per_filter_contribution(
 
     try:
         store = SessionStore()
-        session = store.get_session(session_id)
-        if session is None:
-            return _err(f"session {session_id} not found")
-
-        fr = session.start_fr
-        if not fr or not fr.frequencies:
-            return _err(f"session {session_id} has no frequency response data")
+        try:
+            session, fr = _load_session_fr(store, session_id)
+        except _ToolError as exc:
+            return exc.result
 
         if query_freqs is None:
             query_freqs = _generate_band_centres("sixth_octave", 20.0, 120.0)
@@ -2590,13 +2627,10 @@ async def _tool_optimize_q(
 
     try:
         store = SessionStore()
-        session = store.get_session(session_id)
-        if session is None:
-            return _err(f"session {session_id} not found")
-
-        fr = session.start_fr
-        if not fr or not fr.frequencies:
-            return _err(f"session {session_id} has no frequency response data")
+        try:
+            session, fr = _load_session_fr(store, session_id)
+        except _ToolError as exc:
+            return exc.result
 
         # Default search band: +/- 1 octave around the target frequency
         if band_hz:
@@ -3680,13 +3714,10 @@ async def _tool_design_fir(
 
     try:
         store = SessionStore()
-        session = store.get_session(session_id)
-        if session is None:
-            return _err(f"session {session_id} not found")
-
-        fr = session.start_fr
-        if not fr or not fr.frequencies:
-            return _err(f"session {session_id} has no frequency response data")
+        try:
+            session, fr = _load_session_fr(store, session_id)
+        except _ToolError as exc:
+            return exc.result
 
         import numpy as np
 
@@ -4240,7 +4271,7 @@ async def _tool_design_fir_multi(
         sample_rate = 48000
         if _dsp is not None:
             caps = _dsp.capabilities
-            sample_rate = caps.fir_sample_rate_hz or 48000
+            sample_rate = _resolve_fir_rate()
             if num_taps > caps.fir_max_taps_per_output:
                 return _err(
                     f"num_taps={num_taps} exceeds {caps.fir_max_taps_per_output}"
@@ -4360,7 +4391,7 @@ async def _tool_design_fir_multi_modal(
         sample_rate = 48000
         if _dsp is not None:
             caps = _dsp.capabilities
-            sample_rate = caps.fir_sample_rate_hz or 48000
+            sample_rate = _resolve_fir_rate()
             if num_taps > caps.fir_max_taps_per_output:
                 return _err(f"num_taps={num_taps} exceeds {caps.fir_max_taps_per_output}")
 
@@ -4532,7 +4563,7 @@ async def _tool_design_fir_trinnov(
         # pipeline lands at 2× — a 47 Hz correction at 94 Hz). Do not hardcode a rate.
         fir_sample_rate = 48000  # fallback only when no DSP driver is loaded
         if _dsp is not None:
-            fir_sample_rate = int(_dsp.capabilities.fir_sample_rate_hz or 48000)
+            fir_sample_rate = _resolve_fir_rate()
 
         # Per-sub level balance check: warn when one sub is >6 dB weaker than
         # the reference sub in any 1/3-octave band within the focus range. A
