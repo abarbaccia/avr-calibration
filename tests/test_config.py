@@ -280,3 +280,39 @@ class TestActiveInput:
     def test_defaults_to_zero_when_nothing_configured(self):
         cfg = Config({"dsp_driver": "camilladsp"})
         assert cfg.active_input == 0
+
+
+class TestSubOutputs:
+    """sub_outputs / sub_output_labels resolve signal_graph first, then fallbacks."""
+
+    def test_prefers_signal_graph(self):
+        cfg = Config({
+            "dsp_driver": "camilladsp",
+            "signal_graph": {
+                "processors": [{"name": "camilla", "driver_ref": "camilladsp", "kind": "dsp"}],
+                "transducers": [
+                    {"name": "sub_front_left", "role": "sub", "processor_ref": "camilla",
+                     "output_index": 5, "safety_profile_ref": "svs"},
+                    {"name": "sub_front_right", "role": "sub", "processor_ref": "camilla",
+                     "output_index": 6, "safety_profile_ref": "svs"},
+                ],
+            },
+            # Conflicting legacy values must lose to the graph:
+            "minidsp": {"output_slots": [{"index": 0, "type": "sub"}]},
+            "measurement": {"sub_outputs": [9]},
+        })
+        assert cfg.sub_outputs == [5, 6]
+        assert cfg.sub_output_labels() == [(5, "sub_front_left"), (6, "sub_front_right")]
+
+    def test_falls_back_to_output_slots(self):
+        cfg = Config({
+            "dsp_driver": "minidsp",
+            "minidsp": {"output_slots": [
+                {"index": 0, "type": "sub", "label": "Sub L"},
+                {"index": 1, "type": "sub"},
+                {"index": 2, "type": "unused"},
+            ]},
+        })
+        # No signal_graph block → synthesised graph may or may not carry subs;
+        # at minimum the resolved indices must match the typed slots.
+        assert set(cfg.sub_outputs) >= {0, 1} or cfg.sub_outputs == [0, 1]

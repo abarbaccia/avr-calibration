@@ -613,12 +613,11 @@ async def _tool_apply_eq(
             )
         else:
             cfg = _config()
-            for slot in cfg.minidsp.get("output_slots", []):
-                if slot.get("type") == "sub":
-                    _persist_dsp_state(
-                        dsp_output_key(processor_name, slot["index"], "eq"),
-                        {"filters": filters, "preset": preset},
-                    )
+            for sub_idx in cfg.sub_outputs:
+                _persist_dsp_state(
+                    dsp_output_key(processor_name, sub_idx, "eq"),
+                    {"filters": filters, "preset": preset},
+                )
         return _ok(filters_applied=len(filters), preset=preset,
                     output_index=output_index)
     except DriverError as exc:
@@ -6127,11 +6126,7 @@ async def _tool_calibrate_level(
         if _dsp is None:
             return _err("DSP driver not loaded")
 
-        sub_count = sum(
-            1 for slot in cfg.minidsp.get("output_slots", [])
-            if slot.get("type", "unused") == "sub"
-        )
-        _sub_count = max(1, sub_count)
+        _sub_count = max(1, len(cfg.sub_outputs))
 
         async def _usb_predict_verify() -> dict:
             # ── Step 0: wake sleeping subs ──
@@ -6841,12 +6836,11 @@ async def _tool_get_config() -> dict:
             **fir_block,
         }
 
-        for slot_cfg in cfg.minidsp.get("output_slots", []):
-            idx = slot_cfg["index"]
+        for idx, label in cfg.sub_output_labels():
             if idx in sub_outputs:
                 eq_capabilities["output_peq"].append({
                     "output_index": idx,
-                    "label": slot_cfg.get("label", f"Output {idx}"),
+                    "label": label,
                     "available_slots": slots,
                     "num_slots": len(slots),
                     "description": "Per-sub room correction EQ",

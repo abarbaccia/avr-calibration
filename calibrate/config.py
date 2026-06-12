@@ -319,12 +319,45 @@ class Config:
 
     @property
     def sub_outputs(self) -> list[int]:
-        """Output indices where type='sub'. Falls back to measurement.sub_outputs."""
+        """Output indices of role='sub' transducers.
+
+        Source of truth is the signal graph (synthesised from legacy fields
+        when no ``signal_graph:`` block exists). Falls back to
+        ``minidsp.output_slots`` (miniDSP installs that predate the graph),
+        then ``measurement.sub_outputs``.
+        """
+        try:
+            subs = self.signal_graph.transducers_by_role("sub")
+            if subs:
+                return [int(t.output_index) for t in subs]
+        except Exception:
+            pass
         slots = self.minidsp.get("output_slots", [])
         typed = [s["index"] for s in slots if s.get("type") == "sub"]
         if typed:
             return typed
         return self.measurement.get("sub_outputs", [0, 1])
+
+    def sub_output_labels(self) -> list[tuple[int, str]]:
+        """(output_index, human label) per sub, signal-graph first.
+
+        Fallback chain mirrors :attr:`sub_outputs`: graph transducer names,
+        then ``minidsp.output_slots`` labels, then bare "Output N" labels.
+        """
+        try:
+            subs = self.signal_graph.transducers_by_role("sub")
+            if subs:
+                return [(int(t.output_index), t.name) for t in subs]
+        except Exception:
+            pass
+        slots = self.minidsp.get("output_slots", [])
+        typed = [
+            (int(s["index"]), s.get("label", f"Output {s['index']}"))
+            for s in slots if s.get("type") == "sub"
+        ]
+        if typed:
+            return typed
+        return [(i, f"Output {i}") for i in self.measurement.get("sub_outputs", [0, 1])]
 
     @property
     def speakers(self) -> list[dict]:

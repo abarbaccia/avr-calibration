@@ -986,10 +986,7 @@ async def test_calibrate_level_usb_solo_gain_hint() -> None:
     mock_dsp = AsyncMock()
     mock_dsp.sweep_context = MagicMock(return_value=None)
     mock_cfg = _make_usb_cfg()
-    mock_cfg.minidsp.get.side_effect = lambda key, default=None: (
-        [{"type": "sub"}, {"type": "sub"}, {"type": "shaker"}]
-        if key == "output_slots" else default
-    )
+    mock_cfg.sub_outputs = [5, 6]
 
     wake_fr = _make_fr(50.0)   # wake sweep — ignored
     probe_fr = _make_fr(68.0)
