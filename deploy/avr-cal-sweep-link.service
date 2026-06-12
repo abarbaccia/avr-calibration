@@ -1,11 +1,10 @@
 [Unit]
 # PipeWire null sink (`avr_cal_sweep`) + persistent links into camilladsp_capture
-# and the snd-aloop sink. Lets the avr-calibration container play sweeps into
-# the PipeWire graph end-to-end (USB calibration route, post v0.2.0).
+# (input_3, the LFE feed) and loopback_ref (deconvolution reference). Lets the
+# measurement engine play sweeps into the PipeWire graph end-to-end (USB route).
 #
 # Runs as the `pi` user via the user manager (XDG_RUNTIME_DIR=/run/user/1000)
-# so it joins the same PipeWire session WirePlumber owns. Sister service:
-# loopback-ref-link.service (Scarlett ch3 -> snd-aloop) — untouched here.
+# so it joins the same PipeWire session WirePlumber owns.
 Description=Create avr_cal_sweep PipeWire sink + link to camilladsp_capture
 After=pipewire.service wireplumber.service
 Requires=pipewire.service wireplumber.service
