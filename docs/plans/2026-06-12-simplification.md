@@ -457,6 +457,45 @@ Full suite green; one commit.
 - Update the tool-count assertion anywhere it appears (README/CLAUDE.md "~900
   tools" style claims — correct them to the real count while there).
 
+### 5.6 Tool naming cleanup
+
+Tool names are the API surface the LLM orchestrator chooses from — ambiguous names
+cause wrong-tool selection (documented cost: the apply_fir_identity vs clear_fir
+confusion). Procedure per rename: schema `name=`, handler reference, dispatch/registry
+entry, tests, recipes, docs — one commit per rename, then
+`grep -rn "<old_name>" calibrate/ recipes/ docs/ tests/ CLAUDE.md` must return only
+historical docs (CHANGELOG, research notes, this plan). Lessons DB handling same as
+5.5 (invalidate or report; never hand-edit).
+
+**Definite renames:**
+
+| Old | New | Why |
+|---|---|---|
+| `fit_correction_filter` | `fit_peq_for_target` | It's a PEQ optimizer (grid/LM joint fit), not FIR; parallels `fit_shelf_for_target`. |
+| `resolve_target` | `resolve_measurement_target` | "target" collides with target-curve tools (`anchor_target`); this one resolves the measurement chain target ('subs'/'mains'). |
+
+**Investigate, then rename or document (STOP and report if unclear):**
+
+- A tool/resource registered as `Latest Measurement` (title case, spaces) appears in
+  the schema list. Determine whether it's an MCP resource (acceptable) or a tool
+  (rename to `get_latest_measurement` style).
+- `configure_matrix` vs `set_routing`: determine whether these are duplicate
+  concepts (input→output enable matrix). If one is miniDSP-specific and one
+  CamillaDSP-specific, keep both but make each schema description say which driver
+  it applies to. If they truly overlap, propose a merge in the final report — do
+  not merge without approval.
+
+**Deliberate keeps (do NOT rename):**
+
+- `design_fir_trinnov`, `verify_trinnov_coherence` — jargon, but deeply embedded in
+  recipes, lessons, and research docs; continuity wins.
+- `clear_fir` — semantics changed in d287489 (writes identity, no longer removes
+  the Conv block). Keep the name, but VERIFY the schema description and docstring
+  say "resets to identity passthrough (topology preserved)" — update if stale.
+- Internal-only (non-MCP) rename, free to do: preflight `check_minidsp` /
+  `check_minidsp_combined` → `check_dsp` / `check_dsp_combined` (they've been
+  driver-agnostic for a while; the docstring says so).
+
 ### Phase 5 checkpoint
 
 - Tool registry/dispatch count drops by 4 (design_fir_multi, design_fir_multi_modal,
