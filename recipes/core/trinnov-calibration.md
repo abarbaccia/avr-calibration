@@ -147,16 +147,18 @@ If subs are already aligned from a prior session and you've confirmed
 
 ## Phase 2 — Measure each sub solo (the Trinnov measurement)
 
-**Identity FIR preflight** (REQUIRED if any FIR is active):
+**Clear FIR preflight** (REQUIRED — always clear before Trinnov measurement):
 
 ```
-apply_fir_identity(output_index=5, num_taps=8192)
-apply_fir_identity(output_index=6, num_taps=8192)
+clear_fir(output_index=5)
+clear_fir(output_index=6)
 ```
 
-Then re-measure both subs. This ensures the measurement H_i captures the
-physical room only — a correction FIR in the measurement bakes that
-correction into K_i, making the design circular.
+This ensures H_i captures the physical room only — a correction FIR bakes
+that correction into K_i, making the design circular. Use `clear_fir`, not
+`apply_fir_identity`: identity FIRs are not passthrough (they reshape the
+response), and they force a large PipeWire quantum that can destabilize
+between-session phase when quantum shifts ±39 ms between sessions.
 
 **Per-sub measurement:**
 

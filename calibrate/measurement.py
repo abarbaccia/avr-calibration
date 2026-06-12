@@ -1136,7 +1136,7 @@ class MeasurementEngine:
             if _alsa_direct_ref:
                 log.info(
                     "deconvolution: ALSA hw loopback ref (n=%d) — "
-                    "using analytical sweep for timing, hw ref for H(f)",
+                    "using analytical sweep for H(f) and timing (phase anchor)",
                     n_aligned,
                 )
             else:
@@ -1308,6 +1308,15 @@ class MeasurementEngine:
             T = np.fft.rfft(timing_array[:n_t], n=n_t)
             Y_t = np.fft.rfft(rec_array[:n_t], n=n_t)
             C_full = np.fft.irfft(np.conj(T) * Y_t, n=n_t)
+            # Anchor H(f) to the analytical sweep (not the loopback ref).
+            # The loopback null-sink quantum can jump ±39 ms between sessions
+            # when PipeWire renegotiates (e.g. after FIR tap-count changes).
+            # That timing shift rotates H(f) by ±39 ms × 2π × f — hundreds of
+            # degrees at 25–80 Hz — making cross-session phase comparison invalid
+            # (Trinnov requires coherent H_5, H_6 phase frames). The analytical
+            # sweep is deterministic; PW play-capture jitter is <1 ms (<18° at
+            # 50 Hz) and is acceptable for sub-bass design.
+            X, Y, n = T, Y_t, n_t
         else:
             C_full = np.fft.irfft(np.conj(X) * Y, n=n)
         try:

@@ -262,6 +262,22 @@ def design_multi_input_fir(
     tgt_spl = np.array([p[1] for p in target_points])
     tgt_mag_db = np.interp(freqs_out, tgt_f, tgt_spl,
                            left=tgt_spl[0], right=tgt_spl[-1])
+
+    # Normalize T to the average measured H at the reference frequency.
+    # target_points are relative (e.g. Harman +5/+4/.../0 dB); the last point
+    # is the 0 dB reference (80 Hz). Without normalization, T is in absolute
+    # dBFS (0 dB = 1.0) while H is at the actual sweep measurement level
+    # (typically -50 to -55 dBFS at calibrated gain). The Wiener would then
+    # compute +50 dB boosts to reach 0 dBFS — rejected by SafetyValidator.
+    # Anchoring T to avg(H) at the reference frequency makes corrections
+    # relative: the FIR shapes the response to match the target curve, and
+    # absolute level is set by master gain, not the FIR.
+    ref_freq = float(tgt_f[-1])
+    ref_idx = int(np.argmin(np.abs(freqs_out - ref_freq)))
+    H_mag_at_ref = float(np.mean([np.abs(H_i[ref_idx]) for H_i in H_complex])) if H_complex else 1.0
+    T_scale = max(H_mag_at_ref * n_subs, 1e-30)
+    tgt_mag_db = tgt_mag_db + 20.0 * np.log10(T_scale)
+
     T_mag = 10 ** (tgt_mag_db / 20.0)
 
     # Target phase: minimum-phase reconstruction of |T|
