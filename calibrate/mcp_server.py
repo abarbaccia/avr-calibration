@@ -1991,7 +1991,7 @@ async def _tool_sensitivity_analysis(
         return _err(f"sensitivity_analysis failed: {exc}")
 
 
-async def _tool_fit_correction_filter(
+async def _tool_fit_peq_for_target(
     session_id: int,
     freq_range: list[float],
     target_curve: dict | None = None,
@@ -2135,7 +2135,7 @@ async def _tool_fit_correction_filter(
                     session_id, min_hz=range_lo, max_hz=range_hi,
                 )
             except Exception as exc:
-                log.warning("fit_correction_filter: geometry exclusion failed: %s", exc)
+                log.warning("fit_peq_for_target: geometry exclusion failed: %s", exc)
 
         def _in_geometry(freq_hz: float) -> bool:
             return any(lo <= freq_hz <= hi for lo, hi in geometry_ranges)
@@ -2479,7 +2479,7 @@ async def _tool_fit_correction_filter(
             _single_payload["anchor_warning"] = anchor_warning
         return _ok(**_single_payload)
     except Exception as exc:
-        return _err(f"fit_correction_filter failed: {exc}")
+        return _err(f"fit_peq_for_target failed: {exc}")
 
 
 async def _tool_predict_rms(
@@ -3675,6 +3675,7 @@ async def _tool_design_fir(
     return_coefficients: bool = True,
     preringing_ms: float = 25.0,
     anchor: dict | None = None,
+    compose_on_output_index: int | None = None,
 ) -> dict:
     """Design FIR correction coefficients from a measurement.
 
@@ -4124,6 +4125,31 @@ async def _tool_design_fir(
         _fir_design_cache[int(session_id)] = coefficients
         peak_abs = float(np.max(np.abs(fir_td))) if num_taps else 0.0
 
+        compose_note = ""
+        if compose_on_output_index is not None:
+            # Convolve the designed FIR with the most recently cached FIR
+            # (chronological proxy for the output's current correction).
+            existing_fir: list[float] | None = None
+            for _v in _fir_design_cache.values():
+                existing_fir = list(_v)
+            if existing_fir is None:
+                existing_fir = [0.0] * num_taps
+                existing_fir[0] = 1.0
+            existing_arr = np.asarray(existing_fir, dtype=np.float32)
+            composed = np.convolve(existing_arr, np.asarray(fir_td, dtype=np.float32))
+            composed = composed[:num_taps].astype(np.float32)
+            composed_peak = float(np.max(np.abs(composed)))
+            if composed_peak > 1.0:
+                composed = composed / (composed_peak * 1.001)
+            fir_td = composed
+            coefficients = [round(float(c), 8) for c in fir_td]
+            peak_abs = float(np.max(np.abs(fir_td)))
+            _fir_design_cache[int(session_id)] = coefficients
+            compose_note = (
+                f" Convolved with existing cached FIR on "
+                f"output {compose_on_output_index} (empirical 2-step)."
+            )
+
         # Surface the AVR's per-channel delay-buffer ceiling so the LLM can see
         # immediately whether this FIR's latency is compensable via mains
         # speaker-distance. Empirical X3800H ceiling is ~65 ms; other models
@@ -4177,7 +4203,8 @@ async def _tool_design_fir(
                 f"Latency: {latency_ms}ms (compensate via per-channel mains "
                 f"speaker-distance — set mains LARGER than physical so they "
                 f"wait for the FIR-delayed sub; lip-sync/Audio-Delay does NOT "
-                f"help, that delays all audio uniformly).{budget_msg} "
+                f"help, that delays all audio uniformly).{budget_msg}"
+                f"{compose_note} "
                 f"Pass coefficients to apply_fir(output_index, coefficients) or "
                 f"apply_fir(output_index, design_session_id={session_id})."
             )
@@ -4185,260 +4212,13 @@ async def _tool_design_fir(
             result["note"] = (
                 f"FIR at {fir_fs}Hz, {num_taps} taps, {phase_mode} phase. "
                 f"Freq resolution: {freq_resolution}Hz. Pre-ringing: {pre_ringing_ms}ms. "
-                f"Latency: {latency_ms}ms.{budget_msg} Coefficients cached "
+                f"Latency: {latency_ms}ms.{budget_msg}{compose_note} Coefficients cached "
                 f"server-side; apply via apply_fir(output_index, "
                 f"design_session_id={session_id})."
             )
         return _ok(**result)
     except Exception as exc:
         return _err(f"design_fir failed: {exc}")
-
-
-async def _tool_design_fir_multi(
-    measurements: list[dict],
-    target_curve: dict,
-    num_taps: int = 4096,
-    phase_mode: str = "mixed",
-    preringing_ms: float = 20.0,
-    regularization_lambda: float = 0.1,
-    freq_focus_hz: list[float] | None = None,
-    return_coefficients: bool = False,
-    modal_intents: list[dict] | None = None,
-    modal_taps: int | None = None,
-    gabor_n_cycles: int = 1,
-) -> dict:
-    """Coherent multi-sub FIR design — N FIRs that sum to target at MLP.
-
-    Standard per-sub design_fir flattens each sub's magnitude independently
-    and uses min-phase reconstruction.  At MLP, the two sub contributions
-    may still cancel because their PHASES differ at any given frequency.
-    This tool fixes that: each per-sub FIR is given the complex correction
-    K_i = T_per_sub * conj(H_i) / (|H_i|^2 + lambda^2), which delivers
-    each sub's contribution to the mic at the SAME phase (the target's
-    min-phase reconstruction).  Coherent sum, no cancellation.
-
-    ``measurements``: list of {"session_id": int, "output_index": int, "label": str}.
-    Each session must have phase data (modern measurements do).
-    ``target_curve``: same shape as design_fir's: {"points": [{"freq", "spl"}, ...]}.
-    Target points are absolute SPL across the focus band.
-    ``regularization_lambda``: damping factor for the Wiener inverse.
-    Lower = stronger correction at nulls (more boost requested); higher =
-    accept the null, smaller boost.  Default 0.1 (linear, ~ -20 dB).
-    """
-    if isinstance(modal_intents, str):
-        import json as _json
-        modal_intents = _json.loads(modal_intents)
-    if isinstance(modal_taps, str):
-        import json as _json
-        modal_taps = int(_json.loads(modal_taps))
-    from .storage import SessionStore
-    from .multi_fir import design_multi_input_fir, SubMeasurement
-
-    try:
-        store = SessionStore()
-        sub_meas = []
-        for m in measurements:
-            sid = int(m["session_id"])
-            session = store.get_session(sid)
-            if session is None:
-                return _err(f"session {sid} not found")
-            fr = session.start_fr
-            if not fr or not fr.frequencies:
-                return _err(f"session {sid} has no FR data")
-            if not fr.phase:
-                return _err(
-                    f"session {sid} has no phase data — re-measure to get a session "
-                    "with phase; multi-input design requires complex response per sub"
-                )
-            sub_meas.append(SubMeasurement(
-                freqs=list(fr.frequencies),
-                spl_db=list(fr.spl),
-                phase_rad=list(fr.phase),
-                label=m.get("label", f"output_{m.get('output_index', '?')}"),
-            ))
-
-        if not target_curve or not target_curve.get("points"):
-            return _err("target_curve.points required (list of {freq, spl})")
-        target_points = [(float(p["freq"]), float(p["spl"]))
-                         for p in target_curve["points"]]
-        target_points.sort()
-
-        focus = None
-        if freq_focus_hz and len(freq_focus_hz) >= 2:
-            focus = (float(freq_focus_hz[0]), float(freq_focus_hz[1]))
-
-        # Get sample rate / tap limits from active DSP
-        sample_rate = 48000
-        if _dsp is not None:
-            caps = _dsp.capabilities
-            sample_rate = _resolve_fir_rate()
-            if num_taps > caps.fir_max_taps_per_output:
-                return _err(
-                    f"num_taps={num_taps} exceeds {caps.fir_max_taps_per_output}"
-                )
-            if num_taps < caps.fir_min_taps:
-                return _err(f"num_taps={num_taps} below {caps.fir_min_taps}")
-
-        result = design_multi_input_fir(
-            sub_meas,
-            target_points,
-            sample_rate=sample_rate,
-            num_taps=num_taps,
-            phase_mode=phase_mode,
-            preringing_ms=preringing_ms,
-            regularization_lambda=regularization_lambda,
-            freq_focus_hz=focus,
-            modal_intents=modal_intents or None,
-            modal_taps=modal_taps,
-            gabor_n_cycles=int(gabor_n_cycles),
-        )
-
-        # Cache each FIR keyed by a synthetic id so apply_fir(design_session_id=...) works
-        # Use (first_session_id * 1000 + output_index) as cache key.
-        primary_sid = int(measurements[0]["session_id"])
-        cache_ids = []
-        for i, (m, fir) in enumerate(zip(measurements, result["firs"])):
-            out_idx = int(m.get("output_index", i))
-            cache_id = primary_sid * 1000 + out_idx
-            _fir_design_cache[cache_id] = fir
-            cache_ids.append({"output_index": out_idx, "design_session_id": cache_id})
-
-        response = {
-            "num_subs": result["num_subs"],
-            "num_taps": result["num_taps"],
-            "phase_mode": result["phase_mode"],
-            "regularization_lambda": result["regularization_lambda"],
-            "latency_ms": result["latency_ms"],
-            "modal_pre_delay_ms": result.get("modal_pre_delay_ms", 0.0),
-            "predicted_combined": result["predicted_combined"],
-            "predicted_per_sub": result["predicted_per_sub"],
-            "per_sub_peak_boost_db": result["per_sub_peak_boost_db"],
-            "cache_ids": cache_ids,
-            "note": (
-                f"FIR designed for {result['num_subs']} subs in {phase_mode} mode. "
-                f"Latency ≈ {result['latency_ms']} ms. "
-                f"Apply each via apply_fir(output_index, design_session_id). "
-                "See cache_ids for the mapping."
-            ),
-        }
-        if return_coefficients:
-            response["firs"] = result["firs"]
-        return _ok(**response)
-    except Exception as exc:
-        return _err(f"design_fir_multi failed: {exc}")
-
-
-async def _tool_design_fir_multi_modal(
-    measurements: list[dict],
-    target_curve: dict,
-    modal_intents: list[dict],
-    num_taps: int = 24576,
-    phase_mode: str = "minimum",
-    regularization_lambda: float = 0.01,
-    freq_focus_hz: list[float] | None = None,
-    gabor_n_cycles: int = 1,
-    return_coefficients: bool = False,
-) -> dict:
-    """Combined per-sub Wiener magnitude + anti-pulse T60 correction FIR.
-
-    The correct Trinnov-style architecture: anti-pulses are placed T/2 BEFORE
-    the Wiener correction's main impulse in the same time-domain FIR buffer,
-    so modal cancellation and magnitude leveling cooperate rather than conflict.
-
-    ``measurements``: solo measurements per sub (same format as design_fir_multi).
-    ``target_curve``: combined Harman target (absolute SPL points).
-    ``modal_intents``: anti-pulse specs — list of {freq_hz, treatment='anti_pulse',
-        cancel_strength?, bp_q?, peak_db?, t60_ms?}.
-    ``num_taps``: total taps (split between Wiener mag + anti-pulse budget).
-    """
-    import json as _json
-    from .storage import SessionStore
-    from .multi_fir import design_fir_multi_modal, SubMeasurement
-
-    try:
-        # Parse string-encoded lists (tool framework passes arrays as strings)
-        if isinstance(modal_intents, str):
-            modal_intents = _json.loads(modal_intents)
-
-        store = SessionStore()
-        sub_meas = []
-        for m in measurements:
-            sid = int(m["session_id"])
-            session = store.get_session(sid)
-            if session is None:
-                return _err(f"session {sid} not found")
-            fr = session.start_fr
-            if not fr or not fr.frequencies:
-                return _err(f"session {sid} has no FR data")
-            if not fr.phase:
-                return _err(f"session {sid} has no phase data")
-            sub_meas.append(SubMeasurement(
-                freqs=list(fr.frequencies),
-                spl_db=list(fr.spl),
-                phase_rad=list(fr.phase),
-                label=m.get("label", f"output_{m.get('output_index', '?')}"),
-            ))
-
-        if not target_curve or not target_curve.get("points"):
-            return _err("target_curve.points required")
-        target_points = [(float(p["freq"]), float(p["spl"])) for p in target_curve["points"]]
-        target_points.sort()
-
-        focus = None
-        if freq_focus_hz and len(freq_focus_hz) >= 2:
-            focus = (float(freq_focus_hz[0]), float(freq_focus_hz[1]))
-
-        sample_rate = 48000
-        if _dsp is not None:
-            caps = _dsp.capabilities
-            sample_rate = _resolve_fir_rate()
-            if num_taps > caps.fir_max_taps_per_output:
-                return _err(f"num_taps={num_taps} exceeds {caps.fir_max_taps_per_output}")
-
-        result = design_fir_multi_modal(
-            sub_meas, target_points, modal_intents,
-            sample_rate=sample_rate, num_taps=num_taps,
-            phase_mode=phase_mode, regularization_lambda=regularization_lambda,
-            freq_focus_hz=focus, gabor_n_cycles=int(gabor_n_cycles),
-        )
-
-        primary_sid = int(measurements[0]["session_id"])
-        apply_intent = result.get("apply_intent", "general")
-        cache_ids = []
-        for i, (m, fir) in enumerate(zip(measurements, result["firs"])):
-            out_idx = int(m.get("output_index", i))
-            cache_id = primary_sid * 1000 + out_idx
-            _fir_design_cache[cache_id] = fir
-            # Tag with modal_cancel so apply_fir uses the looser 60 dB cap
-            # (Gabor anti-pulse has large frequency-domain integral but is
-            # transient — SafetyValidator's modal_cancel cap correctly permits it)
-            _fir_design_intent[cache_id] = apply_intent
-            cache_ids.append({"output_index": out_idx, "design_session_id": cache_id})
-
-        response = {
-            "num_subs": result["num_subs"],
-            "num_taps": result["num_taps"],
-            "phase_mode": result["phase_mode"],
-            "regularization_lambda": result["regularization_lambda"],
-            "latency_ms": result["latency_ms"],
-            "modal_pre_delay_ms": result["modal_pre_delay_ms"],
-            "predicted_combined": result["predicted_combined"],
-            "predicted_per_sub": result["predicted_per_sub"],
-            "per_sub_peak_boost_db": result["per_sub_peak_boost_db"],
-            "modal_notes": result.get("modal_notes", []),
-            "cache_ids": cache_ids,
-            "note": (
-                f"Combined Wiener+modal FIR: {result['num_subs']} subs, "
-                f"{num_taps} taps, {result['modal_pre_delay_ms']:.1f} ms anti-pulse pre-ring. "
-                f"Apply each via apply_fir(output_index, design_session_id). "
-                f"FIRs tagged intent={apply_intent!r} for SafetyValidator."
-            ),
-        }
-        if return_coefficients:
-            response["firs"] = result["firs"]
-        return _ok(**response)
-    except Exception as exc:
-        return _err(f"design_fir_multi_modal failed: {exc}")
 
 
 async def _tool_design_fir_trinnov(
@@ -6953,7 +6733,7 @@ async def _tool_get_signal_graph() -> dict:
         return _err(f"get_signal_graph error: {exc}")
 
 
-async def _tool_resolve_target(target: str) -> dict:
+async def _tool_resolve_measurement_target(target: str) -> dict:
     """Resolve a group/transducer/role string to the concrete transducer list."""
     try:
         cfg = _config()
@@ -6972,7 +6752,7 @@ async def _tool_resolve_target(target: str) -> dict:
         ]
         return _ok(target=target, resolved=resolved)
     except Exception as exc:
-        return _err(f"resolve_target error: {exc}")
+        return _err(f"resolve_measurement_target error: {exc}")
 
 
 # ── Shared target dispatch ────────────────────────────────────────────────────
@@ -7588,144 +7368,8 @@ async def _tool_apply_fir(
     return _ok(output_index=output_index, taps=len(coefficients), source=source)
 
 
-async def _tool_design_corrective_fir(
-    session_id: int,
-    target_curve: dict,
-    output_index: int,
-    num_taps: int = 1024,
-    focus_hz: list[float] | None = None,
-    return_coefficients: bool = False,
-) -> dict:
-    """Design a magnitude-correction FIR for the *residual* between a measured
-    listener FR and the target curve, then convolve with the existing FIR
-    cached on ``output_index``. Returns a new design_session_id whose
-    coefficients can be applied via ``apply_fir(design_session_id=...)``.
-
-    This is the **empirical 2-step** workflow:
-      1. Apply some baseline correction (e.g. a modal-cancellation FIR via
-         ``design_modal_fir``).
-      2. Measure the listener result (the ``session_id`` argument here).
-      3. This tool computes the residual ``target − measured`` and designs
-         a min-phase FIR that closes that gap, convolved on top of the
-         existing FIR for ``output_index``.
-      4. Apply via ``apply_fir(output_index, design_session_id=<returned>)``.
-
-    Use after ``design_modal_fir`` / ``apply_fir`` revealed a per-room FR
-    deviation from the target curve that wasn't predictable from the FIR
-    design alone (anti-pulse phase interaction with the room's modal
-    response — see recipe Section 2.2b).
-
-    Args:
-        session_id: post-baseline-FIR measurement (the room's response
-            after the existing FIR is applied to ``output_index``).
-        target_curve: ``{"points": [{"freq", "spl"}, ...], "band": [lo, hi]}``.
-            Same shape as ``design_fir``'s target_curve. Anchored to the
-            60-100 Hz midband so absolute SPL drops out.
-        output_index: DSP output whose existing cached FIR to convolve onto.
-            Must have a cached design (i.e. an earlier ``design_*_fir`` call
-            populated ``_fir_design_cache[session_id]`` referenced by an
-            apply_fir(design_session_id=...)). When no cached FIR is found,
-            falls back to a passthrough impulse (so this tool still works
-            for the first-pass case where there's no baseline FIR yet).
-        num_taps: corrective FIR length (default 1024 — short, since this
-            is just magnitude correction at low frequencies).
-        focus_hz: ``[lo, hi]`` band where correction is applied; outside
-            tapers to 0 dB. Default: target_curve's ``band`` if present,
-            else [25, 120].
-        return_coefficients: include the convolved FIR taps in the response.
-    """
-    from .storage import SessionStore
-    import numpy as _np
-
-    try:
-        store = SessionStore()
-        session = store.get_session(session_id)
-        if session is None:
-            return _err(f"session {session_id} not found")
-        if not session.start_fr or not session.start_fr.frequencies:
-            return _err(f"session {session_id} has no FR data")
-
-        # Target curve plumbing
-        if not isinstance(target_curve, dict) or not target_curve.get("points"):
-            return _err("target_curve.points required")
-        target_points = [
-            (float(p.get("freq", p.get("freq_hz", 0))),
-             float(p.get("spl", p.get("spl_db", 0))))
-            for p in target_curve["points"]
-        ]
-        band = target_curve.get("band") or focus_hz
-        focus = (float(band[0]), float(band[1])) if isinstance(band, (list, tuple)) and len(band) == 2 else (25.0, 120.0)
-
-        # Source FR from the session (raw arrays).
-        fr = session.start_fr
-        source_pairs = list(zip(
-            [float(f) for f in fr.frequencies],
-            [float(s) for s in fr.spl],
-        ))
-
-        # Existing FIR for output_index — find any cached design that was
-        # applied to this output. Fall back to passthrough if none.
-        existing_fir = None
-        for sid, coeffs in _fir_design_cache.items():
-            # Best-effort: assume the most recently applied design is the
-            # right baseline. Without an apply→cache reverse index we
-            # approximate by using the largest session_id that has cached
-            # coefficients (chronological proxy).
-            existing_fir = list(coeffs)
-        if existing_fir is None:
-            existing_fir = [0.0] * num_taps
-            existing_fir[0] = 1.0
-
-        # Design the corrective magnitude FIR.
-        from .modal_fir import _design_magnitude_correction_fir
-        sample_rate = 8000  # FIR processing rate
-        existing_arr = _np.asarray(existing_fir, dtype=_np.float32)
-        corrective = _design_magnitude_correction_fir(
-            fir=existing_arr,
-            target_db=target_points,
-            source_fr_db=source_pairs,
-            sample_rate=sample_rate,
-            n_taps=int(num_taps),
-            focus_hz=focus,
-        )
-        # Convolve corrective with existing — combined FIR delivers both.
-        combined = _np.convolve(existing_arr, corrective)
-        # Cap at a reasonable length so apply_fir doesn't reject. Use the
-        # longer of the two inputs.
-        max_len = max(len(existing_arr), int(num_taps))
-        combined = combined[:max_len].astype(_np.float32)
-        peak = float(_np.max(_np.abs(combined)))
-        if peak > 1.0:
-            combined = combined / (peak * 1.001)
-
-        # Cache under a synthetic session_id derived from the source.
-        cache_id = int(session_id)
-        _fir_design_cache[cache_id] = combined.tolist()
-        _fir_design_intent[cache_id] = "modal_cancel"
-
-        result = {
-            "session_id": session_id,
-            "output_index": int(output_index),
-            "num_taps": int(len(combined)),
-            "sample_rate": sample_rate,
-            "peak_amplitude": round(float(_np.max(_np.abs(combined))), 4),
-            "design_cached": True,
-            "note": (
-                "Empirical 2-step corrective FIR convolved on top of the "
-                "existing cached FIR. Apply via "
-                f"apply_fir(output_index={output_index}, "
-                f"design_session_id={session_id})."
-            ),
-        }
-        if return_coefficients:
-            result["coefficients"] = combined.tolist()
-        return _ok(**result)
-    except Exception as exc:
-        return _err(f"design_corrective_fir failed: {exc}")
-
-
 async def _tool_clear_fir(output_index: int) -> dict:
-    """Clear FIR coefficients and reset output to passthrough."""
+    """Reset FIR to identity passthrough (Conv block preserved; same-length impulse written)."""
     try:
         graph = _config().signal_graph
         bound = {int(t.output_index): t.name for t in graph.transducers}
@@ -10828,7 +10472,7 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
-        name="resolve_target",
+        name="resolve_measurement_target",
         description=(
             "Resolve a scope string to the list of transducers it covers. Accepts "
             "a group name ('bass'), a transducer name ('sub_left'), or a role "
@@ -11218,8 +10862,9 @@ _TOOLS: list[Tool] = [
     Tool(
         name="clear_fir",
         description=(
-            "Clear FIR coefficients on a DSP output, resetting it to passthrough. "
-            "Use before loading new coefficients or to undo a FIR pass."
+            "Reset a DSP output's FIR to identity passthrough (Conv block topology "
+            "preserved — a same-length impulse FIR is written, not removed). "
+            "Use before measuring the physical room baseline or to undo a FIR pass."
         ),
         inputSchema={
             "type": "object",
@@ -11237,77 +10882,6 @@ _TOOLS: list[Tool] = [
         },
     ),
 
-    Tool(
-        name="design_corrective_fir",
-        description=(
-            "Empirical 2-step corrective FIR. Computes target − measured FR "
-            "from a post-baseline-FIR session, designs a min-phase magnitude "
-            "correction FIR for the residual, and convolves it with the "
-            "existing cached FIR for ``output_index``. Returns a "
-            "design_session_id for ``apply_fir(design_session_id=...)``. "
-            "Use after design_modal_fir + apply_fir reveal a per-room "
-            "deviation from the target curve that the modal FIR alone "
-            "didn't predict (anti-pulse phase interaction with the room's "
-            "response — see recipe Section 2.2b)."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "session_id": {
-                    "type": "integer",
-                    "description": (
-                        "Post-baseline-FIR measurement (the room's response "
-                        "after any existing FIR is applied)."
-                    ),
-                },
-                "target_curve": {
-                    "type": "object",
-                    "description": (
-                        "Target curve points + optional band. "
-                        "Shape: {'points': [{'freq': 25, 'spl': 5}, ...], "
-                        "'band': [25, 120]}. Anchored to 60-100 Hz midband "
-                        "so absolute SPL drops out."
-                    ),
-                    "properties": {
-                        "points": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "freq": {"type": "number"},
-                                    "spl": {"type": "number"},
-                                },
-                            },
-                        },
-                        "band": {
-                            "type": "array",
-                            "items": {"type": "number"},
-                        },
-                    },
-                    "required": ["points"],
-                },
-                "output_index": {
-                    "type": "integer",
-                    "description": "DSP output to convolve onto.",
-                },
-                "num_taps": {
-                    "type": "integer",
-                    "default": 1024,
-                    "description": "Corrective FIR length. Default 1024.",
-                },
-                "focus_hz": {
-                    "type": "array",
-                    "items": {"type": "number"},
-                    "description": "[lo, hi] band for correction; outside tapers to 0 dB.",
-                },
-                "return_coefficients": {
-                    "type": "boolean",
-                    "default": False,
-                },
-            },
-            "required": ["session_id", "target_curve", "output_index"],
-        },
-    ),
     Tool(
         name="reset_dsp_defaults",
         description=(
@@ -12226,163 +11800,17 @@ _TOOLS: list[Tool] = [
                         "freq_hz": {"type": "number"},
                     },
                 },
+                "compose_on_output_index": {
+                    "type": "integer",
+                    "description": (
+                        "Empirical 2-step composition: after designing the correction FIR, "
+                        "convolve it with the existing cached FIR for this output index. "
+                        "Use after apply_fir + measure to close the residual gap between "
+                        "the measured result and the target curve."
+                    ),
+                },
             },
             "required": ["session_id"],
-        },
-    ),
-    Tool(
-        name="design_fir_multi",
-        description=(
-            "Coherent multi-sub FIR design. Designs N FIRs (one per sub) that "
-            "sum coherently at MLP to the target curve, using regularized "
-            "Wiener inverse with explicit phase alignment. Each per-sub FIR "
-            "delivers its sub's contribution at the SAME phase as the target, "
-            "so subs add constructively instead of cancelling. Use this instead "
-            "of design_fir-per-sub when you need to fix multi-sub cancellation "
-            "at MLP. Requires solo measurements with phase data."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "measurements": {
-                    "type": "array",
-                    "description": (
-                        "List of solo measurements, one per sub. Each item: "
-                        "{session_id, output_index, label?}. session_id must "
-                        "have phase data."
-                    ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "session_id": {"type": "integer"},
-                            "output_index": {"type": "integer"},
-                            "label": {"type": "string"},
-                        },
-                        "required": ["session_id", "output_index"],
-                    },
-                },
-                "target_curve": {
-                    "type": "object",
-                    "description": (
-                        "Target combined response at MLP. Points as absolute "
-                        "SPL across the focus band. Same shape as design_fir."
-                    ),
-                    "properties": {
-                        "points": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "freq": {"type": "number"},
-                                    "spl": {"type": "number"},
-                                },
-                            },
-                        },
-                    },
-                },
-                "num_taps": {
-                    "type": "integer",
-                    "description": "FIR length per sub. Default 4096.",
-                },
-                "phase_mode": {
-                    "type": "string",
-                    "enum": ["minimum", "linear", "mixed"],
-                    "description": (
-                        "mixed (recommended) = bounded pre-ringing for phase "
-                        "correction. linear = full phase, ~num_taps/2 latency. "
-                        "minimum = no phase coherence (equivalent to running "
-                        "design_fir per sub independently)."
-                    ),
-                },
-                "preringing_ms": {
-                    "type": "number",
-                    "description": "Mixed-phase only: pre-ring window ms. Default 20.",
-                },
-                "regularization_lambda": {
-                    "type": "number",
-                    "description": (
-                        "Wiener damping factor (linear amplitude). Lower = "
-                        "stronger correction at room nulls, more boost demanded. "
-                        "Higher = accept the null, less boost. Default 0.1 "
-                        "(~-20 dB null acceptance)."
-                    ),
-                },
-                "freq_focus_hz": {
-                    "type": "array",
-                    "items": {"type": "number"},
-                    "description": "[lo, hi] — correct only within this band.",
-                },
-                "return_coefficients": {
-                    "type": "boolean",
-                    "description": (
-                        "Return coeff arrays in response. Default false "
-                        "(use cache_ids + apply_fir(design_session_id=…))."
-                    ),
-                },
-                "modal_intents": {
-                    "type": "string",
-                    "description": (
-                        "JSON array of modal anti-pulse intents, e.g. "
-                        "'[{\"freq_hz\":23.4,\"treatment\":\"anti_pulse\","
-                        "\"cancel_strength\":0.5,\"bp_q\":1.5,\"peak_db\":7.9}]'. "
-                        "The shared anti-pulse FIR is convolved with each per-sub "
-                        "Wiener FIR so both magnitude leveling AND T60 correction "
-                        "land in a single FIR per output."
-                    ),
-                },
-                "modal_taps": {
-                    "type": "string",
-                    "description": (
-                        "Integer tap budget for the modal anti-pulse FIR (e.g. '4096'). "
-                        "Auto-sized from mode frequencies if omitted."
-                    ),
-                },
-                "gabor_n_cycles": {
-                    "type": "integer",
-                    "default": 1,
-                    "minimum": 1,
-                    "maximum": 1,
-                    "description": "Gabor envelope cycles for anti-pulses. Must be 1. n_cycles≥2 clips the trailing Gabor half at pre_samples, flipping the cancellation phase from -π to 0 and amplifying modes by tens of dB instead of cancelling them.",
-                },
-            },
-            "required": ["measurements", "target_curve"],
-        },
-    ),
-    Tool(
-        name="design_fir_multi_modal",
-        description=(
-            "Trinnov-style combined per-sub magnitude + T60 correction FIR. "
-            "Correct architecture: Gabor anti-pulses are placed T/2 BEFORE the Wiener "
-            "correction's main impulse in the same time-domain buffer — they cooperate "
-            "rather than conflict. Use this instead of design_fir_multi when you also "
-            "need T60 reduction at specific room modes. Requires solo measurements with "
-            "phase data (same as design_fir_multi) plus modal_intents anti-pulse specs."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "measurements": {
-                    "type": "array",
-                    "description": "Solo measurements per sub: [{session_id, output_index, label?}].",
-                    "items": {"type": "object", "properties": {"session_id": {"type": "integer"}, "output_index": {"type": "integer"}, "label": {"type": "string"}}, "required": ["session_id", "output_index"]},
-                },
-                "target_curve": {
-                    "type": "object",
-                    "description": "Combined Harman target SPL: {points: [{freq, spl}]}.",
-                    "properties": {"points": {"type": "array", "items": {"type": "object", "properties": {"freq": {"type": "number"}, "spl": {"type": "number"}}}}},
-                },
-                "modal_intents": {
-                    "type": "string",
-                    "description": "JSON array of anti-pulse intents: '[{\"freq_hz\":23.4,\"treatment\":\"anti_pulse\",\"cancel_strength\":0.5,\"bp_q\":1.5,\"peak_db\":7.9}]'.",
-                },
-                "num_taps": {"type": "integer", "description": "Total taps per sub FIR (split between Wiener mag + anti-pulse). Default 24576.", "default": 24576},
-                "phase_mode": {"type": "string", "enum": ["minimum", "linear", "mixed"], "description": "Wiener FIR phase mode. Default minimum."},
-                "regularization_lambda": {"type": "number", "description": "Wiener damping. Default 0.01 for our signal levels.", "default": 0.01},
-                "freq_focus_hz": {"type": "array", "items": {"type": "number"}, "description": "[lo, hi] correction band."},
-                "gabor_n_cycles": {"type": "integer", "default": 1, "minimum": 1, "maximum": 1, "description": "Gabor cycles for anti-pulses. Must be 1. n_cycles≥2 clips the trailing Gabor half, flipping cancellation phase and amplifying modes."},
-                "return_coefficients": {"type": "boolean", "description": "Return FIR coefficients in response. Default false."},
-            },
-            "required": ["measurements", "target_curve", "modal_intents"],
         },
     ),
     Tool(
@@ -12767,7 +12195,7 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
-        name="fit_correction_filter",
+        name="fit_peq_for_target",
         description=(
             "Fit PEQ filter(s) to minimize RMS error in a frequency range. "
             "With ``num_filters=1`` (default), grid-search + refine one peaking "
@@ -13147,7 +12575,7 @@ def _register_all_tools() -> None:
         ("promote_lesson", _tool_promote_lesson),
         ("get_config", _tool_get_config),
         ("get_signal_graph", _tool_get_signal_graph),
-        ("resolve_target", _tool_resolve_target),
+        ("resolve_measurement_target", _tool_resolve_measurement_target),
         ("set_config", _tool_set_config),
         ("discover_avr", _tool_discover_avr),
         ("set_avr_mode", _tool_set_avr_mode),
@@ -13164,7 +12592,6 @@ def _register_all_tools() -> None:
         ("analyze_ir", _tool_analyze_ir),
         ("apply_fir", _tool_apply_fir),
         ("clear_fir", _tool_clear_fir),
-        ("design_corrective_fir", _tool_design_corrective_fir),
         ("reset_dsp_defaults", _tool_reset_dsp_defaults),
         ("set_master_gain", _tool_set_master_gain),
         ("set_input_gain", _tool_set_input_gain),
@@ -13189,8 +12616,6 @@ def _register_all_tools() -> None:
         ("optimize_sub_alignment", _tool_optimize_sub_alignment),
         ("sweep_inter_sub_delay", _tool_sweep_inter_sub_delay),
         ("design_fir", _tool_design_fir),
-        ("design_fir_multi", _tool_design_fir_multi),
-        ("design_fir_multi_modal", _tool_design_fir_multi_modal),
         ("design_fir_trinnov", _tool_design_fir_trinnov),
         ("design_modal_fir", _tool_design_modal_fir),
         ("analyze_per_sub_modal_contribution", _tool_analyze_per_sub_modal_contribution),
@@ -13199,7 +12624,7 @@ def _register_all_tools() -> None:
         ("per_filter_contribution", _tool_per_filter_contribution),
         ("interpolate_optimal_gain", _tool_interpolate_optimal_gain),
         ("sensitivity_analysis", _tool_sensitivity_analysis),
-        ("fit_correction_filter", _tool_fit_correction_filter),
+        ("fit_peq_for_target", _tool_fit_peq_for_target),
         ("predict_rms", _tool_predict_rms),
         ("play_and_measure_fft", _tool_play_and_measure_fft),
         ("measure_spl_pink", _tool_measure_spl_pink),

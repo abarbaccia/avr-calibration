@@ -77,7 +77,7 @@ from calibrate.mcp_server import (
     _tool_per_filter_contribution,
     _tool_interpolate_optimal_gain,
     _tool_sensitivity_analysis,
-    _tool_fit_correction_filter,
+    _tool_fit_peq_for_target,
     _tool_predict_rms,
     _tool_recommend_fir_phase,
 )
@@ -5046,7 +5046,7 @@ async def test_sensitivity_analysis_session_not_found() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fit_correction_filter_finds_cut() -> None:
+async def test_fit_peq_for_target_finds_cut() -> None:
     """Fit finds a cut filter for a response that's above target."""
     import numpy as np
     freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
@@ -5060,7 +5060,7 @@ async def test_fit_correction_filter_finds_cut() -> None:
     }
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        result = await _tool_fit_correction_filter(
+        result = await _tool_fit_peq_for_target(
             session_id=1, target_curve=target,
             freq_range=[40.0, 80.0],
         )
@@ -5074,18 +5074,18 @@ async def test_fit_correction_filter_finds_cut() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fit_correction_filter_session_not_found() -> None:
+async def test_fit_peq_for_target_session_not_found() -> None:
     target = {"points": [{"freq": 20, "spl": 75}, {"freq": 120, "spl": 75}], "band": [20, 120]}
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [])
-        result = await _tool_fit_correction_filter(
+        result = await _tool_fit_peq_for_target(
             session_id=999, target_curve=target, freq_range=[20, 120],
         )
     assert not result["ok"]
 
 
 @pytest.mark.asyncio
-async def test_fit_correction_filter_respects_constraints() -> None:
+async def test_fit_peq_for_target_respects_constraints() -> None:
     """max_boost_db constraint prevents the optimizer from boosting above limit."""
     import numpy as np
     freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
@@ -5099,7 +5099,7 @@ async def test_fit_correction_filter_respects_constraints() -> None:
     }
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        result = await _tool_fit_correction_filter(
+        result = await _tool_fit_peq_for_target(
             session_id=1, target_curve=target,
             freq_range=[40.0, 80.0],
             constraints={"max_boost_db": 3.0},
@@ -5112,7 +5112,7 @@ async def test_fit_correction_filter_respects_constraints() -> None:
 # ── multi-filter joint optimization (num_filters > 1) ──────────────────────
 
 @pytest.mark.asyncio
-async def test_fit_correction_filter_joint_beats_single_on_3_peaks() -> None:
+async def test_fit_peq_for_target_joint_beats_single_on_3_peaks() -> None:
     """A response with 3 distinct peaks at 35 / 55 / 80 Hz should be better
     corrected by a 3-filter joint fit than by a single filter.
 
@@ -5134,11 +5134,11 @@ async def test_fit_correction_filter_joint_beats_single_on_3_peaks() -> None:
     }
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        single = await _tool_fit_correction_filter(
+        single = await _tool_fit_peq_for_target(
             session_id=1, target_curve=target,
             freq_range=[25.0, 100.0], num_filters=1,
         )
-        joint = await _tool_fit_correction_filter(
+        joint = await _tool_fit_peq_for_target(
             session_id=1, target_curve=target,
             freq_range=[25.0, 100.0], num_filters=3,
         )
@@ -5155,7 +5155,7 @@ async def test_fit_correction_filter_joint_beats_single_on_3_peaks() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fit_correction_filter_joint_respects_bounds() -> None:
+async def test_fit_peq_for_target_joint_respects_bounds() -> None:
     """Multi-filter mode respects max_boost_db, min_q, max_q bounds."""
     import numpy as np
     freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
@@ -5168,7 +5168,7 @@ async def test_fit_correction_filter_joint_respects_bounds() -> None:
     }
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        result = await _tool_fit_correction_filter(
+        result = await _tool_fit_peq_for_target(
             session_id=1, target_curve=target,
             freq_range=[25.0, 100.0], num_filters=2,
             constraints={"max_boost_db": 3.0, "min_q": 1.0, "max_q": 5.0},
@@ -5180,13 +5180,13 @@ async def test_fit_correction_filter_joint_respects_bounds() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fit_correction_filter_joint_rejects_too_many_filters() -> None:
+async def test_fit_peq_for_target_joint_rejects_too_many_filters() -> None:
     """num_filters > 8 is rejected (SafetyValidator slot budget)."""
     target = {"points": [{"freq": 20, "spl": 75}, {"freq": 120, "spl": 75}], "band": [20, 120]}
     session = _make_fr_session([20.0, 120.0], [75.0, 75.0])
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        result = await _tool_fit_correction_filter(
+        result = await _tool_fit_peq_for_target(
             session_id=1, target_curve=target,
             freq_range=[25.0, 100.0], num_filters=9,
         )
@@ -5195,7 +5195,7 @@ async def test_fit_correction_filter_joint_rejects_too_many_filters() -> None:
 
 
 @pytest.mark.asyncio
-async def test_call_tool_fit_correction_filter_joint_dispatch() -> None:
+async def test_call_tool_fit_peq_for_target_joint_dispatch() -> None:
     """The dispatcher forwards num_filters to the multi-filter path."""
     from calibrate.mcp_server import call_tool
     import numpy as np
@@ -5206,7 +5206,7 @@ async def test_call_tool_fit_correction_filter_joint_dispatch() -> None:
     target = {"points": [{"freq": 20, "spl": 75.0}, {"freq": 120, "spl": 75.0}], "band": [20, 120]}
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        texts = await call_tool("fit_correction_filter", {
+        texts = await call_tool("fit_peq_for_target", {
             "session_id": 1, "target_curve": target,
             "freq_range": [25.0, 100.0], "num_filters": 2,
         })
@@ -5217,7 +5217,7 @@ async def test_call_tool_fit_correction_filter_joint_dispatch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fit_correction_filter_preserve_mean_balances_level() -> None:
+async def test_fit_peq_for_target_preserve_mean_balances_level() -> None:
     """preserve_mean=True should keep mean(correction) near zero, preventing
     the broadband level swings seen in the 2026-04-23 auto-PEQ session
     (v1 mean -1.45 dB, v3 mean -2.06 dB when preserve_mean is off)."""
@@ -5236,12 +5236,12 @@ async def test_fit_correction_filter_preserve_mean_balances_level() -> None:
 
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        off = await _tool_fit_correction_filter(
+        off = await _tool_fit_peq_for_target(
             session_id=1, target_curve=target,
             freq_range=[25.0, 100.0], num_filters=3,
             exclude_geometry=False,
         )
-        on = await _tool_fit_correction_filter(
+        on = await _tool_fit_peq_for_target(
             session_id=1, target_curve=target,
             freq_range=[25.0, 100.0], num_filters=3,
             constraints={"preserve_mean": True},
@@ -5253,7 +5253,7 @@ async def test_fit_correction_filter_preserve_mean_balances_level() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fit_correction_filter_doublet_penalty_discourages_opposing_pairs() -> None:
+async def test_fit_peq_for_target_doublet_penalty_discourages_opposing_pairs() -> None:
     """doublet_penalty > 0 should push the optimiser away from stacking
     a +N/-N pair of filters at nearby centre frequencies (the tonight
     LM +6/-7 doublet at 46.9/49.7 Hz pattern)."""
@@ -5282,13 +5282,13 @@ async def test_fit_correction_filter_doublet_penalty_discourages_opposing_pairs(
 
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        unpenalised = await _tool_fit_correction_filter(
+        unpenalised = await _tool_fit_peq_for_target(
             session_id=1, target_curve=target,
             freq_range=[30.0, 90.0], num_filters=3,
             constraints={"doublet_penalty": 0.0},
             exclude_geometry=False,
         )
-        penalised = await _tool_fit_correction_filter(
+        penalised = await _tool_fit_peq_for_target(
             session_id=1, target_curve=target,
             freq_range=[30.0, 90.0], num_filters=3,
             constraints={"doublet_penalty": 20.0, "doublet_max_hz": 10.0},
@@ -5302,7 +5302,7 @@ async def test_fit_correction_filter_doublet_penalty_discourages_opposing_pairs(
 
 
 @pytest.mark.asyncio
-async def test_fit_correction_filter_exclude_geometry_drops_null_band() -> None:
+async def test_fit_peq_for_target_exclude_geometry_drops_null_band() -> None:
     """exclude_geometry=True should drop frequencies inside geometry bands
     returned by _get_geometry_band_ranges from the residuals — the
     optimiser shouldn't waste a slot fighting an unfixable null."""
@@ -5321,7 +5321,7 @@ async def test_fit_correction_filter_exclude_geometry_drops_null_band() -> None:
          patch("calibrate.mcp_server._get_geometry_band_ranges",
                return_value=[(62.5, 78.7)]):
         _wire_mock_store(MockStore, [session])
-        result = await _tool_fit_correction_filter(
+        result = await _tool_fit_peq_for_target(
             session_id=1, target_curve=target,
             freq_range=[40.0, 100.0], num_filters=2,
             exclude_geometry=True,
@@ -5336,7 +5336,7 @@ async def test_fit_correction_filter_exclude_geometry_drops_null_band() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fit_correction_filter_auto_anchor_from_target_offsets() -> None:
+async def test_fit_peq_for_target_auto_anchor_from_target_offsets() -> None:
     """target_offsets (relative Harman-style) should trigger anchor_target
     and use the returned anchored_points as the absolute target."""
     import numpy as np
@@ -5360,7 +5360,7 @@ async def test_fit_correction_filter_auto_anchor_from_target_offsets() -> None:
          patch("calibrate.mcp_server._tool_anchor_target", side_effect=fake_anchor), \
          patch("calibrate.mcp_server._get_geometry_band_ranges", return_value=[]):
         _wire_mock_store(MockStore, [session])
-        result = await _tool_fit_correction_filter(
+        result = await _tool_fit_peq_for_target(
             session_id=1,
             target_offsets=[
                 {"freq_hz": 25, "offset_db": 5},
@@ -5373,12 +5373,12 @@ async def test_fit_correction_filter_auto_anchor_from_target_offsets() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fit_correction_filter_requires_target_curve_or_offsets() -> None:
+async def test_fit_peq_for_target_requires_target_curve_or_offsets() -> None:
     """Must pass either target_curve or target_offsets."""
     session = _make_fr_session([20.0, 120.0], [75.0, 75.0])
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        result = await _tool_fit_correction_filter(
+        result = await _tool_fit_peq_for_target(
             session_id=1, freq_range=[25.0, 100.0], num_filters=2,
         )
     assert not result["ok"]
@@ -5386,7 +5386,7 @@ async def test_fit_correction_filter_requires_target_curve_or_offsets() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fit_correction_filter_max_q_boost_raises_boost_q() -> None:
+async def test_fit_peq_for_target_max_q_boost_raises_boost_q() -> None:
     """max_q_boost should push boost filters to higher Q (narrower), preventing
     the LM optimiser from parking a broad low-Q boost that bleeds broadband level."""
     import numpy as np
@@ -5402,13 +5402,13 @@ async def test_fit_correction_filter_max_q_boost_raises_boost_q() -> None:
 
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        unconstrained = await _tool_fit_correction_filter(
+        unconstrained = await _tool_fit_peq_for_target(
             session_id=1, target_curve=target,
             freq_range=[30.0, 90.0], num_filters=2,
             constraints={"max_boost_db": 6.0},
             exclude_geometry=False,
         )
-        constrained = await _tool_fit_correction_filter(
+        constrained = await _tool_fit_peq_for_target(
             session_id=1, target_curve=target,
             freq_range=[30.0, 90.0], num_filters=2,
             constraints={"max_boost_db": 6.0, "max_q_boost": 3.0, "boost_q_penalty": 10.0},
@@ -5432,7 +5432,7 @@ async def test_fit_correction_filter_max_q_boost_raises_boost_q() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fit_correction_filter_baseline_filters_incremental() -> None:
+async def test_fit_peq_for_target_baseline_filters_incremental() -> None:
     """baseline_filters should pre-apply an existing correction so the
     optimiser designs *additional* filters on top rather than redoing the
     whole bank from scratch."""
@@ -5456,13 +5456,13 @@ async def test_fit_correction_filter_baseline_filters_incremental() -> None:
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
         # Without baseline — optimiser sees both peaks, assigns filters to both.
-        without_baseline = await _tool_fit_correction_filter(
+        without_baseline = await _tool_fit_peq_for_target(
             session_id=1, target_curve=target,
             freq_range=[30.0, 90.0], num_filters=2,
             exclude_geometry=False,
         )
         # With baseline — 40 Hz peak already corrected; optimiser should focus on 70 Hz.
-        with_baseline = await _tool_fit_correction_filter(
+        with_baseline = await _tool_fit_peq_for_target(
             session_id=1, target_curve=target,
             freq_range=[30.0, 90.0], num_filters=2,
             baseline_filters=[existing_filter],
@@ -5483,7 +5483,7 @@ async def test_fit_correction_filter_baseline_filters_incremental() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fit_correction_filter_preserve_mean_suppressed_when_max_boost_zero() -> None:
+async def test_fit_peq_for_target_preserve_mean_suppressed_when_max_boost_zero() -> None:
     """Bug regression: preserve_mean=True + max_boost_db=0 creates a degenerate
     optimizer state — preserve_mean penalises net-downward corrections while
     max_boost_db=0 prevents compensating boosts. The tool must auto-suppress
@@ -5503,7 +5503,7 @@ async def test_fit_correction_filter_preserve_mean_suppressed_when_max_boost_zer
 
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        result = await _tool_fit_correction_filter(
+        result = await _tool_fit_peq_for_target(
             session_id=1, target_curve=target,
             freq_range=[25.0, 100.0], num_filters=4,
             constraints={"max_boost_db": 0, "preserve_mean": True},
@@ -5523,7 +5523,7 @@ async def test_fit_correction_filter_preserve_mean_suppressed_when_max_boost_zer
 
 
 @pytest.mark.asyncio
-async def test_fit_correction_filter_anchor_warning_when_anchor_diverges() -> None:
+async def test_fit_peq_for_target_anchor_warning_when_anchor_diverges() -> None:
     """Bug regression: auto-anchor with target_offsets can set reference_spl
     well above the measured value at the reference frequency, forcing boost
     filters that produce doublets. When anchor diverges >3 dB above measured
@@ -5555,7 +5555,7 @@ async def test_fit_correction_filter_anchor_warning_when_anchor_diverges() -> No
                side_effect=fake_anchor_high), \
          patch("calibrate.mcp_server._get_geometry_band_ranges", return_value=[]):
         _wire_mock_store(MockStore, [session])
-        result = await _tool_fit_correction_filter(
+        result = await _tool_fit_peq_for_target(
             session_id=1,
             target_offsets=[
                 {"freq_hz": 25, "offset_db": 5},
@@ -5579,7 +5579,7 @@ async def test_fit_correction_filter_anchor_warning_when_anchor_diverges() -> No
 
 
 @pytest.mark.asyncio
-async def test_fit_correction_filter_no_anchor_warning_when_anchor_close() -> None:
+async def test_fit_peq_for_target_no_anchor_warning_when_anchor_close() -> None:
     """Complement: no anchor_warning when anchor is within 3 dB of measured."""
     import numpy as np
 
@@ -5606,7 +5606,7 @@ async def test_fit_correction_filter_no_anchor_warning_when_anchor_close() -> No
                side_effect=fake_anchor_close), \
          patch("calibrate.mcp_server._get_geometry_band_ranges", return_value=[]):
         _wire_mock_store(MockStore, [session])
-        result = await _tool_fit_correction_filter(
+        result = await _tool_fit_peq_for_target(
             session_id=1,
             target_offsets=[
                 {"freq_hz": 25, "offset_db": 3},
@@ -5801,7 +5801,7 @@ async def test_call_tool_sensitivity_analysis_dispatch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_call_tool_fit_correction_filter_dispatch() -> None:
+async def test_call_tool_fit_peq_for_target_dispatch() -> None:
     from calibrate.mcp_server import call_tool
     import numpy as np
     freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
@@ -5809,7 +5809,7 @@ async def test_call_tool_fit_correction_filter_dispatch() -> None:
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        texts = await call_tool("fit_correction_filter", {
+        texts = await call_tool("fit_peq_for_target", {
             "session_id": 1,
             "target_curve": {
                 "points": [{"freq": 20, "spl": 75}, {"freq": 120, "spl": 75}],
@@ -5861,10 +5861,10 @@ async def test_get_signal_graph_returns_summary_from_legacy_shim() -> None:
 
 @pytest.mark.asyncio
 async def test_resolve_target_returns_transducers_for_group() -> None:
-    from calibrate.mcp_server import _tool_resolve_target
+    from calibrate.mcp_server import _tool_resolve_measurement_target
 
     # Default legacy config synthesises a "bass" group with two subs.
-    result = await _tool_resolve_target("bass")
+    result = await _tool_resolve_measurement_target("bass")
     assert result["ok"]
     assert len(result["resolved"]) == 2
     assert all(r["role"] == "sub" for r in result["resolved"])
@@ -5872,9 +5872,9 @@ async def test_resolve_target_returns_transducers_for_group() -> None:
 
 @pytest.mark.asyncio
 async def test_resolve_target_unknown_returns_empty_list() -> None:
-    from calibrate.mcp_server import _tool_resolve_target
+    from calibrate.mcp_server import _tool_resolve_measurement_target
 
-    result = await _tool_resolve_target("no_such_thing")
+    result = await _tool_resolve_measurement_target("no_such_thing")
     assert result["ok"]
     assert result["resolved"] == []
 
