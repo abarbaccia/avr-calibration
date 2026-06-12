@@ -290,6 +290,18 @@ if [ -f "$SCRIPT_DIR/avr-cal-sweep-link.service" ] && [ -d /home/pi ]; then
     echo "Installed + enabled: avr-cal-sweep-link.service (user)"
 fi
 
+# Retire the stale system-level UMIK resample rule (installed to
+# /etc/wireplumber/main.lua.d/51-umik-resample.lua on or before 2026-06-08).
+# Replaced by the corrected user-level 51-umik.lua (installs above to
+# ~/.config/wireplumber/main.lua.d/51-umik.lua). The old system-level file
+# set node.autoconnect = false on the UMIK device node — ineffective because
+# WirePlumber links stream nodes, not device nodes. The corrected rule uses
+# stream.rules to actually prevent UMIK→camilladsp_capture auto-links.
+if [ -f /etc/wireplumber/main.lua.d/51-umik-resample.lua ]; then
+    sudo rm -f /etc/wireplumber/main.lua.d/51-umik-resample.lua
+    echo "Retired: /etc/wireplumber/main.lua.d/51-umik-resample.lua"
+fi
+
 # Retire the deprecated ALSA loopback-ref bridge (Scarlett AUX2 → snd-aloop).
 # Replaced by the loopback_ref PW null sink (11-loopback-ref.conf). Remove the
 # unit + script from upgraded Pis.
