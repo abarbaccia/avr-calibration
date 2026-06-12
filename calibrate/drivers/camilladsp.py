@@ -1323,25 +1323,21 @@ class CamillaDSPDriver(DSPDriver):
         except SafetyValidationError as exc:
             raise DriverError(str(exc))
 
-        quantum_change = False
+        new_conv_block = False
         async with self._lock:
             n_taps = len(coefficients)
             prev = list(self._fir_state.get(output_index, []))
-            prev_peers: dict[int, list[float]] = {}
-            # Impulse at tap 0 — zero-delay passthrough for peer outputs.
             identity = [0.0] * n_taps
             identity[0] = 1.0
 
-            # Track whether this push changes the pipeline structure (adds a new
-            # Conv block, or changes its tap count) which causes PW quantum shift.
-            prev_n_taps = len(prev)
-            quantum_change = (prev_n_taps == 0) or (prev_n_taps != n_taps)
+            # Track whether this is the first Conv block for this output.
+            # Adding a new Conv block triggers a CamillaDSP pipeline reload.
+            new_conv_block = len(prev) == 0
 
             self._fir_state[int(output_index)] = [float(c) for c in coefficients]
-            # Pad all routed peer outputs to the same tap count so CamillaDSP
-            # uses a uniform FFT buffer size on every Conv-capable channel.
-            # Mixed tap counts (e.g. 8192 on subs, 0 on shaker) shift the
-            # PipeWire loopback xcorr timing and corrupt sweep deconvolution.
+            # Ensure all routed peers have the same tap count — CamillaDSP uses
+            # a uniform FFT buffer size across all Conv-capable channels.
+            prev_peers: dict[int, list[float]] = {}
             for peer in self._routed_outputs:
                 if peer == int(output_index):
                     continue
@@ -1363,86 +1359,42 @@ class CamillaDSPDriver(DSPDriver):
                         self._fir_state.pop(peer, None)
                 raise
 
-        # Sleep outside the lock when the pipeline structure changed — adding a new
-        # Conv block (or resizing it) shifts the PipeWire data-loop quantum and any
-        # sweep taken within ~1 s of the push will have unstable loopback timing.
-        if quantum_change:
+        # Sleep only when a brand-new Conv block is added — that's the one
+        # unavoidable CamillaDSP pipeline reload. Resizing or swapping
+        # coefficients in an existing block does not change pipeline structure.
+        if new_conv_block:
             log.debug(
-                "apply_fir(output=%d, taps=%d): pipeline quantum change — "
-                "sleeping 1.5 s for PipeWire renegotiation",
+                "apply_fir(output=%d, taps=%d): new Conv block — "
+                "sleeping 1.5 s for CamillaDSP pipeline reload",
                 output_index,
                 n_taps,
             )
             await asyncio.sleep(1.5)
 
     async def clear_fir(self, output_index: int) -> None:
-        """Clear FIR coefficients on a single output (filter removed from pipeline).
+        """Reset FIR on one output to identity (passthrough).
 
-        Only removes the explicitly requested output's Conv filter.  Peer outputs
-        that carry matching-length identity pads are left untouched — they will be
-        cleaned up by their own ``clear_fir`` calls.  This avoids a double quantum
-        transition when both sub outputs are cleared sequentially (first call was
-        previously removing BOTH Conv blocks at once, dropping the PipeWire quantum
-        in a single push and leaving the measurement chain unstable for ~1–2 s).
+        If a Conv block exists for this output, its coefficients are replaced
+        with an identity (tap 0 = 1.0, rest 0.0) of the same length — keeping
+        the pipeline structure (and CamillaDSP latency) constant.  This is the
+        correct way to "clear" a FIR without destabilising the measurement chain.
 
-        A 1.5 s stabilisation sleep is issued after any push that removes a Conv
-        block, giving PipeWire time to renegotiate the data-loop quantum before
-        the next ``measure`` call.
+        If no Conv block exists for this output, this is a no-op.
+
+        No sleep is issued — writing identity coefficients does not change the
+        pipeline structure, so no CamillaDSP reload occurs.
         """
         async with self._lock:
-            prev = list(self._fir_state.get(output_index, []))
-
-            def _is_identity(taps: list[float]) -> bool:
-                return bool(taps) and taps[0] == 1.0 and all(t == 0.0 for t in taps[1:])
-
-            # Snapshot whether this output currently has an active Conv block so we
-            # know whether the push will change the pipeline structure (and therefore
-            # trigger a PW quantum renegotiation).
-            had_conv = bool(prev)
-
-            # A peer has an "active correction" only when its FIR is non-empty and
-            # not a passthrough identity pad (taps[0]=1, rest=0).
-            active_peer_taps = max(
-                (len(c) for p, c in self._fir_state.items()
-                 if p in self._routed_outputs and p != int(output_index)
-                 and c and not _is_identity(c)),
-                default=0,
-            )
-
-            if active_peer_taps > 0:
-                # At least one peer still has a real correction FIR.
-                # Keep a matching-length identity so the PW quantum stays stable.
-                identity = [0.0] * active_peer_taps
-                identity[0] = 1.0
-                self._fir_state[int(output_index)] = identity
-                # Replacing an active FIR with a same-length identity pad does not
-                # change the pipeline structure — no quantum shift, no sleep needed.
-                had_conv = False
-            else:
-                # No active corrections remain on any routed output.
-                # Remove only THIS output's filter.  Leave peer identity pads in
-                # place so each peer is cleaned up by its own clear_fir() call.
-                # Removing both in one push caused a double-quantum-transition and
-                # left the measurement chain unstable (observed: coherence 0.35–0.46,
-                # group delays 272–376 ms on the following sweep).
-                self._fir_state[int(output_index)] = []
+            prev = list(self._fir_state.get(int(output_index), []))
+            if not prev:
+                # No Conv block active — nothing to clear.
+                return
+            n_taps = len(prev)
+            identity = [0.0] * n_taps
+            identity[0] = 1.0
+            self._fir_state[int(output_index)] = identity
             try:
                 await self._push_config_locked()
             except DriverError:
-                if prev:
-                    self._fir_state[output_index] = prev
-                else:
-                    self._fir_state.pop(output_index, None)
+                self._fir_state[int(output_index)] = prev
                 raise
-
-        # Sleep OUTSIDE the lock so callers aren't blocked and so a concurrent
-        # measure() can still acquire the lock (it will just see the new config).
-        # Only sleep when we actually removed a Conv block from the pipeline —
-        # that's the transition that causes PW quantum renegotiation.
-        if had_conv and not self._fir_state.get(int(output_index)):
-            log.debug(
-                "clear_fir(output=%d): Conv block removed — sleeping 1.5 s for "
-                "PipeWire quantum renegotiation",
-                output_index,
-            )
-            await asyncio.sleep(1.5)

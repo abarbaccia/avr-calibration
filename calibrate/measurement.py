@@ -582,30 +582,15 @@ class MeasurementEngine:
     output conversion.
     """
 
-    def __init__(self, config: Config, fir_n_taps: int = 0) -> None:
+    def __init__(self, config: Config) -> None:
         self.config = config
-        # Configurable xcorr search window — increase when long FIRs push
-        # CamillaDSP processing latency beyond the default 200 ms ceiling.
-        # measurement.xcorr_search_window_ms in config.yaml overrides the default.
-        # fir_n_taps auto-floors the window so it always covers FIR latency
-        # (N/2 samples) plus up to 100 ms of acoustic travel + margin, preventing
-        # peak_sign flips and coherence collapse when a long identity or correction
-        # FIR is loaded.  Formula: FIR latency = n_taps / (2 * sample_rate);
-        # add 100 ms headroom for acoustic travel + rounding.
-        _config_window = float(
+        # Configurable xcorr search window. With constant pipeline topology
+        # (Conv blocks stay resident, coefficients are swapped), latency is
+        # stable — no per-call floor calculation needed. Override via
+        # measurement.xcorr_search_window_ms in config.yaml.
+        self._xcorr_search_window_ms = float(
             config._data.get("measurement", {}).get("xcorr_search_window_ms", 200.0)
         )
-        if fir_n_taps > 0:
-            _sample_rate = float(
-                config._data.get("measurement", {}).get("sample_rate", 48000)
-            )
-            # FIR group delay (linear phase) = n_taps / 2 samples
-            _fir_latency_ms = (fir_n_taps / 2.0) / _sample_rate * 1000.0
-            # Add 100 ms for acoustic travel + startup jitter margin
-            _min_window = _fir_latency_ms + 100.0
-            self._xcorr_search_window_ms = max(_config_window, _min_window)
-        else:
-            self._xcorr_search_window_ms = _config_window
         # Use the module-level _MEASURE_LOCK, not an instance lock — MeasurementEngine
         # is created fresh per MCP tool call, so an instance lock would not serialize
         # concurrent callers. The module lock is shared across all instances.
@@ -1308,15 +1293,13 @@ class MeasurementEngine:
             T = np.fft.rfft(timing_array[:n_t], n=n_t)
             Y_t = np.fft.rfft(rec_array[:n_t], n=n_t)
             C_full = np.fft.irfft(np.conj(T) * Y_t, n=n_t)
-            # Anchor H(f) to the analytical sweep (not the loopback ref).
-            # The loopback null-sink quantum can jump ±39 ms between sessions
-            # when PipeWire renegotiates (e.g. after FIR tap-count changes).
-            # That timing shift rotates H(f) by ±39 ms × 2π × f — hundreds of
-            # degrees at 25–80 Hz — making cross-session phase comparison invalid
-            # (Trinnov requires coherent H_5, H_6 phase frames). The analytical
-            # sweep is deterministic; PW play-capture jitter is <1 ms (<18° at
-            # 50 Hz) and is acceptable for sub-bass design.
-            X, Y, n = T, Y_t, n_t
+            # Deconvolution uses the loopback ref (X, Y already set from
+            # deconv_x/deconv_y) — only xcorr window placement uses timing_array.
+            # The loopback is the correct phase reference: with constant pipeline
+            # topology (no Conv block additions/removals after the first apply_fir),
+            # loopback_xcorr_peak_ms is stable across sessions. Using the loopback
+            # lets common-mode PW jitter cancel and keeps H(f) = mic/loopback so
+            # FIR and PEQ corrections are visible in every measurement.
         else:
             C_full = np.fft.irfft(np.conj(X) * Y, n=n)
         try:

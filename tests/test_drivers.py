@@ -2026,20 +2026,31 @@ async def test_camilladsp_apply_fir_writes_conv_filter_with_inline_values() -> N
 
 
 @pytest.mark.asyncio
-async def test_camilladsp_clear_fir_removes_conv_filter_from_pipeline() -> None:
+async def test_camilladsp_clear_fir_writes_identity_and_keeps_conv_block() -> None:
+    """clear_fir must replace coefficients with identity, NOT remove the Conv block.
+
+    Keeping the Conv block stable prevents CamillaDSP pipeline reloads between
+    measurements, which would shift loopback_xcorr_peak_ms and corrupt Trinnov
+    cross-session phase comparisons.
+    """
     driver = CamillaDSPDriver(output_channels=4)
-    _stub_client(driver)
+    call = _stub_client(driver)
     await driver.apply_fir(0, [0.0, 1.0, 0.0])
-    call = driver._client.call  # retain the same mock
 
     await driver.clear_fir(0)
     cfg = _last_pushed_config(call)
-    assert "cal_out0_fir" not in cfg["filters"]
+    # Conv block must still be present
+    assert "cal_out0_fir" in cfg["filters"]
+    vals = cfg["filters"]["cal_out0_fir"]["parameters"]["values"]
+    assert vals[0] == 1.0 and all(v == 0.0 for v in vals[1:]), "must be identity"
+    # Find the per-output processing step (contains cal_out0_delay, distinct from
+    # the cal_master_gain step which also runs on channel 0).
     out0_step = next(
         s for s in cfg["pipeline"]
         if s.get("type") == "Filter" and s.get("channels") == [0]
+        and any("cal_out0_delay" in n for n in s.get("names", []))
     )
-    assert "cal_out0_fir" not in out0_step["names"]
+    assert "cal_out0_fir" in out0_step["names"]
 
 
 @pytest.mark.asyncio
@@ -2068,15 +2079,8 @@ async def test_camilladsp_apply_fir_rejects_wrong_sample_rate() -> None:
 
 
 @pytest.mark.asyncio
-async def test_clear_fir_does_not_remove_peer_identity_firs() -> None:
-    """clear_fir(5) must NOT remove the identity FIR on peer output 6.
-
-    The old code cleared both in one push when no 'active' (non-identity)
-    FIR existed on any peer, causing a double quantum transition and
-    degraded measurements (coherence 0.35–0.46, group delays 272–376 ms).
-    The fix: only remove the explicitly requested output's Conv block;
-    peer identity pads are cleaned up by their own clear_fir() calls.
-    """
+async def test_clear_fir_writes_identity_and_does_not_touch_peers() -> None:
+    """clear_fir(5) must write identity on output 5 and leave output 6 untouched."""
     driver = CamillaDSPDriver(
         sub_outputs=[5, 6],
         routed_outputs=[5, 6],
@@ -2084,54 +2088,61 @@ async def test_clear_fir_does_not_remove_peer_identity_firs() -> None:
     )
     call = _stub_client(driver)
 
-    # Load identity FIRs on both outputs (mimics apply_fir_identity sequence)
     identity = [1.0] + [0.0] * 99  # 100-tap identity
     driver._fir_state[5] = list(identity)
     driver._fir_state[6] = list(identity)
 
-    # Clear output 5 only
     await driver.clear_fir(5)
 
-    # Output 5's FIR must be gone
-    assert driver._fir_state.get(5) == [] or 5 not in driver._fir_state
+    # Output 5 must still carry an identity (Conv block kept)
+    out5 = driver._fir_state.get(5, [])
+    assert out5 and out5[0] == 1.0 and all(v == 0.0 for v in out5[1:])
 
-    # Output 6's identity FIR must remain untouched
-    assert driver._fir_state.get(6) == identity, (
-        "clear_fir(5) must not remove the identity FIR on peer output 6 — "
-        "each output must be cleared by its own explicit clear_fir() call"
-    )
+    # Output 6 must be untouched
+    assert driver._fir_state.get(6) == identity
 
-    # The pushed config must have cal_out6_fir present but not cal_out5_fir
     cfg = _last_pushed_config(call)
-    assert "cal_out5_fir" not in cfg["filters"]
+    assert "cal_out5_fir" in cfg["filters"]
     assert "cal_out6_fir" in cfg["filters"]
 
 
 @pytest.mark.asyncio
-async def test_clear_fir_second_call_removes_last_identity() -> None:
-    """The second clear_fir() call (on the peer) must remove its identity FIR."""
+async def test_clear_fir_noop_when_no_slot_exists() -> None:
+    """clear_fir on an output with no Conv block must be a no-op."""
     driver = CamillaDSPDriver(
         sub_outputs=[5, 6],
         routed_outputs=[5, 6],
         output_channels=8,
     )
     call = _stub_client(driver)
+    call.reset_mock()
+
+    # No FIR state loaded — clear_fir must not push anything
+    await driver.clear_fir(5)
+    call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_clear_fir_sequential_both_stay_as_identity() -> None:
+    """Calling clear_fir on both outputs leaves both as identities (topology stable)."""
+    driver = CamillaDSPDriver(
+        sub_outputs=[5, 6],
+        routed_outputs=[5, 6],
+        output_channels=8,
+    )
+    _stub_client(driver)
 
     identity = [1.0] + [0.0] * 99
     driver._fir_state[5] = list(identity)
     driver._fir_state[6] = list(identity)
 
-    # Clear output 5, then output 6
     await driver.clear_fir(5)
     await driver.clear_fir(6)
 
-    # Both must now be empty
-    assert not driver._fir_state.get(5)
-    assert not driver._fir_state.get(6)
-
-    cfg = _last_pushed_config(call)
-    assert "cal_out5_fir" not in cfg["filters"]
-    assert "cal_out6_fir" not in cfg["filters"]
+    # Both must remain as identities — no Conv blocks removed
+    for idx in (5, 6):
+        out = driver._fir_state.get(idx, [])
+        assert out and out[0] == 1.0 and all(v == 0.0 for v in out[1:])
 
 
 @pytest.mark.asyncio

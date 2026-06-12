@@ -265,6 +265,12 @@ if [ -f "$SCRIPT_DIR/wireplumber-scarlett.lua" ] && [ -d /home/pi ]; then
         /home/pi/.config/wireplumber/main.lua.d/50-scarlett.lua
     echo "Installed: /home/pi/.config/wireplumber/main.lua.d/50-scarlett.lua"
 fi
+if [ -f "$SCRIPT_DIR/wireplumber-umik.lua" ] && [ -d /home/pi ]; then
+    sudo install -d -o pi -g pi /home/pi/.config/wireplumber/main.lua.d
+    sudo install -m 0644 -o pi -g pi "$SCRIPT_DIR/wireplumber-umik.lua" \
+        /home/pi/.config/wireplumber/main.lua.d/51-umik.lua
+    echo "Installed: /home/pi/.config/wireplumber/main.lua.d/51-umik.lua"
+fi
 if [ -f "$SCRIPT_DIR/pipewire-scarlett-clock.conf" ]; then
     sudo install -d /etc/pipewire/pipewire.conf.d
     sudo install -m 0644 "$SCRIPT_DIR/pipewire-scarlett-clock.conf" \

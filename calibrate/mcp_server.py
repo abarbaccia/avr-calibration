@@ -4457,6 +4457,31 @@ async def _tool_design_fir_trinnov(
                 label=label,
             ))
 
+        # Hard gate: all measurement sessions must have the same loopback timing.
+        # loopback_xcorr_peak_ms encodes CamillaDSP pipeline latency + acoustic
+        # travel — when it differs across sessions the H_i phase frames are not
+        # comparable and the Wiener K_i will compute wrong phase corrections.
+        # A 1 ms shift at 50 Hz is ~18° of phase error; 2 ms is ~36°.
+        xcorr_peaks = {}
+        for m in measurements:
+            sid = int(m["session_id"])
+            sess = store.get_session(sid)
+            if sess and sess.start_fr and sess.start_fr.loopback_xcorr_peak_ms is not None:
+                xcorr_peaks[sid] = sess.start_fr.loopback_xcorr_peak_ms
+        if len(xcorr_peaks) >= 2:
+            peaks_list = list(xcorr_peaks.values())
+            xcorr_range = max(peaks_list) - min(peaks_list)
+            if xcorr_range > 0.5:
+                ids_detail = ", ".join(
+                    f"session {sid}: {ms:.2f} ms" for sid, ms in xcorr_peaks.items()
+                )
+                return _err(
+                    f"Sessions have inconsistent loopback_xcorr_peak_ms (range={xcorr_range:.2f} ms > 0.5 ms): "
+                    f"{ids_detail}. Cross-session phase comparison is invalid — Trinnov will produce wrong "
+                    "phase corrections. Re-measure all subs in immediate succession with the same "
+                    "pipeline topology (same FIR tap counts loaded, same PipeWire graph)."
+                )
+
         # Parse target curve
         points = target_curve.get("points", [])
         target_points = [(float(p["freq"]), float(p["spl"])) for p in points]
@@ -5724,20 +5749,6 @@ async def _tool_trigger_measurement(
         graph = cfg.signal_graph
         targets = tuple(graph.transducers_by_role("sub")) or graph.transducers
 
-        # Compute the longest active FIR tap count so the measurement service
-        # can auto-floor its xcorr search window.  A Conv FIR with N taps adds
-        # N/2 samples of group delay; the default 200 ms window is too narrow
-        # for FIRs ≥ ~16384 taps at 96 kHz (latency ~85 ms + acoustic travel).
-        _active_fir_n_taps = 0
-        try:
-            if _dsp is not None and hasattr(_dsp, "_fir_state"):
-                _active_fir_n_taps = max(
-                    (len(taps) for taps in _dsp._fir_state.values() if taps),
-                    default=0,
-                )
-        except Exception:
-            _active_fir_n_taps = 0
-
         if (
             route == "hdmi"
             and _drivers is not None
@@ -5753,7 +5764,6 @@ async def _tool_trigger_measurement(
                     freq_max=resolved_max,
                     route=route,
                     direct_path_window_ms=direct_path_window_ms,
-                    fir_n_taps=_active_fir_n_taps,
                 )
         elif route == "hdmi":
             # Per-channel mains sweep (resolved_out_channel set) or legacy path.
@@ -5773,8 +5783,7 @@ async def _tool_trigger_measurement(
                         out_channel_override=resolved_out_channel,
                         route=route,
                         direct_path_window_ms=direct_path_window_ms,
-                        fir_n_taps=_active_fir_n_taps,
-                    )
+                        )
             else:
                 fr = await meas_client.measure(
                     freq_min=resolved_min,
@@ -5782,7 +5791,6 @@ async def _tool_trigger_measurement(
                     out_channel_override=resolved_out_channel,
                     route=route,
                     direct_path_window_ms=direct_path_window_ms,
-                    fir_n_taps=_active_fir_n_taps,
                 )
         else:
             # USB route: enter the DSP sweep context per-measurement so any
@@ -5798,15 +5806,13 @@ async def _tool_trigger_measurement(
                         freq_max=resolved_max,
                         route=route,
                         direct_path_window_ms=direct_path_window_ms,
-                        fir_n_taps=_active_fir_n_taps,
-                    )
+                        )
             else:
                 fr = await meas_client.measure(
                     freq_min=resolved_min,
                     freq_max=resolved_max,
                     route=route,
                     direct_path_window_ms=direct_path_window_ms,
-                    fir_n_taps=_active_fir_n_taps,
                 )
 
         # Compute IR-derived metadata at capture time. Query the DSP for the
