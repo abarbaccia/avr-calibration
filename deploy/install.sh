@@ -377,7 +377,10 @@ cp pyproject.toml uv.lock "$MEAS_DIR/src/"
 
 # Create venv and install
 cd "$MEAS_DIR/src"
-uv venv "$MEAS_DIR/venv"
+# --clear: replace any existing venv. Without it uv errors out on re-runs,
+# aborting the script (set -e) before `uv sync` — the service then keeps
+# running stale code while everything earlier in this script reports success.
+uv venv --clear "$MEAS_DIR/venv"
 UV_PROJECT_ENVIRONMENT="$MEAS_DIR/venv" uv sync --no-dev --extra measurement --no-editable
 cd -
 
