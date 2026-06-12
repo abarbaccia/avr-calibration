@@ -1460,13 +1460,15 @@ async def test_camilladsp_get_state_disconnected_returns_minimal_dict() -> None:
 
 @pytest.mark.asyncio
 async def test_camilladsp_get_state_returns_full_shape_when_connected() -> None:
-    """Connected get_state calls GetState+GetVolume+GetMute+GetProcessingLoad."""
+    """Connected get_state calls GetState+GetMute+GetProcessingLoad and reads volume
+    from shadow state (SetVolume is a no-op in CamillaDSP v4; volume is tracked
+    in _master_gain_db and reported from shadow rather than a GetVolume call)."""
     driver = CamillaDSPDriver()
+    driver._master_gain_db = -12.0  # simulate a previously-set gain
 
     # Fake a connected client with canned responses per command.
     responses = {
         "GetState": "Running",
-        "GetVolume": -12.0,
         "GetMute": False,
         "GetProcessingLoad": 0.08,
     }
@@ -1477,7 +1479,7 @@ async def test_camilladsp_get_state_returns_full_shape_when_connected() -> None:
 
     assert state["connected"] is True
     assert state["state"] == "Running"
-    assert state["volume"] == -12.0
+    assert state["volume"] == -12.0  # from shadow state, not GetVolume
     assert state["mute"] is False
     assert state["cpu_load"] == 0.08
     # Protocol-compatibility fields are present but stubbed.
@@ -1504,11 +1506,17 @@ async def test_camilladsp_get_state_tolerates_missing_processing_load() -> None:
 
 
 @pytest.mark.asyncio
-async def test_camilladsp_set_master_gain_dispatches_setvolume() -> None:
+async def test_camilladsp_set_master_gain_updates_shadow_and_pushes_config() -> None:
+    """set_master_gain updates _master_gain_db and pushes SetConfig (not SetVolume)."""
     driver = CamillaDSPDriver()
+    driver._client._ws = object()  # mark as connected so _push_config_locked works
     driver._client.call = AsyncMock(return_value=None)
     await driver.set_master_gain(-9.5)
-    driver._client.call.assert_awaited_once_with("SetVolume", -9.5)
+    assert driver._master_gain_db == -9.5
+    # SetConfig should have been called (not SetVolume — that's a no-op in v4).
+    cmds = [c.args[0] for c in driver._client.call.await_args_list]
+    assert "SetConfig" in cmds
+    assert "SetVolume" not in cmds
 
 
 # ── _USBSweepContext ──────────────────────────────────────────────────────────
