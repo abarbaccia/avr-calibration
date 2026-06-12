@@ -59,6 +59,7 @@ Usage (via Docker Compose service):
 from __future__ import annotations
 
 import asyncio
+import inspect as _inspect
 import json
 import logging
 import os
@@ -155,6 +156,16 @@ class _BoundedDict(OrderedDict):
         self.move_to_end(key)
         while len(self) > self._maxsize:
             self.popitem(last=False)
+
+
+# Tool dispatch registry — maps tool name → (handler_fn, frozenset_of_param_names).
+# Built by _register() calls after all _tool_* functions are defined.
+# Dispatcher uses this for a single dict lookup instead of a 600-line elif chain.
+_TOOL_HANDLERS: dict[str, tuple] = {}
+
+
+def _register(name: str, fn) -> None:
+    _TOOL_HANDLERS[name] = (fn, frozenset(_inspect.signature(fn).parameters))
 
 
 # Server-side cache for FIR coefficients produced by design_fir. Lets callers
@@ -306,7 +317,7 @@ async def _tool_get_measurement_history(
     max_hz: float | None = None,
     smooth: str = "twelfth_octave",
     decimation: int = 1,
-    fmt: str = "compact",
+    format: str = "compact",  # noqa: A002 — MCP arg name; fmt renamed for dispatch
     include_phase: bool = False,
 ) -> dict:
     """Return last *limit* measurement sessions from SessionStore.
@@ -318,8 +329,8 @@ async def _tool_get_measurement_history(
         smooth: Octave smoothing — "twelfth_octave" (default, ~40 bands for subs),
             "sixth_octave" (~20 bands), "third_octave" (~10 bands), "raw" (full resolution).
         decimation: Legacy stride decimation (ignored when smooth != "raw").
-        fmt: "compact" (default; "freq:spl,..." string) or "full" (arrays).
-        include_phase: Include phase_rad[] (fmt="full" only). Omit for EQ iteration loops.
+        format: "compact" (default; "freq:spl,..." string) or "full" (arrays).
+        include_phase: Include phase_rad[] (format="full" only). Omit for EQ iteration loops.
     """
     from .storage import SessionStore
     bpo = _SMOOTH_BPO.get(smooth)
@@ -352,7 +363,7 @@ async def _tool_get_measurement_history(
                     freqs, spls = _filter_and_decimate_fr(
                         fr.frequencies, fr.spl, min_hz, max_hz, decimation
                     )
-                if fr.phase and fmt == "full" and include_phase:
+                if fr.phase and format == "full" and include_phase:
                     phase_freqs, phase_vals = _filter_and_decimate_fr(
                         fr.frequencies, fr.phase, min_hz, max_hz, decimation
                     )
@@ -366,7 +377,7 @@ async def _tool_get_measurement_history(
                 "timestamp": s.timestamp,
                 "label": s.label,
             }
-            if fmt == "compact":
+            if format == "compact":
                 # Encode as compact "freq:spl,freq:spl,..." string — ~12 chars/point
                 # vs ~40 chars/point in full JSON array format (3x smaller)
                 entry["fr"] = ",".join(
@@ -379,7 +390,7 @@ async def _tool_get_measurement_history(
                 if phase_vals:
                     entry["phase_rad"] = [round(v, 4) for v in phase_vals]
             if s.metadata:
-                if fmt == "compact":
+                if format == "compact":
                     # In compact mode, downsample group_delay to 1/3-octave (not strip)
                     compact_meta = {}
                     for k, v in s.metadata.items():
@@ -484,6 +495,8 @@ async def _tool_get_fr_summary(
     If *session_ids* is given, return those specific sessions.
     Otherwise return the last *limit* sessions.
     """
+    if session_ids:
+        session_ids = [int(x) for x in session_ids]
     from .storage import SessionStore
     try:
         store = SessionStore()
@@ -3112,6 +3125,7 @@ async def _tool_optimize_sub_alignment(
     band's SPL — surfaces the polarity insight that the global optimizer
     can miss when its objective averages across the full band).
     """
+    session_ids = [int(x) for x in session_ids]
     try:
         from .storage import SessionStore
         import numpy as np
@@ -3469,6 +3483,7 @@ async def _tool_sweep_inter_sub_delay(
     delta. Apply the recommended delta via ``set_delay`` on the
     trailing sub.
     """
+    session_ids = [int(x) for x in session_ids]
     try:
         from .storage import SessionStore
         import numpy as np
@@ -4179,6 +4194,12 @@ async def _tool_design_fir_multi(
     Lower = stronger correction at nulls (more boost requested); higher =
     accept the null, smaller boost.  Default 0.1 (linear, ~ -20 dB).
     """
+    if isinstance(modal_intents, str):
+        import json as _json
+        modal_intents = _json.loads(modal_intents)
+    if isinstance(modal_taps, str):
+        import json as _json
+        modal_taps = int(_json.loads(modal_taps))
     from .storage import SessionStore
     from .multi_fir import design_multi_input_fir, SubMeasurement
 
@@ -5681,6 +5702,8 @@ async def _tool_trigger_measurement(
     per-channel mains sweep is a no-op on the USB sub path, so the prior
     behavior (silently honoring the config flag) was a foot-gun.
     """
+    if direct_path_window_ms == "":
+        direct_path_window_ms = None
     try:
         from .measurement_client import MeasurementServiceClient, MeasurementServiceError
         cfg = _config()
@@ -7295,6 +7318,7 @@ async def _tool_set_polarity(
     target: str | None = None,
 ) -> dict:
     """Set polarity (inverted=True flips phase). See ``set_delay`` for targeting."""
+    inverted = bool(inverted)
     if target is not None and output_index is not None:
         return _err("set_polarity: pass either target or output_index, not both")
     from .storage import dsp_output_key
@@ -7428,6 +7452,8 @@ async def _tool_apply_fir(
         call. Coefficients are retrieved from the server-side cache; avoids
         shipping large arrays through the tool call.
     """
+    if coefficients is not None:
+        coefficients = [float(c) for c in coefficients]
     if coefficients is not None and design_session_id is not None:
         return _err("apply_fir: pass either coefficients or design_session_id, not both")
     if coefficients is None and design_session_id is None:
@@ -8691,6 +8717,7 @@ async def _tool_verify_trinnov_coherence(
 
     Returns per-band comparison + summary of destructive/constructive/marginal bands.
     """
+    solo_session_ids = [int(x) for x in solo_session_ids]
     from .storage import SessionStore
     import math
 
@@ -9184,6 +9211,7 @@ async def _tool_analyze_per_sub_modal_contribution(
     subs. It is *data-as-derived-fact*, not a recommendation; the LLM
     may ignore it.
     """
+    session_ids = [int(x) for x in session_ids]
     from .storage import SessionStore
 
     if not session_ids or len(session_ids) < 2:
@@ -13140,6 +13168,106 @@ _TOOLS: list[Tool] = [
 ]
 
 
+# ── Tool registry — all _tool_* handlers registered here ─────────────────────
+# After all handlers are defined, register them. The dispatcher uses a single
+# dict lookup instead of the old 600-line elif chain.
+def _register_all_tools() -> None:
+    for name, fn in [
+        ("get_device_state", _tool_get_device_state),
+        ("get_measurement_history", _tool_get_measurement_history),
+        ("apply_eq", _tool_apply_eq),
+        ("apply_input_eq", _tool_apply_input_eq),
+        ("set_volume", _tool_avr_set_volume),
+        ("avr_set_volume", _tool_avr_set_volume),
+        ("set_denon_volume", _tool_avr_set_volume),
+        ("push_avr_speaker_layout", _tool_push_avr_speaker_layout),
+        ("set_speaker_distances", _tool_set_speaker_distances),
+        ("get_avr_audyssey_state", _tool_get_avr_audyssey_state),
+        ("design_avr_fir", _tool_design_avr_fir),
+        ("apply_avr_fir", _tool_apply_avr_fir),
+        ("measure", _tool_trigger_measurement),
+        ("trigger_measurement", _tool_trigger_measurement),
+        ("calibrate_level", _tool_calibrate_level),
+        ("fetch_recipe", _tool_fetch_recipe),
+        ("get_calibration_runs", _tool_get_calibration_runs),
+        ("fit_shelf_for_target", _tool_fit_shelf_for_target),
+        ("start_calibration", _tool_start_calibration),
+        ("save_calibration_run", _tool_save_calibration_run),
+        ("update_calibration_run", _tool_update_calibration_run),
+        ("save_calibration_iteration", _tool_save_calibration_iteration),
+        ("record_lesson", _tool_record_lesson),
+        ("get_relevant_lessons", _tool_get_relevant_lessons),
+        ("list_lessons", _tool_list_lessons),
+        ("invalidate_lessons", _tool_invalidate_lessons),
+        ("promote_lesson", _tool_promote_lesson),
+        ("get_config", _tool_get_config),
+        ("get_signal_graph", _tool_get_signal_graph),
+        ("resolve_target", _tool_resolve_target),
+        ("set_config", _tool_set_config),
+        ("discover_avr", _tool_discover_avr),
+        ("set_avr_mode", _tool_set_avr_mode),
+        ("set_avr_multi_eq", _tool_set_avr_multi_eq),
+        ("set_avr_dynamic_eq", _tool_set_avr_dynamic_eq),
+        ("set_avr_dynamic_volume", _tool_set_avr_dynamic_volume),
+        ("set_avr_input", _tool_set_avr_input),
+        ("mute_output", _tool_mute_output),
+        ("unmute_output", _tool_unmute_output),
+        ("end_sweep_session", _tool_end_sweep_session),
+        ("set_delay", _tool_set_delay),
+        ("set_polarity", _tool_set_polarity),
+        ("get_output_state", _tool_get_output_state),
+        ("analyze_ir", _tool_analyze_ir),
+        ("apply_fir", _tool_apply_fir),
+        ("clear_fir", _tool_clear_fir),
+        ("apply_fir_identity", _tool_apply_fir_identity),
+        ("design_corrective_fir", _tool_design_corrective_fir),
+        ("reset_dsp_defaults", _tool_reset_dsp_defaults),
+        ("set_master_gain", _tool_set_master_gain),
+        ("set_input_gain", _tool_set_input_gain),
+        ("set_output_gain", _tool_set_output_gain),
+        ("configure_matrix", _tool_configure_matrix),
+        ("set_routing", _tool_set_routing),
+        ("restore_listening_mode", _tool_restore_listening_mode),
+        ("analyze_decay", _tool_analyze_decay),
+        ("recommend_fir_phase", _tool_recommend_fir_phase),
+        ("verify_input_eq_effect", _tool_verify_input_eq_effect),
+        ("verify_fir_effect", _tool_verify_fir_effect),
+        ("verify_trinnov_coherence", _tool_verify_trinnov_coherence),
+        ("check_system", _tool_check_system),
+        ("get_fr_summary", _tool_get_fr_summary),
+        ("compute_deviation", _tool_compute_deviation),
+        ("anchor_target", _tool_anchor_target),
+        ("compare_sessions", _tool_compare_sessions),
+        ("simulate_eq", _tool_simulate_eq),
+        ("optimize_q", _tool_optimize_q),
+        ("analyze_phase", _tool_analyze_phase),
+        ("compare_sub_phase", _tool_compare_sub_phase),
+        ("optimize_sub_alignment", _tool_optimize_sub_alignment),
+        ("sweep_inter_sub_delay", _tool_sweep_inter_sub_delay),
+        ("design_fir", _tool_design_fir),
+        ("design_fir_multi", _tool_design_fir_multi),
+        ("design_fir_multi_modal", _tool_design_fir_multi_modal),
+        ("design_fir_trinnov", _tool_design_fir_trinnov),
+        ("design_modal_fir", _tool_design_modal_fir),
+        ("analyze_per_sub_modal_contribution", _tool_analyze_per_sub_modal_contribution),
+        ("simulate_per_sub_fir", _tool_simulate_per_sub_fir),
+        ("evaluate_transfer_function", _tool_evaluate_transfer_function),
+        ("per_filter_contribution", _tool_per_filter_contribution),
+        ("interpolate_optimal_gain", _tool_interpolate_optimal_gain),
+        ("sensitivity_analysis", _tool_sensitivity_analysis),
+        ("fit_correction_filter", _tool_fit_correction_filter),
+        ("predict_rms", _tool_predict_rms),
+        ("play_and_measure_fft", _tool_play_and_measure_fft),
+        ("measure_spl_pink", _tool_measure_spl_pink),
+        ("measure_impulse_ir", _tool_measure_impulse_ir),
+        ("assign_headroom_tones", _tool_assign_headroom_tones),
+    ]:
+        _register(name, fn)
+
+
+_register_all_tools()
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return _TOOLS
@@ -13147,601 +13275,13 @@ async def list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    result: dict
-    if name == "get_device_state":
-        result = await _tool_get_device_state()
-    elif name == "get_measurement_history":
-        min_hz = arguments.get("min_hz")
-        max_hz = arguments.get("max_hz")
-        result = await _tool_get_measurement_history(
-            limit=int(arguments.get("limit", 10)),
-            min_hz=float(min_hz) if min_hz is not None else None,
-            max_hz=float(max_hz) if max_hz is not None else None,
-            smooth=arguments.get("smooth", "twelfth_octave"),
-            decimation=int(arguments.get("decimation", 1)),
-            fmt=arguments.get("format", "compact"),
-            include_phase=bool(arguments.get("include_phase", False)),
-        )
-    elif name == "apply_eq":
-        output_index = arguments.get("output_index")
-        if output_index is not None:
-            output_index = int(output_index)
-        result = await _tool_apply_eq(
-            arguments.get("filters", []),
-            output_index=output_index,
-            target=arguments.get("target"),
-            simulation_verified=bool(arguments.get("simulation_verified", False)),
-            bypass_iteration_limit=bool(arguments.get("bypass_iteration_limit", False)),
-        )
-    elif name == "apply_input_eq":
-        result = await _tool_apply_input_eq(
-            arguments.get("filters", []),
-            target_curve=arguments.get("target_curve"),
-            target=arguments.get("target"),
-            simulation_verified=bool(arguments.get("simulation_verified", False)),
-            bypass_iteration_limit=bool(arguments.get("bypass_iteration_limit", False)),
-        )
-    elif name in ("set_volume", "avr_set_volume", "set_denon_volume"):
-        result = await _tool_avr_set_volume(float(arguments["level_db"]))
-    elif name == "push_avr_speaker_layout":
-        result = await _tool_push_avr_speaker_layout(
-            ady_path=str(arguments["ady_path"]),
-            distance_overrides_m=arguments.get("distance_overrides_m"),
-            level_overrides_db=arguments.get("level_overrides_db"),
-            crossover_overrides_hz=arguments.get("crossover_overrides_hz"),
-            commit=bool(arguments.get("commit", False)),
-        )
-    elif name == "set_speaker_distances":
-        result = await _tool_set_speaker_distances(
-            distances=dict(arguments["distances"]),
-            n_positions=int(arguments.get("n_positions", 1)),
-            commit=bool(arguments.get("commit", False)),
-            use_custom=bool(arguments.get("use_custom", False)),
-        )
-    elif name == "get_avr_audyssey_state":
-        result = await _tool_get_avr_audyssey_state()
-    elif name == "design_avr_fir":
-        result = await _tool_design_avr_fir(
-            channel_id=str(arguments["channel_id"]),
-            target_curve_db=list(arguments["target_curve_db"]),
-            cache_key=str(arguments["cache_key"]),
-            samplerate_hz=float(arguments.get("samplerate_hz", 48000.0)),
-            auto_smooth_below_hz=float(arguments.get("auto_smooth_below_hz", 200.0)),
-            smooth_octaves=float(arguments.get("smooth_octaves", 1.0)),
-        )
-    elif name == "apply_avr_fir":
-        result = await _tool_apply_avr_fir(
-            host=str(arguments["host"]),
-            ady_path=str(arguments["ady_path"]),
-            cache_key=str(arguments["cache_key"]),
-            channel_ids=arguments.get("channel_ids"),
-            distances_override_m=arguments.get("distances_override_m"),
-            target_curves=arguments.get("target_curves"),
-            samplerates_hz=arguments.get("samplerates_hz"),
-            inter_packet_delay_ms=float(arguments.get("inter_packet_delay_ms", 25.0)),
-            commit_fin=bool(arguments.get("commit_fin", True)),
-            abort_fin_on_nack=bool(arguments.get("abort_fin_on_nack", True)),
-            allow_partial=bool(arguments.get("allow_partial", False)),
-        )
-    elif name in ("measure", "trigger_measurement"):
-        result = await _tool_trigger_measurement(
-            label=arguments.get("label"),
-            position=arguments.get("position"),
-            target_curve=arguments.get("target_curve"),
-            target=arguments.get("target"),
-            freq_min=(int(arguments["freq_min"]) if arguments.get("freq_min") is not None else None),
-            freq_max=(int(arguments["freq_max"]) if arguments.get("freq_max") is not None else None),
-            sweep_channel=arguments.get("sweep_channel"),
-            sweep_volume_db=(float(arguments["sweep_volume_db"]) if arguments.get("sweep_volume_db") is not None else None),
-            direct_path_window_ms=(float(arguments["direct_path_window_ms"]) if arguments.get("direct_path_window_ms") not in (None, "") else None),
-        )
-    elif name == "calibrate_level":
-        result = await _tool_calibrate_level(
-            target_spl_db=float(arguments.get("target_spl_db", 78.0)),
-            start_db=float(arguments.get("start_db", -30.0)),
-            max_volume_db=float(arguments.get("max_volume_db", 0.0)),
-        )
-    elif name == "fetch_recipe":
-        result = await _tool_fetch_recipe(arguments["name"])
-    elif name == "get_calibration_runs":
-        result = await _tool_get_calibration_runs(
-            limit=int(arguments.get("limit", 10)),
-            run_id=arguments.get("run_id"),
-        )
-    elif name == "fit_shelf_for_target":
-        result = await _tool_fit_shelf_for_target(
-            session_id=int(arguments["session_id"]),
-            target_curve=arguments["target_curve"],
-            min_hz=float(arguments.get("min_hz", 20.0)),
-            max_hz=float(arguments.get("max_hz", 120.0)),
-            shelf_type=str(arguments.get("shelf_type", "low_shelf")),
-            freq_bounds=arguments.get("freq_bounds"),
-            gain_bounds=arguments.get("gain_bounds"),
-            q_bounds=arguments.get("q_bounds"),
-        )
-    elif name == "start_calibration":
-        result = await _tool_start_calibration(
-            recipe_name=str(arguments["recipe_name"]),
-            target=str(arguments["target"]),
-            reset_state=bool(arguments.get("reset_state", True)),
-            preserve_eq=bool(arguments.get("preserve_eq", False)),
-        )
-    elif name == "save_calibration_run":
-        result = await _tool_save_calibration_run(
-            recipe_name=arguments["recipe_name"],
-            target=arguments["target"],
-            device_state=arguments.get("device_state"),
-            run_type=arguments.get("run_type", "calibration"),
-            goal=arguments.get("goal"),
-            hypothesis=arguments.get("hypothesis"),
-        )
-    elif name == "update_calibration_run":
-        result = await _tool_update_calibration_run(
-            run_id=int(arguments["run_id"]),
-            converged=bool(arguments["converged"]),
-            iterations_run=int(arguments["iterations_run"]),
-            baseline_rms=float(arguments["baseline_rms"]) if arguments.get("baseline_rms") is not None else None,
-            final_rms=float(arguments["final_rms"]) if arguments.get("final_rms") is not None else None,
-            error=arguments.get("error", ""),
-            target_curve_data=arguments.get("target_curve_data"),
-            sessions=arguments.get("sessions"),
-            outcome=arguments.get("outcome"),
-        )
-    elif name == "save_calibration_iteration":
-        result = await _tool_save_calibration_iteration(
-            run_id=int(arguments["run_id"]),
-            iteration=int(arguments["iteration"]),
-            rms_before=float(arguments["rms_before"]),
-            rms_after=float(arguments["rms_after"]),
-            filters_proposed=arguments.get("filters_proposed", []),
-            filters_applied=arguments.get("filters_applied", []),
-            safety_ok=bool(arguments.get("safety_ok", True)),
-            safety_error=arguments.get("safety_error", ""),
-        )
-    elif name == "record_lesson":
-        result = await _tool_record_lesson(
-            claim=str(arguments["claim"]),
-            scope=str(arguments["scope"]),
-            run_id=arguments.get("run_id"),
-            category=arguments.get("category"),
-            context=arguments.get("context"),
-            confidence=float(arguments.get("confidence", 0.7)),
-            evidence=arguments.get("evidence"),
-            target_curve=arguments.get("target_curve"),
-            tags=arguments.get("tags"),
-            invalidators=arguments.get("invalidators"),
-        )
-    elif name == "get_relevant_lessons":
-        result = await _tool_get_relevant_lessons(
-            category=arguments.get("category"),
-            tags=arguments.get("tags"),
-            scope=arguments.get("scope"),
-            target_curve=arguments.get("target_curve"),
-            limit=int(arguments.get("limit", 10)),
-            include_invalidated=bool(arguments.get("include_invalidated", False)),
-        )
-    elif name == "list_lessons":
-        result = await _tool_list_lessons(
-            limit=int(arguments.get("limit", 50)),
-            status=arguments.get("status"),
-        )
-    elif name == "invalidate_lessons":
-        result = await _tool_invalidate_lessons(
-            events=arguments.get("events"),
-            codes=arguments.get("codes"),
-            state_changed=bool(arguments.get("state_changed", False)),
-            reason=arguments.get("reason"),
-        )
-    elif name == "promote_lesson":
-        result = await _tool_promote_lesson(
-            lesson_id=int(arguments["lesson_id"]),
-            promoted_to=str(arguments["promoted_to"]),
-        )
-    elif name == "get_config":
-        result = await _tool_get_config()
-    elif name == "get_signal_graph":
-        result = await _tool_get_signal_graph()
-    elif name == "resolve_target":
-        result = await _tool_resolve_target(str(arguments["target"]))
-    elif name == "set_config":
-        result = await _tool_set_config(arguments["updates"])
-    elif name == "discover_avr":
-        result = await _tool_discover_avr()
-    elif name == "set_avr_mode":
-        result = await _tool_set_avr_mode(str(arguments["sound_mode"]))
-    elif name == "set_avr_multi_eq":
-        result = await _tool_set_avr_multi_eq(str(arguments["slot"]))
-    elif name == "set_avr_dynamic_eq":
-        result = await _tool_set_avr_dynamic_eq(bool(arguments["enabled"]))
-    elif name == "set_avr_dynamic_volume":
-        result = await _tool_set_avr_dynamic_volume(str(arguments["level"]))
-    elif name == "set_avr_input":
-        result = await _tool_set_avr_input(str(arguments["input_name"]))
-    elif name == "mute_output":
-        result = await _tool_mute_output(
-            output_indices=arguments.get("output_indices"),
-            target=arguments.get("target"),
-        )
-    elif name == "unmute_output":
-        result = await _tool_unmute_output(
-            output_indices=arguments.get("output_indices"),
-            target=arguments.get("target"),
-        )
-    elif name == "end_sweep_session":
-        result = await _tool_end_sweep_session()
-    elif name == "set_delay":
-        result = await _tool_set_delay(
-            delay_ms=float(arguments["delay_ms"]),
-            output_index=(int(arguments["output_index"]) if "output_index" in arguments else None),
-            target=arguments.get("target"),
-        )
-    elif name == "set_polarity":
-        result = await _tool_set_polarity(
-            inverted=arguments["inverted"] is True,
-            output_index=(int(arguments["output_index"]) if "output_index" in arguments else None),
-            target=arguments.get("target"),
-        )
-    elif name == "get_output_state":
-        result = await _tool_get_output_state()
-    elif name == "analyze_ir":
-        result = await _tool_analyze_ir(
-            session_id=int(arguments["session_id"]) if "session_id" in arguments else None,
-            search_window_ms=float(arguments.get("search_window_ms", 50.0)),
-        )
-    elif name == "apply_fir":
-        coeffs_arg = arguments.get("coefficients")
-        result = await _tool_apply_fir(
-            output_index=int(arguments["output_index"]),
-            coefficients=([float(c) for c in coeffs_arg] if coeffs_arg is not None else None),
-            design_session_id=(
-                int(arguments["design_session_id"]) if "design_session_id" in arguments else None
-            ),
-        )
-    elif name == "clear_fir":
-        result = await _tool_clear_fir(output_index=int(arguments["output_index"]))
-    elif name == "apply_fir_identity":
-        result = await _tool_apply_fir_identity(
-            output_index=int(arguments["output_index"]),
-            num_taps=int(arguments.get("num_taps", 8192)),
-        )
-    elif name == "design_corrective_fir":
-        result = await _tool_design_corrective_fir(
-            session_id=int(arguments["session_id"]),
-            target_curve=arguments["target_curve"],
-            output_index=int(arguments["output_index"]),
-            num_taps=int(arguments.get("num_taps", 1024)),
-            focus_hz=arguments.get("focus_hz"),
-            return_coefficients=bool(arguments.get("return_coefficients", False)),
-        )
-    elif name == "reset_dsp_defaults":
-        result = await _tool_reset_dsp_defaults(
-            dry_run=bool(arguments.get("dry_run", False)),
-            preserve_eq=bool(arguments.get("preserve_eq", False)),
-        )
-    elif name == "set_master_gain":
-        result = await _tool_set_master_gain(gain_db=float(arguments["gain_db"]))
-    elif name == "set_input_gain":
-        result = await _tool_set_input_gain(
-            input_index=int(arguments["input_index"]),
-            gain_db=float(arguments["gain_db"]),
-        )
-    elif name == "set_output_gain":
-        result = await _tool_set_output_gain(
-            gain_db=float(arguments["gain_db"]),
-            output_index=(int(arguments["output_index"]) if "output_index" in arguments else None),
-            target=arguments.get("target"),
-        )
-    elif name == "configure_matrix":
-        result = await _tool_configure_matrix(
-            active_input=int(arguments["active_input"]) if "active_input" in arguments else None
-        )
-    elif name == "set_routing":
-        result = await _tool_set_routing(arguments["routing"])
-    elif name == "restore_listening_mode":
-        result = await _tool_restore_listening_mode(
-            master_gain_db=float(arguments.get("master_gain_db", -20.0)),
-            lfe_input=int(arguments.get("lfe_input", 0)),
-            dry_run=bool(arguments.get("dry_run", False)),
-        )
-    elif name == "analyze_decay":
-        result = await _tool_analyze_decay(
-            session_id=int(arguments["session_id"]) if "session_id" in arguments else None,
-            t60_threshold_ms=float(arguments.get("t60_threshold_ms", 300.0)),
-            freq_min=float(arguments.get("freq_min", 20.0)),
-            freq_max=float(arguments.get("freq_max", 200.0)),
-            bands_per_octave=int(arguments["bands_per_octave"]) if "bands_per_octave" in arguments else None,
-        )
-    elif name == "recommend_fir_phase":
-        result = await _tool_recommend_fir_phase(
-            session_id=int(arguments["session_id"]),
-            t60_threshold_ms=float(arguments.get("t60_threshold_ms", 500.0)),
-            peak_db_threshold=float(arguments.get("peak_db_threshold", 0.0)),
-            freq_min=float(arguments.get("freq_min", 20.0)),
-            freq_max=float(arguments.get("freq_max", 200.0)),
-            mains_distance_budget_ms=float(arguments.get(
-                "mains_distance_budget_ms",
-                arguments.get("audio_delay_budget_ms", 53.0),  # back-compat alias
-            )),
-            preringing_ms=float(arguments.get("preringing_ms", 25.0)),
-        )
-    elif name == "verify_input_eq_effect":
-        result = await _tool_verify_input_eq_effect(
-            pre_session_id=int(arguments["pre_session_id"]),
-            post_session_id=int(arguments["post_session_id"]),
-            predicted_filters=list(arguments["predicted_filters"]),
-            tolerance_db=float(arguments.get("tolerance_db", 2.0)),
-            min_hz=float(arguments.get("min_hz", 20.0)),
-            max_hz=float(arguments.get("max_hz", 200.0)),
-        )
-    elif name == "verify_fir_effect":
-        result = await _tool_verify_fir_effect(
-            pre_session_id=int(arguments["pre_session_id"]),
-            post_session_id=int(arguments["post_session_id"]),
-            predicted_effect=arguments["predicted_effect"],
-            tolerance_db=float(arguments.get("tolerance_db", 2.0)),
-            min_hz=float(arguments.get("min_hz", 20.0)),
-            max_hz=float(arguments.get("max_hz", 120.0)),
-        )
-    elif name == "verify_trinnov_coherence":
-        result = await _tool_verify_trinnov_coherence(
-            combined_session_id=int(arguments["combined_session_id"]),
-            solo_session_ids=[int(s) for s in arguments["solo_session_ids"]],
-            min_hz=float(arguments.get("min_hz", 20.0)),
-            max_hz=float(arguments.get("max_hz", 120.0)),
-            destructive_threshold_db=float(arguments.get("destructive_threshold_db", 3.0)),
-        )
-    elif name == "check_system":
-        result = await _tool_check_system()
-    elif name == "get_fr_summary":
-        session_ids = arguments.get("session_ids")
-        if session_ids:
-            session_ids = [int(sid) for sid in session_ids]
-        result = await _tool_get_fr_summary(
-            session_ids=session_ids,
-            limit=int(arguments.get("limit", 5)),
-        )
-    elif name == "compute_deviation":
-        result = await _tool_compute_deviation(
-            session_id=int(arguments["session_id"]),
-            target_curve=arguments["target_curve"],
-            null_threshold_db=float(arguments.get("null_threshold_db", 15.0)),
-            port_rolloff_hz=float(arguments.get("port_rolloff_hz", 28.0)),
-            resolution=arguments.get("resolution", "sixth_octave"),
-            convergence_threshold=float(arguments.get("convergence_threshold", 1.5)),
-            exclude_geometry=bool(arguments.get("exclude_geometry", True)),
-            weight_by_coherence=bool(arguments.get("weight_by_coherence", False)),
-        )
-    elif name == "anchor_target":
-        result = await _tool_anchor_target(
-            session_id=int(arguments["session_id"]),
-            target_offsets=arguments["target_offsets"],
-            band=arguments.get("band"),
-            max_boost_db=float(arguments.get("max_boost_db", 6.0)),
-            null_threshold_db=float(arguments.get("null_threshold_db", 15.0)),
-            port_rolloff_hz=float(arguments.get("port_rolloff_hz", 28.0)),
-            exclude_geometry=bool(arguments.get("exclude_geometry", True)),
-            direction=str(arguments.get("direction", "balanced")),
-        )
-    elif name == "compare_sessions":
-        result = await _tool_compare_sessions(
-            session_a=int(arguments["session_a"]),
-            session_b=int(arguments["session_b"]),
-            min_hz=float(arguments.get("min_hz", 20.0)),
-            max_hz=float(arguments.get("max_hz", 120.0)),
-        )
-    elif name == "simulate_eq":
-        result = await _tool_simulate_eq(
-            session_id=int(arguments["session_id"]),
-            filters=arguments.get("filters", []),
-            min_hz=float(arguments.get("min_hz", 20.0)),
-            max_hz=float(arguments.get("max_hz", 120.0)),
-        )
-    elif name == "optimize_q":
-        result = await _tool_optimize_q(
-            session_id=int(arguments["session_id"]),
-            freq_hz=float(arguments["freq_hz"]),
-            target_gain_db=float(arguments["target_gain_db"]),
-            band_hz=arguments.get("band_hz"),
-        )
-    elif name == "analyze_phase":
-        result = await _tool_analyze_phase(
-            session_id=int(arguments["session_id"]),
-            min_hz=float(arguments.get("min_hz", 20.0)),
-            max_hz=float(arguments.get("max_hz", 120.0)),
-        )
-    elif name == "compare_sub_phase":
-        result = await _tool_compare_sub_phase(
-            session_a=int(arguments["session_a"]),
-            session_b=int(arguments["session_b"]),
-            min_hz=float(arguments.get("min_hz", 20.0)),
-            max_hz=float(arguments.get("max_hz", 120.0)),
-        )
-    elif name == "optimize_sub_alignment":
-        result = await _tool_optimize_sub_alignment(
-            session_ids=[int(x) for x in arguments["session_ids"]],
-            target_curve=arguments.get("target_curve"),
-            min_hz=float(arguments.get("min_hz", 20.0)),
-            max_hz=float(arguments.get("max_hz", 120.0)),
-            max_delay_ms=float(arguments.get("max_delay_ms", 30.0)),
-            search_polarity=bool(arguments.get("search_polarity", True)),
-            gain_search_db=float(arguments.get("gain_search_db", 3.0)),
-            priority_band=arguments.get("priority_band"),
-        )
-    elif name == "sweep_inter_sub_delay":
-        result = await _tool_sweep_inter_sub_delay(
-            session_ids=[int(x) for x in arguments["session_ids"]],
-            sub_polarity=arguments.get("sub_polarity"),
-            sub_gain_db=arguments.get("sub_gain_db"),
-            base_delays_ms=arguments.get("base_delays_ms"),
-            priority_band=arguments.get("priority_band", [28.0, 50.0]),
-            sweep_range_ms=float(arguments.get("sweep_range_ms", 2.0)),
-            step_ms=float(arguments.get("step_ms", 0.25)),
-        )
-    elif name == "design_fir":
-        result = await _tool_design_fir(
-            session_id=int(arguments["session_id"]),
-            target_curve=arguments.get("target_curve"),
-            num_taps=int(arguments.get("num_taps", 1024)),
-            phase_mode=arguments.get("phase_mode", "minimum"),
-            freq_focus_hz=arguments.get("freq_focus_hz"),
-            return_coefficients=bool(arguments.get("return_coefficients", True)),
-            preringing_ms=float(arguments.get("preringing_ms", 25.0)),
-            anchor=arguments.get("anchor"),
-        )
-    elif name == "design_fir_multi_modal":
-        import json as _json
-        _raw_mi = arguments.get("modal_intents")
-        _modal_intents = _json.loads(_raw_mi) if isinstance(_raw_mi, str) else _raw_mi
-        result = await _tool_design_fir_multi_modal(
-            measurements=arguments["measurements"],
-            target_curve=arguments["target_curve"],
-            modal_intents=_modal_intents or [],
-            num_taps=int(arguments.get("num_taps", 24576)),
-            phase_mode=arguments.get("phase_mode", "minimum"),
-            regularization_lambda=float(arguments.get("regularization_lambda", 0.01)),
-            freq_focus_hz=arguments.get("freq_focus_hz"),
-            gabor_n_cycles=int(arguments.get("gabor_n_cycles", 1)),
-            return_coefficients=bool(arguments.get("return_coefficients", False)),
-        )
-    elif name == "design_fir_trinnov":
-        result = await _tool_design_fir_trinnov(
-            ir_session_id=int(arguments["ir_session_id"]),
-            measurements=arguments["measurements"],
-            target_curve=arguments["target_curve"],
-            num_taps=int(arguments.get("num_taps", 24576)),
-            phase_mode=arguments.get("phase_mode", "mixed"),
-            regularization_lambda=float(arguments.get("regularization_lambda", 0.01)),
-            freq_focus_hz=arguments.get("freq_focus_hz"),
-            preringing_ms=float(arguments.get("preringing_ms", 20.0)),
-            freq_min=float(arguments.get("freq_min", 20.0)),
-            freq_max=float(arguments.get("freq_max", 120.0)),
-            bands_per_octave=int(arguments.get("bands_per_octave", 6)),
-            t60_threshold_ms=float(arguments.get("t60_threshold_ms", 300.0)),
-            return_coefficients=bool(arguments.get("return_coefficients", False)),
-        )
-    elif name == "design_fir_multi":
-        import json as _json
-        _raw_mi = arguments.get("modal_intents")
-        _modal_intents = _json.loads(_raw_mi) if isinstance(_raw_mi, str) else _raw_mi
-        _raw_mt = arguments.get("modal_taps")
-        _modal_taps = int(_json.loads(_raw_mt) if isinstance(_raw_mt, str) else _raw_mt) if _raw_mt is not None else None
-        result = await _tool_design_fir_multi(
-            measurements=arguments["measurements"],
-            target_curve=arguments["target_curve"],
-            num_taps=int(arguments.get("num_taps", 4096)),
-            phase_mode=arguments.get("phase_mode", "mixed"),
-            preringing_ms=float(arguments.get("preringing_ms", 20.0)),
-            regularization_lambda=float(arguments.get("regularization_lambda", 0.1)),
-            freq_focus_hz=arguments.get("freq_focus_hz"),
-            return_coefficients=bool(arguments.get("return_coefficients", False)),
-            modal_intents=_modal_intents,
-            modal_taps=_modal_taps,
-            gabor_n_cycles=int(arguments.get("gabor_n_cycles", 1)),
-        )
-    elif name == "design_modal_fir":
-        result = await _tool_design_modal_fir(
-            session_id=int(arguments["session_id"]),
-            intents=arguments.get("intents"),
-            target_curve=arguments.get("target_curve"),
-            target_t60_ms=float(arguments.get("target_t60_ms", 300.0)),
-            peak_action_db=float(arguments.get("peak_action_db", 3.0)),
-            short_loud_t60_factor=float(arguments.get("short_loud_t60_factor", 0.5)),
-            short_loud_peak_db=float(arguments.get("short_loud_peak_db", 12.0)),
-            long_ringy_t60_factor=float(arguments.get("long_ringy_t60_factor", 2.0)),
-            anti_pulse_cancel_strength=float(arguments.get("anti_pulse_cancel_strength", 0.6)),
-            num_taps=int(arguments.get("num_taps", 4096)),
-            max_pre_ring_ms=float(arguments.get("max_pre_ring_ms", 25.0)),
-            samplerate=int(arguments.get("samplerate", 8000)),
-            return_coefficients=bool(arguments.get("return_coefficients", False)),
-            anchor=arguments.get("anchor"),
-            gabor_n_cycles=int(arguments.get("gabor_n_cycles", 1)),
-            skip_freqs_hz=arguments.get("skip_freqs_hz"),
-        )
-    elif name == "analyze_per_sub_modal_contribution":
-        result = await _tool_analyze_per_sub_modal_contribution(
-            session_ids=[int(x) for x in arguments["session_ids"]],
-        )
-    elif name == "simulate_per_sub_fir":
-        result = await _tool_simulate_per_sub_fir(
-            per_sub_specs=list(arguments["per_sub_specs"]),
-        )
-    # ── LLM filter-design math tools ────────────────────────────────────────
-    elif name == "evaluate_transfer_function":
-        result = await _tool_evaluate_transfer_function(
-            filters=arguments.get("filters", []),
-            query_freqs=arguments.get("query_freqs", []),
-        )
-    elif name == "per_filter_contribution":
-        result = await _tool_per_filter_contribution(
-            filters=arguments.get("filters", []),
-            session_id=int(arguments["session_id"]),
-            query_freqs=arguments.get("query_freqs"),
-        )
-    elif name == "interpolate_optimal_gain":
-        result = await _tool_interpolate_optimal_gain(
-            freq=float(arguments["freq"]),
-            q=float(arguments["q"]),
-            filter_type=arguments["filter_type"],
-            measured_errors=arguments["measured_errors"],
-        )
-    elif name == "sensitivity_analysis":
-        result = await _tool_sensitivity_analysis(
-            filters=arguments.get("filters", []),
-            session_id=int(arguments["session_id"]),
-            target_curve=arguments["target_curve"],
-            perturbation_db=float(arguments.get("perturbation_db", 0.5)),
-        )
-    elif name == "fit_correction_filter":
-        result = await _tool_fit_correction_filter(
-            session_id=int(arguments["session_id"]),
-            target_curve=arguments.get("target_curve"),
-            target_offsets=arguments.get("target_offsets"),
-            freq_range=arguments["freq_range"],
-            constraints=arguments.get("constraints"),
-            num_filters=int(arguments.get("num_filters", 1)),
-            exclude_geometry=bool(arguments.get("exclude_geometry", True)),
-            baseline_filters=arguments.get("baseline_filters"),
-        )
-    elif name == "predict_rms":
-        result = await _tool_predict_rms(
-            filters=arguments.get("filters", []),
-            session_id=int(arguments["session_id"]),
-            target_curve=arguments["target_curve"],
-            null_threshold_db=float(arguments.get("null_threshold_db", 15.0)),
-            port_rolloff_hz=float(arguments.get("port_rolloff_hz", 28.0)),
-            convergence_threshold=float(arguments.get("convergence_threshold", 1.5)),
-        )
-    elif name == "play_and_measure_fft":
-        result = await _tool_play_and_measure_fft(
-            channel_assignments=arguments["channel_assignments"],
-            duration_s=float(arguments.get("duration_s", 2.0)),
-            amplitude=float(arguments.get("amplitude", 0.5)),
-            fft_size=int(arguments.get("fft_size", 8192)),
-        )
-    elif name == "measure_spl_pink":
-        result = await _tool_measure_spl_pink(
-            channel=int(arguments["channel"]),
-            duration_s=float(arguments.get("duration_s", 10.0)),
-            level_dbfs=float(arguments.get("level_dbfs", -20.0)),
-            weighting=str(arguments.get("weighting", "C")),
-            n_output_channels=int(arguments.get("n_output_channels", 6)),
-            integration_time_s=float(arguments.get("integration_time_s", 1.0)),
-        )
-    elif name == "measure_impulse_ir":
-        result = await _tool_measure_impulse_ir(
-            n_averages=int(arguments.get("n_averages", 64)),
-            record_duration_s=float(arguments.get("record_duration_s", 2.5)),
-            impulse_amplitude=float(arguments.get("impulse_amplitude", 0.9)),
-        )
-    elif name == "assign_headroom_tones":
-        result = await _tool_assign_headroom_tones(
-            speaker_passbands=arguments["speaker_passbands"],
-            tones_per_speaker=int(arguments.get("tones_per_speaker", 4)),
-            min_spacing_hz=float(arguments.get("min_spacing_hz", 30.0)),
-            min_frequency_hz=float(arguments.get("min_frequency_hz", 200.0)),
-        )
-    # Legacy aliases for backwards compatibility with cached sessions
+    arguments = arguments or {}
+    entry = _TOOL_HANDLERS.get(name)
+    if entry is not None:
+        fn, params = entry
+        result = await fn(**{k: v for k, v in arguments.items() if k in params})
     elif name == "mute_sub_outputs":
+        # Legacy alias: composite mute + unmute in one call
         mute = arguments.get("mute")
         unmute = arguments.get("unmute")
         results_list = []
@@ -13753,7 +13293,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = failed[0] if failed else _ok(message="mute/unmute complete")
     else:
         result = _err(f"unknown tool: {name}")
-
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 

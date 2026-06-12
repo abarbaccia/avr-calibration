@@ -238,7 +238,7 @@ async def test_get_measurement_history_returns_sessions() -> None:
         mock_store = MagicMock()
         mock_store.list_sessions.return_value = [mock_session]
         mock_store_cls.return_value = mock_store
-        result = await _tool_get_measurement_history(limit=5, fmt="full", smooth="raw")
+        result = await _tool_get_measurement_history(limit=5, format="full", smooth="raw")
 
     assert result["ok"]
     assert result["count"] == 1
@@ -2679,7 +2679,7 @@ async def test_get_measurement_history_min_hz_filters_low_freqs() -> None:
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        result = await _tool_get_measurement_history(limit=1, min_hz=20.0, fmt="full", smooth="raw")
+        result = await _tool_get_measurement_history(limit=1, min_hz=20.0, format="full", smooth="raw")
     assert result["ok"]
     data = result["sessions"][0]
     assert data["freq_hz"] == [20.0, 50.0, 100.0, 200.0]
@@ -2693,7 +2693,7 @@ async def test_get_measurement_history_max_hz_filters_high_freqs() -> None:
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        result = await _tool_get_measurement_history(limit=1, max_hz=100.0, fmt="full", smooth="raw")
+        result = await _tool_get_measurement_history(limit=1, max_hz=100.0, format="full", smooth="raw")
     data = result["sessions"][0]
     assert data["freq_hz"] == [10.0, 20.0, 50.0, 100.0]
     assert data["spl_db"] == [1.0, 2.0, 3.0, 4.0]
@@ -2706,7 +2706,7 @@ async def test_get_measurement_history_min_max_hz_combined() -> None:
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        result = await _tool_get_measurement_history(limit=1, min_hz=20.0, max_hz=100.0, fmt="full", smooth="raw")
+        result = await _tool_get_measurement_history(limit=1, min_hz=20.0, max_hz=100.0, format="full", smooth="raw")
     data = result["sessions"][0]
     assert data["freq_hz"] == [20.0, 50.0, 100.0]
     assert data["spl_db"] == [2.0, 3.0, 4.0]
@@ -2719,7 +2719,7 @@ async def test_get_measurement_history_decimation() -> None:
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        result = await _tool_get_measurement_history(limit=1, decimation=2, fmt="full", smooth="raw")
+        result = await _tool_get_measurement_history(limit=1, decimation=2, format="full", smooth="raw")
     data = result["sessions"][0]
     assert data["freq_hz"] == [10.0, 30.0, 50.0]
     assert data["spl_db"] == [1.0, 3.0, 5.0]
@@ -2732,7 +2732,7 @@ async def test_get_measurement_history_rounds_floats() -> None:
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        result = await _tool_get_measurement_history(limit=1, fmt="full", smooth="raw")
+        result = await _tool_get_measurement_history(limit=1, format="full", smooth="raw")
     data = result["sessions"][0]
     assert data["freq_hz"] == [20.14, 40.28]
     assert data["spl_db"] == [-5.12, -3.99]
@@ -3643,7 +3643,7 @@ async def test_get_measurement_history_compact_format() -> None:
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        result = await _tool_get_measurement_history(limit=1, fmt="compact", smooth="raw")
+        result = await _tool_get_measurement_history(limit=1, format="compact", smooth="raw")
     data = result["sessions"][0]
     assert "fr" in data
     assert "freq_hz" not in data
@@ -3661,7 +3661,7 @@ async def test_get_measurement_history_compact_with_range() -> None:
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
         result = await _tool_get_measurement_history(
-            limit=1, min_hz=20.0, max_hz=100.0, fmt="compact", smooth="raw"
+            limit=1, min_hz=20.0, max_hz=100.0, format="compact", smooth="raw"
         )
     data = result["sessions"][0]
     assert data["fr"] == "20.00:2.0,50.00:3.0,100.00:4.0"
@@ -3681,7 +3681,7 @@ async def test_get_measurement_history_compact_downsamples_group_delay() -> None
     }
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        result = await _tool_get_measurement_history(limit=1, fmt="compact")
+        result = await _tool_get_measurement_history(limit=1, format="compact")
     data = result["sessions"][0]
     assert "metadata" in data
     # group_delay should be present but downsampled to 1/3-octave
@@ -3704,7 +3704,7 @@ async def test_get_measurement_history_full_keeps_group_delay() -> None:
     }
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        result = await _tool_get_measurement_history(limit=1, fmt="full")
+        result = await _tool_get_measurement_history(limit=1, format="full")
     data = result["sessions"][0]
     assert "group_delay" in data["metadata"]
 
@@ -3718,7 +3718,7 @@ async def test_get_measurement_history_smooth_twelfth_octave() -> None:
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        result = await _tool_get_measurement_history(limit=1, fmt="compact")
+        result = await _tool_get_measurement_history(limit=1, format="compact")
     data = result["sessions"][0]
     # Octave-smoothed: far fewer points than raw 200
     assert data["point_count"] < 60
@@ -3737,7 +3737,7 @@ async def test_get_measurement_history_smooth_raw_returns_all_points() -> None:
     session = _make_fr_session(freqs, spls)
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        result = await _tool_get_measurement_history(limit=1, fmt="compact", smooth="raw")
+        result = await _tool_get_measurement_history(limit=1, format="compact", smooth="raw")
     data = result["sessions"][0]
     assert data["point_count"] == 5
 
