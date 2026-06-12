@@ -5244,7 +5244,7 @@ async def _tool_design_avr_fir(
     processor) has to reach for a different design function. The recipe must
     branch on DSP capability today; once the refactor lands, the recipe will
     call one ``design_fir`` and route the output to whichever apply tool
-    matches the hardware. See recipes/custom/mains-calibration.md Phase 6.
+    matches the hardware. See recipes/core/mains-calibration.md Phase 6.
 
     Pipeline: ``target_curve_db`` (per-frequency gain targets) →
     16,321-tap (speaker) / 16,055-tap (sub) impulse response →
@@ -10990,7 +10990,7 @@ _TOOLS: list[Tool] = [
             "state where measurements aren't contaminated by DYNEQ and pushed "
             "FIRs aren't bypassed by sound mode (DIRECT/PURE DIRECT) or "
             "PSMULTEQ:OFF. Replaces the 'walk to AVR menu and read' step in "
-            "the mains-calibration-v2 recipe."
+            "the mains-calibration recipe."
         ),
         inputSchema={
             "type": "object",

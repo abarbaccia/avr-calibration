@@ -1,329 +1,837 @@
-# Recipe: Mains + Subs Unified Calibration
-version: 0.1.0
+# Recipe: Mains + Subs Cinema Calibration
+version: 2.0.0
 
 ## Goal
 
-Calibrate **every channel** in the active signal path (mains, surrounds, atmos,
-subs) at the primary listening position so the full system converges on a single
-unified target curve (default: `harman-plus-4`). The recipe enumerates channels
-from `config.signal_graph.transducers` + `config.speakers` — it adapts to whatever
-hardware is present, never hardcoded.
+Calibrate every channel for a **cinema-ready listening experience** at MLP, not
+a flat anechoic frequency response. The system should:
 
-The recipe is **single-seat (MLP only)**. Multi-position averaging is a future
-extension and explicitly out of scope here.
+- Hit reference loudness at AVR volume −10 to −5 dB (not require near-max)
+- Have **felt** sub bass on action content (chest pressure at 25–40 Hz)
+- Keep modal warmth (don't cut every measured peak)
+- Reproduce voices with chest-resonance body intact (no aggressive cuts in
+  100–200 Hz on the Center channel)
 
-This recipe writes to the AVR (distances, levels, crossovers, optional FIR via
-Audyssey) and to the sub DSP. Every write is gated by user confirmation in
-safe mode; SafetyValidator still enforces the per-band limits in either mode.
+This is a deliberate course-correction from the original v1 recipe (superseded;
+see git history), which
+cut every modal peak above ~+5 dB and produced a technically flat but
+perceptually flat-sounding room. The lesson note
+`feedback_calibration_v2_avoid_flat.md` captures the failure mode and the
+corrected philosophy this recipe encodes.
 
-## Filter Strategy
+## Filter philosophy — be surgical, not greedy
 
-| Layer | Tool | Slots | Purpose | Required? |
-|-------|------|-------|---------|-----------|
-| Sub-DSP shelf | `apply_input_eq` (CamillaDSP) | 8 | Anchor the bass region of the unified target on the sub bus | Required |
-| Sub-DSP per-output PEQ | `apply_eq` per sub | 8 / sub | Per-sub modal correction (existing bass-calibration output, kept) | Carried-over |
-| AVR per-channel FIR | `design_avr_fir` + `apply_avr_fir` | 1024 / 704 coeff | Per-channel correction toward target on the mains bus | Capability-dependent |
-| AVR distances/levels/crossovers | `push_avr_speaker_layout` | n/a | Time + level alignment, atomic write | Required |
+The v1 failure was treating "minimize RMS deviation from target" as the
+objective. v2 treats it as one input among several:
 
-Phase ordering — measure-first, then time/level alignment, then filter design,
-then verify. FIR design comes BEFORE writing distances + levels because the
-target-curve fit treats the corrected response, not the raw measurement.
+1. **Cut only narrow modes**: Q > 3 AND peak > +8 dB above the local target.
+   Broader humps (Q < 3, peak +3 to +6 dB) are "warmth" — leave them.
+2. **Cap any single cut at −5 dB.** Deeper cuts on a mode-rich curve produce
+   the flat/dull sound. If a peak is +12 dB, don't try to fully erase it; cut
+   it to +7 dB and accept the residue.
+3. **Never cut 100–200 Hz on the Center channel** more than −3 dB. That band
+   carries male voice fundamentals and chest resonance; aggressive cuts
+   muffle dialog.
+4. **Target curve = `recipes/curves/harman-plus-4.json`** — anchored at
+   **1 kHz** (not 80 Hz), with a **+4 dB bass shelf 20–50 Hz** tapering
+   to 0 dB at ~200 Hz, then a ~1 dB/octave downward HF tilt. Read the
+   curve file at runtime — don't hand-write target values into the
+   recipe.
+5. **Level-match POST-FIR**, not before. FIR insertion changes per-channel
+   gain. Setting AVR trims to the post-FIR pink-noise level fixes the
+   "doesn't feel like reference" symptom.
+6. **Modal-robustness check, not full multi-position averaging.** We don't
+   yet have an `average_sessions` MCP tool, and ≤80 Hz wavelengths (4+ m)
+   barely shift across a 20 cm head movement so spatial averaging there
+   is low-value anyway. Instead: take the primary sweep at MLP, then a
+   single head-shift sweep ~20 cm to one side. Use the second only as a
+   **modal robustness discriminator** — only cut a peak if it shows up
+   in both. A peak at one head position but not the other is positional
+   comb-filtering, not a room mode; cutting it makes the other position
+   worse.
 
-> **TODO (filter-design refactor — see `_tool_design_avr_fir` docstring):** the
-> filter-design tool surface is currently coupled to AVR Audyssey output format
-> (`design_avr_fir`) and CamillaDSP (`design_fir`). A future refactor should
-> split these into a generic `design_fir(target_curve, samplerate, taps, phase)`
-> + hardware-specific apply adapters. Until that lands, Phase 6 below MUST
-> branch on `config.eq_capabilities` and the active processors in
-> `config.signal_graph.processors` to decide which design tool to call. If the
-> active hardware has no FIR-capable mains DSP, Phase 6 (mains FIR) is skipped
-> and the report says so.
+## Addressing scopes — `target` vs `output_index` vs `channel_ids`
+
+Three different addressing namespaces are in play:
+
+- **AVR speaker channels** — `["FL", "C", "FR", "SLA", "SRA", "TFL",
+  "TFR", "TRL", "TRR", "SW1"]`. Used by `apply_avr_fir`,
+  `push_avr_speaker_layout`, and `design_avr_fir`. These are Audyssey
+  `commandId` values from `signal_graph` / `.ady`. Discover via
+  `get_signal_graph` + `.ady` parse.
+- **CamillaDSP outputs** — integer indices `0`–`9`. Used by `apply_eq`,
+  `apply_fir`, `set_delay`, `set_polarity`, `clear_fir`. Index 5/6 =
+  subs, 7 = shaker on this rig. Discover via `get_signal_graph` and
+  prefer `target=...` (transducer name like `"sub_front_right"`,
+  group like `"bass"`, or role `"sub"`) over raw indices.
+- **Run-tracking labels** — strings in measurement labels and
+  iteration filter dicts. Use the AVR commandId for consistency with
+  the run record across phases.
+
+Use `resolve_target("bass")` when you need raw indices for legacy
+tools. Otherwise prefer named targets so per-transducer safety
+profiles auto-apply.
+
+## Measurement Signal Path
+
+This recipe requires the AVR-routed path for every measurement so IR
+peak times are commensurable across channels. Distance computation
+(Phase 2) is from measured IR peaks — never from physical room
+measurements or static offsets.
+
+```
+Pi → HDMI → AVR (Audyssey + bass-mgmt + our FIRs)
+              ├─→ speakers → room → mic → Pi (FL/FR/C/SLA/SRA/atmos)
+              └─→ sub pre-out → Scarlett input 3 → CamillaDSP
+                                                  → (input_eq + per-output)
+                                                  → Scarlett analog out
+                                                  → subs → room → mic → Pi
+```
+
+Both subs and mains sweep via HDMI so peak times share the same trigger
+and distances are referenced to each other.
 
 ## Configuration
 
 Ask the user (or accept defaults):
 
-- **Target curve** (default: `harman-plus-4`). Load
-  `recipes/curves/{name}.json`. The curve's `points` are interpolated across
-  20 Hz – 20 kHz for the full system.
-- **Crossover frequency** (default: read from current `.ady` per channel; the
-  recipe does NOT propose a global crossover unless the user asks).
-- **Convergence threshold** (default: 1.5 dB RMS deviation in-band).
-- **Max iterations per phase** (default: 3).
-- **Reference channel for level matching** (default: `C` if present, else `FL`).
-- **Bass region for sub-shelf fit** (default: 20 – 200 Hz).
+- **Target curve** (default: `harman-plus-4` — load `recipes/curves/{name}.json`)
+- **Reference SPL** (default: `75 dB` C-weighted at MLP for −20 dBFS pink noise
+  per channel — Audyssey/THX standard)
+- **AVR Audyssey EQ Set** (default: `Reference` for cinema — warmer HF tilt;
+  use `Flat` only for music monitoring)
+- **AVR Dynamic EQ** (default: `ON` for cinema — compensates for low-volume
+  listening per Fletcher-Munson; off for reference-level listening)
+- **Head-shift offset** (default: `20 cm` to one side — sole purpose is
+  modal-vs-positional discrimination; not used for averaging)
+- **Modal cut threshold** (default: `+8 dB above local target` — peaks below
+  this are left as warmth)
+- **Modal cut Q threshold** (default: `3` — only cut narrow peaks)
+- **Max single cut depth** (default: `−5 dB` — beyond this is over-correction)
+- **Max FIR refinement iterations** (default: `3` — exit early on listening
+  test pass; never loop indefinitely)
+- **Sub-bus master gain** (default: `−15 dB` — subs hotter than mains-parity by
+  5 dB; closer to LFE-channel +10 dB cinema spec without overshoot)
+- **Sub trim bump** (default: `+3 dB` on AVR `PSSWL` — cinematic bass headroom)
+- **Center trim bump** (default: `+2 dB` on AVR `SSLEVC` — dialog clarity)
 
-## Measurement Signal Path
+## Compliance — Run Instrumentation (NON-NEGOTIABLE)
 
-This recipe requires **every measurement to share the same AVR-routed path** so
-IR peak times are commensurable. Distance computation is from measured IR peak
-times — no calculation, no static offsets.
+Run-instrumentation is mandatory — every measurement-bearing phase below
+calls these. Don't reference v1 by pointer; this list is the spec.
 
-Build the diagram from `config`:
+1. **At START** — `save_calibration_run(recipe_name, target, goal,
+   hypothesis, device_state)` produces the `run_id` used by every other
+   call.
+2. **After every iteration of every measurement-bearing phase**
+   (Phase 1, 1.5, 3 design, 4 sub-bus shaping, 5 per-sub modal, 6
+   atomic push verification, 7 level matching, 8.5 each refinement
+   pass) — `save_calibration_iteration(run_id, iteration, rms_before,
+   rms_after, filters_proposed, filters_applied, safety_ok)`.
+   `filters_proposed` should include enough text to identify which
+   recipe phase produced the decision, so post-hoc audits can detect
+   skipped phases.
+3. **On every exit path before cleanup** (convergence, max iterations,
+   listening-test pass, listening-test fail, hardware error, user
+   abort) — `update_calibration_run(run_id, converged, final_rms,
+   iterations_run, outcome, error)` BEFORE Phase 11 cleanup.
+4. **Lessons** — at run end, `record_lesson` for ≤2 falsifiable claims,
+   tagged `room` (with invalidators) or `general` (followed by
+   `promote_lesson`).
 
-- Pi → HDMI → AVR → speakers → room → mic → Pi (mains)
-- Pi → HDMI → AVR → sub-pre-out → Focusrite → CamillaDSP → subs → room → mic → Pi (subs)
-
-Both paths share the same HDMI trigger so peak times are referenced to each other.
+SafetyValidator enforces per-band limits server-side regardless of safe
+vs autonomous mode. The recipe never disables it; if a proposed filter
+is rejected, retry with a milder version.
 
 ## Pre-flight
 
-### 0.1 System check
-Call `check_system`. STOP if any component is unreachable.
+### 0.1 System check + speaker presence
+- `check_system` — STOP if any component unreachable.
+- Verify SSSPC bits via Telnet: `SSSPC ?` should report all expected positions
+  YES (FRO, CEN, SUA at minimum; SBK if 7.x). After ANY Fin commit during
+  this recipe, re-issue `SSSPCCEN YES` / `SSSPCSUA YES` (the commit resets
+  them — see `feedback_avr_layout_push_does_not_engage_sspc.md`).
+- **TODO — atmos visibility confirmation**. Telnet `SSSPC ?` does NOT
+  enumerate height/ceiling channels (TFL/TFR/TRL/TRR), so we can't verify
+  programmatically that atmos is engaged. After every layout push, ASK
+  the user to confirm on the AVR menu (`Setup → Speakers → Speaker
+  Configuration`) that all expected height channels are listed. If
+  missing, the issue is almost always `Setup → Speakers → Amp Assign`
+  reverting from a `.4` (atmos) layout to plain `5.1ch` / `7.1ch` — the
+  .ady envelope's `enAmpAssignType` doesn't change Amp Assign mode, only
+  the speaker-config payload, so the user must set Amp Assign manually
+  on the AVR menu to re-engage the atmos preamp outs. Future
+  improvement: probe + report the active Amp Assign via Telnet
+  (commands like `SSAMSP ?` returned blank on X3800H; needs further
+  RE) and either include it in `check_system` or pass it through
+  `push_avr_speaker_layout`.
 
-### 0.2 Read config
-Call `get_config`. Discover:
-- All transducers from `signal_graph.transducers` (role, processor, output_index, profile)
-- All speaker positions from `speakers[].positions` (model, sweep_range_hz, crossover_hz, freq_response, sensitivity_db, impedance_ohms)
-- DSP capabilities from `eq_capabilities` (FIR-capable? max taps? PEQ slots?)
-- Mic from `mic.name`
+### 0.2 Backup + stale-state check
+- Verify a recent `.ady` is on disk (will be Phase 6's layout-push baseline
+  AND the rollback target if Phase 9 fails catastrophically).
+- `get_device_state()` — this snapshot goes into the run record.
+- Inspect active DSP state for stale per-output writes (polarity, gain,
+  delay) from prior runs — `feedback_check_stale_dsp_state.md`. Anything
+  not in this run's plan should be cleared or explicitly preserved.
 
-### 0.3 HDMI sweep gate (open blocker as of 2026-05-03)
-Take a sanity sweep on the reference channel (e.g. C). If the result has
-SNR < `measurement.min_snr_db`, STOP with a diagnostic — see project memory
-`project_2026-05-03_hdmi_mains_blocked.md`.
+### 0.3 AVR Audyssey state — calibration vs operating split
 
-### 0.4 Mute everything that shouldn't play during cal
-- Shakers: `mute_output` on every shaker output (per `feedback_shakers_never_during_cal.md`)
-- Confirm AVR is in a sound mode that engages Audyssey (NOT Pure Direct, MultEQ on)
-- Set `master_gain_db` per `config.measurement.master_gain_hdmi_db`
+Calibration measurements and movie-watching want different Audyssey state.
+Don't conflate them.
 
-### 0.5 Back up current AVR state
-Confirm a recent `.ady` file is on disk (look in `backups/` and `1_BACKUP_*.ady`).
-The AVR-write tools depend on this as the layout source of truth. STOP if no
-`.ady` is found — the user must export one from MultEQ Editor first.
+**During calibration (Phases 1–8.5)** — we want clean measurements free of
+volume-dependent loudness compensation:
 
-### 0.6 Save run record
-Call `save_calibration_run(recipe_name="mains-calibration", target=<curve>,
-goal=..., hypothesis=..., device_state=get_device_state())`. Save the run_id.
+| Setting | Probe (Telnet) | Set value | Why |
+|---|---|---|---|
+| MultEQ slot | `PSMULTEQ:?` | `FLAT` | Active so our pushed FIRs are engaged. FLAT slot's stored target curve is unity, so our FIR is the only modification — predictable. |
+| Dynamic EQ | `PSDYNEQ ?` | `OFF` | DYNEQ applies volume-dependent FR shaping; sweeps would fight the curve. Never tune with DYNEQ on. |
+| Dynamic Volume | `PSDYNVOL ?` | `OFF` | Compresses dynamic range; not what we measure. |
+| Sound mode | `MS?` | NOT `DIRECT`, NOT `PURE DIRECT` | Both modes forcibly bypass Audyssey (and therefore our pushed FIRs). Use `MULTI CH STEREO`, `DOLBY SURROUND`, or `STEREO`. |
 
-## Phase 1 — Baseline measurement of every channel
+**For movie watching (after Phase 11 cleanup)** the user can flip:
+`PSDYNEQ ON` for low-volume Fletcher-Munson; sound mode to whatever the
+content drives (Dolby Surround, DTS:X, etc).
 
-For **each transducer** present in the signal graph (mains, surrounds, atmos,
-subs), measure solo at MLP through the AVR path:
+**REFERENCE vs FLAT slot:** the AVR may not accept `PSMULTEQ:REFERENCE` if
+the committed `.ady` was last pushed without Reference curve data —
+`PSMULTEQ:?` will keep returning `FLAT` when you try to set Reference.
+Probe the available slots before assuming. **Recipe target is the FLAT slot
+exclusively** so our FIR is the entire correction; bake any cinema-style
+HF tilt into the designed FIR instead of relying on Audyssey's stored
+Reference curve overlay (which compounds with our FIR per the runtime
+multiplication audit in `project_avr_fir_decimation_broken.md`).
 
-1. Solo-route the channel: mute every other output at the appropriate layer
-   (AVR speaker mute for mains, DSP `mute_output` for subs).
-2. Use the speaker spec's `sweep_range_hz` from `config.speakers` for that
-   position (e.g. mains: 60 Hz–20 kHz; surrounds: 80 Hz–20 kHz). For subs,
-   use 20 Hz–200 Hz from `sub.sweep_range_hz`.
-3. Call `measure(label="mains-cal-baseline-{position}", target_position="MLP")`.
-4. After all sweeps, call `analyze_ir(session_id)` per channel to get IR peak
-   time and SPL. Save the per-channel peak time `t_peak_ms` and band-limited
-   SPL.
-5. Save iteration: `save_calibration_iteration(run_id, iteration=1, ...)`.
+**Programmatic setup** (recommended): call `get_avr_audyssey_state()` to
+probe current values, then set via Telnet. We can NOT push these flags
+through `push_avr_speaker_layout` — they live outside the .ady envelope.
 
-Unmute after each solo measurement before moving to the next channel.
+After every Phase 6 Fin commit, re-verify (some firmware versions toggle
+MultEQ off after a coef push). **Re-verify before Phase 9** — listening
+test on a bypassed-Audyssey system invalidates the gate.
 
-## Phase 2 — Distance alignment (measured, not calculated)
+### 0.4 Mains baseline route — target-driven
 
-Distance is derived from IR peak time difference between the slowest channel
-and each other channel. NEVER infer from physical measurements or assume
-sub-chain latency — measure it.
+Recipe Phase 1 baselines use `measure(target='FL')` etc. The target-driven
+resolver in `measurement_profiles.py` selects the HDMI route, the right
+sweep_channel for the position, and the appropriate sound_mode override.
+**Do NOT manually set `config.measurement.playback_route`** — that field
+is deprecated in favor of signal_graph + measurement_profiles. The
+resolver returns a `legacy_path=True` warning if it falls through to the
+old playback_route field; treat that as a config bug worth fixing.
 
-1. Find the channel with the **largest** `t_peak_ms` from Phase 1
-   (slowest-arriving). Call this `t_max`.
-2. For each other channel `c`, the required additional delay is
-   `Δt_c = t_max - t_peak_c (ms)`. Convert to a distance increment:
-   `Δd_c = Δt_c × 343 / 1000  (meters at 343 m/s)`.
-3. Read each channel's current `customDistance` from the `.ady`. The new
-   distance for channel `c` is `current_distance_c + Δd_c`.
-4. Build `distance_overrides_m = {channel_id: new_distance_m, ...}`.
-5. Sub channels often need to push past the MultEQ Editor 18 m UI cap because
-   of accumulated FIR latency on the sub chain — `push_avr_speaker_layout`
-   handles values past the cap. Document any sub channel that lands above 18 m.
+1. Take a sanity sweep on FL via `measure(target='FL', sound_mode='MULTI CH STEREO')`.
+   The sound_mode override keeps Audyssey active during the measurement
+   (per 0.3); without it the main role profile defaults to PURE DIRECT
+   which bypasses our FIRs.
+2. STOP if SNR < `measurement.min_snr_db` — see
+   `project_2026-05-03_hdmi_mains_blocked.md` for diagnostics.
+3. STOP if `legacy_path=True` in the resolver result — fix the
+   target/profile config before continuing.
 
-Do NOT push yet — accumulate `distance_overrides_m` for the atomic Phase 7
-write.
+### 0.5 Save run + mute shakers
+- `save_calibration_run(recipe_name="mains-calibration",
+  target="harman-plus-4", goal=..., hypothesis=...,
+  device_state=<from 0.2>)`. Save the returned `run_id`.
+- `mute_output(target="tactile")` for every shaker output. Tactile content
+  is never a calibration target — see
+  `feedback_shakers_never_during_cal.md`.
 
-## Phase 3 — Level alignment
+## Phase 1 — Baseline measurement (per channel, MLP + 1 head-shift)
 
-For each channel, compute band-limited average SPL from the Phase 1 measurement:
-- Mains/surrounds/atmos: 500 Hz – 2 kHz (mid-band, free of room mode and
-  treble tilt)
-- Subs: 30 Hz – 60 Hz (sub midband, above port and below crossover)
+Solo each channel through the AVR path. For each transducer in the signal
+graph + speakers config:
 
-Compare against the chosen reference channel's SPL.
+1. Mute everything else (AVR speaker mute for mains, DSP `mute_output`
+   for subs).
+2. **MLP-exact sweep** at the speaker's `sweep_range_hz` (mains
+   60 Hz–20 kHz, surrounds 80 Hz–20 kHz, subs 20–200 Hz).
+   `measure(label="v2-baseline-{channel}-mlp", position="MLP")`
+3. **Head-shift sweep** at MLP + 20 cm (one side; pick consistent side
+   across all channels for the run). Same sweep range.
+   `measure(label="v2-baseline-{channel}-shift", position="MLP+20cm")`
+4. `analyze_ir(mlp_session_id)` — capture `t_peak_ms` and band-limited
+   SPL. Time alignment uses the MLP-exact peak only; the head-shift is
+   for modal-robustness only.
 
-`level_override_db_c = SPL_reference - SPL_c`
+After the full pass: `save_calibration_iteration(run_id, iteration=1,
+rms_before=0, rms_after=0, filters_proposed=<per-channel session ids>,
+filters_applied=[], safety_ok=True)`. RMS is 0/0 because this is
+measure-only; both session_ids per channel + analyze_ir summaries go
+into `filters_proposed` for the audit trail.
 
-Build `level_overrides_db = {channel_id: trim_db, ...}`. Cap to ±10 dB to stay
-inside Audyssey's clamp.
+### 1.5 Sub-mains crossover phase verification (LLM-driven, no AVR write)
 
-For sub-vs-mains level (cross-band), use a separate reference: aim for
-`SPL_subs_30-60Hz` to be `target_curve.offset_at(50_Hz) - target_curve.offset_at(1_kHz)`
-relative to `SPL_mains_500_Hz-2_kHz`. With `harman-plus-4` at 50 Hz the offset
-is +4 dB.
+Before designing FIRs, verify sub + mains are not phase-cancelling at the
+crossover region. This is a major contributor to "dull" perceived bass
+that no FIR shaping will fix.
 
-## Phase 4 — Crossover alignment (subs ↔ mains phase at XO)
+**Important — LLM-first**: this phase used to call `optimize_sub_alignment`,
+which sweeps a parameter space and picks the local minimum by a fixed
+cost function. That's a solver doing the LLM's job. Replaced with a
+data + analytics + judgment workflow.
 
-After distances are computed (Phase 2) but before pushing, refine sub-bus delay
-to phase-align subs and mains in the crossover region.
+**Important — no AVR write here**. This phase only *proposes* a candidate
+SW1 distance. Phase 2 rolls candidates into `distance_overrides_m` for
+Phase 6's atomic push. We never write to the AVR mid-recipe.
 
-1. With Phase 2 distance overrides applied volatile-only (`commit=False`),
-   measure the L+R+C mains group (no subs) and the subs group (no mains).
-2. Restrict the analysis to ±1 octave around the user's crossover frequency.
-3. Call `optimize_sub_alignment(session_ids=[mains_id, subs_id],
-   priority_band=[xo*0.5, xo*2.0])` — search delay/gain/polarity in the XO
-   region.
-4. Apply per-sub recommendations via `set_delay` / `set_polarity` /
-   `set_output_gain` on the sub DSP. Do NOT change AVR sub distance here —
-   that was set in Phase 2 from the IR peak measurement and reflects total
-   acoustic delay.
-5. Re-measure subs solo to confirm peak time hasn't drifted; if it did,
-   recompute Phase 2 sub distance and update `distance_overrides_m`.
+1. **Measure** three sessions at MLP:
+   - FL-solo (mains route only, sub muted)
+   - sub-solo (sub-bus only, mains muted)
+   - FL+sub combined (FL active + bass-mgmt routing to sub)
+2. **Numerical comparison** (no `sum_of` primitive exists — Claude
+   reasons across two pairwise diffs):
+   - `compare_sessions(combined_id, FL_solo_id)` — shows what the sub
+     adds (in-phase = strong addition; out-of-phase = cancellation).
+   - `compare_sessions(combined_id, sub_solo_id)` — shows what the
+     mains add at the crossover.
+   - Inspect the 60–100 Hz region of each. **Suspect cancellation if**
+     combined is *not* greater than the louder of the two solos by at
+     least 2 dB across 60–100 Hz, or if there's a sharp dip in
+     `combined - FL_solo` localized in that band.
+3. **Classify** the same band: `analyze_phase(combined_id)` returns
+   per-1/3-octave `geometry` / `partial` / `minimum_phase`
+   classifications.
+4. **Claude reasons** over the data:
+   - If combined is louder than each solo by ≥2 dB across 60–100 Hz →
+     in-phase, OK. Record SW1 distance unchanged for Phase 2.
+   - If a dip is in a `geometry`-classified band → leave it. "Geometric
+     null at NN Hz, accepted" is the right answer; chasing geometric
+     nulls with delay creates new nulls elsewhere.
+   - If a dip is in `minimum_phase` or `partial` → fixable.
+     Starting Δd from the freq of the deepest dip:
+     `Δd_candidate ≈ 343 / (2 × null_freq_hz)` meters (a half-wavelength
+     shift inverts the cancelling phase). This is a starting point only;
+     iterate via Phase 8.5 if the first candidate doesn't help.
+5. **Record** for Phase 2: candidate `SW1_new = SW1_current + Δd_candidate`,
+   the residual diff plots, and the rationale. NO AVR WRITE HERE.
+6. `save_calibration_iteration(run_id, iteration=N, rms_before=...,
+   rms_after=..., filters_proposed=[{"phase": "1.5",
+   "sw1_candidate_m": ..., "rationale": ...}], filters_applied=[],
+   safety_ok=True)`. `filters_applied` is empty because we deferred
+   the write to Phase 6.
 
-## Phase 5 — Anchor the unified target
+**Why no solver**: the actual judgment is "is this null fixable, or is it
+geometry that we should stop fighting?" — that depends on room context
+Claude has more access to than a delay-sweep cost function.
 
-1. Load the target curve JSON. Resample its `points` across 20 Hz – 20 kHz
-   for full-range fit, and across the bass region for sub-shelf fit.
-2. For the **bass region**: take a fresh combined-bass measurement (all subs
-   playing, mains playing as bass-managed) and call
-   `anchor_target(session_id, target_offsets=<bass-region points>,
-   direction="cuts_only")`. This sets the absolute SPL anchor that minimizes
-   required boosts.
-3. The anchor's `reference_spl` is used in Phase 6 to set the input-EQ shelf
-   gain on the sub bus.
+## Phase 2 — Time alignment (measured, deferred-write)
 
-## Phase 6 — Design correction filters
+Pick the slowest-arriving channel from Phase 1 IR peak times, compute Δt
+per other channel, convert to `Δd_m = Δt_ms × 0.343`, build the
+`distance_overrides_m` dict. **Don't push yet** — write happens
+atomically in Phase 6.
 
-> **TODO — DSP-capability branching.** The exact tool calls below assume an
-> Audyssey-FIR-capable AVR with a CamillaDSP sub bus. Generalize once the
-> filter-design refactor lands (see top-of-file TODO). Until then, branch on:
->
-> - `eq_capabilities.fir_capable` for the sub DSP path
-> - `signal_graph.processors[].kind == "avr"` AND the AVR driver advertising
->   `audyssey_fir_supported` for the mains FIR path
->
-> If mains FIR is unsupported, skip Phase 6.2 and report what was skipped.
+Roll Phase 1.5's SW1 candidate (if proposed) into the same dict here:
+if both Phase 2 and 1.5 propose a SW1 distance, prefer Phase 1.5's
+(it's tuned to the actual sub-mains coherence, not just IR peak time).
+Document the divergence in the iteration record.
 
-### 6.1 Sub bus shelf (CamillaDSP input PEQ)
+Sub channels typically need values past the 18 m UI cap; that's expected
+because of FIR-induced latency on the sub chain. Document any channel
+above 18 m.
 
-For the bass-region target shape, fit a low shelf:
-`fit_shelf_for_target(session_id=<combined-bass>, target_curve=<harman-plus-4 bass region>,
-min_hz=20, max_hz=120)`.
+`save_calibration_iteration(run_id, iteration=N, rms_before=0,
+rms_after=0, filters_proposed=<distance_overrides_m + per-channel
+Δt rationale>, filters_applied=[], safety_ok=True)`. Applied is empty
+because we deferred the AVR write to Phase 6.
 
-`apply_input_eq(filters=[18Hz HPF, fitted shelf, ...existing per-sub corrections preserved])`
-on the sub bus. Always include the 18 Hz HPF.
+## Phase 3 — Surgical modal cuts (per-channel FIR target curves, LLM-driven)
 
-### 6.2 Mains FIR (AVR Audyssey path)
+**No `anchor_target` calls.** That tool conflates analytics with judgment
+(it picks the reference-SPL anchor by a fixed heuristic, which is exactly
+the decision the LLM should be making with full room/run context). The
+workflow below uses `analyze_phase` + `compute_deviation` + Claude's
+judgment instead.
 
-For each main/surround/atmos channel `c`:
-1. Compute the per-channel correction target: `target(f) = curve(f) - measured_c(f)`
-   over `speaker.sweep_range_hz` for that position.
-2. Cap correction to ±6 dB per band (Audyssey hard limit) and 0 dB outside the
-   speaker's freq_response.
-3. Call `design_avr_fir(channel_id=c, target_curve_db=<correction>,
-   cache_key="mains-cal-<run_id>")`.
+**Known limitation — AVR FIR is unreliable below ~80 Hz** (per
+`project_avr_fir_decimation_broken.md`). The 117 Hz region delivers as
+designed; 70 Hz delivered 7.7 dB short of design. Treat mains FIR as a
+≥80 Hz tool only. For sub-bass shaping (≤80 Hz), rely on Phase 4
+input_eq on the sub bus, where filters are not affected by this AVR
+bug. Mains-FIR cuts in 60–80 Hz may underdeliver and require iterative
+re-design — note this in the run record.
 
-Repeat for every mains channel present.
+For each main / surround / atmos channel:
 
-### 6.3 Simulate before writing
+1. **Run analytics on the MLP-exact session**:
+   - `analyze_phase(mlp_session_id)` — per-1/3-octave classification of
+     `geometry` / `partial` / `minimum_phase` bands. Geometry bands
+     (cancellation nulls) are **never cut and never boosted**.
+   - `analyze_decay(mlp_session_id)` — returns `modes` list (note: tool
+     returns `modes`, not `decay_modes`). Each mode has `freq_hz`,
+     `t60_ms`, `peak_db`, `suggested_q`. Q comes from this tool, not
+     from FR magnitude derivation.
+2. **Identify candidate cuts** — modes that satisfy ALL:
+   - `peak_db > +8 dB` above local 1/3-octave target
+   - `suggested_q > 3` (narrow, isolated)
+   - `t60_ms > 200 ms` (narrow modal character, not a transient)
+   - **AND** a peak within ±1 1/3-octave band shows up in the head-
+     shift session (modal-robustness; rules out positional comb-
+     filtering — exact-Hz matching is too strict, ±band is right)
+   - **AND** band classification is `minimum_phase` or `partial`
+     (geometry bands stay untouched)
+   - **AND** for mains channels, `freq_hz ≥ 80 Hz` (LF AVR-FIR bug —
+     leave the deeper modes for Phase 4 input_eq)
+3. **Propose cut depth**: `depth = −min(peak_excess − 3, 5) dB` (leave
+   3 dB of the peak, cap at 5 dB cut). Q matches `suggested_q`.
+4. **Center channel exception**: any cut in 100–200 Hz capped at −3 dB
+   regardless of peak height. Voice clarity overrides modal flatness.
+5. **Cumulative-boost sanity check**: after building the per-channel
+   filter list, sum any boosts within each 1/3-octave band. If the
+   cumulative exceeds the speaker profile's
+   `max_cumulative_boost_in_third_octave_db`, drop the smallest
+   contributor and re-check. SafetyValidator will reject the push
+   otherwise.
+6. **Pick a reference SPL** — Claude's judgment, not a solver:
+   - Read each channel's `band_avg_spl` from the FR data
+   - Read the speaker profile's `max_boost_per_band_db` headroom limit
+   - Pick a candidate `reference_spl` at a frequency where measured ≈
+     local target — i.e. anchor at the *natural band*, not the curve's
+     0 dB point (per `feedback_anchor_target_at_natural_band.md`).
+     Boosts at sub-bass don't deliver well in modal-rich rooms; cuts do.
+   - Validate via `compute_deviation` — note the parameter shape:
+     ```
+     target_curve = {
+       "type": "harman-plus-4",
+       "reference_spl": <candidate>,
+       "band": [25, 500],
+       "points": [{"freq_hz": ..., "spl": <candidate> + harman_offset}, ...]
+     }
+     compute_deviation(session_id=..., target_curve=target_curve,
+                       resolution="sixth_octave")
+     ```
+     `reference_spl` is encoded into each `points[*].spl` (NOT a
+     top-level arg).
+   - Inspect the residual map. If any band needs boost > headroom,
+     lower `reference_spl` and re-run. If the map is "mostly cuts above
+     the anchor with low residuals", that's the anchor.
+   - Don't overthink; an iter1 anchor that's 1-2 dB off is fine — Phase
+     8.5 iteration tightens it.
+7. **Build per-channel `target_curve_db`** (the input to
+   `design_avr_fir`, distinct from the `target_curve` dict for
+   `compute_deviation`): list of `{freq_hz, gain_db}` points combining
+   the harman-plus-4 offsets (scaled to `reference_spl`) with the
+   surgical cuts from steps 2–3.
+8. `design_avr_fir(channel_id=..., target_curve_db=..., cache_key=...)`
+   — verify peak_amplitude < 0.95 in the response (means we have
+   FIR-coefficient headroom).
+9. **Passthrough channels**: atmos (TFL/TFR/TRL/TRR) and SW1 get
+   explicit passthrough designs (target_curve_db with two 0 dB points)
+   so they're in the cache for the Phase 6 atomic push.
 
-Before any apply, call `simulate_eq` (sub bus filters) and inspect the FIR
-target-curve fit error per channel. Iterate in simulation until the predicted
-in-band RMS deviation is below the convergence threshold. No hardware writes
-until simulation is satisfied.
+`save_calibration_iteration(run_id, iteration=N, rms_before=..., rms_after=...,
+filters_proposed=<per-channel target_curve_db dicts>, filters_applied=[],
+safety_ok=True)` — applied is empty because we defer the AVR write to
+Phase 6. Keep `filters_proposed` human-readable so post-hoc audits can
+see Claude's reasoning.
 
-## Phase 7 — Write to hardware (gated by user confirmation)
+## Phase 4 — Sub-bus shaping (CamillaDSP input_eq, LLM-driven)
 
-Atomic AVR write — distances + levels + crossovers in one envelope:
+Modest, not aggressive. **Derive parameters from the measured sub
+response — never hardcode shelf gains.**
+
+**LLM-first**: this phase used to call `fit_shelf_for_target` to pick
+shelf params. That's the same solver pattern we removed elsewhere — a
+tool deciding "what shelf shape minimizes residual error". Replaced
+with a candidate-and-validate loop: Claude proposes shelf params,
+`simulate_eq` reports the predicted residual, Claude adjusts.
+`fit_shelf_for_target` may still be called as a *suggestion oracle*
+(read its output as a starting point), but the recipe uses
+`simulate_eq` as the source-of-truth verification.
+
+The complete filter list passed to `apply_input_eq` MUST include every
+filter the chain needs — the call replaces the existing input_eq
+wholesale, so any omitted filter (including the mandatory HPF) is
+lost. Be explicit.
+
+1. **Inputs**:
+   - The sub-solo session from Phase 1 (per-sub) plus the FL+sub
+     combined session from Phase 1.5 (for the punch-zone validation).
+   - Speaker profile: `svs_pb12_nsd` — 18 Hz mandatory HPF, max boost
+     +6 dB/band, max cumulative +9 dB/octave, min boost freq 25 Hz.
+2. **Mandatory filters** (always present in the output list):
+   - `{"freq": 18, "gain_db": 0, "q": 0.7, "type": "hpf"}` — driver
+     protection, never omit.
+3. **Propose a low-shelf** for the Harman+4 bass tilt:
+   - Read the sub-solo measurement's natural response (port roll-off
+     freq, modal hot-spots).
+   - Candidate starting point: `low_shelf` at 40–60 Hz, +2 to +5 dB,
+     q≈1.0. Pick from this range based on where the sub's natural
+     response drops below the target.
+4. **Don't cut 50–80 Hz on input_eq.** That's the kick/punch zone shared
+   by sub + bass-managed mains; cuts here register as "no impact".
+5. **Optional modal cut**: only if a specific sub-bus mode clearly
+   dominates the combined response (>+8 dB Q>3 in a band classified
+   `minimum_phase`), add ONE peaking cut for it. Otherwise leave it.
+6. **Validate via simulation**:
+   ```
+   simulate_eq(session_id=<sub-solo session>, filters=<full list>,
+               band=[20, 200])
+   ```
+   Inspect predicted FR vs the harman-plus-4 target. Acceptance:
+   predicted ≤ ±3 dB from target across 25–80 Hz; ±2 dB across
+   80–200 Hz. If wider, adjust shelf gain/freq and re-simulate. Don't
+   apply until simulation passes.
+7. `apply_input_eq(filters=<full list with HPF>,
+   simulation_verified=True)`. The full list always includes HPF;
+   never call apply_input_eq with a list missing the HPF.
+8. `save_calibration_iteration(run_id, iteration=N, rms_before=...,
+   rms_after=..., filters_proposed=<full list>,
+   filters_applied=<full list>, safety_ok=True)`.
+
+## Phase 5 — Per-sub modal correction (only if obvious)
+
+For each sub solo response from Phase 1:
+
+1. Identify modes that meet **all three**: peak > +10 dB above local
+   target, T60 > 400 ms, Q > 3 (Q from `analyze_decay`'s `suggested_q`).
+2. **If ZERO modes qualify**, skip per-sub FIR — use only input_eq from
+   Phase 4.
+3. **If 1–2 modes qualify**, design **same treatment type on every
+   sub** (per `feedback_per_sub_phase_coherence_trap.md` — mixed
+   treatments collapse 20–50 Hz coherence at MLP). Different
+   `cancel_strength` per sub is fine; mixing `anti_pulse` on one sub
+   with `linear_notch` on another is not.
+4. Use `design_modal_fir` at samplerate=48000 (NOT 8000 — see
+   `project_sub_cal_signal_chain_TODO.md`; 8 kHz design at 48 kHz
+   playback lands anti-pulses 6× too early).
+5. **Check the FIR-history cache first** — `active_dsp_state_history`
+   (PR #159) preserves prior-run FIRs. If a recent good-result FIR
+   exists for this sub at the same modal frequency, restore it via
+   `restore_active_dsp_history(history_id)` before designing fresh
+   (saves measurement work + iteration time). Note: no MCP tool exposes
+   this yet — for now, designing fresh is the only path. Listed here
+   for the future tool wiring.
+6. `save_calibration_iteration(run_id, iteration=N, rms_before=...,
+   rms_after=..., filters_proposed=<modal FIR specs>,
+   filters_applied=<applied via apply_fir>, safety_ok=...)`.
+
+## Phase 6 — Atomic 10-channel push (FIR + envelope)
+
+Single TCP/1256 session writes everything. Required because per-channel
+pushes wipe other channels' FIRs (see `feedback_avr_5ch_push_unreliable.md`,
+now resolved by retry-on-NACK in `audyssey_filter_upload.py`).
+
+1. **Build call args**:
+   - `host` = AVR IP from config
+   - `ady_path` = path to backup .ady on the container filesystem
+   - `cache_key` = the same `run_iter` used in Phase 3's design calls
+   - `channel_ids` = `["FL", "C", "FR", "SLA", "SRA", "TFL", "TFR",
+      "TRL", "TRR", "SW1"]` — full 10-channel set, including atmos +
+      sub passthrough designs
+   - `distances_override_m` = the dict accumulated from Phase 2 + 1.5
+   - `inter_packet_delay_ms` = `100`
+2. `apply_avr_fir(...)` — call returns when EXIT_AUDMD ACKs.
+3. **Verify response**:
+   - `coef_nack_count == 0` (retry-on-NACK auto-recovers transient
+     drops; final 0 means everything got through after retries)
+   - `coef_packets_unrecovered == 0` (any unrecovered means a
+     permanent NACK on a packet — abort, do not commit Fin)
+   - `fin_commit_ack == True` (NVRAM write succeeded)
+   - Surface `coef_packet_retries` in the run record (count of
+     transient NACKs auto-recovered)
+4. **Settle 30 seconds** before any subsequent TCP/1256 or Telnet
+   operation. The AVR's NVRAM flush continues after EXIT_AUDMD ACKs,
+   and Telnet writes during this window have caused crashes (see
+   `feedback_avr_settle_after_commit.md`).
+5. **After the settle**, re-enable speaker presence (Fin commit
+   resets these — see
+   `feedback_avr_layout_push_does_not_engage_sspc.md`):
+   ```
+   echo "SSSPCCEN YES" | nc <avr> 23
+   sleep 1
+   echo "SSSPCSUA YES" | nc <avr> 23
+   ```
+   Verify with `SSSPC ?` that all expected positions read YES. Re-issue
+   if any didn't stick.
+6. **Re-verify Audyssey state** (per Phase 0.3 — Fin commits sometimes
+   toggle MultEQ off):
+   ```
+   echo "PSDYNEQ ?" | nc <avr> 23
+   echo "PSAUDY ?" | nc <avr> 23
+   ```
+   If MultEQ is OFF, set on AVR menu (we don't push this flag
+   programmatically).
+7. `save_calibration_iteration(run_id, iteration=N, rms_before=...,
+   rms_after=..., filters_proposed=<full Phase 3+4+5 plan>,
+   filters_applied=<channel_ids actually committed>,
+   safety_ok=(coef_nack_count==0 and fin_commit_ack))`.
+
+If verification fails (NACKs unrecovered, Fin gate aborted, AVR drops
+TCP) — go to Phase 9's catastrophic-failure rollback, do NOT iterate.
+
+## Phase 7 — Level alignment (POST-FIR pink noise)
+
+This is what fixes the "doesn't feel like reference" symptom in v1.
+
+### 7.1 Reference-volume sanity check
+
+Before adjusting per-channel trims, verify what AVR volume corresponds to
+reference SPL on this system:
+
+1. Play −20 dBFS pink noise on FL solo at AVR volume = **−10 dB**.
+2. Measure C-weighted SPL at MLP. Audyssey/THX reference says this should
+   land around **75 dB**. Note the actual value as `avr_minus10_spl`.
+3. The "AVR volume that delivers 75 dB" = `−10 + (75 − avr_minus10_spl)` dB.
+   Document this in the run record so the user knows what knob position
+   reads as reference.
+4. If `avr_minus10_spl < 70 dB` even with our calibration: trims are
+   too low; bump per-channel `SSLEV<chan>` uniformly +3 dB before per-
+   channel level matching.
+
+### 7.2 Per-channel trim landing
+
+1. For each main / surround / atmos channel, play −20 dBFS pink noise via
+   the channel solo path at the AVR volume from 7.1.
+2. Measure C-weighted SPL at MLP with the UMIK.
+3. Adjust AVR per-channel trim (`SSLEV<chan>`) until SPL = `reference_spl`
+   (default 75 dB) ±0.5 dB.
+4. For sub: target = `reference_spl + 10 dB` (+10 dB LFE spec). Set
+   `PSSWL` accordingly. Apply the additional `+3 dB` cinema bump on top
+   if the user's preference includes it.
+5. Center: apply the `+2 dB` clarity bump on top of the level-matched
+   value.
+6. `save_calibration_iteration(run_id, iteration=N, rms_before=...,
+   rms_after=..., filters_proposed=<per-channel target SPL>,
+   filters_applied=<per-channel trim landing values>, safety_ok=True)`.
+
+### 7.3 Distortion / clip check before high-SPL listening
+
+Brief safety check. We **don't** programmatically toggle clip-warning
+yet, so this is a guarded listen rather than an automated test:
+
+1. Pick a known content track with sustained low-bass (e.g. *Tron Legacy*
+   opening 30 s).
+2. Start at the reference AVR volume from 7.1; listen for distortion,
+   port chuffing, or audible compression on bass transients.
+3. While playing, watch CamillaDSP `cpu_load` via `get_device_state`. If
+   `> 80 %`, the DSP is starved and may drop samples — pull master gain
+   back 3 dB and retry.
+4. If audible distortion at reference volume: pull sub-bus master gain
+   3 dB OR pull `PSSWL` 3 dB before listening tests.
+5. **Future enhancement**: wire `assign_headroom_tones` (which exists
+   but is unverified for this use) into a programmatic clip check.
+
+### 7.4 Re-verify AVR Audyssey state
+
+The flag set was originally configured on the AVR menu in Phase 0.3.
+Phase 6's Fin commit can drift them. Re-verify before listening tests:
 
 ```
-push_avr_speaker_layout(
-    ady_path=<latest .ady>,
-    distance_overrides_m=<from Phase 2/4>,
-    level_overrides_db=<from Phase 3>,
-    crossover_overrides_hz=<from Phase 5 if changed, else omit>,
-    commit=True,  # only after explicit user OK
-)
+echo "PSAUDY ?" | nc <avr> 23     # should match the menu choice (Reference)
+echo "PSDYNEQ ?" | nc <avr> 23    # should be ON for cinema
+echo "PSDYNVOL ?" | nc <avr> 23   # should be OFF for cinema
 ```
 
-If FIR designs exist (Phase 6.2):
+If any drift, re-set on the AVR remote/menu and document in the
+iteration record. We do NOT push these flags programmatically yet.
 
-```
-apply_avr_fir(
-    host=<config.denon.host>,
-    ady_path=<latest .ady>,
-    cache_key="mains-cal-<run_id>",
-    distances_override_m=<distance_overrides_m>,  # keep distances aligned in this write too
-)
-```
+## Phase 8 — DSP master + sub-bus level
 
-Sub-DSP writes (Phase 6.1) via `apply_input_eq` — same iteration.
+1. `set_master_gain(-15)` — sub bus operates at −15 dB (5 dB hotter than
+   v1's −20 mains-parity).
+2. Verify with a quick listen: bass should feel fuller without overpowering
+   mains.
 
-In safe mode, describe each write in plain English before calling — channels,
-values, why — and wait for explicit confirmation.
+## Phase 8.5 — Iteration loop (max 3 passes, RMS is a signal not a gate)
 
-## Phase 8 — Verify
+This is the place to refine, before calling listening verification. Each
+pass is a fresh measurement → identify residual issues → narrow re-design
+→ atomic re-push. **The convergence gate is Phase 9 (listening test).**
+RMS-deviation values here are *signals to escalate* the listening test,
+not pass/fail gates.
 
-1. Re-measure each main solo + each sub solo + combined.
-2. `compute_deviation(session_id=<combined>, target=<harman-plus-4>,
-   resolution="sixth_octave", convergence_threshold=1.5)`.
-3. `compare_sessions(baseline_id, final_id)` for the before/after scorecard.
-4. Re-run `analyze_ir` per channel. Confirm peak times now align within
-   ±1 ms (single-seat target).
+1. Take a fresh exact-MLP sweep on FL, C, FR.
+2. For each, build the same `target_curve` dict used in Phase 3.6 and
+   compute residual deviation:
+   ```
+   compute_deviation(session_id=..., target_curve=<harman+4 with absolute
+                     SPL>, resolution="sixth_octave")
+   ```
+   Note: `target_curve.band` is set inside the dict; there's no
+   top-level `band` arg. Record `rms_after` per channel.
+3. **Exit signals** (any one means "go listen"):
+   - `rms_after ≤ 4 dB` AND no single residual peak > +6 dB above target
+   - Iteration count == `max_FIR_refinement_iterations` (default 3)
+   - User says "good enough"
+4. **Always go listen first** before another iteration — even if RMS
+   says we could improve, the listening test may already be acceptable.
+   Phase 9 has the actual gate.
+5. If Phase 9 says iterate: tighten ONE parameter only per pass — don't
+   change everything at once. Common single-knob tightenings:
+   - "Boomy at 50 Hz" → drop modal cut threshold to +6 dB above target
+     (still cap depth at −5 dB); re-design + atomic push.
+   - "Voices still muffled" → reduce Center 100–200 Hz cuts toward −2 dB
+     ceiling; re-design Center only (still 10-ch atomic push with the
+     others' designs unchanged from this iteration's cache).
+   - "Too quiet overall" → re-run Phase 7 trim landing; possibly bump
+     Phase 7.1's `avr_minus10_spl` target 2 dB hotter.
+   - "Sub muddy / not deep" → re-run Phase 1.5 crossover phase check
+     and Phase 4 bass-shelf simulation; one of them is wrong.
+6. **Re-push uses the same `inter_packet_delay_ms=100` and a fresh 30 s
+   settle** before any subsequent TCP/Telnet (per
+   `feedback_avr_settle_after_commit.md`).
+7. `save_calibration_iteration(...)` after every pass.
 
-## Convergence
+## Phase 9 — Listening verification (the actual convergence gate)
 
-- In-band RMS deviation from target ≤ 1.5 dB (default), configurable.
-- Per-channel IR peak times within ±1 ms of slowest channel.
-- No safety violations from `apply_eq` / `apply_input_eq`.
-- All Phase 7 writes ACK'd; `applied=True`, `committed=True`.
+RMS deviation from target is a **secondary** metric for cinema. The
+convergence gate is subjective listening with reference content.
 
-If max iterations reached without convergence: STOP, do NOT keep iterating.
-Report the residual deviations and proceed to the retrospective.
+Reference test material (each evaluated for ~30–60 s). Ask the user to
+**also pick 2–3 tracks they know intimately**; user-specific material
+catches issues generic test scenes miss.
 
-## When convergence fails
+| Track / Scene | What to listen for |
+|---|---|
+| *Tron Legacy* — opening Daft Punk synth | Sub depth at 25–40 Hz; chest pressure |
+| *Edge of Tomorrow* — beach landing | Mid-bass impact + dialog clarity |
+| *La La Land* — "Another Day of Sun" | Voice intelligibility, no muffling |
+| *Mad Max: Fury Road* — chase scenes | Modal warmth, no boom or boxiness |
+| Reference pink noise at −20 dBFS | All channels equal, no channel sticks out |
+| **User-picked: 2–3 known tracks** | Naturalness, "sounds like the recording" |
 
-Distinguish EQ-fixable vs placement-fixable:
-- `analyze_phase` says `fixable=False` at problematic frequencies → recommend
-  speaker repositioning, room treatment.
-- Coherence < 0.8 in the deviation band → measurement noise; re-measure with
-  higher SNR before designing more filters.
-- Sub+mains XO null persists after Phase 4 → physical sub placement issue,
-  not a delay problem.
+Decision tree:
 
-## Cleanup (NON-NEGOTIABLE)
+- **Sounds great** → record outcome + lesson, exit recipe (Phase 10).
+- **Bass shallow / no impact** → bump `PSSWL` +3 dB; retry listening.
+- **Voices muffled** → reduce Center FIR cuts in 100–200 Hz toward −2 dB
+  ceiling; re-design Center only + 10-ch atomic re-push (Phase 8.5).
+- **Overall too quiet** → bump per-channel `SSLEV<chan>` +2 dB (every
+  main + center); verify volume sits at AVR −10 to −5 dB.
+- **Boomy / boxy** → modal cut threshold was too lenient; tighten to
+  +6 dB above local target (still cap at −5 dB depth); re-design + push.
+- **Brittle / fatiguing** → cuts are too aggressive in upper-bass; reduce
+  cut depth or drop a borderline cut; re-design + push.
+- **One channel sticks out** (subjectively louder/quieter than the rest)
+  → re-run Phase 7.2 for that channel only; verify pink-noise SPL is
+  within 0.5 dB of `reference_spl`.
+- **Phantom-center collapse** (vocals pull to one side instead of
+  anchoring center) → FL/FR are louder than C; re-run Phase 7.2 for all
+  three.
+- **Atmos channels too quiet/loud** → re-run Phase 7.2 for atmos
+  channels; their solo trim landing was likely skipped.
+- **Sub-mains incoherence** (bass note hits but no chest pressure, or
+  bass note + sub thump arrive separated in time) → re-run Phase 1.5
+  crossover phase check; SW1 distance candidate may need a different
+  Δd.
+- **Iteration count == max_iterations and listening still fails** →
+  exit with `converged=False`, record outcome describing the residual
+  problem, recommend follow-ups (bass traps, sub repositioning, sub
+  crawl). Don't loop indefinitely.
+- **Catastrophically worse than baseline** (audibly broken — no
+  dialog, distortion, channels missing) → ROLLBACK:
+  1. `list_dsp_snapshots(run_id=<this run>)` — newest-first list of
+     every state mutation in this run, each with operation name +
+     iteration tag. Find the last-good-iteration snapshot id (or the
+     `start_calibration` / `save_calibration_run` snapshot if you want
+     to revert to pre-recipe state).
+  2. `restore_dsp_snapshot(<id>)` — one call returns the DSP shadow
+     (input EQ, per-output FIRs, delays, polarities, gains) to that
+     exact state. The current state is itself snapshotted first so the
+     rollback is reversible.
+  3. AVR-side restore (only if Phase 6's Fin commit corrupted ChSetup):
+     `push_avr_speaker_layout(ady_path=<backup .ady from 0.2>,
+     commit=True)` to re-establish speaker layout + distances. If FIRs
+     also need to be wiped on the AVR side, push 10 passthrough FIRs
+     via `apply_avr_fir` — but in most cases the snapshot restore
+     covers what you need.
+  4. `update_calibration_run(converged=False, error="rollback after
+     catastrophic listening-test failure")` then exit.
 
-1. `update_calibration_run(run_id, converged=..., final_rms=..., iterations_run=...)` — ALWAYS, before any cleanup.
-2. `unmute_output` for every output muted in Phase 0 (shakers etc.).
-3. `restore_listening_mode()` — re-establishes the cal_matrix and master gain.
-4. `set_master_gain(0)` and verify (`end_sweep_session` does NOT do this).
-5. Confirm AVR is back on the user's normal sound mode.
+## Phase 10 — Run instrumentation close-out
 
-## Retrospective
+`update_calibration_run(run_id, converged=<bool>, final_rms=<float>,
+iterations_run=<N>, outcome=<prose>)`. Outcome should compare actual
+listening result to hypothesis.
 
-Required, even on convergence:
+`record_lesson(...)` for ≤2 falsifiable claims. Examples:
 
-1. **Before/after scorecard** via `compare_sessions`.
-2. **Per-channel IR peak time table** — slowest channel, all deltas, all final residuals.
-3. **Per-channel level table** — measured, target, applied trim.
-4. **Unfixable problems** from `analyze_phase` `fixable=False` bands — placement / treatment recommendations.
-5. **Lessons** — `record_lesson` for any non-obvious finding, capped at 2 per run, scope `room` (with invalidators) or `general` (with promotion plan).
+- **room scope**: "Center −3 dB cut at 117 Hz delivered legible dialog
+  improvement vs −7 dB; deeper cut muffled male voices at this room/MLP."
+- **general scope** (with `promote_lesson` after action): "Cinema
+  calibration converges on listening tests, not RMS deviation; v2 recipe
+  encodes this gate."
 
-## MCP tools used
+## Phase 11 — Cleanup
 
-### Hardware I/O
-- `check_system`, `measure`, `mute_output`, `unmute_output`, `set_delay`, `set_polarity`, `set_output_gain`
-- `apply_input_eq` (sub bus shelf)
-- `apply_eq` (per-sub PEQ, if carried over)
-- `push_avr_speaker_layout` (atomic distance + level + crossover write)
-- `design_avr_fir` + `apply_avr_fir` (mains FIR — capability-gated; see TODO)
-- `set_master_gain`, `end_sweep_session`, `restore_listening_mode`
+1. `unmute_output(target="tactile")` for every shaker output (per
+   `feedback_calibration_cleanup.md` — but note that bass-recipe
+   convention says "set master to 0 dB"; this recipe deliberately
+   diverges because **−15 dB IS our cinema operating level**, not a
+   transient cal-time setting).
+2. **`set_master_gain(-15)` (NOT 0)** — confirm with the operator that
+   the recipe ends at −15 dB. Ignore the bass-recipe cleanup convention
+   here; verify the operating level matches Configuration's
+   `sub_bus_master_gain`.
+3. Verify SSSPC presence still YES; re-enable via Telnet if any drifted
+   to NO during Phase 9 iterations.
+4. Re-verify Audyssey state per Phase 7.4 (PSAUDY, PSDYNEQ, PSDYNVOL).
+5. Final `get_device_state` snapshot — record AVR volume, DSP master,
+   per-channel trim landing values, MultEQ state for the run report.
 
-### Analytics
-- `analyze_ir` (peak times, SPL — backbone of Phase 2 + 3)
-- `analyze_phase` (fixability for filter targeting)
-- `compute_deviation`, `compare_sessions`
-- `optimize_sub_alignment` (XO-region phase alignment, Phase 4)
+## Notes / Future work
 
-### Simulation
-- `simulate_eq` (sub bus shelf preview)
-- `fit_shelf_for_target` (Phase 6.1)
-- `anchor_target` (Phase 5)
+### LLM-first deprecations baked into this recipe
 
-### State and config
-- `get_config`, `get_device_state`, `get_output_state`, `get_measurement_history`
-- `save_calibration_run`, `save_calibration_iteration`, `update_calibration_run`
-- `record_lesson`, `get_relevant_lessons`
+- **`anchor_target`** — conflated analytics (per-band error) with
+  judgment (where to anchor) and the judgment piece belongs to the LLM.
+  Phase 3 uses `analyze_phase` + `compute_deviation` directly with
+  Claude's reasoning. Task #11 is now scoped as "delete the tool and
+  callers", not "fix the crash."
+- **`optimize_sub_alignment`** — same pattern (delay-sweep solver
+  picking local minimum). Phase 1.5 replaces it with `compare_sessions`
+  + `analyze_phase` + Claude's "fixable phase or geometric null?"
+  judgment.
+- **`fit_shelf_for_target`** — same pattern (shelf params chosen by
+  fit). Phase 4 uses `simulate_eq` as the source-of-truth verification;
+  Claude proposes shelf candidates; `fit_shelf_for_target` may be
+  consulted as a starting-point oracle but is not the deciding tool.
+
+The line: tools that compute *one* derived value (like `suggested_q`
+from `analyze_decay`) are data tools, fine. Tools that pick *which*
+peak to correct or *what* parameter value to apply are solver-shaped
+and don't belong in an LLM-first recipe.
+
+### Capabilities not yet wired
+
+- **Atmos sweep_channel support in `measure`** — current `sweep_channel`
+  arg accepts FL/FR/C/LFE/SL/SR/SBL/SBR (HDMI channels 1-8). Atmos
+  channels (TFL/TFR/TRL/TRR = HDMI ch 7+ in 5.1.4 layouts) aren't
+  supported, so v2 Phase 1 cannot solo-sweep atmos for baseline. For
+  iter1 those channels just get passthrough FIRs in Phase 6. Future
+  improvement: extend the measure tool's HDMI channel map to cover
+  TFL/TFR/TML/TMR/TRL/TRR + the higher channels.
+
+
+- **No `average_sessions` MCP tool** — multi-position averaging is
+  approximated in Phase 1 by a single head-shift session used as a
+  modal-robustness discriminator (peak must appear in both, not strict
+  mean). True spatial averaging would need a tool to interpolate to a
+  common bin grid and combine.
+- **No `flag_overrides` on `push_avr_speaker_layout`** — AudyEqSet,
+  AudyDynEq, AudyDynVol, AudyMultEQ are set on the AVR menu manually
+  in Phase 0.3 and re-verified in Phase 7.4. Open improvement.
+- **`active_dsp_state_history`** (per-key fine-grained, PR #159) and
+  **`dsp_snapshots`** (per-operation coarse-grained, this PR) both auto-
+  archive on every state mutation. No recipe-side instrumentation
+  needed — every `apply_avr_fir`, `apply_eq`, `apply_input_eq`,
+  `apply_fir`, `clear_fir`, `push_avr_speaker_layout`, `set_delay`,
+  `set_polarity`, `set_output_gain`, `set_master_gain`, and
+  `reset_dsp_defaults` call records its pre-mutation state. Snapshots
+  taken inside a `save_calibration_run` / `update_calibration_run`
+  boundary are tagged with `run_id` + `iteration` so they're trivially
+  queryable per run via `list_dsp_snapshots(run_id=...)`. Phase 9's
+  catastrophic-rollback should use
+  `restore_dsp_snapshot(<last-good-snapshot-id>)` — one call returns
+  the DSP shadow to that exact state. AVR-side envelope restore (if
+  Phase 6 corrupted ChSetup) is still a separate
+  `push_avr_speaker_layout` call from the backup .ady.
+- **Computational compute split (task #10)** — recommended before
+  iter3+ to keep MCP responsive during long runs. v2 doesn't depend on
+  it but heavy iteration sessions are stress-prone without it.
+- **No programmatic clip detection** — Phase 7.3's distortion check
+  is a guarded listening test, not an automated clip probe. Wiring
+  `assign_headroom_tones` (which exists but doesn't currently report
+  clip state) would close this gap.
