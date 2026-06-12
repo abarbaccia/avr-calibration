@@ -7760,66 +7760,6 @@ async def _tool_clear_fir(output_index: int) -> dict:
     return _ok(output_index=output_index, message="FIR cleared")
 
 
-async def _tool_apply_fir_identity(output_index: int, num_taps: int = 8192) -> dict:
-    """Apply a delta-function identity FIR (passthrough) of num_taps length.
-
-    Equivalent to applying [1.0, 0.0, 0.0, ...] with num_taps coefficients.
-    Useful for pre-initialising CamillaDSP's FFT convolution block to a fixed
-    size so that subsequent FIR swaps do not shift the loopback-reference
-    timing.  Both output channels must carry the same tap count for the
-    quantum to stabilise.
-
-    Parameters
-    ----------
-    output_index : DSP output index (must be a bound transducer)
-    num_taps     : FIR length in samples (default 8192). Must match the
-                   planned correction FIR length so the FFT block does not
-                   resize when the correction is loaded.
-    """
-    if num_taps < 1 or num_taps > 65536:
-        return _err(f"apply_fir_identity: num_taps={num_taps} out of range [1, 65536]")
-    try:
-        graph = _config().signal_graph
-        bound = {int(t.output_index): t.name for t in graph.transducers}
-        if bound and int(output_index) not in bound:
-            valid = ", ".join(
-                f"{idx}={name}" for idx, name in sorted(bound.items())
-            )
-            return _err(
-                f"apply_fir_identity: output_index={output_index} not bound. "
-                f"Valid: {valid}."
-            )
-    except Exception:
-        pass
-
-    # Build identity (delta) FIR: tap[0]=1.0, rest 0.0
-    identity = [0.0] * num_taps
-    identity[0] = 1.0
-
-    try:
-        await _dsp.apply_fir(output_index, identity, intent="standard")  # type: ignore[union-attr]
-    except DriverError as exc:
-        return _err(str(exc))
-    except Exception as exc:
-        return _err(f"apply_fir_identity error: {exc}")
-
-    _sweep_blocked_outputs.discard(int(output_index))
-    _fir_design_intent[int(output_index)] = "standard"
-
-    # Persist so a container restart rehydrates the identity FIR (maintaining
-    # the FFT block size for timing stability).
-    from .storage import dsp_output_key
-    processor = _default_dsp_name() or "dsp"
-    _persist_dsp_state(
-        dsp_output_key(processor, int(output_index), "fir"),
-        {"coefficients": identity, "num_taps": num_taps},
-    )
-    return _ok(
-        output_index=output_index,
-        taps=num_taps,
-        message=f"Identity FIR ({num_taps} taps) applied — output is passthrough.",
-    )
-
 
 async def _tool_reset_dsp_defaults(
     dry_run: bool = False,
@@ -11296,33 +11236,7 @@ _TOOLS: list[Tool] = [
             "required": ["output_index"],
         },
     ),
-    Tool(
-        name="apply_fir_identity",
-        description=(
-            "Apply a delta-function (passthrough) FIR of num_taps to a DSP output. "
-            "Equivalent to [1, 0, 0, ...] with num_taps samples — audio is unchanged. "
-            "Use before taking a pre-FIR baseline to pre-initialise CamillaDSP's FFT "
-            "convolution block: with matching tap-count FIRs on all sub outputs the "
-            "loopback-reference timing stabilises, enabling reliable pre/post FIR "
-            "comparison.  After the baseline, replace with the actual correction FIR "
-            "(same tap count) without timing shift."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "output_index": {
-                    "type": "integer",
-                    "description": "DSP output index (bound transducer only).",
-                },
-                "num_taps": {
-                    "type": "integer",
-                    "default": 8192,
-                    "description": "FIR length in samples. Must match the planned correction FIR tap count.",
-                },
-            },
-            "required": ["output_index"],
-        },
-    ),
+
     Tool(
         name="design_corrective_fir",
         description=(
@@ -13250,7 +13164,6 @@ def _register_all_tools() -> None:
         ("analyze_ir", _tool_analyze_ir),
         ("apply_fir", _tool_apply_fir),
         ("clear_fir", _tool_clear_fir),
-        ("apply_fir_identity", _tool_apply_fir_identity),
         ("design_corrective_fir", _tool_design_corrective_fir),
         ("reset_dsp_defaults", _tool_reset_dsp_defaults),
         ("set_master_gain", _tool_set_master_gain),

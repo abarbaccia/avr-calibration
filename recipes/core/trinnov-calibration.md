@@ -317,7 +317,7 @@ delayed to match.
 | `analyze_decay` | Phase 3 and Phase 6 T60 reports |
 | `design_fir_trinnov` | Phase 4 FIR design |
 | `apply_fir` | Phase 5 FIR application |
-| `apply_fir_identity` | Phase 2 preflight (reset to physical room baseline) |
+| `clear_fir` | Phase 2 preflight (reset to physical room baseline) |
 | `verify_trinnov_coherence` | Phase 6 — coherent summation check |
 | `verify_fir_effect` | Phase 6 — magnitude check (complementary) |
 | `compare_sessions` | Phase 0.5 sub balance check |
