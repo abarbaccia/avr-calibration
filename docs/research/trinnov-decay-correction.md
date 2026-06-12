@@ -166,13 +166,14 @@ mode's pole directly, no per-mode decomposition needed. Multi-position IR averag
 `design_fir_trinnov` = coherent mixed-phase Wiener inverse + informational T60 report.
 No anti-ringing/pre-causal section. Tagged `correction` (strict safety cap), sweep-safe.
 
-The legacy 2-pulse Gabor design (`design_fir_multi_modal`) is unchanged. Note that the
-`C * h` matched-filter argument applies to Gabor anti-pulses too; treat their measured
-T60 benefit with the same skepticism and verify per-mode before trusting it.
+The legacy 2-pulse Gabor design (`multi_fir.design_fir_multi_modal`) is unchanged as a
+library function but is no longer an MCP tool. Note that the `C * h` matched-filter
+argument applies to Gabor anti-pulses too; treat their measured T60 benefit with the
+same skepticism and verify per-mode before trusting it.
 
 ## References
 
 - `calibrate/multi_fir.py`: `design_fir_trinnov()` (wrapper), `design_multi_input_fir()`
 - `calibrate/mcp_server.py`: `_tool_design_fir_trinnov()`
-- Related: `design_fir_multi_modal()` (legacy Gabor approach)
+- Related: `multi_fir.design_fir_multi_modal()` (legacy Gabor approach; library function, not MCP tool)
 - Trinnov Altitude documentation (proprietary; community descriptions only)

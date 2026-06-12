@@ -63,7 +63,7 @@ group names in preference to raw output indices:
 - `apply_eq(target="bass", filters=[...])` — broadcast to every sub in the
   `bass` group. Equivalent to the legacy omit-`output_index` broadcast.
 - `apply_eq(target="sub_1", filters=[...])` — per-transducer by name.
-- `resolve_target("bass")` — get `{transducer, output_index, profile}` entries
+- `resolve_measurement_target("bass")` — get `{transducer, output_index, profile}` entries
   when you need raw indices for tools that still take `output_index` only
   (`set_delay`, `set_polarity`, `set_output_gain`, `mute_output`).
 

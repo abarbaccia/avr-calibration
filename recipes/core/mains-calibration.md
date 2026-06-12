@@ -68,7 +68,7 @@ Three different addressing namespaces are in play:
   iteration filter dicts. Use the AVR commandId for consistency with
   the run record across phases.
 
-Use `resolve_target("bass")` when you need raw indices for legacy
+Use `resolve_measurement_target("bass")` when you need raw indices for legacy
 tools. Otherwise prefer named targets so per-transducer safety
 profiles auto-apply.
 

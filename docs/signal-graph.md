@@ -99,7 +99,7 @@ Safety profiles live in two places:
 - **MCP surface** — `apply_eq` and `apply_input_eq` gain an optional
   `target` parameter (group / transducer / role name). Legacy
   `output_index` still works. New tools: `get_signal_graph` (compact
-  summary for LLM reasoning) and `resolve_target` (name → concrete
+  summary for LLM reasoning) and `resolve_measurement_target` (name → concrete
   transducer list).
 
 ## Known gaps (follow-ups)

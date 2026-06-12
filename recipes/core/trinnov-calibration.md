@@ -155,10 +155,9 @@ clear_fir(output_index=6)
 ```
 
 This ensures H_i captures the physical room only — a correction FIR bakes
-that correction into K_i, making the design circular. Use `clear_fir`, not
-`apply_fir_identity`: identity FIRs are not passthrough (they reshape the
-response), and they force a large PipeWire quantum that can destabilize
-between-session phase when quantum shifts ±39 ms between sessions.
+that correction into K_i, making the design circular. Use `clear_fir` to
+reset to identity passthrough; this preserves the Conv block topology so
+the PipeWire quantum stays stable between sessions.
 
 **Per-sub measurement:**
 
