@@ -155,6 +155,67 @@ def _read_audio_mode() -> str | None:
         return None
 
 
+def _read_pw_capture_links() -> dict | None:
+    """Probe PipeWire link state for camilladsp_capture contamination.
+
+    Runs ``pw-link -l`` (host-side) and returns a dict:
+      {
+        "umik_into_dsp": bool,   # True when any UMIK source is linked into camilladsp_capture
+        "sources": [str, ...],   # list of node names currently linked into camilladsp_capture
+      }
+
+    Returns None on any error (pw-link absent, timeout, parse failure) so
+    callers can omit the field gracefully when the information is unavailable.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["pw-link", "-l"],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+    output = result.stdout or ""
+    # pw-link -l format:
+    #   <source_node>:<source_port>
+    #     |-> <dest_node>:<dest_port>
+    #   ...
+    # Parse by tracking the current source node and collecting destinations
+    # that contain "camilladsp_capture".
+    current_source: str | None = None
+    sources_into_dsp: set[str] = set()
+
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if stripped.startswith("|->"):
+            # Destination line: check if it feeds camilladsp_capture
+            dest = stripped[3:].strip()
+            if "camilladsp_capture" in dest and current_source is not None:
+                sources_into_dsp.add(current_source)
+        else:
+            # Source line: extract node name (everything before the first colon)
+            if ":" in stripped:
+                current_source = stripped.split(":")[0]
+            else:
+                current_source = None
+
+    umik_into_dsp = any(
+        "umik" in s.lower() or "minidsp_umik" in s.lower()
+        for s in sources_into_dsp
+    )
+    return {
+        "umik_into_dsp": umik_into_dsp,
+        "sources": sorted(sources_into_dsp),
+    }
+
+
 @app.get("/health")
 async def health():
     mode = _read_audio_mode()
@@ -163,6 +224,9 @@ async def health():
         payload["audio_mode"] = mode
     if _SOURCE_HASHES:
         payload["source_hashes"] = _SOURCE_HASHES
+    pw_links = _read_pw_capture_links()
+    if pw_links is not None:
+        payload["pw_capture_links"] = pw_links
     return payload
 
 

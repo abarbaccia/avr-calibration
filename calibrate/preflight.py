@@ -65,7 +65,7 @@ class PreflightChecker:
         """Run all hardware checks concurrently. Never raises — errors become failed results.
 
         Equipment checks:
-            [Config]  [Measurement service]  [Service version]  [Audio mode]  [Microphone]  [miniDSP (USB+daemon)]  [Denon AVR + Playback]  [Signal Path]
+            [Config]  [Measurement service]  [Service version]  [Audio mode]  [Microphone]  [miniDSP (USB+daemon)]  [Denon AVR + Playback]  [Signal Path]  [Chain contamination]
         """
         dsp_label = _DSP_DISPLAY_NAMES.get(
             self.config.dsp_driver_name, self.config.dsp_driver_name
@@ -83,6 +83,7 @@ class PreflightChecker:
             ("DSP persisted state", self.check_dsp_persisted_state()),
             ("Loopback reference", self.check_loopback_reference()),
             ("Loopback timing stability", self.check_loopback_xcorr_stability()),
+            ("Chain contamination", self.check_chain_contamination()),
         ]
         names = [name for name, _ in checks]
         coros = [coro for _, coro in checks]
@@ -1091,4 +1092,85 @@ class PreflightChecker:
                 passed=True,
                 detail=f"could not inspect session history ({exc}); skipped",
             )
+
+    async def check_chain_contamination(self) -> CheckResult:
+        """Detect UMIK→camilladsp_capture auto-links that create a feedback loop.
+
+        When WirePlumber auto-links the UMIK microphone into CamillaDSP's
+        capture ports, the routing matrix carries mic audio toward the subs:
+        mic→DSP→subs→room→mic. This creates an acoustic feedback loop that:
+          - randomises polarity (loop phase determines constructive/destructive)
+          - drifts SPL between identical sweeps (loop gain instability)
+          - makes xcorr sign and magnitude noise-sensitive
+
+        Confirmed live 2026-06-12: flipping one sub's DSP polarity changed the
+        captured level by 21 dB (loop phase), polarity signs were random, and
+        SPL drifted between consecutive identical sweeps.
+
+        Reads ``pw_capture_links`` from the bare-metal measurement service's
+        /health endpoint (added alongside this check) which runs pw-link -l
+        host-side where PipeWire is accessible.
+
+        Behavior:
+          - umik_into_dsp=True              → FAIL with feedback loop explanation
+          - umik_into_dsp=False             → PASS, list active DSP sources
+          - pw_capture_links absent         → pass-with-warning (old service)
+          - service unreachable             → pass-with-warning (not double-reported)
+        """
+        from .measurement_client import MeasurementServiceClient, MeasurementServiceError
+
+        client = MeasurementServiceClient()
+        try:
+            health = await client.health()
+        except MeasurementServiceError:
+            return CheckResult(
+                name="Chain contamination",
+                passed=True,
+                detail="chain contamination unknown (measurement service unreachable — see above)",
+            )
+        except Exception as exc:
+            return CheckResult(
+                name="Chain contamination",
+                passed=True,
+                detail=f"chain contamination unknown (health probe error: {exc})",
+            )
+
+        pw_links = health.get("pw_capture_links")
+        if pw_links is None:
+            return CheckResult(
+                name="Chain contamination",
+                passed=True,
+                detail="chain contamination unknown (service predates this check — update deploy/install.sh)",
+            )
+
+        umik_into_dsp: bool = pw_links.get("umik_into_dsp", False)
+        sources: list = pw_links.get("sources", [])
+
+        if umik_into_dsp:
+            sources_str = ", ".join(sources) if sources else "(unknown)"
+            return CheckResult(
+                name="Chain contamination",
+                passed=False,
+                detail=(
+                    f"UMIK is linked into camilladsp_capture "
+                    f"(active DSP sources: {sources_str})"
+                ),
+                error=(
+                    "UMIK→camilladsp_capture link detected. This creates a "
+                    "mic→DSP→subs→room→mic acoustic feedback loop. Symptoms: "
+                    "random polarity sign, SPL drift between identical sweeps, "
+                    "xcorr peak sign instability. "
+                    "Fix: remove the UMIK→camilladsp_capture links manually "
+                    "(pw-link -d <umik-port> <camilla-port>), then restart "
+                    "wireplumber to apply the corrected 51-umik.lua rule: "
+                    "systemctl --user restart wireplumber"
+                ),
+            )
+
+        sources_str = ", ".join(sources) if sources else "none"
+        return CheckResult(
+            name="Chain contamination",
+            passed=True,
+            detail=f"no UMIK→camilladsp_capture links (active DSP sources: {sources_str})",
+        )
 

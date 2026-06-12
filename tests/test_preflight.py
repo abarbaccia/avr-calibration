@@ -614,10 +614,11 @@ class TestRunAll:
             patch.object(checker, "check_dsp_persisted_state", return_value=CheckResult("DSP persisted state", True, "all defaults")),
             patch.object(checker, "check_loopback_reference", return_value=CheckResult("Loopback reference", True, "enabled")),
             patch.object(checker, "check_loopback_xcorr_stability", return_value=CheckResult("Loopback timing stability", True, "stable")),
+            patch.object(checker, "check_chain_contamination", return_value=CheckResult("Chain contamination", True, "no UMIK links")),
         ):
             results = await checker.run_all()
         assert all(r.passed for r in results)
-        assert len(results) == 12
+        assert len(results) == 13
 
     async def test_unhandled_exception_becomes_failed_result(self, config):
         checker = PreflightChecker(config)
@@ -652,13 +653,14 @@ class TestRunAll:
             patch.object(checker, "check_dsp_persisted_state", side_effect=RuntimeError("err")),
             patch.object(checker, "check_loopback_reference", side_effect=RuntimeError("err")),
             patch.object(checker, "check_loopback_xcorr_stability", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_chain_contamination", side_effect=RuntimeError("err")),
         ):
             results = await checker.run_all()
         assert [r.name for r in results] == [
             "Config", "Measurement service", "Service version", "Audio mode",
             "Microphone", "miniDSP 2x4 HD", "Denon AVR",
             "Signal Path", "Output routing", "DSP persisted state",
-            "Loopback reference", "Loopback timing stability",
+            "Loopback reference", "Loopback timing stability", "Chain contamination",
         ]
 
     async def test_result_names_camilladsp_label(self, config):
@@ -1248,5 +1250,133 @@ class TestDspPersistedState:
             result = await checker.check_dsp_persisted_state()
         assert result.passed  # skipped, not failed
         assert "skipped" in result.detail.lower()
+
+
+# ── Chain contamination check ─────────────────────────────────────────────────
+
+class TestChainContaminationCheck:
+    """check_chain_contamination detects UMIK→camilladsp_capture auto-links.
+
+    Coverage:
+      - [TESTED] umik_into_dsp=True  → FAIL with feedback-loop error
+      - [TESTED] umik_into_dsp=False → PASS with active-sources detail
+      - [TESTED] pw_capture_links absent (old svc) → pass-with-warning
+      - [TESTED] service unreachable → pass-with-warning (not double-reported)
+      - [TESTED] health probe error  → pass-with-warning
+    """
+
+    def _health_ok(self, pw_links: dict) -> dict:
+        return {"status": "ok", "pw_capture_links": pw_links}
+
+    async def test_umik_into_dsp_fails(self, config):
+        """UMIK→camilladsp_capture present → FAIL with feedback loop hint."""
+        pw_links = {
+            "umik_into_dsp": True,
+            "sources": ["alsa_input.usb-miniDSP_Umik-1_Gain__18dB"],
+        }
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.health = AsyncMock(return_value=self._health_ok(pw_links))
+            result = await PreflightChecker(config).check_chain_contamination()
+        assert not result.passed
+        assert "UMIK" in result.detail
+        assert "feedback" in result.error.lower()
+        assert "wireplumber" in result.error.lower()
+
+    async def test_no_umik_links_passes(self, config):
+        """No UMIK→camilladsp_capture links → PASS with active sources."""
+        pw_links = {
+            "umik_into_dsp": False,
+            "sources": ["avr_cal_sweep"],
+        }
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.health = AsyncMock(return_value=self._health_ok(pw_links))
+            result = await PreflightChecker(config).check_chain_contamination()
+        assert result.passed
+        assert "avr_cal_sweep" in result.detail
+
+    async def test_pw_capture_links_absent_passes_with_warning(self, config):
+        """Old service without pw_capture_links → pass (graceful degradation)."""
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.health = AsyncMock(return_value={"status": "ok"})
+            result = await PreflightChecker(config).check_chain_contamination()
+        assert result.passed
+        assert "predates" in result.detail.lower() or "unknown" in result.detail.lower()
+
+    async def test_service_unreachable_passes_with_warning(self, config):
+        """Service unreachable → pass-with-warning (measurement check handles it)."""
+        from calibrate.measurement_client import MeasurementServiceError
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.health = AsyncMock(
+                side_effect=MeasurementServiceError("unreachable")
+            )
+            result = await PreflightChecker(config).check_chain_contamination()
+        assert result.passed
+        assert "unreachable" in result.detail.lower()
+
+    async def test_health_probe_error_passes_with_warning(self, config):
+        """Unexpected exception → pass-with-warning."""
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.health = AsyncMock(side_effect=RuntimeError("timeout"))
+            result = await PreflightChecker(config).check_chain_contamination()
+        assert result.passed
+        assert "unknown" in result.detail.lower()
+
+
+# ── _read_pw_capture_links (measurement_service) ──────────────────────────────
+
+class TestReadPwCaptureLinks:
+    """Unit tests for measurement_service._read_pw_capture_links().
+
+    Coverage:
+      - [TESTED] UMIK→camilladsp_capture present → umik_into_dsp=True, source listed
+      - [TESTED] Only Scarlett→camilladsp_capture → umik_into_dsp=False
+      - [TESTED] pw-link not found → returns None
+      - [TESTED] Empty PW graph (no links) → umik_into_dsp=False, sources=[]
+    """
+
+    def _run(self, stdout: str):
+        from calibrate.measurement_service import _read_pw_capture_links
+        import subprocess
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout=stdout, returncode=0)
+            return _read_pw_capture_links()
+
+    def test_umik_into_dsp_detected(self):
+        """UMIK source linked into camilladsp_capture → umik_into_dsp=True."""
+        pw_output = (
+            "alsa_input.usb-miniDSP_Umik-1_Gain__18dB_00002:capture_FL\n"
+            "  |-> camilladsp_capture:input_1\n"
+            "avr_cal_sweep:monitor_FL\n"
+            "  |-> camilladsp_capture:input_3\n"
+        )
+        result = self._run(pw_output)
+        assert result is not None
+        assert result["umik_into_dsp"] is True
+        assert any("Umik" in s for s in result["sources"])
+
+    def test_scarlett_only_no_umik(self):
+        """Only Scarlett sources linked into camilladsp_capture → umik_into_dsp=False."""
+        pw_output = (
+            "alsa_input.usb-Focusrite_Scarlett_18i20:capture_FL\n"
+            "  |-> camilladsp_capture:input_1\n"
+        )
+        result = self._run(pw_output)
+        assert result is not None
+        assert result["umik_into_dsp"] is False
+        assert any("Focusrite" in s for s in result["sources"])
+
+    def test_pw_link_not_found_returns_none(self):
+        """pw-link binary absent → returns None gracefully."""
+        from calibrate.measurement_service import _read_pw_capture_links
+        with patch("subprocess.run", side_effect=FileNotFoundError("pw-link")):
+            result = _read_pw_capture_links()
+        assert result is None
+
+    def test_empty_graph_returns_empty_sources(self):
+        """No links in PW graph → umik_into_dsp=False, sources=[]."""
+        result = self._run("")
+        assert result is not None
+        assert result["umik_into_dsp"] is False
+        assert result["sources"] == []
 
 
