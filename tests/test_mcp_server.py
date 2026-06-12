@@ -8479,3 +8479,31 @@ async def test_set_speaker_distances_use_custom_surfaces_deprecation_error() -> 
     assert not result["ok"]
     assert "deprecated" in result["error"].lower()
     assert "push_full_envelope_from_ady" in result["error"]
+
+
+# ── _BoundedDict ──────────────────────────────────────────────────────────────
+
+
+def test_bounded_dict_evicts_oldest_entry():
+    from calibrate.mcp_server import _BoundedDict
+
+    bd = _BoundedDict(maxsize=3)
+    for i in range(4):
+        bd[i] = i * 10
+    # maxsize=3 → entry 0 evicted, entries 1,2,3 remain
+    assert 0 not in bd
+    assert list(bd.keys()) == [1, 2, 3]
+
+
+def test_bounded_dict_update_moves_to_end_and_does_not_over_evict():
+    from calibrate.mcp_server import _BoundedDict
+
+    bd = _BoundedDict(maxsize=3)
+    bd[0] = "a"
+    bd[1] = "b"
+    bd[2] = "c"
+    bd[0] = "a2"  # touch existing key — moves to end
+    bd[3] = "d"   # 1 must be evicted (oldest), 0 stays because it was just touched
+    assert 1 not in bd
+    assert 0 in bd
+    assert list(bd.keys()) == [2, 0, 3]

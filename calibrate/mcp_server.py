@@ -62,6 +62,7 @@ import asyncio
 import json
 import logging
 import os
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -142,24 +143,41 @@ _dsp: DSPDriver | None = None
 # pointing at the first entry of each kind, preserving every legacy call site.
 _drivers = None  # DriverRegistry | None
 
+class _BoundedDict(OrderedDict):
+    """OrderedDict that evicts the oldest entry when maxsize is exceeded."""
+
+    def __init__(self, maxsize: int = 8) -> None:
+        super().__init__()
+        self._maxsize = maxsize
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.move_to_end(key)
+        while len(self) > self._maxsize:
+            self.popitem(last=False)
+
+
 # Server-side cache for FIR coefficients produced by design_fir. Lets callers
 # opt out of the coefficient round-trip (design_fir returns arrays up to
 # ~65 536 floats; ~140 KB JSON at 8 192 taps) by passing
 # return_coefficients=false and later referencing the cached design by its
 # source session_id in apply_fir(design_session_id=...). Cleared implicitly
 # on process restart — callers must re-design if the server has been bounced.
-_fir_design_cache: dict[int, list[float]] = {}
+# Bounded at 8 entries — oldest evicted; evicted entries produce the existing
+# "design_session_id not found in cache — re-run the design tool" error.
+_fir_design_cache: _BoundedDict = _BoundedDict(8)
 # Tracks the design intent of cached coefficients so apply_fir can pass the
 # right ``intent`` to SafetyValidator (e.g., ``modal_cancel`` for FIRs from
 # ``design_modal_fir`` to admit their intentionally hot modal-band gain).
-_fir_design_intent: dict[int, str] = {}
+_fir_design_intent: _BoundedDict = _BoundedDict(8)
 # Outputs with anti-pulse (Gabor) FIRs loaded — sweeping while these are
 # active causes DAC clipping.  Set by apply_fir when intent=modal_cancel;
 # cleared by clear_fir.  Checked at the start of every measure() call.
 _sweep_blocked_outputs: set[int] = set()
 # Cached room IRs from measure_impulse_ir, keyed by ir_session_id.
 # Used by design_fir_trinnov to avoid re-measuring.
-_ir_cache: dict[int, list[float]] = {}
+# Bounded at 8 entries — IR data is ~200 KB each at 48 kHz.
+_ir_cache: _BoundedDict = _BoundedDict(8)
 _ir_cache_counter: list[int] = [0]
 
 
