@@ -112,33 +112,6 @@ else
     cat /tmp/mcp-server.log >&2
 fi
 
-# ── PipeWire loopback reference links (fallback) ──────────────────────────────
-# avr-cal-sweep-link.service is the primary mechanism for these links.
-# This block is a belt-and-suspenders fallback: if the host service is missing
-# or fails, the container still establishes the two critical paths.
-#
-# Link 1: avr_cal_sweep:monitor_FL → camilladsp_capture:input_2
-#   Sweep enters CamillaDSP LFE mixer so audio reaches the subs.
-#
-# Link 2: avr_cal_sweep:monitor_FL → loopback_ref:playback_1
-#   Pre-CamillaDSP reference for measurement deconvolution.
-#   H = H_acoustic × FIR × PEQ (FIR corrections ARE visible in measurements).
-#
-# "File exists" means the host service already set the link — treat as success.
-_pw_link() {
-    result=$(pw-link "$1" "$2" 2>&1) && return 0
-    echo "$result" | grep -q 'File exists' && return 0
-    return 1
-}
-( for i in 2 4 6 8 10; do
-    sleep $i
-    r=0
-    _pw_link avr_cal_sweep:monitor_FL camilladsp_capture:input_2 || r=1
-    _pw_link avr_cal_sweep:monitor_FR camilladsp_capture:input_2 || r=1
-    _pw_link avr_cal_sweep:monitor_FL loopback_ref:playback_1   || r=1
-    [ "$r" = "0" ] && echo 'PipeWire cal-sweep links established' && break
-  done ) &
-
 # ── uvicorn (web dashboard) ──────────────────────────────────────────────────
 # Run in background so we can wait on it and forward signals via the trap.
 # Using exec would bypass the trap handler.
