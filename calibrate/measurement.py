@@ -76,6 +76,7 @@ class FrequencyResponse:
     recording_rms_dbfs: Optional[float] = None  # RMS of raw recording (sweep portion)
     coherence: Optional[list[float]] = None  # 0-1 per frequency, measurement reliability
     xcorr_peak_ms: Optional[float] = None  # cross-correlation peak time (propagation delay)
+    xcorr_peak_sign: Optional[int] = None  # sign of cross-correlation peak (+1 or -1); reliable polarity for band-limited IRs
     loopback_xcorr_peak_ms: Optional[float] = None  # xcorr(ref, mic): CamillaDSP latency + acoustic travel
     avr_processing_ms: Optional[float] = None       # xcorr(sweep, ref): AVR processing delay
 
@@ -92,6 +93,7 @@ class FrequencyResponse:
         data.setdefault("recording_rms_dbfs", None)  # backward compat
         data.setdefault("coherence", None)  # backward compat
         data.setdefault("xcorr_peak_ms", None)  # backward compat
+        data.setdefault("xcorr_peak_sign", None)  # backward compat
         data.setdefault("loopback_xcorr_peak_ms", None)  # backward compat
         data.setdefault("avr_processing_ms", None)  # backward compat
         return cls(**data)
@@ -1142,7 +1144,7 @@ class MeasurementEngine:
         # [3ms, 200ms] acoustic-arrival search window.
         _timing_array = sweep_for_deconv if _alsa_direct_ref else None
 
-        frequencies, spl, ir_samples, phase, coherence, xcorr_peak_ms = self._compute_fr_arrays(
+        frequencies, spl, ir_samples, phase, coherence, xcorr_peak_ms, xcorr_peak_sign = self._compute_fr_arrays(
             np, deconv_x, deconv_y, freq_min, freq_max, sample_rate,
             cal_curve=cal_curve,
             timing_array=_timing_array,
@@ -1206,6 +1208,7 @@ class MeasurementEngine:
             recording_rms_dbfs=rec_rms_dbfs,
             coherence=coherence,
             xcorr_peak_ms=xcorr_peak_ms,
+            xcorr_peak_sign=xcorr_peak_sign,
             loopback_xcorr_peak_ms=loopback_xcorr_peak_ms,
             avr_processing_ms=avr_processing_ms,
         )
@@ -1231,13 +1234,18 @@ class MeasurementEngine:
         sample_rate: int,
         cal_curve: list[tuple[float, float]] | None = None,
         timing_array=None,  # optional separate 1-D float64 for xcorr timing only
-    ) -> tuple[list[float], list[float], list[float], list[float], list[float] | None, float]:
+    ) -> tuple[list[float], list[float], list[float], list[float], list[float] | None, float, int]:
         """
         Core deconvolution on raw numpy arrays.
 
         Deconvolves via H(f) = Y·X* / (|X|² + ε), then gates the
         impulse response in the time domain before converting back to
         the frequency domain for a clean FR.
+
+        Returns a 7-tuple:
+          (freq_list, spl_list, ir_samples, phase, coh_list, xcorr_peak_ms, xcorr_peak_sign)
+        xcorr_peak_sign (+1 or -1) is the sign of the cross-correlation at its
+        peak — the reliable polarity indicator for band-limited sub IRs.
 
         Also computes cross-correlation peak timing for IR onset detection.
         Cross-correlation (C = IFFT(conj(X)·Y)) has no division, so it
@@ -1450,7 +1458,7 @@ class MeasurementEngine:
         except Exception as exc:
             log.warning("coherence computation failed: %s", exc)
 
-        return freq_list, spl_list, ir_samples, phase_rad[mask].tolist(), coh_list, xcorr_peak_ms
+        return freq_list, spl_list, ir_samples, phase_rad[mask].tolist(), coh_list, xcorr_peak_ms, xcorr_peak_sign
 
     def _compute_fr(
         self,
@@ -1461,7 +1469,7 @@ class MeasurementEngine:
         freq_max: int,
         sample_rate: int,
         cal_curve: list[tuple[float, float]] | None = None,
-    ) -> tuple[list[float], list[float], list[float], list[float], list[float] | None, float]:
+    ) -> tuple[list[float], list[float], list[float], list[float], list[float] | None, float, int]:
         """Wrapper that extracts numpy arrays from PyTTa SignalObj inputs."""
         x = sweep.timeSignal[:, 0]
         y = recording.timeSignal[:, 0]
@@ -1677,6 +1685,7 @@ def detect_ir_onset(
     sample_rate: int,
     search_window_ms: float = 50.0,
     xcorr_peak_ms: float | None = None,
+    xcorr_peak_sign: int | None = None,
     min_sustained_ms: float = 4.0,
     fir_pre_delay_ms: float = 0.0,
 ) -> dict:
@@ -1696,13 +1705,27 @@ def detect_ir_onset(
     recorded after the alignment fix have their pre-sweep silence stripped
     before the IR is computed, so their peak is within the first 50 ms.
 
-    Returns:
-        {peak_time_ms, peak_sign, spl_db, sample_rate}
+    Polarity:
+      When xcorr_peak_sign is provided (from _compute_fr_arrays), it is used
+      as the authoritative polarity source.  xcorr(sweep, mic) is a wideband
+      cross-correlation that is not subject to the half-cycle ambiguity that
+      plagues the Wiener-deconvolved IR: a band-limited IR (15–150 Hz) is a
+      ringing wavelet several cycles long, and which half-cycle happens to be
+      the largest |sample| is noise-sensitive — it is essentially a coin flip
+      when the sub's direct arrival is weak (room null, standby sub, etc.).
+      When xcorr_peak_sign is absent (legacy stored sessions), the old
+      ir[max_idx] sign is used unchanged.
 
-    ``peak_time_ms`` is the absolute travel time from the sub to the mic in ms
-    (measured from the start of the stored IR). Two calls on different solo-sub
-    sessions produce values whose difference is the delay offset to apply via
-    ``set_delay``.
+    Known limitation: for deconvolution against the analytical sweep (no
+    recorded loopback ref), band-limited artifacts near the 1 ms skip boundary
+    can cause peak_time_ms to be pinned at 1 ms independent of actual travel
+    time. This is a timing artifact, not a polarity issue.
+
+    Returns:
+        {peak_time_ms, peak_sign, peak_sign_source, spl_db, sample_rate}
+
+      peak_sign_source: "xcorr" when xcorr_peak_sign was used; "ir_max" when
+        the fallback ir[max_idx] sign was used (legacy sessions or no xcorr).
     """
     import numpy as np
 
@@ -1768,14 +1791,31 @@ def detect_ir_onset(
     # ``min_sustained_ms`` is reserved for a future sustained-energy gate.
     _ = min_sustained_ms
 
-    # Polarity reads the dominant impulse, not the onset crossing.
-    peak_sign = 1 if ir[max_idx] >= 0.0 else -1
+    # Polarity: prefer xcorr_peak_sign when available.
+    #
+    # The xcorr sign is computed from C = IFFT(conj(X)·Y) at the peak index
+    # inside _compute_fr_arrays.  Because xcorr is a wideband operation (it
+    # does not suffer from Wiener-deconvolution DC artifacts or from the
+    # band-limiting of the stored IR), its sign is stable across different
+    # excitations of the same sub — it does not flip when a room null
+    # changes which half-cycle of the ringing wavelet happens to be the
+    # largest |sample|.  For sub measurements (15–150 Hz), the IR is a
+    # ringing wavelet and the largest half-cycle is noise-sensitive;
+    # using ir[max_idx] for polarity is effectively a coin flip.
+    if xcorr_peak_sign is not None:
+        peak_sign = xcorr_peak_sign
+        peak_sign_source = "xcorr"
+    else:
+        peak_sign = 1 if ir[max_idx] >= 0.0 else -1
+        peak_sign_source = "ir_max"
+
     peak_time_s = peak_idx / sample_rate
     spl_db = float(20.0 * np.log10(abs_ir[max_idx_local] + 1e-12))
 
     return {
         "peak_time_ms": round(peak_time_s * 1000.0, 3),
         "peak_sign": peak_sign,
+        "peak_sign_source": peak_sign_source,
         "spl_db": round(spl_db, 1),
         "sample_rate": sample_rate,
     }
@@ -1807,6 +1847,7 @@ def compute_session_metadata(
         metadata["ir"] = detect_ir_onset(
             ir_arr, sample_rate, search_window_ms,
             xcorr_peak_ms=fr.xcorr_peak_ms,
+            xcorr_peak_sign=fr.xcorr_peak_sign,
             fir_pre_delay_ms=fir_pre_delay_ms,
         )
 

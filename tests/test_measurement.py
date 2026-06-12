@@ -388,7 +388,7 @@ class TestComputeFr:
         n = 4800
         sweep = make_signal(n)
         recording = make_signal(n)
-        freqs, spl, _ir, _phase, _coh, _xcorr = engine._compute_fr(np, sweep, recording, 20, 200, 48000)
+        freqs, spl, _ir, _phase, _coh, _xcorr, _xcorr_sign = engine._compute_fr(np, sweep, recording, 20, 200, 48000)
         assert all(isinstance(f, float) for f in freqs)
         assert all(isinstance(s, float) for s in spl)
         assert all(np.isfinite(s) for s in spl)
@@ -401,13 +401,13 @@ class TestComputeFr:
         sweep = MagicMock()
         sweep.timeSignal = np.zeros((n, 1))
         recording = make_signal(n)
-        freqs, spl, _ir, _phase, _coh, _xcorr = engine._compute_fr(np, sweep, recording, 20, 200, 48000)
+        freqs, spl, _ir, _phase, _coh, _xcorr, _xcorr_sign = engine._compute_fr(np, sweep, recording, 20, 200, 48000)
         assert all(np.isfinite(s) for s in spl)
 
     def test_output_frequencies_in_requested_band(self):
         engine = self._engine()
         n = 4800
-        freqs, spl, _ir, _phase, _coh, _xcorr = engine._compute_fr(np, make_signal(n), make_signal(n), 50, 120, 48000)
+        freqs, spl, _ir, _phase, _coh, _xcorr, _xcorr_sign = engine._compute_fr(np, make_signal(n), make_signal(n), 50, 120, 48000)
         assert all(50 <= f <= 120 for f in freqs)
 
     def test_no_frequencies_in_band_returns_empty(self):
@@ -415,7 +415,7 @@ class TestComputeFr:
         engine = self._engine()
         n = 100
         # With sample_rate=1000 and n=100, max freq=500Hz; band [600,700] is empty
-        freqs, spl, _ir, _phase, _coh, _xcorr = engine._compute_fr(np, make_signal(n), make_signal(n), 600, 700, 1000)
+        freqs, spl, _ir, _phase, _coh, _xcorr, _xcorr_sign = engine._compute_fr(np, make_signal(n), make_signal(n), 600, 700, 1000)
         assert freqs == []
         assert spl == []
 
@@ -671,7 +671,7 @@ class TestComputeSessionMetadata:
         engine = MeasurementEngine(make_config(sample_rate=sample_rate))
         sweep = np.random.default_rng(42).standard_normal(n)
         rec = np.random.default_rng(99).standard_normal(n)
-        freqs, spl, ir, phase, _coh, _xcorr = engine._compute_fr_arrays(
+        freqs, spl, ir, phase, _coh, _xcorr, _xcorr_sign = engine._compute_fr_arrays(
             np, sweep, rec, 20, 200, sample_rate
         )
         return FrequencyResponse(
@@ -754,7 +754,7 @@ class TestComputeSessionMetadata:
         n = 4800
         sweep = np.random.default_rng(42).standard_normal(n)
         rec = np.random.default_rng(99).standard_normal(n)
-        freqs, spl, ir, phase, _coh, _xcorr = engine._compute_fr_arrays(np, sweep, rec, 20, 200, 48000)
+        freqs, spl, ir, phase, _coh, _xcorr, _xcorr_sign = engine._compute_fr_arrays(np, sweep, rec, 20, 200, 48000)
         assert len(phase) == len(freqs)
         assert all(isinstance(p, float) for p in phase)
         assert all(np.isfinite(p) for p in phase)
@@ -789,7 +789,7 @@ class TestComputeSessionMetadata:
         # Recording = circular convolution of sweep with room IR
         rec = np.real(np.fft.ifft(np.fft.fft(sweep) * np.fft.fft(ir_room)))
 
-        freqs, spl, ir_out, phase, _coh, _xcorr = engine._compute_fr_arrays(
+        freqs, spl, ir_out, phase, _coh, _xcorr, _xcorr_sign = engine._compute_fr_arrays(
             np, sweep, rec, 20, 200, sr,
         )
         assert len(freqs) > 0
@@ -824,7 +824,7 @@ class TestComputeSessionMetadata:
         ir_room[100:100 + len(t_ring)] += 0.4 * np.sin(2 * np.pi * 50 * t_ring) * np.exp(-t_ring * 5)
         rec = np.real(np.fft.ifft(np.fft.fft(sweep) * np.fft.fft(ir_room)))
 
-        freqs, spl, _, _, _, _ = engine._compute_fr_arrays(np, sweep, rec, 20, 200, sr)
+        freqs, spl, _, _, _, _, _ = engine._compute_fr_arrays(np, sweep, rec, 20, 200, sr)
 
         # Find SPL near 50 Hz — should show the mode peak
         idx_50 = min(range(len(freqs)), key=lambda i: abs(freqs[i] - 50))
@@ -986,7 +986,7 @@ class TestCoherenceMetric:
         ir_room[200] = 1.0  # clean direct arrival, nothing else
         rec = np.real(np.fft.ifft(np.fft.fft(sweep) * np.fft.fft(ir_room)))
 
-        _, _, _, _, coh, _ = engine._compute_fr_arrays(
+        _, _, _, _, coh, _, _ = engine._compute_fr_arrays(
             np, sweep, rec, 20, 200, sr,
         )
         assert coh is not None
@@ -1002,7 +1002,7 @@ class TestCoherenceMetric:
         rng = np.random.default_rng(7)
         rec = rng.standard_normal(n)
 
-        _, _, _, _, coh, _ = engine._compute_fr_arrays(
+        _, _, _, _, coh, _, _ = engine._compute_fr_arrays(
             np, sweep, rec, 20, 200, sr,
         )
         assert coh is not None
@@ -1031,7 +1031,7 @@ class TestCoherenceMetric:
         # comfortable, only at 5× and 20× does it bite.
         for noise_level in [0.0, 1.0, 5.0, 20.0]:
             rec = rec_clean + noise * noise_level
-            _, _, _, _, coh, _ = engine._compute_fr_arrays(
+            _, _, _, _, coh, _, _ = engine._compute_fr_arrays(
                 np, sweep, rec, 20, 200, sr,
             )
             results.append(sum(coh) / len(coh))
@@ -1230,14 +1230,15 @@ class TestDetectIrOnset:
         assert 8.0 < result["peak_time_ms"] < 25.0
         assert result["peak_sign"] == 1
 
-    def test_negative_polarity_preserved(self):
-        """Onset detection reads polarity from the original IR even when
-        xcorr_peak_ms is provided as a (now-ignored) hint."""
+    def test_negative_polarity_from_ir_when_no_xcorr_sign(self):
+        """When xcorr_peak_sign is not provided, polarity falls back to ir[max_idx].
+        xcorr_peak_ms alone does not influence polarity — only xcorr_peak_sign does."""
         sr = 48000
         ir = np.zeros(24000)
         ir[int(0.010 * sr)] = -1.0  # inverted
         result = detect_ir_onset(ir, sr, search_window_ms=50.0, xcorr_peak_ms=10.0)
         assert result["peak_sign"] == -1
+        assert result["peak_sign_source"] == "ir_max"
 
     def test_picks_direct_arrival_over_louder_late_resonance(self):
         """Direct arrival (transient) at 5 ms + much louder resonance burst at
@@ -1337,6 +1338,70 @@ class TestDetectIrOnset:
         assert r1["peak_time_ms"] != r2["peak_time_ms"], (
             "Two sessions with different travel times must return different peak_time_ms"
         )
+
+    # ── xcorr_peak_sign / peak_sign_source tests (DEFECT 4 fix) ────────────
+
+    def test_xcorr_sign_overrides_ir_max_sign(self):
+        """Synthetic band-limited IR: the largest half-cycle is negative, but
+        xcorr_peak_sign is positive → detect_ir_onset must report peak_sign=+1
+        with source='xcorr'.
+
+        This tests the core DEFECT 4 fix: for band-limited sub IRs, the Wiener-
+        deconvolved IR is a ringing wavelet and which half-cycle is largest is
+        noise-sensitive.  The xcorr sign is stable and must win when provided.
+        """
+        sr = 48000
+        n = 24000
+        # Construct a band-limited (40 Hz) wavelet whose largest absolute peak
+        # is negative (the negative half-cycle happens to be larger).
+        t = np.arange(n) / sr
+        # 40 Hz sine burst at 12 ms — positive polarity, but modulated so the
+        # first negative half-cycle is slightly larger than the positive one.
+        onset = int(0.012 * sr)
+        burst_len = int(0.25 / 40 * sr)  # one quarter-period
+        ir = np.zeros(n)
+        t_burst = np.arange(burst_len) / sr
+        # Start at -sin so the first large excursion is negative
+        ir[onset:onset + burst_len] = -np.sin(2 * np.pi * 40 * t_burst) * 0.8
+        # Make the magnitude of the negative half-cycle slightly larger
+        ir[onset + burst_len:onset + 2 * burst_len] = (
+            np.sin(2 * np.pi * 40 * t_burst) * 0.5
+        )
+        # Confirm the largest |sample| has a negative sign
+        assert ir[np.argmax(np.abs(ir))] < 0, "Test IR must have negative-dominant peak"
+
+        # xcorr says the source is positive-polarity → should win
+        result = detect_ir_onset(ir, sr, xcorr_peak_sign=+1)
+        assert result["peak_sign"] == 1, (
+            f"xcorr_peak_sign=+1 must override negative ir[max_idx] sign; "
+            f"got peak_sign={result['peak_sign']}"
+        )
+        assert result["peak_sign_source"] == "xcorr"
+
+    def test_legacy_path_uses_ir_max_sign_when_no_xcorr_sign(self):
+        """Without xcorr_peak_sign, fallback to ir[max_idx] sign with source='ir_max'."""
+        sr = 48000
+        ir = np.zeros(24000)
+        ir[int(0.012 * sr)] = -1.0  # dominant negative peak
+        result = detect_ir_onset(ir, sr)
+        assert result["peak_sign"] == -1
+        assert result["peak_sign_source"] == "ir_max"
+
+    def test_peak_sign_source_key_always_present(self):
+        """peak_sign_source must be in the returned dict for all code paths."""
+        sr = 48000
+        ir = np.zeros(24000)
+        ir[int(0.010 * sr)] = 1.0
+        # No xcorr args at all
+        r1 = detect_ir_onset(ir, sr)
+        assert "peak_sign_source" in r1
+        # With xcorr_peak_ms only (no xcorr_peak_sign) — still ir_max
+        r2 = detect_ir_onset(ir, sr, xcorr_peak_ms=10.0)
+        assert "peak_sign_source" in r2
+        assert r2["peak_sign_source"] == "ir_max"
+        # With xcorr_peak_sign — xcorr path
+        r3 = detect_ir_onset(ir, sr, xcorr_peak_sign=1)
+        assert r3["peak_sign_source"] == "xcorr"
 
 
 # ── parse_umik_sensitivity ────────────────────────────────────────────────────
