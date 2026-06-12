@@ -9,6 +9,13 @@ Coverage diagram:
   │   ├── [TESTED] Service healthy → passes with URL in detail
   │   ├── [TESTED] Service unreachable → fails with systemctl hint
   │   └── [TESTED] Unexpected status → fails gracefully
+  ├── check_audio_mode()
+  │   ├── [TESTED] mode='cal' → passes with detail
+  │   ├── [TESTED] mode='listening' → FAIL with audio-mode set hint
+  │   ├── [TESTED] mode='karaoke' → FAIL with audio-mode set hint
+  │   ├── [TESTED] field absent (old service) → pass-with-warning (graceful degrade)
+  │   ├── [TESTED] service unreachable → pass-with-warning (not double-reported)
+  │   └── [TESTED] health probe error → pass-with-warning
   ├── check_mic()
   │   ├── [TESTED] UMIK found by name match → passes with device detail
   │   ├── [TESTED] Name match is case-insensitive
@@ -41,7 +48,7 @@ Coverage diagram:
   │   ├── [TESTED] Denon passes, USB route, device missing → fails with playback error
   │   └── [TESTED] Denon fails → propagates failure without running playback check
   └── run_all()
-      ├── [TESTED] All pass → 10 passed results (Config, Measurement service, Microphone, …)
+      ├── [TESTED] All pass → 11 passed results (Config, Measurement service, Audio mode, Microphone, …)
       ├── [TESTED] Unhandled exception → captured as failed result
       ├── [TESTED] Results named correctly even when exceptions occur
       └── [TESTED] Partial failure (1 fail, rest pass)
@@ -109,6 +116,72 @@ class TestMeasurementServiceCheck:
             result = await PreflightChecker(config).check_measurement_service()
         assert not result.passed
         assert "systemctl" in result.error
+
+
+# ── Audio mode checks ────────────────────────────────────────────────────────
+
+class TestAudioModeCheck:
+    """check_audio_mode reads audio-mode via the /health endpoint.
+
+    Coverage:
+      - [TESTED] mode='cal'           → passes with detail
+      - [TESTED] mode='listening'     → FAIL with audio-mode set hint
+      - [TESTED] mode='karaoke'       → FAIL with audio-mode set hint
+      - [TESTED] field absent (old svc)→ pass-with-warning (graceful degrade)
+      - [TESTED] service unreachable  → pass-with-warning (not double-reported)
+      - [TESTED] health probe error   → pass-with-warning
+    """
+
+    async def test_mode_cal_passes(self, config):
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.health = AsyncMock(return_value={"status": "ok", "audio_mode": "cal"})
+            result = await PreflightChecker(config).check_audio_mode()
+        assert result.passed
+        assert "cal" in result.detail
+        assert result.error is None
+
+    async def test_mode_listening_fails_with_set_hint(self, config):
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.health = AsyncMock(return_value={"status": "ok", "audio_mode": "listening"})
+            result = await PreflightChecker(config).check_audio_mode()
+        assert not result.passed
+        assert "listening" in result.detail
+        assert "audio-mode set cal" in result.error
+
+    async def test_mode_karaoke_fails_with_set_hint(self, config):
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.health = AsyncMock(return_value={"status": "ok", "audio_mode": "karaoke"})
+            result = await PreflightChecker(config).check_audio_mode()
+        assert not result.passed
+        assert "karaoke" in result.detail
+        assert "audio-mode set cal" in result.error
+
+    async def test_field_absent_old_service_passes_with_warning(self, config):
+        """Old service without audio_mode field → pass (graceful degradation)."""
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.health = AsyncMock(return_value={"status": "ok"})
+            result = await PreflightChecker(config).check_audio_mode()
+        assert result.passed
+        assert "unknown" in result.detail.lower() or "predates" in result.detail.lower()
+
+    async def test_service_unreachable_passes_with_warning(self, config):
+        """Measurement service unreachable → pass (check_measurement_service handles it)."""
+        from calibrate.measurement_client import MeasurementServiceError
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.health = AsyncMock(
+                side_effect=MeasurementServiceError("unreachable")
+            )
+            result = await PreflightChecker(config).check_audio_mode()
+        assert result.passed
+        assert "unreachable" in result.detail.lower()
+
+    async def test_health_probe_error_passes_with_warning(self, config):
+        """Unexpected exception from health probe → pass-with-warning."""
+        with patch(_MEAS_CLIENT) as MockClient:
+            MockClient.return_value.health = AsyncMock(side_effect=RuntimeError("timeout"))
+            result = await PreflightChecker(config).check_audio_mode()
+        assert result.passed
+        assert "unknown" in result.detail.lower()
 
 
 # ── Microphone checks ────────────────────────────────────────────────────────
@@ -382,6 +455,7 @@ class TestRunAll:
         with (
             patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
             patch.object(checker, "check_measurement_service", return_value=CheckResult("Measurement service", True, "healthy")),
+            patch.object(checker, "check_audio_mode", return_value=CheckResult("Audio mode", True, "audio-mode=cal")),
             patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1 (device 0, 48000Hz)")),
             patch.object(checker, "check_minidsp_combined", return_value=CheckResult("miniDSP", True, "2x4HD; /dev/hidraw0 present")),
             patch.object(checker, "check_denon_and_playback", return_value=CheckResult("Denon AVR", True, "X3800H; USB: miniDSP")),
@@ -393,13 +467,14 @@ class TestRunAll:
         ):
             results = await checker.run_all()
         assert all(r.passed for r in results)
-        assert len(results) == 10
+        assert len(results) == 11
 
     async def test_unhandled_exception_becomes_failed_result(self, config):
         checker = PreflightChecker(config)
         with (
             patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
             patch.object(checker, "check_measurement_service", return_value=CheckResult("Measurement service", True, "healthy")),
+            patch.object(checker, "check_audio_mode", return_value=CheckResult("Audio mode", True, "audio-mode=cal")),
             patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1")),
             patch.object(checker, "check_minidsp_combined", side_effect=RuntimeError("boom")),
             patch.object(checker, "check_denon_and_playback", return_value=CheckResult("Denon AVR", True, "X3800H")),
@@ -416,6 +491,7 @@ class TestRunAll:
         with (
             patch.object(checker, "check_config", side_effect=RuntimeError("err")),
             patch.object(checker, "check_measurement_service", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_audio_mode", side_effect=RuntimeError("err")),
             patch.object(checker, "check_mic", side_effect=RuntimeError("err")),
             patch.object(checker, "check_minidsp_combined", side_effect=RuntimeError("err")),
             patch.object(checker, "check_denon_and_playback", side_effect=RuntimeError("err")),
@@ -427,8 +503,8 @@ class TestRunAll:
         ):
             results = await checker.run_all()
         assert [r.name for r in results] == [
-            "Config", "Measurement service", "Microphone", "miniDSP 2x4 HD", "Denon AVR",
-            "Signal Path", "Output routing", "DSP persisted state",
+            "Config", "Measurement service", "Audio mode", "Microphone", "miniDSP 2x4 HD",
+            "Denon AVR", "Signal Path", "Output routing", "DSP persisted state",
             "Loopback reference", "Loopback timing stability",
         ]
 
@@ -439,19 +515,21 @@ class TestRunAll:
         with (
             patch.object(checker, "check_config", side_effect=RuntimeError("err")),
             patch.object(checker, "check_measurement_service", side_effect=RuntimeError("err")),
+            patch.object(checker, "check_audio_mode", side_effect=RuntimeError("err")),
             patch.object(checker, "check_mic", side_effect=RuntimeError("err")),
             patch.object(checker, "check_minidsp_combined", side_effect=RuntimeError("err")),
             patch.object(checker, "check_denon_and_playback", side_effect=RuntimeError("err")),
             patch.object(checker, "check_signal_path_sync", side_effect=RuntimeError("err")),
         ):
             results = await checker.run_all()
-        assert results[3].name == "CamillaDSP"
+        assert results[4].name == "CamillaDSP"
 
     async def test_partial_failure(self, config):
         checker = PreflightChecker(config)
         with (
             patch.object(checker, "check_config", return_value=CheckResult("Config", True, "Required fields present")),
             patch.object(checker, "check_measurement_service", return_value=CheckResult("Measurement service", True, "healthy")),
+            patch.object(checker, "check_audio_mode", return_value=CheckResult("Audio mode", True, "audio-mode=cal")),
             patch.object(checker, "check_mic", return_value=CheckResult("Microphone", True, "UMIK-1")),
             patch.object(checker, "check_minidsp_combined", return_value=CheckResult("miniDSP", False, "", "start minidspd")),
             patch.object(checker, "check_denon_and_playback", return_value=CheckResult("Denon AVR", True, "X3800H")),
@@ -460,10 +538,11 @@ class TestRunAll:
             results = await checker.run_all()
         assert results[0].passed       # Config
         assert results[1].passed       # Measurement service
-        assert results[2].passed       # Microphone
-        assert not results[3].passed   # miniDSP
-        assert results[4].passed       # Denon AVR
-        assert results[5].passed       # Signal Path
+        assert results[2].passed       # Audio mode
+        assert results[3].passed       # Microphone
+        assert not results[4].passed   # miniDSP
+        assert results[5].passed       # Denon AVR
+        assert results[6].passed       # Signal Path
 
 
 # ── Playback route checks ─────────────────────────────────────────────────────

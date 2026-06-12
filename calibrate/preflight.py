@@ -65,7 +65,7 @@ class PreflightChecker:
         """Run all hardware checks concurrently. Never raises — errors become failed results.
 
         Equipment checks:
-            [Config]  [Measurement service]  [Microphone]  [miniDSP (USB+daemon)]  [Denon AVR + Playback]  [Signal Path]
+            [Config]  [Measurement service]  [Audio mode]  [Microphone]  [miniDSP (USB+daemon)]  [Denon AVR + Playback]  [Signal Path]
         """
         dsp_label = _DSP_DISPLAY_NAMES.get(
             self.config.dsp_driver_name, self.config.dsp_driver_name
@@ -73,6 +73,7 @@ class PreflightChecker:
         checks = [
             ("Config", self.check_config()),
             ("Measurement service", self.check_measurement_service()),
+            ("Audio mode", self.check_audio_mode()),
             ("Microphone", self.check_mic()),
             (dsp_label, self.check_minidsp_combined()),
             ("Denon AVR", self.check_denon_and_playback()),
@@ -855,6 +856,68 @@ class PreflightChecker:
                 "answers. Verify these values are intentional before calibrating. "
                 "To clear: set_polarity / set_output_gain / set_delay to defaults, "
                 "or end_sweep_session followed by a fresh calibration run."
+            ),
+        )
+
+    async def check_audio_mode(self) -> CheckResult:
+        """Check that the Pi host audio-mode is set to 'cal' before calibration.
+
+        The state file /var/lib/audio-mode lives on the Pi host (not in the
+        Docker container), so this check reads it via the bare-metal
+        avr-measurement service's /health endpoint, which includes the
+        ``audio_mode`` field since the corresponding update.
+
+        Behavior:
+          - mode == 'cal'                 → pass with detail.
+          - mode in (listening, karaoke)  → FAIL with operator guidance.
+          - field absent (/health predates this feature) → pass-with-warning
+            (graceful degradation for old deployed services).
+          - service unreachable           → pass-with-warning (measurement
+            service check handles the hard failure separately).
+        """
+        from .measurement_client import MeasurementServiceClient, MeasurementServiceError
+        client = MeasurementServiceClient()
+        try:
+            health = await client.health()
+        except MeasurementServiceError:
+            # Measurement service unreachable — that check will fail loudly.
+            # Don't double-report here.
+            return CheckResult(
+                name="Audio mode",
+                passed=True,
+                detail="audio-mode unknown (measurement service unreachable — see above)",
+            )
+        except Exception as exc:
+            return CheckResult(
+                name="Audio mode",
+                passed=True,
+                detail=f"audio-mode unknown (health probe error: {exc})",
+            )
+
+        mode = health.get("audio_mode")
+        if mode is None:
+            # Old service deployment that predates the audio_mode field.
+            return CheckResult(
+                name="Audio mode",
+                passed=True,
+                detail="audio-mode unknown (service predates skew check — update deploy/install.sh)",
+            )
+
+        if mode == "cal":
+            return CheckResult(
+                name="Audio mode",
+                passed=True,
+                detail=f"audio-mode=cal (ready for calibration)",
+            )
+
+        return CheckResult(
+            name="Audio mode",
+            passed=False,
+            detail=f"audio-mode={mode!r} (expected 'cal')",
+            error=(
+                f"Pi host is in audio-mode={mode!r}, not 'cal'. "
+                "Calibration sweeps require CamillaDSP in calibration routing mode. "
+                "Run: ssh pi@<pi-host> 'sudo /usr/local/sbin/audio-mode set cal'"
             ),
         )
 

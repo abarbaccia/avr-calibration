@@ -98,9 +98,31 @@ def _cfg():
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
+_AUDIO_MODE_STATE_FILE = "/var/lib/audio-mode"
+
+
+def _read_audio_mode() -> str | None:
+    """Read the current audio-mode from the host state file.
+
+    Returns the mode string (e.g. 'listening', 'cal', 'karaoke') or None
+    if the state file is absent or unreadable (old deployments without the
+    file, or pre-319a5a2 installs using /run/audio-mode).
+    """
+    import os
+    try:
+        with open(_AUDIO_MODE_STATE_FILE) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    mode = _read_audio_mode()
+    payload: dict = {"status": "ok"}
+    if mode is not None:
+        payload["audio_mode"] = mode
+    return payload
 
 
 @app.get("/devices")
