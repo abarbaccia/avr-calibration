@@ -38,21 +38,29 @@ fi
 
 # Start minidspd — HTTP REST daemon for miniDSP 2x4 HD
 # Bind to 0.0.0.0 so both FastAPI and MCP server can reach it within the container
-MINIDSPD_CONF=/tmp/minidspd.toml
-cat > "$MINIDSPD_CONF" << 'TOML'
+# Gated on dsp_driver (default minidsp when key absent — un-migrated configs
+# keep their daemon).
+CONFIG_FILE="${CONFIG_FILE:-/data/.avr-calibration/config.yaml}"
+DSP_DRIVER=$(grep -E '^dsp_driver:' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' | tr -d '"' || true)
+if [ "${DSP_DRIVER:-minidsp}" = "minidsp" ]; then
+    MINIDSPD_CONF=/tmp/minidspd.toml
+    cat > "$MINIDSPD_CONF" << 'TOML'
 [http_server]
 bind_address = "0.0.0.0:5380"
 TOML
 
-echo "Starting minidspd on 0.0.0.0:5380..."
-minidspd --config "$MINIDSPD_CONF" >/tmp/minidspd.log 2>&1 &
-MINIDSPD_PID=$!
-sleep 2
-if kill -0 "$MINIDSPD_PID" 2>/dev/null; then
-    echo "minidspd started (pid $MINIDSPD_PID)"
+    echo "Starting minidspd on 0.0.0.0:5380..."
+    minidspd --config "$MINIDSPD_CONF" >/tmp/minidspd.log 2>&1 &
+    MINIDSPD_PID=$!
+    sleep 2
+    if kill -0 "$MINIDSPD_PID" 2>/dev/null; then
+        echo "minidspd started (pid $MINIDSPD_PID)"
+    else
+        echo "WARNING: minidspd exited — DSP control unavailable"
+        cat /tmp/minidspd.log >&2
+    fi
 else
-    echo "WARNING: minidspd exited — DSP control unavailable"
-    cat /tmp/minidspd.log >&2
+    echo "dsp_driver=${DSP_DRIVER} — minidspd not started"
 fi
 
 # Start MCP server in background

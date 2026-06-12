@@ -69,22 +69,32 @@ trap cleanup TERM INT
 # Requires --privileged (or equivalent device access) on `docker run`.
 # Without device access, minidspd starts but reports no devices; DSP control
 # operations will fail gracefully via HTTP error in the web server.
-MINIDSPD_CONF=/tmp/minidspd.toml
-cat > "$MINIDSPD_CONF" << 'TOML'
+#
+# Gated on dsp_driver: only start the daemon when config selects miniDSP
+# (default when the key is absent — un-migrated configs keep their daemon).
+CONFIG_FILE="${CONFIG_FILE:-/data/.avr-calibration/config.yaml}"
+DSP_DRIVER=$(grep -E '^dsp_driver:' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' | tr -d '"' || true)
+MINIDSPD_PID=""
+if [ "${DSP_DRIVER:-minidsp}" = "minidsp" ]; then
+    MINIDSPD_CONF=/tmp/minidspd.toml
+    cat > "$MINIDSPD_CONF" << 'TOML'
 [http_server]
 bind_address = "127.0.0.1:5380"
 TOML
 
-echo "Starting minidspd (HTTP REST) on localhost:5380..."
-minidspd --config "$MINIDSPD_CONF" >/tmp/minidspd.log 2>&1 &
-MINIDSPD_PID=$!
-# Give it a moment to bind the port
-sleep 2
-if kill -0 "$MINIDSPD_PID" 2>/dev/null; then
-    echo "minidspd started (pid $MINIDSPD_PID)"
+    echo "Starting minidspd (HTTP REST) on localhost:5380..."
+    minidspd --config "$MINIDSPD_CONF" >/tmp/minidspd.log 2>&1 &
+    MINIDSPD_PID=$!
+    # Give it a moment to bind the port
+    sleep 2
+    if kill -0 "$MINIDSPD_PID" 2>/dev/null; then
+        echo "minidspd started (pid $MINIDSPD_PID)"
+    else
+        echo "WARNING: minidspd exited — DSP control unavailable. Check /tmp/minidspd.log"
+        cat /tmp/minidspd.log >&2
+    fi
 else
-    echo "WARNING: minidspd exited — DSP control unavailable. Check /tmp/minidspd.log"
-    cat /tmp/minidspd.log >&2
+    echo "dsp_driver=${DSP_DRIVER} — minidspd not started"
 fi
 
 # ── MCP server ────────────────────────────────────────────────────────────────

@@ -96,9 +96,9 @@ correctly and the mic captured no signal correlated with the sweep.
 
 If the measurement succeeds with normal-looking data when both subs are
 muted, the sweep is reaching the mic by some other path. Stop. Diagnose:
-- `check_system` includes an `Audio stack` check that flags PipeWire/
-  wireplumber/PulseAudio holding `/dev/snd` handles. Disable them on the
-  host: `systemctl --user mask pipewire wireplumber pipewire-pulse`.
+- Inspect the live PipeWire graph on the Pi (`pw-link -l`): the sweep must
+  reach the mic only via avr_cal_sweep → camilladsp_capture:input_3 →
+  subs → room. Any unexpected link into another sink is the leak.
 - Verify `get_signal_graph` shows the sweep path is routed to subs only.
 
 ### 2. Trust coherence as the data quality signal
