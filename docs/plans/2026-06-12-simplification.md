@@ -267,16 +267,11 @@ Per the architecture rule, handlers orchestrate; math lives in domain modules.
   way that can't be separated by a pure move, skip it and list it in the final
   report rather than restructuring.
 
-### 3.4 FIR design tool consolidation — PROPOSAL ONLY
+### 3.4 FIR design tool consolidation
 
-Do NOT implement. Produce a one-page proposal (`docs/plans/fir-tool-consolidation.md`)
-mapping the ten FIR-related tools (`design_fir`, `design_fir_multi`,
-`design_fir_multi_modal`, `design_modal_fir`, `design_fir_trinnov`,
-`design_corrective_fir`, `design_avr_fir`, `fit_correction_filter`,
-`fit_shelf_for_target`, `recommend_fir_phase`) onto a target surface of ~3, with the
-shared helpers (target-curve parsing, measurement loading, rate checks) they'd use.
-Identify which recipes/memories reference each tool name. Andrew decides before any
-tool is removed — recipes and saved lessons reference these names.
+Superseded — Andrew approved consolidation 2026-06-12. Execute as **Phase 5** below
+(can run before or after 3.2/3.3; if 3.2 hasn't run, "remove the tool" means
+removing its elif branch too).
 
 ### Phase 3 checkpoint
 
@@ -351,6 +346,128 @@ Only after 4.1 confirms and 4.2 ships and a real karaoke session works:
 - Acceptance: karaoke session works end-to-end; kiosk is inaudible in listening
   mode while a video plays in the kiosk; calibration `measure` still passes
   preflight + produces coherence ≥ 0.85.
+
+---
+
+## Phase 5 — FIR tool consolidation (approved 2026-06-12)
+
+### Target surface
+
+The FIR design surface goes from 7 design tools to 4. Inventory facts verified
+2026-06-12 (handler line refs from that date; re-locate with grep, they will have
+drifted):
+
+| Tool | Fate | Rationale |
+|---|---|---|
+| `design_fir` (~3603) | **KEEP** — absorbs `design_corrective_fir` | The single-output workhorse; referenced by 4 recipes + CLAUDE.md. |
+| `design_fir_trinnov` (~4375) | **KEEP** | Multi-sub coherent Wiener; trinnov recipe. Supersedes design_fir_multi (same Wiener core in multi_fir.py; adds target phase, T60 report, xcorr gate; PR #185 history). |
+| `design_modal_fir` | **KEEP** | Anti-pulse T60 cancellation — distinct physics; bass-calibration-fir + mains-v2 recipes. |
+| `design_avr_fir` | **KEEP** | Audyssey/AVR hardware path — different target device. |
+| `recommend_fir_phase` (~8354) | **KEEP** | Decay-based phase-mode analysis; bass-calibration-fir recipe Phase 2.5a depends on it. |
+| `design_fir_multi` (~4134) | **DELETE** (tool only) | No recipe references it. design_fir_trinnov covers it: same `design_multi_input_fir` core, has `phase_mode="minimum"` for magnitude-only. |
+| `design_fir_multi_modal` (~4262) | **DELETE** (tool only) | No recipe references it. The combined Wiener+anti-pulse capability remains available in code via `multi_fir.design_fir_multi_modal` / `ModalAwareFIRDesigner(base_correction=...)`. |
+| `design_corrective_fir` (~7522) | **FOLD into design_fir** | Unique capability = residual correction convolved onto the FIR cached for an output (empirical 2-step). Becomes `design_fir(compose_on_output_index=...)`. |
+| `apply_fir_identity` (~7694) | **DELETE** | Redundant since d287489: `clear_fir` now writes a same-length identity. Also known-buggy ("identity not passthrough" memory, 2026-06-11). |
+
+NOT in scope (misgrouped — they are PEQ tools, not FIR): `fit_correction_filter`,
+`fit_shelf_for_target`. Leave them alone.
+
+"DELETE (tool only)" means: remove the `Tool(...)` schema entry, the `_tool_*`
+handler, and the dispatch branch/registry entry. The underlying module functions in
+`multi_fir.py` and their unit tests STAY — they are library code that surviving
+tools and future work use.
+
+### 5.1 Extract shared helpers (behavior-neutral, do first)
+
+The design tools duplicate four blocks. Extract into module-level helpers in
+mcp_server.py (or a new `calibrate/_tool_helpers.py` if mcp_server is being shrunk):
+
+1. `_load_session_fr(store, session_id, require_phase=False)` → returns
+   `(session, fr)` or raises a ToolError carrying the exact current error strings
+   ("session {id} not found", "has no FR data", "has no phase data — re-measure
+   with phase"). ~8 duplicate sites.
+2. `_parse_target_curve(target_curve: dict)` → `list[tuple[float, float]]` +
+   optional band. ~6 duplicate sites.
+3. `_resolve_fir_rate(_dsp)` → int (driver `caps.fir_sample_rate_hz`, 48000
+   fallback, with the "must match live pipeline rate" comment). ~5 sites.
+4. `_cache_fir_design(session_id, output_index, taps, intent)` → cache_id, single
+   place implementing the `session_id * 1000 + output_index` scheme and writing
+   `_fir_design_cache` + `_fir_design_intent`.
+
+Error-message strings must remain byte-identical where tests assert on them.
+Full suite green; one commit.
+
+### 5.2 Delete `apply_fir_identity`
+
+- Confirm current `clear_fir` semantics first (calibrate/drivers/camilladsp.py —
+  clear_fir writes identity, post-d287489). If it doesn't, STOP.
+- Remove tool schema, handler (~7694), dispatch entry, and its tests (port any
+  test asserting "identity preserves topology" to target clear_fir instead).
+- Update `recipes/core/trinnov-calibration.md`: remove the `apply_fir_identity`
+  row from the "MCP tools used" table (the recipe body already says use clear_fir).
+- Grep sweep: `grep -rn "apply_fir_identity" calibrate/ recipes/ docs/ tests/` —
+  zero hits outside CHANGELOG/plan docs when done.
+
+### 5.3 Delete `design_fir_multi` and `design_fir_multi_modal` (tools only)
+
+- Remove both schemas, handlers (~4134, ~4262), dispatch entries.
+- Keep `multi_fir.design_multi_input_fir` and `multi_fir.design_fir_multi_modal`
+  module functions AND `tests/test_multi_fir.py` untouched.
+- Move tool-level tests: any test exercising the handlers via dispatch gets
+  deleted; any asserting module behavior moves to test_multi_fir.py if not
+  already covered.
+- Update docs that present these as the current interface:
+  - `CLAUDE.md` "FIR design — critical invariants": reword the
+    `design_fir_multi regularization_lambda` and `design_fir_multi_modal`
+    invariants to reference `design_fir_trinnov` / the module functions (the
+    physics guidance stays — λ=0.01 for this hardware, anti-pulse-before-Wiener
+    in same buffer).
+  - `docs/research/trinnov-decay-correction.md`: add a one-line note that the
+    standalone tools were folded into design_fir_trinnov (do not rewrite history).
+
+### 5.4 Fold `design_corrective_fir` into `design_fir`
+
+- FIRST write a characterization test: synthetic FR session + a cached baseline
+  FIR for output N → call the existing `_tool_design_corrective_fir` → record the
+  output coefficients. This test must pass before AND after the fold.
+- Add to `design_fir` signature: `compose_on_output_index: int | None = None`.
+  When set, after designing the residual-correction FIR, convolve it with the FIR
+  currently cached for that output (port the exact convolution + fallback-to-
+  impulse logic from the old handler, including the no-cached-FIR passthrough
+  case). Result is cached and returned exactly like any design_fir result.
+- Keep the old handler's docstring guidance (the empirical 2-step workflow) as
+  part of design_fir's schema description for the new parameter.
+- Delete the old tool schema/handler/dispatch entry once the characterization
+  test passes against the new path.
+- Grep sweep for `design_corrective_fir` in recipes/docs (its docstring mentions
+  "recipe Section 2.2b" — find and update whichever recipe section that is, if it
+  still exists).
+
+### 5.5 Documentation + lessons sweep
+
+- `grep -rn "design_fir_multi\|design_fir_multi_modal\|design_corrective_fir\|apply_fir_identity" recipes/ docs/ CLAUDE.md` —
+  every remaining hit is either updated or is a historical doc (research notes,
+  CHANGELOG, this plan) that explicitly may keep the old names.
+- Lessons DB: call the `list_lessons` MCP tool (or query the SQLite lessons table)
+  for lessons whose claim names a deleted tool. For each, call
+  `invalidate_lessons` with reason "tool removed in FIR consolidation, see
+  docs/plans/2026-06-12-simplification.md Phase 5". If MCP access is unavailable
+  in the execution environment, list the affected lessons in the final report
+  instead — do not edit the DB by hand.
+- Update the tool-count assertion anywhere it appears (README/CLAUDE.md "~900
+  tools" style claims — correct them to the real count while there).
+
+### Phase 5 checkpoint
+
+- Tool registry/dispatch count drops by 4 (design_fir_multi, design_fir_multi_modal,
+  design_corrective_fir, apply_fir_identity).
+- Full suite green; characterization test from 5.4 in the suite permanently.
+- Recipes reference only surviving tools.
+- One PR titled `refactor(fir): consolidate FIR tool surface 7→4 design tools`.
+- **STOP CONDITION** (whole phase): if at any point a surviving tool turns out NOT
+  to cover a deleted tool's capability (e.g. design_fir_trinnov lacks a
+  design_fir_multi parameter someone needs), stop and report rather than porting
+  parameters ad hoc.
 
 ---
 
