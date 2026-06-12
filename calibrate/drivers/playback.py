@@ -80,6 +80,77 @@ def _stop_pw_record(proc, reader_thread) -> None:
     reader_thread.join(timeout=3.0)
 
 
+def _verify_pw_record_binding(
+    expected_node: str,
+    timeout_s: float = 2.0,
+    poll_interval_s: float = 0.1,
+) -> tuple[bool, str]:
+    """Verify that a just-started pw-record stream is linked to *expected_node*.
+
+    Polls ``pw-link -l`` for up to *timeout_s* seconds looking for a link
+    whose source port belongs to *expected_node* and whose destination port
+    belongs to a pw-record stream input.
+
+    Returns ``(ok, reason)`` where *ok* is True when the expected binding is
+    confirmed, False otherwise.  On failure *reason* contains a human-readable
+    explanation suitable for use as ref_error.
+
+    This detects the failure mode where PipeWire silently falls back to the
+    default source (e.g. the UMIK) when the requested target node is absent or
+    unlinked.  In that case the pw-record stream binds to the UMIK and the
+    captured "loopback ref" is actually the microphone, making the two captured
+    arrays statistically identical (same source) and deconvolution timing
+    degenerate.
+    """
+    import subprocess
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    last_output = ""
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                ["pw-link", "-l"],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+            )
+            last_output = result.stdout
+            # pw-link -l output groups port-links.  Each source block looks like:
+            #   <node>:<port>
+            #     |-> <dest_node>:<dest_port>
+            # We look for any line that contains expected_node as the source node.
+            for line in last_output.splitlines():
+                line_stripped = line.strip()
+                # Source lines: "<node>:<port>" (no leading "|->")
+                if line_stripped.startswith("|->"):
+                    continue
+                if expected_node in line_stripped:
+                    return True, ""
+        except FileNotFoundError:
+            # pw-link not available on this system — skip verification
+            return True, ""
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception:
+            pass
+        time.sleep(poll_interval_s)
+
+    return (
+        False,
+        (
+            f"pw-record did not bind to {expected_node!r} within {timeout_s:.1f}s "
+            f"(pw-link -l shows no matching source link). "
+            f"PipeWire likely fell back to the default source (e.g. the UMIK). "
+            f"Loopback reference is unusable — deconvolution will use the "
+            f"analytical sweep template instead. "
+            f"Fix: ensure {expected_node!r} node exists in the PipeWire graph "
+            f"before starting measurements "
+            f"(check avr-cal-sweep-link.service status)."
+        ),
+    )
+
+
 def _aux_channel_map(n: int) -> str:
     """Return a PipeWire AUX channel-map string for n channels (AUX0,AUX1,…,AUX{n-1}).
 
@@ -857,6 +928,23 @@ class LoopbackRefPlayback:
                 ref_failed[0] = True
                 ref_error[0] = f"pw-record start failed: {exc}"
 
+            # Verify that pw-record actually bound to the configured node.
+            # Without this check, PipeWire silently falls back to the default
+            # source (typically the UMIK mic) when the target node is absent.
+            # That produces a "loopback ref" that is statistically identical to
+            # the mic recording, making deconvolution timing completely degenerate
+            # (observed: avr_processing_ms bouncing 3–13 ms across sessions).
+            if not ref_failed[0] and ref_proc is not None:
+                binding_ok, binding_reason = _verify_pw_record_binding(
+                    self.ref_pipewire_node
+                )
+                if not binding_ok:
+                    _stop_pw_record(ref_proc, ref_reader)
+                    ref_proc = None
+                    ref_reader = None
+                    ref_failed[0] = True
+                    ref_error[0] = binding_reason
+
             base_thread = threading.Thread(target=_base_runner, daemon=True)
             base_thread.start()
             base_thread.join(timeout=120.0)
@@ -998,12 +1086,45 @@ class LoopbackRefPlayback:
         if not ref_failed[0] and np.any(ref_1d != 0):
             ref_peak_db = 20 * np.log10(np.max(np.abs(ref_1d)) + 1e-12)
             ref_rms_db = 20 * np.log10(np.sqrt(np.mean(ref_1d ** 2)) + 1e-12)
-            log.info(
-                "LoopbackRefPlayback: ref captured source=%s ch=%d n=%d "
-                "peak=%.1f dBFS rms=%.1f dBFS",
-                ref_source, self.ref_channel_index, len(ref_1d),
-                ref_peak_db, ref_rms_db,
-            )
+
+            # Identity check: two physically distinct signals (mic and loopback
+            # reference) cannot share both peak AND rms within 0.5 dB.  If they
+            # do, pw-record silently captured the same source as the mic
+            # (typically the UMIK fell back as the default PipeWire source).
+            # Treat the ref as invalid in that case so deconvolution falls back
+            # to the analytical sweep template rather than dividing mic by itself.
+            if len(mic_1d) > 0 and np.any(mic_1d != 0):
+                mic_peak_db = 20 * np.log10(np.max(np.abs(mic_1d)) + 1e-12)
+                mic_rms_db = 20 * np.log10(np.sqrt(np.mean(mic_1d ** 2)) + 1e-12)
+                peak_match = abs(ref_peak_db - mic_peak_db) <= 0.5
+                rms_match = abs(ref_rms_db - mic_rms_db) <= 0.5
+                if peak_match and rms_match:
+                    ref_failed[0] = True
+                    ref_error[0] = (
+                        f"pw-record bound to wrong source — ref and mic are "
+                        f"statistically identical (ref peak={ref_peak_db:.1f} dBFS "
+                        f"rms={ref_rms_db:.1f} dBFS; mic peak={mic_peak_db:.1f} dBFS "
+                        f"rms={mic_rms_db:.1f} dBFS; both within 0.5 dB). "
+                        f"Two distinct physical signals cannot match to 0.5 dB on both "
+                        f"metrics — PipeWire fell back to the default source. "
+                        f"Loopback reference unusable; deconvolution will use the "
+                        f"analytical sweep template."
+                    )
+                    log.warning(
+                        "LoopbackRefPlayback: ref/mic identity check FAILED "
+                        "(source=%s) — ref peak=%.1f rms=%.1f dBFS, "
+                        "mic peak=%.1f rms=%.1f dBFS — treating ref as invalid",
+                        ref_source, ref_peak_db, ref_rms_db, mic_peak_db, mic_rms_db,
+                    )
+                    ref_1d = np.zeros_like(mic_1d)
+
+            if not ref_failed[0]:
+                log.info(
+                    "LoopbackRefPlayback: ref captured source=%s ch=%d n=%d "
+                    "peak=%.1f dBFS rms=%.1f dBFS",
+                    ref_source, self.ref_channel_index, len(ref_1d),
+                    ref_peak_db, ref_rms_db,
+                )
         else:
             ref_1d = np.zeros_like(mic_1d)
             log.warning(

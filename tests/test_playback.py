@@ -12,6 +12,16 @@ Coverage diagram:
 
   HDMIPlayback.play_and_record()
   └── [TESTED] happy path — opens explicit InputStream/OutputStream, returns arrays
+
+  _verify_pw_record_binding()
+  ├── [TESTED] binding confirmed → returns (True, "")
+  ├── [TESTED] node absent from pw-link output → returns (False, reason)
+  └── [TESTED] pw-link not found (FileNotFoundError) → skip, returns (True, "")
+
+  LoopbackRefPlayback (pw-record path)
+  ├── [TESTED] binding verified OK → ref captured normally
+  ├── [TESTED] binding fails → ref_1d zeros, error logged
+  └── [TESTED] identity check trips (ref≈mic) → ref_1d zeros, error in log
 """
 
 from __future__ import annotations
@@ -26,7 +36,9 @@ from calibrate.drivers.playback import (
     HDMIAplayPlayback,  # backward-compat alias for HDMIPwCatPlayback
     HDMIPwCatPlayback,
     HDMIPlayback,
+    LoopbackRefPlayback,
     USBPlayback,
+    _verify_pw_record_binding,
     playback_for_route,
 )
 
@@ -364,3 +376,191 @@ class TestHDMIPwCatPlayback:
 
         assert sweep_1d.shape == (n_samples,)
         assert rec_1d.dtype == np.float64
+
+
+# ── _verify_pw_record_binding ────────────────────────────────────────────────
+
+class TestVerifyPwRecordBinding:
+    """Unit tests for the pw-record source-binding verifier."""
+
+    def test_confirmed_binding_returns_true(self):
+        """pw-link output shows the expected node as a source → (True, '')."""
+        pw_output = (
+            "alsa_input.usb-miniDSP_loopback_ref:capture_FL\n"
+            "  |-> pw-record-stream:input_1\n"
+        )
+        with patch(
+            "subprocess.run",
+            return_value=MagicMock(stdout=pw_output, returncode=0),
+        ):
+            ok, reason = _verify_pw_record_binding(
+                "alsa_input.usb-miniDSP_loopback_ref", timeout_s=0.01, poll_interval_s=0.005
+            )
+        assert ok is True
+        assert reason == ""
+
+    def test_wrong_binding_returns_false_with_reason(self):
+        """pw-link shows a different source (UMIK, not loopback_ref) → (False, reason)."""
+        pw_output = (
+            "alsa_input.usb-miniDSP_Umik-1:capture_FL\n"
+            "  |-> pw-record-stream:input_1\n"
+        )
+        with patch(
+            "subprocess.run",
+            return_value=MagicMock(stdout=pw_output, returncode=0),
+        ):
+            ok, reason = _verify_pw_record_binding(
+                "loopback_ref", timeout_s=0.05, poll_interval_s=0.01
+            )
+        assert ok is False
+        assert "loopback_ref" in reason
+        assert "fell back" in reason.lower() or "fallback" in reason.lower() or "wrong source" in reason.lower()
+
+    def test_pw_link_not_found_skips_verification(self):
+        """If pw-link binary is absent, verification is skipped → (True, '')."""
+        with patch("subprocess.run", side_effect=FileNotFoundError("pw-link not found")):
+            ok, reason = _verify_pw_record_binding(
+                "loopback_ref", timeout_s=0.01, poll_interval_s=0.005
+            )
+        assert ok is True
+        assert reason == ""
+
+
+# ── LoopbackRefPlayback pw-record binding + identity checks ──────────────────
+
+class TestLoopbackRefPlaybackBinding:
+    """Integration tests for the binding verification and identity check in
+    LoopbackRefPlayback.play_and_record (pw-record path)."""
+
+    def _make_base(self, mic_signal: np.ndarray) -> MagicMock:
+        """Return a fake base strategy that gives *mic_signal* as the recording."""
+        base = MagicMock()
+        sweep_1d = np.linspace(-0.5, 0.5, len(mic_signal))
+        base.play_and_record = MagicMock(return_value=(sweep_1d, mic_signal))
+        base.skip_warmup = True  # suppress warmup trimming
+        return base
+
+    def _ref_raw_bytes(self, ref_audio: np.ndarray) -> bytes:
+        """Encode *ref_audio* as f32le bytes (as pw-record would produce)."""
+        return ref_audio.astype(np.float32).tobytes()
+
+    def test_verified_binding_captures_ref_normally(self):
+        """When pw-link confirms the binding, ref_1d is non-zero and distinct."""
+        n = 4800
+        mic = np.sin(2 * np.pi * 50 * np.arange(n) / 48000) * 0.1
+        # ref is a different signal (loopback pre-DSP — ~10 dB louder)
+        ref = np.sin(2 * np.pi * 50 * np.arange(n) / 48000) * 0.3
+
+        base = self._make_base(mic)
+        raw = self._ref_raw_bytes(ref)
+        chunks: list[bytes] = [raw]
+
+        with (
+            patch(
+                "calibrate.drivers.playback._start_pw_record",
+                return_value=(MagicMock(), chunks, MagicMock()),
+            ),
+            patch("calibrate.drivers.playback._stop_pw_record"),
+            patch("calibrate.drivers.playback._verify_pw_record_binding", return_value=(True, "")),
+        ):
+            strategy = LoopbackRefPlayback(
+                base=base,
+                ref_pipewire_node="loopback_ref",
+                ref_pw_channels=1,
+            )
+            sweep_out, mic_out, ref_out = strategy.play_and_record(MagicMock(), 48000, 1, 1)
+
+        assert np.any(ref_out != 0), "ref_1d must be non-zero when binding is confirmed"
+
+    def test_wrong_binding_zeroes_ref(self):
+        """When pw-link reports wrong binding, ref_1d is zeros."""
+        n = 4800
+        mic = np.sin(2 * np.pi * 50 * np.arange(n) / 48000) * 0.1
+        ref = np.sin(2 * np.pi * 50 * np.arange(n) / 48000) * 0.3
+        raw = self._ref_raw_bytes(ref)
+        chunks: list[bytes] = [raw]
+
+        base = self._make_base(mic)
+
+        with (
+            patch(
+                "calibrate.drivers.playback._start_pw_record",
+                return_value=(MagicMock(), chunks, MagicMock()),
+            ),
+            patch("calibrate.drivers.playback._stop_pw_record"),
+            patch(
+                "calibrate.drivers.playback._verify_pw_record_binding",
+                return_value=(
+                    False,
+                    "pw-record bound to wrong source — PipeWire fell back to default source",
+                ),
+            ),
+        ):
+            strategy = LoopbackRefPlayback(
+                base=base,
+                ref_pipewire_node="loopback_ref",
+                ref_pw_channels=1,
+            )
+            sweep_out, mic_out, ref_out = strategy.play_and_record(MagicMock(), 48000, 1, 1)
+
+        assert np.all(ref_out == 0), "ref_1d must be all-zeros when binding check fails"
+
+    def test_identity_check_zeroes_ref_when_ref_matches_mic(self):
+        """When ref and mic peak+rms are within 0.5 dB, ref_1d is zeroed (same source)."""
+        n = 48000
+        # Same signal for both mic and ref (as happens when pw-record captures UMIK)
+        identical = np.sin(2 * np.pi * 40 * np.arange(n) / 48000) * 0.05
+
+        base = self._make_base(identical.copy())
+        # Inject the same signal as ref
+        raw = self._ref_raw_bytes(identical)
+        chunks: list[bytes] = [raw]
+
+        with (
+            patch(
+                "calibrate.drivers.playback._start_pw_record",
+                return_value=(MagicMock(), chunks, MagicMock()),
+            ),
+            patch("calibrate.drivers.playback._stop_pw_record"),
+            patch("calibrate.drivers.playback._verify_pw_record_binding", return_value=(True, "")),
+        ):
+            strategy = LoopbackRefPlayback(
+                base=base,
+                ref_pipewire_node="loopback_ref",
+                ref_pw_channels=1,
+            )
+            sweep_out, mic_out, ref_out = strategy.play_and_record(MagicMock(), 48000, 1, 1)
+
+        assert np.all(ref_out == 0), (
+            "ref_1d must be zeroed when ref and mic are statistically identical"
+        )
+
+    def test_identity_check_passes_when_signals_differ(self):
+        """When ref and mic differ by more than 0.5 dB, ref is accepted as valid."""
+        n = 48000
+        mic = np.sin(2 * np.pi * 40 * np.arange(n) / 48000) * 0.05
+        # ref is ~6 dB louder — clearly different physical signal
+        ref = np.sin(2 * np.pi * 40 * np.arange(n) / 48000) * 0.10
+
+        base = self._make_base(mic.copy())
+        raw = self._ref_raw_bytes(ref)
+        chunks: list[bytes] = [raw]
+
+        with (
+            patch(
+                "calibrate.drivers.playback._start_pw_record",
+                return_value=(MagicMock(), chunks, MagicMock()),
+            ),
+            patch("calibrate.drivers.playback._stop_pw_record"),
+            patch("calibrate.drivers.playback._verify_pw_record_binding", return_value=(True, "")),
+        ):
+            strategy = LoopbackRefPlayback(
+                base=base,
+                ref_pipewire_node="loopback_ref",
+                ref_pw_channels=1,
+            )
+            sweep_out, mic_out, ref_out = strategy.play_and_record(MagicMock(), 48000, 1, 1)
+
+        assert np.any(ref_out != 0), (
+            "ref_1d must be non-zero when ref and mic differ sufficiently"
+        )
