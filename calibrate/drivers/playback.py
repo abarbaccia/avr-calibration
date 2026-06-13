@@ -1099,24 +1099,49 @@ class LoopbackRefPlayback:
                 peak_match = abs(ref_peak_db - mic_peak_db) <= 0.5
                 rms_match = abs(ref_rms_db - mic_rms_db) <= 0.5
                 if peak_match and rms_match:
-                    ref_failed[0] = True
-                    ref_error[0] = (
-                        f"pw-record bound to wrong source — ref and mic are "
-                        f"statistically identical (ref peak={ref_peak_db:.1f} dBFS "
-                        f"rms={ref_rms_db:.1f} dBFS; mic peak={mic_peak_db:.1f} dBFS "
-                        f"rms={mic_rms_db:.1f} dBFS; both within 0.5 dB). "
-                        f"Two distinct physical signals cannot match to 0.5 dB on both "
-                        f"metrics — PipeWire fell back to the default source. "
-                        f"Loopback reference unusable; deconvolution will use the "
-                        f"analytical sweep template."
-                    )
-                    log.warning(
-                        "LoopbackRefPlayback: ref/mic identity check FAILED "
-                        "(source=%s) — ref peak=%.1f rms=%.1f dBFS, "
-                        "mic peak=%.1f rms=%.1f dBFS — treating ref as invalid",
-                        ref_source, ref_peak_db, ref_rms_db, mic_peak_db, mic_rms_db,
-                    )
-                    ref_1d = np.zeros_like(mic_1d)
+                    # Level match alone is a false positive when the sweep
+                    # amplitude and calibrated UMIK level coincide (observed
+                    # 2026-06-12: sweep at -13.7 dBFS = UMIK at 78 dB SPL
+                    # within 0.5 dB). Cross-correlation discriminates: if ref
+                    # and mic are from the same source (UMIK fallback), they
+                    # are highly correlated (corr > 0.8). If they are
+                    # distinct signals at coincidentally similar levels, the
+                    # loopback ref is valid.
+                    # NOTE: use corr >= 0.8, NOT abs(corr) >= 0.8. A strong
+                    # NEGATIVE correlation (corr ≈ −0.9) means the loopback ref
+                    # is polarity-inverted — it is a valid reference signal and
+                    # must NOT be rejected. Only a high POSITIVE correlation
+                    # (same-source fallback) indicates the failure mode.
+                    n_corr = min(len(ref_1d), len(mic_1d), int(sample_rate * 5))
+                    corr = float(np.corrcoef(
+                        ref_1d[:n_corr], mic_1d[:n_corr]
+                    )[0, 1]) if n_corr > 1 else 0.0
+                    if corr >= 0.8:
+                        ref_failed[0] = True
+                        ref_error[0] = (
+                            f"pw-record bound to wrong source — ref and mic are "
+                            f"statistically identical (ref peak={ref_peak_db:.1f} dBFS "
+                            f"rms={ref_rms_db:.1f} dBFS; mic peak={mic_peak_db:.1f} dBFS "
+                            f"rms={mic_rms_db:.1f} dBFS; corr={corr:.3f}). "
+                            f"Two distinct physical signals cannot be this correlated — "
+                            f"PipeWire fell back to the default source. "
+                            f"Loopback reference unusable; deconvolution will use the "
+                            f"analytical sweep template."
+                        )
+                        log.warning(
+                            "LoopbackRefPlayback: ref/mic identity check FAILED "
+                            "(source=%s) — ref peak=%.1f rms=%.1f dBFS, "
+                            "mic peak=%.1f rms=%.1f dBFS corr=%.3f — treating ref as invalid",
+                            ref_source, ref_peak_db, ref_rms_db, mic_peak_db, mic_rms_db, corr,
+                        )
+                        ref_1d = np.zeros_like(mic_1d)
+                    else:
+                        log.info(
+                            "LoopbackRefPlayback: levels match mic but signals are "
+                            "distinct (corr=%.3f) — loopback ref valid (sweep amplitude "
+                            "coincides with calibrated UMIK level)",
+                            corr,
+                        )
 
             if not ref_failed[0]:
                 log.info(
