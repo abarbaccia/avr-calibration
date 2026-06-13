@@ -4306,29 +4306,44 @@ async def _tool_design_fir_trinnov(
                 label=label,
             ))
 
-        # Hard gate: all measurement sessions must have the same loopback timing.
-        # loopback_xcorr_peak_ms encodes CamillaDSP pipeline latency + acoustic
-        # travel — when it differs across sessions the H_i phase frames are not
-        # comparable and the Wiener K_i will compute wrong phase corrections.
-        # A 1 ms shift at 50 Hz is ~18° of phase error; 2 ms is ~36°.
+        # xcorr_peak_ms encodes CamillaDSP pipeline latency + acoustic travel.
+        # Two failure modes:
+        #   (A) CamillaDSP config push between sessions → pipeline quantum shifts
+        #       by N×chunksize (typically 5-15 ms per push). Corrupts phase. HARD ERROR.
+        #   (B) Sub positions differ acoustically → each sub has a different travel
+        #       time to the mic. This IS the inter-sub delay the Wiener design corrects.
+        #       The phase_rad arrays already encode it correctly. WARNING only.
+        # Threshold: >15 ms almost certainly pipeline drift (>2 config pushes);
+        # ≤15 ms is plausible acoustic geometry (≤5 m path difference).
         xcorr_peaks = {}
         for m in measurements:
             sid = int(m["session_id"])
             sess = store.get_session(sid)
             if sess and sess.start_fr and sess.start_fr.loopback_xcorr_peak_ms is not None:
                 xcorr_peaks[sid] = sess.start_fr.loopback_xcorr_peak_ms
+        xcorr_warnings: list[str] = []
         if len(xcorr_peaks) >= 2:
             peaks_list = list(xcorr_peaks.values())
             xcorr_range = max(peaks_list) - min(peaks_list)
-            if xcorr_range > 0.5:
+            if xcorr_range > 15.0:
                 ids_detail = ", ".join(
                     f"session {sid}: {ms:.2f} ms" for sid, ms in xcorr_peaks.items()
                 )
                 return _err(
-                    f"Sessions have inconsistent loopback_xcorr_peak_ms (range={xcorr_range:.2f} ms > 0.5 ms): "
-                    f"{ids_detail}. Cross-session phase comparison is invalid — Trinnov will produce wrong "
-                    "phase corrections. Re-measure all subs in immediate succession with the same "
-                    "pipeline topology (same FIR tap counts loaded, same PipeWire graph)."
+                    f"Sessions have inconsistent loopback_xcorr_peak_ms (range={xcorr_range:.2f} ms > 15 ms): "
+                    f"{ids_detail}. This indicates a CamillaDSP pipeline restart or config push occurred "
+                    "between measurements — phase comparison is invalid. Re-measure all subs with the same "
+                    "pipeline topology (no config changes between solos; use Scarlett hardware mutes)."
+                )
+            elif xcorr_range > 0.5:
+                ids_detail = ", ".join(
+                    f"session {sid}: {ms:.2f} ms" for sid, ms in xcorr_peaks.items()
+                )
+                xcorr_warnings.append(
+                    f"xcorr range {xcorr_range:.2f} ms — likely physical inter-sub acoustic delay "
+                    f"({xcorr_range * 343 / 1000:.2f} m path difference); phase_rad data is valid "
+                    "if no CamillaDSP config changes occurred between sessions. "
+                    f"Per-session: {ids_detail}."
                 )
 
         # Parse target curve
@@ -4417,6 +4432,8 @@ async def _tool_design_fir_trinnov(
         )
         if balance_warnings:
             note += " ⚠️ Sub balance warnings: " + "; ".join(balance_warnings)
+        if xcorr_warnings:
+            note += " ⚠️ xcorr: " + "; ".join(xcorr_warnings)
 
         response = {
             "num_subs": result["num_subs"],
@@ -4432,6 +4449,7 @@ async def _tool_design_fir_trinnov(
             "per_sub_peak_boost_db": result["per_sub_peak_boost_db"],
             "output_gain_db": result["output_gain_db"],
             "balance_warnings": balance_warnings,
+            "xcorr_warnings": xcorr_warnings,
             "cache_ids": cache_ids,
             "note": note,
         }
