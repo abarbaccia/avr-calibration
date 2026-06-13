@@ -223,6 +223,22 @@ Each calibration run carries three short prose fields and produces ≤2 lessons.
 | 63 | +1 dB  |
 | 80 | 0 dB   |
 
+## Subagents — when to auto-dispatch
+
+Project subagents live in `.claude/agents/`. The orchestrator MUST reach for them at these moments, without being asked:
+
+| Trigger | Agent | Why |
+|---|---|---|
+| Anything fails unexpectedly (low coherence, weird per-sub deficit, sign flapping, subs silent, pw-cat hang, AVR crash) | `symptom-historian` | FIRST, before debugging from scratch — these failures are almost always already documented. The "Consult memory BY SYMPTOM" rule. |
+| Before trusting ANY FR / coherence / T60 data; after any reboot or container restart; start of every measurement session | `measurement-chain-validator` | Go/no-go gate. A bad chain produces confident, wrong numbers. |
+| Before any `apply_fir` / `apply_eq` / `apply_avr_fir` to a real output | `fir-design-reviewer` | Invariant + safety gate in the path to a $2k sub. Never write a filter without it. |
+| Before trusting a *method* or judging whether a measured effect is real vs an artifact | `acoustician` | The physics/math authority. Use when the question is "is this actually true," not "does it obey our house rules." |
+| On-metal fix needed (PW wiring, Scarlett routing, dead service, stale PW, reboot, deploy) | `pi-operator` | The hands on the hardware. Pairs with the validator: validator diagnoses, pi-operator fixes. |
+| A change touches `calibrate/mcp_server.py`, `drivers/`, or analysis modules, before shipping | `mcp-tool-auditor` | Facade-contract + test-coverage guard. |
+| `MEMORY.md` over budget, or on demand / `/loop` | `memory-gardener` | Prune, consolidate, fix index overflow, promote general lessons. The only agent that writes the memory dir. |
+
+Hard rules: never `apply_fir`/`apply_avr_fir` without `fir-design-reviewer` first; never trust measurement data the `measurement-chain-validator` hasn't cleared this session; dispatch `symptom-historian` before hand-debugging any unexpected failure.
+
 ## Skill routing
 
 gstack skills are disabled for this repo. Do NOT auto-invoke ship, review, investigate, or other gstack skills. Handle all requests directly without routing to skills.
