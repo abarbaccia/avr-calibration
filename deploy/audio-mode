@@ -47,6 +47,7 @@ PW_ENV="XDG_RUNTIME_DIR=/run/user/1000 PIPEWIRE_RUNTIME_DIR=/run/user/1000"
 # (pinned in 50-scarlett.lua) — the pro-audio profile renames these nodes
 # to pro-output-0/pro-input-0 and breaks every consumer.
 SCARLETT_CAPTURE="alsa_input.usb-Focusrite_Scarlett_18i20_USB_P9W3FNX378D03D-00.multichannel-input"
+SCARLETT_PLAYBACK="alsa_output.usb-Focusrite_Scarlett_18i20_USB_P9W3FNX378D03D-00.multichannel-output"
 UMIK_NODE="alsa_input.usb-miniDSP_Umik-1_Gain__18dB_00002-00.analog-stereo"
 CAM_CAPTURE="camilladsp_capture"
 SWEEP_SINK="avr_cal_sweep"
@@ -188,17 +189,24 @@ PY
 # ── PipeWire wiring ─────────────────────────────────────────────────────────
 
 # pw-link FROM TO. "File exists" = already linked = success (idempotent).
+# Every pw-link is wrapped in `timeout` so a single call can NEVER block:
+# on a mid-convergence/wedged graph pw-link can hang indefinitely, and when
+# this ran synchronously as camilladsp.service ExecStartPost that hang tripped
+# the systemd start-post timeout → daemon killed → restart flap → polluted
+# graph (root cause of the 2026-06-13 boot wedge). Bounded calls + the
+# backgrounded ExecStartPost (see camilladsp.service) make wiring self-healing.
+PW_LINK_TIMEOUT="${PW_LINK_TIMEOUT:-4}"
 link_one() {
     local out
-    out=$(env $PW_ENV pw-link "$1" "$2" 2>&1) && return 0
+    out=$(timeout "$PW_LINK_TIMEOUT" env $PW_ENV pw-link "$1" "$2" 2>&1) && return 0
     echo "$out" | grep -q 'File exists' && return 0
     return 1
 }
 
-unlink_one() { env $PW_ENV pw-link -d "$1" "$2" 2>/dev/null || true; }
+unlink_one() { timeout "$PW_LINK_TIMEOUT" env $PW_ENV pw-link -d "$1" "$2" 2>/dev/null || true; }
 
 port_exists() {
-    env $PW_ENV pw-link -o -i 2>/dev/null | grep -qF "$1"
+    timeout "$PW_LINK_TIMEOUT" env $PW_ENV pw-link -o -i 2>/dev/null | grep -qF "$1"
 }
 
 remove_umik_links() {
@@ -232,6 +240,17 @@ cmd_wire() {
     # Deconvolution reference tap (static null sinks; independent of CamillaDSP).
     link_one "${SWEEP_SINK}:monitor_FL" "${LOOPBACK_REF}:playback_1" \
         || log "WARNING: loopback_ref link failed (${SWEEP_SINK} or ${LOOPBACK_REF} missing?)"
+
+    # Playback: camilladsp_playback:output_N+1 → Scarlett playback_AUXN (20 ch).
+    # WP 0.4.13's link policy wedges permanently when any client dies mid-
+    # activation ("N pending linkables... should never happen"), after which it
+    # creates no links at all. We stopped depending on it: wire owns these too.
+    local n ok=0
+    for n in $(seq 0 19); do
+        link_one "camilladsp_playback:output_$((n+1))" \
+                 "${SCARLETT_PLAYBACK}:playback_AUX${n}" && ok=$((ok+1))
+    done
+    [ "$ok" -lt 20 ] && log "WARNING: only ${ok}/20 playback→Scarlett links up"
 
     # camilladsp_capture ports appear a moment after CamillaDSP starts — retry.
     local i

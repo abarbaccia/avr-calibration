@@ -1,0 +1,13 @@
+-- Disable WirePlumber stream-target restoration (appliance Pi).
+--
+-- restore-stream remembers a target per application name. Every pw-record
+-- shares application.name="pw-record", so a remembered target from ANY prior
+-- pw-record (e.g. a loopback_ref capture) gets force-restored onto later
+-- pw-records, overriding their --target. Verified 2026-06-12: the mic
+-- pw-record (--target UMIK) and ref pw-record (--target loopback_ref)
+-- returned bit-identical data — both re-targeted to the same remembered
+-- node, tripping the ref/mic identity guard on every sweep.
+--
+-- All routing on this Pi is owned explicitly by `audio-mode wire`; nothing
+-- should ever have its target silently remembered or restored.
+stream_defaults.properties["restore-target"] = false

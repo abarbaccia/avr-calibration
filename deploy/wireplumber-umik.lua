@@ -13,6 +13,15 @@
 --
 -- This rule is now belt-and-suspenders only: if WP somehow tries to autolink the
 -- UMIK device node anywhere, this prevents it.
+--
+-- resample.quality (2026-06-13):
+--   The UMIK-1 (own USB clock) and the Scarlett/PipeWire graph (own clock) are
+--   bridged by PipeWire's adaptive resampler. At the default resample.quality=4
+--   (32-tap sinc) the clock-domain noise caps sub-cal coherence at ~0.72.
+--   Raising it to 14 (128-tap sinc) takes coherence to 0.995-0.999 across
+--   20-200 Hz (verified 2026-06-08). This property was lost when 51-umik.lua
+--   was rewritten for the feedback-loop fix (f8b8dc1, 2026-06-12) — re-added
+--   here so it survives deploys. It MUST coexist with node.autoconnect=false.
 
 table.insert(alsa_monitor.rules, {
   matches = {
@@ -22,5 +31,6 @@ table.insert(alsa_monitor.rules, {
   },
   apply_properties = {
     ["node.autoconnect"] = false,
+    ["resample.quality"] = 14,
   },
 })

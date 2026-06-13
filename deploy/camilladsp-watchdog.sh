@@ -25,6 +25,10 @@ STATUS_FILE="${STATUS_FILE:-/run/avr-status.json}"
 LED_ACT="/sys/class/leds/ACT"
 LED_PWR="/sys/class/leds/PWR"
 STALL_RESTART_THRESHOLD="${STALL_RESTART_THRESHOLD:-2}"
+# Don't restart camilladsp.service for stalls within this many seconds of it
+# becoming active — at boot the PW graph + capture wiring take longer than one
+# poll cycle to converge, and a premature restart wedges the graph.
+BOOT_GRACE_S="${BOOT_GRACE_S:-180}"
 
 stall_count=0
 
@@ -143,12 +147,24 @@ while true; do
         camilla="stalled"
         stall_count=$((stall_count + 1))
         log "CamillaDSP not Running (consecutive: $stall_count)"
-        if [ "$stall_count" -ge "$STALL_RESTART_THRESHOLD" ]; then
-            log "restarting camilladsp.service after $stall_count consecutive stalls"
+        # A "not Running" daemon at boot is usually just UNWIRED: its capture
+        # (input_3 ← avr_cal_sweep:monitor) hasn't been linked yet, so it never
+        # leaves Starting. Restarting it here only wedges the graph (verified
+        # 2026-06-13: a mid-init restart left the null sink a detached driver and
+        # hung the daemon in 'deactivating'). So: try to WIRE it first — that is
+        # what actually lets it reach Running — and only restart as a last resort,
+        # and never during the boot grace window while it is still converging.
+        WIRE_RETRIES=2 /usr/local/sbin/audio-mode wire >/dev/null 2>&1 || true
+        svc_started=$(date -d "$(systemctl show camilladsp.service -p ActiveEnterTimestamp --value 2>/dev/null)" +%s 2>/dev/null || echo 0)
+        svc_uptime=$(( $(date +%s) - svc_started ))
+        if [ "$stall_count" -ge "$STALL_RESTART_THRESHOLD" ] && [ "$svc_started" -gt 0 ] && [ "$svc_uptime" -ge "$BOOT_GRACE_S" ]; then
+            log "restarting camilladsp.service after $stall_count consecutive stalls (uptime ${svc_uptime}s)"
             systemctl restart camilladsp || log "systemctl restart failed"
             # Give it a moment before next probe; don't reset stall_count here,
             # the next successful probe will. If restart didn't help, we stay red.
             sleep 5
+        elif [ "$stall_count" -ge "$STALL_RESTART_THRESHOLD" ]; then
+            log "stalled but within boot grace (uptime ${svc_uptime}s < ${BOOT_GRACE_S}s) — wiring, not restarting"
         fi
     fi
 
