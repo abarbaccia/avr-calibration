@@ -1033,7 +1033,27 @@ class PreflightChecker:
 
         Queries the 10 most recent sessions with xcorr data and warns if
         range > 1.0 ms or stddev > 0.5 ms.
+
+        R11 (measurement.loopback_ref_pw_channels >= 2): the reference and mic
+        are captured into one 2-ch, sample-locked loopback node, so absolute
+        xcorr_peak_ms spread no longer reflects a phase-comparability problem —
+        H(f) = mic / loopback_ref is computed from the same buffer regardless of
+        the absolute peak position. In that mode this check is obsolete; report
+        informationally as passed.
         """
+        loopback_2ch = int(
+            self.config.measurement.get("loopback_ref_pw_channels", 1)
+        ) >= 2
+        if loopback_2ch:
+            return CheckResult(
+                name="Loopback timing stability",
+                passed=True,
+                detail=(
+                    "R11 (2-ch sample-locked loopback) decouples measurement "
+                    "validity from absolute xcorr_peak_ms spread — check obsolete, "
+                    "reporting informationally."
+                ),
+            )
         try:
             from .storage import SessionStore
             import math as _math

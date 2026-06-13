@@ -355,7 +355,14 @@ async def play_and_measure_fft(req: PlayAndMeasureFftRequest):
         if mic_idx is None:
             mic_name = cfg.mic.get("name", "UMIK")
             mic_idx = _find_umik_device(devices, name_substring=mic_name)
-        if mic_idx is None:
+        # R11: under the 2-ch sample-locked loopback the UMIK is consumed into
+        # loopback_ref and is no longer a standalone PortAudio device, so
+        # _find_umik_device returns None. The mic still arrives via the default
+        # PortAudio input (loopback path), so tolerate a missing explicit index
+        # and let play_and_record fall back to sd.default.device[0]. Only the
+        # legacy 1-ch path hard-fails on a missing UMIK.
+        _loopback_2ch = int(cfg.measurement.get("loopback_ref_pw_channels", 1)) >= 2
+        if mic_idx is None and not _loopback_2ch:
             return JSONResponse(status_code=500, content={"error": "UMIK microphone not found — check USB connection"})
 
         hdmi_idx = cfg.measurement.get("hdmi_device_index")
@@ -511,7 +518,7 @@ def _check_pw_link_l() -> dict:
 
     Returns a dict with:
       - input3_linked: bool  (avr_cal_sweep:monitor_FL → camilladsp_capture:input_3)
-      - loopback_ref_linked: bool  (avr_cal_sweep:monitor_FL → loopback_ref:playback_1)
+      - loopback_ref_linked: bool  (avr_cal_sweep:monitor_FL → loopback_ref:playback_FL, or legacy playback_1)
       - umik_into_dsp: bool  (any UMIK → camilladsp_capture link — feedback-loop hazard)
       - umik_sources: list[str]  (node names of UMIK sources linked into DSP capture)
       - playback_link_count: int  (camilladsp_playback → Scarlett links, expect ~20)
@@ -559,10 +566,12 @@ def _check_pw_link_l() -> dict:
             ):
                 input3_linked = True
 
-            # Deconvolution reference tap
-            if (
-                "avr_cal_sweep" in src_node
-                and "loopback_ref:playback_1" in dest
+            # Deconvolution reference tap. Under R11 the loopback_ref sink is
+            # 2-channel so the port is playback_FL; the legacy 1-ch sink used
+            # playback_1. Accept either.
+            if "avr_cal_sweep" in src_node and (
+                "loopback_ref:playback_FL" in dest
+                or "loopback_ref:playback_1" in dest
             ):
                 loopback_ref_linked = True
 
@@ -814,7 +823,7 @@ async def audio_stack_health():
             )
         if not wiring.get("loopback_ref_linked"):
             warnings.append(
-                "MISSING: avr_cal_sweep:monitor_FL → loopback_ref:playback_1 "
+                "MISSING: avr_cal_sweep:monitor_FL → loopback_ref:playback_FL "
                 "(deconvolution reference tap) — coherence will collapse"
             )
         if wiring.get("umik_into_dsp"):

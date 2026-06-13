@@ -48,6 +48,61 @@ def test_rejects_bad_phase_mode():
                                phase_mode="bogus")
 
 
+def test_max_correction_db_clamps_fir_gain():
+    """max_correction_db bounds the per-band FIR gain deviation (±N dB around the
+    in-band median, phase preserved), so the Wiener can't over-correct a tall
+    GEOMETRY mode into a deep cut that guts the band (fir-design-reviewer, run 36)."""
+    freqs = np.linspace(20, 200, 200).tolist()
+    # Flat baseline except a tall +15 dB mode around 50 Hz.
+    mag = [15.0 if 45 <= f <= 55 else 0.0 for f in freqs]
+    m1 = _synth_measurement(freqs, mag, label="sub1")
+    m2 = _synth_measurement(freqs, mag, label="sub2")
+    target = [(20, 0.0), (200, 0.0)]
+    focus = (30.0, 120.0)
+    common = dict(num_taps=4096, sample_rate=48000, phase_mode="mixed",
+                  freq_focus_hz=focus, regularization_lambda=0.01)
+
+    unclamped = design_multi_input_fir([m1, m2], target, **common)
+    clamped = design_multi_input_fir([m1, m2], target, max_correction_db=6.0, **common)
+
+    def fir_effect_spread(res):
+        eff = res["predicted_per_sub"][0]["fir_effect_bands"]
+        vals = [b["spl_db"] for b in eff if 30.0 <= b["freq_hz"] <= 120.0]
+        return max(vals) - min(vals)
+
+    spread_unclamped = fir_effect_spread(unclamped)
+    spread_clamped = fir_effect_spread(clamped)
+    assert spread_clamped < spread_unclamped, (
+        f"clamp must reduce gain spread: clamped={spread_clamped:.1f} "
+        f"unclamped={spread_unclamped:.1f}"
+    )
+    # ±6 dB around the median ⇒ total spread ≤ ~12 dB (+ band-edge tolerance).
+    assert spread_clamped <= 14.0, f"clamped spread {spread_clamped:.1f} dB exceeds ~12 dB bound"
+
+
+def test_max_correction_db_zero_magnitude_band_does_not_crash():
+    """A degenerate sub measurement with zero magnitude across the focus band
+    makes |K_i| == 0 everywhere in-band, so the clamp's positive-magnitude set
+    `_band_mag = _mag[in_band][_mag>0]` is empty. The `if _band_mag.size:` guard
+    must skip the clamp (no median-of-empty / div-by-zero) and the design must
+    still return a finite FIR per sub."""
+    freqs = np.linspace(20, 200, 120).tolist()
+    # spl_db = -inf → linear magnitude exactly 0.0 → |H_i| == 0 → |K_i| == 0 in-band.
+    silent = _synth_measurement(freqs, [-np.inf] * len(freqs), label="silent")
+    normal = _synth_measurement(freqs, [0.0] * len(freqs), label="normal")
+    result = design_multi_input_fir(
+        [silent, normal], [(20, 0.0), (200, 0.0)],
+        num_taps=2048, sample_rate=48000, phase_mode="mixed",
+        freq_focus_hz=(30.0, 120.0), regularization_lambda=0.01,
+        max_correction_db=6.0,
+    )
+    assert result["num_subs"] == 2
+    assert len(result["firs"]) == 2
+    # No NaN/inf must leak through from the degenerate sub.
+    for fir in result["firs"]:
+        assert np.all(np.isfinite(fir)), "clamp/degenerate path leaked a non-finite tap"
+
+
 def test_flat_measurement_flat_target_produces_near_identity():
     """Two flat subs at unit gain summing to flat target — combined should
     hit target in the mid-band (away from focus edges where bandpass

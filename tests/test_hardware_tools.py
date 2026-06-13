@@ -449,6 +449,16 @@ some_other_node:output_1
   |-> some_dest:input
 """
 
+    # R11: the loopback_ref sink is 2-channel, so the reference port is
+    # playback_FL (not the legacy mono playback_1).
+    _R11_WIRING = """\
+avr_cal_sweep:monitor_FL
+  |-> camilladsp_capture:input_3
+  |-> loopback_ref:playback_FL
+avr_cal_sweep:monitor_FR
+  |-> loopback_ref:playback_FR
+"""
+
     def _run(self, stdout: str, side_effect=None):
         from calibrate.measurement_service import _check_pw_link_l
         mock_result = MagicMock()
@@ -483,6 +493,13 @@ some_other_node:output_1
         assert result["input3_linked"] is False
         assert result["loopback_ref_linked"] is False
         assert result["umik_into_dsp"] is False
+
+    def test_r11_playback_fl_detected_as_linked(self):
+        """Under R11 the 2-ch loopback sink uses playback_FL — must count as linked."""
+        result = self._run(self._R11_WIRING)
+        assert result["error"] is None
+        assert result["input3_linked"] is True
+        assert result["loopback_ref_linked"] is True
 
     def test_pw_link_not_found(self):
         result = self._run("", side_effect=FileNotFoundError("pw-link"))
@@ -813,3 +830,61 @@ class TestAudioStackHealthEndpoint:
         body = self._apply_and_call(patches)
         # When wiring has an error, we report the error warning, NOT the individual link warnings
         assert any("pw-link probe error" in w for w in body["warnings"])
+
+
+# ── play_and_measure_fft R11 UMIK gating ──────────────────────────────────────
+
+
+@pytest.mark.usefixtures("fake_sounddevice_module")
+class TestPlayAndMeasureFftUmikGating:
+    """The /play_and_measure_fft endpoint must tolerate a missing PortAudio UMIK
+    under R11 (loopback_ref_pw_channels>=2), where the mic is consumed into the
+    loopback path. The legacy 1-ch path still hard-fails on a missing UMIK.
+    """
+
+    def _make_cfg(self, channels: int):
+        from calibrate.config import Config
+        return Config({
+            "denon": {"host": ""},
+            "minidsp": {"host": "localhost", "port": 5380},
+            "mic": {"name": "UMIK"},
+            "measurement": {"loopback_ref_pw_channels": channels},
+        })
+
+    def _call(self, channels: int):
+        import numpy as np
+        from fastapi.testclient import TestClient
+        from calibrate.measurement_service import app
+
+        # No UMIK present → _find_umik_device returns None.
+        devices = [
+            {"name": "HDMI Output", "max_input_channels": 0, "max_output_channels": 8},
+        ]
+
+        fake_player = MagicMock()
+        fake_player.play_and_record.return_value = (np.ones(48000, dtype=np.float64), 48000)
+
+        with (
+            patch("calibrate.measurement_service._cfg", return_value=self._make_cfg(channels)),
+            patch("calibrate.measurement._find_umik_device", return_value=None),
+            patch("sounddevice.query_devices", return_value=devices),
+            patch("calibrate.drivers.playback.MultichannelPlayback", return_value=fake_player),
+        ):
+            client = TestClient(app)
+            return client.post("/play_and_measure_fft", json={
+                "channel_assignments": {"0": [50.0]},
+                "duration_s": 0.1,
+                "n_channels": 6,
+                "sample_rate": 48000,
+            })
+
+    def test_r11_tolerates_missing_umik(self):
+        resp = self._call(channels=2)
+        # Must NOT be the "UMIK microphone not found" 500.
+        if resp.status_code == 500:
+            assert "UMIK microphone not found" not in resp.json().get("error", "")
+
+    def test_legacy_1ch_hard_fails_on_missing_umik(self):
+        resp = self._call(channels=1)
+        assert resp.status_code == 500
+        assert "UMIK microphone not found" in resp.json().get("error", "")

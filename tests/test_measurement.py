@@ -35,6 +35,7 @@ Coverage diagram:
   └── [TESTED] exits 1 and prints error when MeasurementEngine raises RuntimeError
 """
 
+import subprocess
 import sys
 import numpy as np
 import pytest
@@ -1780,3 +1781,91 @@ class TestXcorrWindow:
         cfg = make_config(xcorr_search_window_ms=500.0)
         engine = MeasurementEngine(cfg)
         assert engine._xcorr_search_window_ms == 500.0
+
+
+# ── MeasurementEngine.measure_impulse_ir() ────────────────────────────────────
+
+class TestMeasureImpulseIr:
+    """measure_impulse_ir averages N impulse shots, and MUST guarantee that
+    neither pw-record nor pw-cat is left running — an orphaned pw-record holds
+    the mic node open and wedges the next measurement (the try/finally added
+    after the ReadTimeout/hung-service incident).
+
+    A small sample_rate keeps the test fast: pre_silence = int(0.2*sr) must stay
+    below rec_samples = int(record_duration_s*sr), so sr=1000 / 0.3 s → 200 < 300.
+    """
+
+    def _engine(self):
+        cfg = make_config(
+            sample_rate=1000,
+            usb_pipewire_node="avr_cal_sweep",
+            mic_pipewire_node="umik",
+        )
+        return MeasurementEngine(cfg)
+
+    def _make_proc(self, *, read_bytes=b"", poll_after=0, communicate_side_effect=None):
+        """Build a mock subprocess.Popen instance."""
+        proc = MagicMock()
+        proc.poll.return_value = poll_after  # 0 = already exited; None = running
+        if communicate_side_effect is not None:
+            proc.communicate.side_effect = communicate_side_effect
+        else:
+            proc.communicate.return_value = (b"", b"")
+        proc.stdout = MagicMock()
+        proc.stdout.read.return_value = read_bytes
+        return proc
+
+    async def test_happy_path_accumulates_and_cleans_up(self):
+        """One shot: recorded f32 samples are averaged and both procs are cleaned up."""
+        engine = self._engine()
+        rec_samples = int(0.3 * 1000)
+        rec_bytes = np.ones(rec_samples, dtype=np.float32).tobytes()
+        rec_proc = self._make_proc(read_bytes=rec_bytes, poll_after=0)
+        play_proc = self._make_proc(poll_after=0)
+
+        # Popen called rec-first, play-second within each shot.
+        with patch("subprocess.Popen", side_effect=[rec_proc, play_proc]):
+            out = await engine.measure_impulse_ir(n_averages=1, record_duration_s=0.3)
+
+        assert len(out) == rec_samples
+        # averaged over 1 shot → ~1.0 in the captured region
+        assert out[0] == pytest.approx(1.0)
+        # recorder is force-killed after the tail; playback finished on its own
+        rec_proc.kill.assert_called()
+
+    async def test_timeout_expired_branch_kills_playback(self):
+        """If pw-cat communicate() times out, it is killed and drained, not left hung."""
+        engine = self._engine()
+        rec_samples = int(0.3 * 1000)
+        rec_proc = self._make_proc(
+            read_bytes=np.zeros(rec_samples, dtype=np.float32).tobytes(), poll_after=0
+        )
+        # first communicate (with input+timeout) raises; second (drain) returns
+        play_proc = self._make_proc(
+            poll_after=0,
+            communicate_side_effect=[
+                subprocess.TimeoutExpired(cmd="pw-cat", timeout=5),
+                (b"", b""),
+            ],
+        )
+        with patch("subprocess.Popen", side_effect=[rec_proc, play_proc]):
+            out = await engine.measure_impulse_ir(n_averages=1, record_duration_s=0.3)
+
+        assert len(out) == rec_samples
+        play_proc.kill.assert_called()  # killed in the TimeoutExpired branch
+
+    async def test_finally_cleans_up_both_procs_on_midshot_exception(self):
+        """If a shot raises mid-way (e.g. stdout.read), finally kills BOTH live procs
+        and the exception still propagates."""
+        engine = self._engine()
+        rec_proc = self._make_proc(poll_after=None)   # still "running"
+        rec_proc.stdout.read.side_effect = RuntimeError("boom mid-shot")
+        play_proc = self._make_proc(poll_after=None)  # still "running"
+
+        with patch("subprocess.Popen", side_effect=[rec_proc, play_proc]):
+            with pytest.raises(RuntimeError, match="boom mid-shot"):
+                await engine.measure_impulse_ir(n_averages=1, record_duration_s=0.3)
+
+        # finally must reap both subprocesses (poll() is None → kill + communicate)
+        rec_proc.kill.assert_called()
+        play_proc.kill.assert_called()

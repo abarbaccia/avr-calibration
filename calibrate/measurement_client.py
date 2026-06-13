@@ -33,8 +33,14 @@ class MeasurementServiceClient:
 
     # ── Internal helper ────────────────────────────────────────────────────────
 
-    async def _post(self, path: str, body: dict) -> dict:
-        """POST to the service, raise MeasurementServiceError on failure."""
+    async def _post(self, path: str, body: dict, timeout: float | None = None) -> dict:
+        """POST to the service, raise MeasurementServiceError on failure.
+
+        ``timeout``: per-request read/connect timeout in seconds. Defaults to
+        300 s. Long-running measurements (e.g. a 64-shot impulse-IR run, which
+        takes several minutes) must pass a generous value or httpx will
+        ReadTimeout mid-measurement and orphan the host-side pw-record process.
+        """
         try:
             import httpx
         except ImportError as exc:
@@ -42,9 +48,10 @@ class MeasurementServiceClient:
                 "httpx is required for MeasurementServiceClient — pip install httpx"
             ) from exc
 
+        effective_timeout = 300.0 if timeout is None else timeout
         url = f"{self.base_url}{path}"
         try:
-            async with httpx.AsyncClient(timeout=300.0) as client:
+            async with httpx.AsyncClient(timeout=effective_timeout) as client:
                 resp = await client.post(url, json=body)
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             raise MeasurementServiceError(
@@ -172,11 +179,15 @@ class MeasurementServiceClient:
         impulse_amplitude: float = 0.9,
     ) -> tuple[list[float], int]:
         """Measure room impulse response. Returns (ir_samples, sample_rate)."""
+        # A 64-shot run takes ~n_averages * record_duration_s seconds plus
+        # per-shot settle/gap overhead; the fixed 300 s default ReadTimeouts on
+        # large runs. Budget 5x the nominal record time per shot + 60 s slack.
+        timeout = max(300.0, n_averages * record_duration_s * 5.0 + 60.0)
         data = await self._post("/measure_impulse_ir", {
             "n_averages": n_averages,
             "record_duration_s": record_duration_s,
             "impulse_amplitude": impulse_amplitude,
-        })
+        }, timeout=timeout)
         result = data["result"]
         return result["ir_samples"], result["sample_rate"]
 

@@ -1252,6 +1252,61 @@ class TestDspPersistedState:
         assert "skipped" in result.detail.lower()
 
 
+# ── Loopback xcorr stability check (R11 gating) ───────────────────────────────
+
+class TestLoopbackXcorrStability:
+    """check_loopback_xcorr_stability — under R11 (2-ch sample-locked loopback)
+    the absolute xcorr spread is benign, so the check must PASS. The legacy
+    1-ch path keeps the drift-detection FAIL behavior.
+    """
+
+    def _sessions_with_peaks(self, peaks):
+        from types import SimpleNamespace
+        return [
+            SimpleNamespace(start_fr=SimpleNamespace(loopback_xcorr_peak_ms=p))
+            for p in peaks
+        ]
+
+    def _config_with_channels(self, channels):
+        from calibrate.config import Config
+        return Config({
+            "denon": {"host": "192.168.1.100"},
+            "minidsp": {"host": "localhost", "port": 5380},
+            "mic": {"name": "UMIK"},
+            "measurement": {"loopback_ref_pw_channels": channels},
+        })
+
+    async def test_legacy_1ch_drift_still_fails(self):
+        # Wide drift: 3.0 vs 5.0 ms
+        config = self._config_with_channels(1)
+        checker = PreflightChecker(config)
+        sessions = self._sessions_with_peaks([3.0, 5.0, 3.1, 4.9])
+        with patch("calibrate.storage.SessionStore") as MockStore:
+            MockStore.return_value.list_sessions.return_value = sessions
+            result = await checker.check_loopback_xcorr_stability()
+        assert not result.passed
+
+    async def test_r11_2ch_drift_passes(self):
+        # Same wide drift, but R11 config → should pass (informational).
+        config = self._config_with_channels(2)
+        checker = PreflightChecker(config)
+        sessions = self._sessions_with_peaks([3.0, 5.0, 3.1, 4.9])
+        with patch("calibrate.storage.SessionStore") as MockStore:
+            MockStore.return_value.list_sessions.return_value = sessions
+            result = await checker.check_loopback_xcorr_stability()
+        assert result.passed
+        assert "R11" in result.detail
+
+    async def test_legacy_1ch_stable_passes(self):
+        config = self._config_with_channels(1)
+        checker = PreflightChecker(config)
+        sessions = self._sessions_with_peaks([3.0, 3.1, 3.05, 3.02])
+        with patch("calibrate.storage.SessionStore") as MockStore:
+            MockStore.return_value.list_sessions.return_value = sessions
+            result = await checker.check_loopback_xcorr_stability()
+        assert result.passed
+
+
 # ── Chain contamination check ─────────────────────────────────────────────────
 
 class TestChainContaminationCheck:
