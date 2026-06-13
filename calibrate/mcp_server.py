@@ -5861,7 +5861,8 @@ async def _tool_measure_impulse_ir(
             ),
         )
     except Exception as exc:
-        return _err(f"measure_impulse_ir failed: {exc}")
+        log.exception("measure_impulse_ir failed")
+        return _err(f"measure_impulse_ir failed: {exc!r}")
 
 
 async def _tool_assign_headroom_tones(
