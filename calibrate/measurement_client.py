@@ -199,3 +199,26 @@ class MeasurementServiceClient:
             "sample_rate": sample_rate,
         })
         return data["result"]
+
+    async def hardware_mute_output(self, output_index: int, muted: bool) -> dict:
+        """Mute or unmute a Scarlett 18i20 physical output via amixer on the Pi host.
+
+        Returns a dict with keys: ok, output_index, line, muted, amixer_card.
+        Raises MeasurementServiceError on service or amixer failure.
+        """
+        data = await self._post("/hardware_mute_output", {
+            "output_index": output_index,
+            "muted": muted,
+        })
+        return data
+
+    async def audio_stack_health(self) -> dict:
+        """Fetch the audio infrastructure health report from the bare-metal service.
+
+        Runs pw-dump, pw-link -l, CamillaDSP websocket, and systemctl on the
+        Pi host and returns a structured dict with keys:
+          ok, healthy, warnings, camilladsp, umik, wiring, services.
+        Raises MeasurementServiceError on service unreachability.
+        """
+        result = await self._get("/audio_stack_health")
+        return result  # type: ignore[return-value]

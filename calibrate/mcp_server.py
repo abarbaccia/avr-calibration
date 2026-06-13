@@ -8620,6 +8620,83 @@ async def _tool_check_system() -> dict:
         return _err(f"check_system error: {exc}")
 
 
+# ── Hardware mute + audio stack diagnostics ────────────────────────────────────
+
+
+async def _tool_hardware_mute_output(output_index: int, muted: bool) -> dict:
+    """Mute/unmute a Scarlett 18i20 physical output via amixer on the Pi host.
+
+    WHY THIS EXISTS: the existing mute_output tool mutes INSIDE CamillaDSP by
+    pushing a gain=-127dB config update, which shifts the PipeWire processing
+    quantum and invalidates loopback timing / cross-measurement phase comparison.
+    Hardware mute at the Scarlett analog output makes NO CamillaDSP config
+    change — required for per-sub solo isolation where phase must be comparable
+    across solos (e.g. Trinnov-style per-sub FIR derivation).
+
+    The Scarlett control name is derived as "Line {output_index+1:02d} Mute":
+      output_index 5 → Line 06 Mute (sub_front_right)
+      output_index 6 → Line 07 Mute (sub_nearfield)
+      output_index 7 → Line 08 Mute (shaker)
+
+    amixer semantics: on=muted, off=unmuted.
+    """
+    from .measurement_client import MeasurementServiceClient, MeasurementServiceError
+
+    client = MeasurementServiceClient()
+    try:
+        result = await client.hardware_mute_output(
+            output_index=int(output_index),
+            muted=bool(muted),
+        )
+        return result
+    except MeasurementServiceError as exc:
+        return _err(f"hardware_mute_output: {exc}")
+    except Exception as exc:
+        return _err(f"hardware_mute_output error: {exc}")
+
+
+async def _tool_diagnose_audio_stack() -> dict:
+    """One-call health report of the audio infrastructure.
+
+    Runs Pi-host commands (pw-dump, pw-link -l, CamillaDSP websocket, systemctl)
+    via the bare-metal avr-measurement service and returns structured JSON.
+
+    Use this instead of a pile of manual SSH checks when something sounds wrong
+    or before starting a calibration session to confirm wiring is intact.
+
+    Returned fields:
+      healthy (bool)       — false if any warning is present
+      warnings ([str])     — human-readable list of all detected problems
+      camilladsp:
+        state              — "Running" | "Starting" | "Idle" | null
+        cpu_load_percent   — float or null
+      umik:
+        present            — whether UMIK node appears in PipeWire graph
+        node_state         — "running" | "idle" | "suspended" | null
+        resample_quality   — integer; MUST be 14 (flags warning if not)
+        autoconnect        — should be false (true = feedback-loop risk)
+      wiring:
+        input3_linked      — avr_cal_sweep → camilladsp_capture:input_3 (load-bearing)
+        loopback_ref_linked — avr_cal_sweep → loopback_ref:playback_1 (deconv ref)
+        umik_into_dsp      — UMIK linked into DSP capture (HAZARD — feedback loop)
+        umik_sources       — list of UMIK node names contributing to DSP capture
+        playback_link_count — number of camilladsp_playback→Scarlett links (expect 20)
+      services:
+        camilladsp.service, avr-measurement.service, camilladsp-watchdog.service
+        → each maps to systemd active-state string ("active" | "inactive" | ...)
+    """
+    from .measurement_client import MeasurementServiceClient, MeasurementServiceError
+
+    client = MeasurementServiceClient()
+    try:
+        result = await client.audio_stack_health()
+        return result
+    except MeasurementServiceError as exc:
+        return _err(f"diagnose_audio_stack: {exc}")
+    except Exception as exc:
+        return _err(f"diagnose_audio_stack error: {exc}")
+
+
 # ── Per-sub modal-FIR data + simulation tools (LLM-first allocation) ─────────
 #
 # These two tools support the per-sub modal-FIR recipe documented in CLAUDE.md
@@ -12538,6 +12615,67 @@ _TOOLS: list[Tool] = [
             "required": ["speaker_passbands"],
         },
     ),
+    Tool(
+        name="hardware_mute_output",
+        description=(
+            "Mute or unmute a Scarlett 18i20 physical output via amixer on the Pi host.\n\n"
+            "WHY THIS EXISTS: the existing mute_output tool mutes INSIDE CamillaDSP by "
+            "pushing a gain=-127dB config update, which shifts the PipeWire processing "
+            "quantum and invalidates loopback timing / cross-measurement phase comparison. "
+            "Hardware mute at the Scarlett analog output makes NO CamillaDSP config "
+            "change — required for per-sub solo isolation where phase must be comparable "
+            "across solos (e.g. Trinnov-style per-sub FIR derivation).\n\n"
+            "Mapping: output_index → Scarlett 'Line {output_index+1:02d} Mute' control.\n"
+            "  output_index 5 → Line 06 Mute (sub_front_right)\n"
+            "  output_index 6 → Line 07 Mute (sub_nearfield)\n"
+            "  output_index 7 → Line 08 Mute (shaker)\n\n"
+            "amixer semantics: muted=true sets 'on', muted=false sets 'off'.\n"
+            "Runs via the bare-metal avr-measurement service."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "output_index": {
+                    "type": "integer",
+                    "description": (
+                        "CamillaDSP output index to mute/unmute. "
+                        "Known values: 5 (sub_front_right), 6 (sub_nearfield), 7 (shaker)."
+                    ),
+                },
+                "muted": {
+                    "type": "boolean",
+                    "description": "true = mute the output; false = unmute.",
+                },
+            },
+            "required": ["output_index", "muted"],
+        },
+    ),
+    Tool(
+        name="diagnose_audio_stack",
+        description=(
+            "One-call health report of the audio infrastructure. "
+            "Use at session start or when something sounds wrong — replaces a pile of "
+            "manual SSH checks.\n\n"
+            "Runs Pi-host commands (pw-dump, pw-link -l, CamillaDSP websocket, systemctl) "
+            "via the bare-metal avr-measurement service and returns structured JSON.\n\n"
+            "Key fields:\n"
+            "  healthy (bool) — false if any warning is present\n"
+            "  warnings ([str]) — human-readable problems (check this first)\n"
+            "  camilladsp.state — 'Running' expected\n"
+            "  umik.resample_quality — MUST be 14\n"
+            "  umik.autoconnect — MUST be false (true = feedback-loop risk)\n"
+            "  wiring.input3_linked — avr_cal_sweep→input_3 (load-bearing LFE sub feed)\n"
+            "  wiring.loopback_ref_linked — avr_cal_sweep→loopback_ref (deconv ref)\n"
+            "  wiring.umik_into_dsp — HAZARD if true (mic feedback loop)\n"
+            "  wiring.playback_link_count — expect 20 (camilladsp_playback→Scarlett)\n"
+            "  services — camilladsp.service, avr-measurement.service, "
+            "camilladsp-watchdog.service active states"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {},
+        },
+    ),
 ]
 
 
@@ -12630,6 +12768,8 @@ def _register_all_tools() -> None:
         ("measure_spl_pink", _tool_measure_spl_pink),
         ("measure_impulse_ir", _tool_measure_impulse_ir),
         ("assign_headroom_tones", _tool_assign_headroom_tones),
+        ("hardware_mute_output", _tool_hardware_mute_output),
+        ("diagnose_audio_stack", _tool_diagnose_audio_stack),
     ]:
         _register(name, fn)
 
