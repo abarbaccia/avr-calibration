@@ -1,15 +1,32 @@
 #!/usr/bin/env bash
-# audio-mode — switch the Pi audio stack between listening / cal / karaoke.
+# audio-mode — switch the Pi audio stack between listening / cal / karaoke,
+# and own ALL camilladsp_capture PipeWire wiring (`audio-mode wire`).
 #
 # Modes:
-#   listening : CamillaDSP runs, pikaraoke container stopped, internal cal_mode=OFF.
-#               Normal home-theater operation. AVR sub pre-out → Scarlett input 3 →
-#               CamillaDSP → Scarlett output → subs.
-#   cal       : CamillaDSP runs, pikaraoke container stopped, internal cal_mode=ON.
-#               Calibration capture routing: snd-aloop → CamillaDSP, bypassing AVR.
-#               (Cal-mode capture flip is delegated to avr-calibration via HTTP.)
+#   listening : CamillaDSP runs, pikaraoke container stopped.
+#               Normal home-theater operation. AVR sub pre-out → Scarlett input 3
+#               (port capture_AUX2) → camilladsp_capture:input_3 → subs.
+#   cal       : CamillaDSP runs, pikaraoke container stopped.
+#               Calibration routing: avr_cal_sweep null sink → camilladsp_capture:input_3.
 #   karaoke   : CamillaDSP stopped, pikaraoke container running. pikaraoke owns
 #               the Scarlett directly — no dmix, no buzz.
+#
+# ── Wiring ownership (single source of truth) ──────────────────────────────
+# CamillaDSP's capture node has node.autoconnect=false (autoconnect_to: null in
+# scarlett.yml). WirePlumber NEVER links camilladsp_capture — history showed WP
+# fallback behaviour linking the UMIK into the DSP capture (mic→subs→room→mic
+# feedback loop, 2026-06-12). All capture links are created here, explicitly:
+#
+#   cal:       avr_cal_sweep:monitor_FL      → camilladsp_capture:input_3
+#   listening: Scarlett:capture_AUX2         → camilladsp_capture:input_3
+#   always:    avr_cal_sweep:monitor_FL      → loopback_ref:playback_1
+#   always:    remove any UMIK→camilladsp_capture links (feedback-loop guard)
+#
+# `audio-mode wire` is invoked from three places so the graph re-converges
+# after every disruption:
+#   1. avr-cal-sweep-link.service (user)  — at session/boot start
+#   2. camilladsp.service ExecStartPost   — after every CamillaDSP restart
+#   3. camilladsp-watchdog.sh             — every poll (idempotent self-heal)
 #
 # State file: /var/lib/audio-mode (single token: listening|cal|karaoke).
 # /var/lib survives reboots; /run (tmpfs) was wiped on every Pi restart, causing
@@ -23,6 +40,23 @@ CAMILLA_SVC="${CAMILLA_SVC:-camilladsp.service}"
 PIKARAOKE_CONTAINER="${PIKARAOKE_CONTAINER:-pikaraoke}"
 CAL_API_URL="${CAL_API_URL:-http://127.0.0.1:8000/api/cal-mode}"
 
+# PipeWire session env — works for both the pi user and root (watchdog).
+PW_ENV="XDG_RUNTIME_DIR=/run/user/1000 PIPEWIRE_RUNTIME_DIR=/run/user/1000"
+
+# Node names. The Scarlett MUST be on the ACP multichannel profile
+# (pinned in 50-scarlett.lua) — the pro-audio profile renames these nodes
+# to pro-output-0/pro-input-0 and breaks every consumer.
+SCARLETT_CAPTURE="alsa_input.usb-Focusrite_Scarlett_18i20_USB_P9W3FNX378D03D-00.multichannel-input"
+SCARLETT_PLAYBACK="alsa_output.usb-Focusrite_Scarlett_18i20_USB_P9W3FNX378D03D-00.multichannel-output"
+UMIK_NODE="alsa_input.usb-miniDSP_Umik-1_Gain__18dB_00002-00.analog-stereo"
+CAM_CAPTURE="camilladsp_capture"
+SWEEP_SINK="avr_cal_sweep"
+LOOPBACK_REF="loopback_ref"
+
+# How long `wire` waits for camilladsp_capture ports to appear (seconds × 0.5).
+# The watchdog sets WIRE_RETRIES=1 — in its healthy path ports always exist.
+WIRE_RETRIES="${WIRE_RETRIES:-12}"
+
 usage() {
     cat <<EOF
 usage: audio-mode <command>
@@ -31,6 +65,10 @@ commands:
   get                       Print current mode (listening|cal|karaoke|unknown).
   set <listening|cal|karaoke>
                             Transition to the named mode.
+  wire [mode]               (Re)create the camilladsp_capture PipeWire links for
+                            the given mode (default: current mode). Idempotent.
+                            Also removes stray UMIK→capture links and ensures the
+                            loopback_ref deconvolution tap.
 
 state file: $STATE_FILE  (persists across reboots)
 EOF
@@ -148,13 +186,109 @@ asyncio.run(go())
 PY
 }
 
-# Note: cal-mode capture flip (analog input vs snd-aloop) is intentionally NOT
-# performed here. MCP server and web server hold separate driver instances in
-# separate processes; mutating cal_mode from a third party desyncs them. The
-# /avr:calibrate recipes flip cal_mode via the MCP tool as their first step,
-# which is the single coordination point. audio-mode just owns the gross
-# Scarlett-ownership question (listening vs karaoke); cal/listening differ
-# only in what the recipe asks CamillaDSP to do once it's running.
+# ── PipeWire wiring ─────────────────────────────────────────────────────────
+
+# pw-link FROM TO. "File exists" = already linked = success (idempotent).
+# Every pw-link is wrapped in `timeout` so a single call can NEVER block:
+# on a mid-convergence/wedged graph pw-link can hang indefinitely, and when
+# this ran synchronously as camilladsp.service ExecStartPost that hang tripped
+# the systemd start-post timeout → daemon killed → restart flap → polluted
+# graph (root cause of the 2026-06-13 boot wedge). Bounded calls + the
+# backgrounded ExecStartPost (see camilladsp.service) make wiring self-healing.
+PW_LINK_TIMEOUT="${PW_LINK_TIMEOUT:-4}"
+link_one() {
+    local out
+    out=$(timeout "$PW_LINK_TIMEOUT" env $PW_ENV pw-link "$1" "$2" 2>&1) && return 0
+    echo "$out" | grep -q 'File exists' && return 0
+    return 1
+}
+
+unlink_one() { timeout "$PW_LINK_TIMEOUT" env $PW_ENV pw-link -d "$1" "$2" 2>/dev/null || true; }
+
+port_exists() {
+    timeout "$PW_LINK_TIMEOUT" env $PW_ENV pw-link -o -i 2>/dev/null | grep -qF "$1"
+}
+
+remove_umik_links() {
+    # Feedback-loop guard: the UMIK is captured directly by the bare-metal
+    # measurement service (PortAudio). A UMIK→camilladsp_capture link creates
+    # a mic→DSP→subs→room→mic acoustic loop (fabricated per-sub deficits,
+    # ±21 dB polarity-flip swings — verified 2026-06-12).
+    for port in input_1 input_2 input_3 input_4; do
+        unlink_one "${UMIK_NODE}:capture_FL" "${CAM_CAPTURE}:${port}"
+        unlink_one "${UMIK_NODE}:capture_FR" "${CAM_CAPTURE}:${port}"
+    done
+}
+
+cmd_wire() {
+    local mode="${1:-$(current_mode)}"
+
+    case "$mode" in
+        karaoke)
+            log "wire: karaoke mode — CamillaDSP down, nothing to wire"
+            return 0
+            ;;
+        listening|cal) ;;
+        *)
+            log "wire: unknown mode '$mode' — set a mode first (audio-mode set <mode>)"
+            return 2
+            ;;
+    esac
+
+    remove_umik_links
+
+    # Deconvolution reference tap (static null sinks; independent of CamillaDSP).
+    link_one "${SWEEP_SINK}:monitor_FL" "${LOOPBACK_REF}:playback_1" \
+        || log "WARNING: loopback_ref link failed (${SWEEP_SINK} or ${LOOPBACK_REF} missing?)"
+
+    # Playback: camilladsp_playback:output_N+1 → Scarlett playback_AUXN (20 ch).
+    # WP 0.4.13's link policy wedges permanently when any client dies mid-
+    # activation ("N pending linkables... should never happen"), after which it
+    # creates no links at all. We stopped depending on it: wire owns these too.
+    local n ok=0
+    for n in $(seq 0 19); do
+        link_one "camilladsp_playback:output_$((n+1))" \
+                 "${SCARLETT_PLAYBACK}:playback_AUX${n}" && ok=$((ok+1))
+    done
+    [ "$ok" -lt 20 ] && log "WARNING: only ${ok}/20 playback→Scarlett links up"
+
+    # camilladsp_capture ports appear a moment after CamillaDSP starts — retry.
+    local i
+    for i in $(seq 1 "$WIRE_RETRIES"); do
+        port_exists "${CAM_CAPTURE}:input_3" && break
+        if [ "$i" -eq "$WIRE_RETRIES" ]; then
+            log "WARNING: ${CAM_CAPTURE}:input_3 not found after ${WIRE_RETRIES} attempts — is CamillaDSP running?"
+            return 1
+        fi
+        sleep 0.5
+    done
+
+    case "$mode" in
+        cal)
+            unlink_one "${SCARLETT_CAPTURE}:capture_AUX2" "${CAM_CAPTURE}:input_3"
+            if link_one "${SWEEP_SINK}:monitor_FL" "${CAM_CAPTURE}:input_3"; then
+                log "wired (cal): ${CAM_CAPTURE}:input_3 ← ${SWEEP_SINK}:monitor_FL"
+            else
+                log "ERROR: could not link ${SWEEP_SINK} → ${CAM_CAPTURE}:input_3"
+                return 1
+            fi
+            ;;
+        listening)
+            unlink_one "${SWEEP_SINK}:monitor_FL" "${CAM_CAPTURE}:input_3"
+            if link_one "${SCARLETT_CAPTURE}:capture_AUX2" "${CAM_CAPTURE}:input_3"; then
+                log "wired (listening): ${CAM_CAPTURE}:input_3 ← Scarlett:capture_AUX2 (Denon LFE)"
+            else
+                log "ERROR: could not link Scarlett:capture_AUX2 → ${CAM_CAPTURE}:input_3"
+                return 1
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# Note: CamillaDSP-internal cal_mode state is still owned by the avr-calibration
+# recipes via MCP (single coordination point). `wire` owns only the PW-graph
+# question: which source feeds camilladsp_capture:input_3.
 
 cmd_set() {
     local target="$1"
@@ -163,19 +297,21 @@ cmd_set() {
             kill_kiosk                            # free Scarlett before camilladsp grabs it
             ensure_pikaraoke_down
             ensure_camilladsp_up || true
-            set_shaker_mute off                   # shaker unmuted in listening
             write_state listening
+            cmd_wire listening || true
+            set_shaker_mute off                   # shaker unmuted in listening
             relaunch_kiosk                        # kiosk back up; can't grab Scarlett (camilla has it) — fine
-            log "→ listening  (subs + shakers unmuted)"
+            log "→ listening  (Scarlett:AUX2 → input_3; subs + shakers unmuted)"
             ;;
         cal)
             kill_kiosk                            # free Scarlett before camilladsp grabs it
             ensure_pikaraoke_down
             ensure_camilladsp_up || true
-            set_shaker_mute on                    # shaker muted during calibration
             write_state cal
+            cmd_wire cal || true
+            set_shaker_mute on                    # shaker muted during calibration
             relaunch_kiosk
-            log "→ cal  (shaker muted; recipes flip CamillaDSP cal capture via MCP)"
+            log "→ cal  (avr_cal_sweep → input_3; shaker muted)"
             ;;
         karaoke)
             ensure_camilladsp_down                # release Scarlett for Chromium
@@ -196,6 +332,7 @@ cmd_set() {
 case "${1:-}" in
     get)            current_mode ;;
     set)            shift; cmd_set "${1:-}" ;;
+    wire)           shift; cmd_wire "${1:-}" ;;
     ""|-h|--help)   usage ;;
     *)              usage; exit 2 ;;
 esac

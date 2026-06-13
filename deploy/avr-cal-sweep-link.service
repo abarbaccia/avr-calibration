@@ -1,19 +1,26 @@
 [Unit]
-# PipeWire null sink (`avr_cal_sweep`) + persistent links into camilladsp_capture
-# (input_3, the LFE feed) and loopback_ref (deconvolution reference). Lets the
-# measurement engine play sweeps into the PipeWire graph end-to-end (USB route).
+# Boot-time convergence of the camilladsp_capture PipeWire wiring.
+#
+# The null sinks (avr_cal_sweep, loopback_ref) are created by the PipeWire
+# daemon itself (/etc/pipewire/pipewire.conf.d/10-avr-cal-sweep.conf,
+# 11-loopback-ref.conf). camilladsp_capture has node.autoconnect=false, so
+# WirePlumber never links it — `audio-mode wire` is the single wiring owner
+# (mode-aware: cal → avr_cal_sweep, listening → Scarlett AUX2; plus the
+# loopback_ref deconvolution tap and UMIK feedback-loop guard).
+#
+# This unit handles the session-start case. camilladsp.service ExecStartPost
+# and camilladsp-watchdog.sh handle restarts and continuous self-heal.
 #
 # Runs as the `pi` user via the user manager (XDG_RUNTIME_DIR=/run/user/1000)
 # so it joins the same PipeWire session WirePlumber owns.
-Description=Create avr_cal_sweep PipeWire sink + link to camilladsp_capture
+Description=Wire camilladsp_capture PipeWire links for the current audio mode
 After=pipewire.service wireplumber.service
 Requires=pipewire.service wireplumber.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/sbin/avr-cal-sweep-link.sh up
-ExecStop=/usr/local/sbin/avr-cal-sweep-link.sh down
+ExecStart=/usr/local/sbin/audio-mode wire
 
 [Install]
 WantedBy=default.target

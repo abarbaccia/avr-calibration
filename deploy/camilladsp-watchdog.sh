@@ -25,6 +25,10 @@ STATUS_FILE="${STATUS_FILE:-/run/avr-status.json}"
 LED_ACT="/sys/class/leds/ACT"
 LED_PWR="/sys/class/leds/PWR"
 STALL_RESTART_THRESHOLD="${STALL_RESTART_THRESHOLD:-2}"
+# Don't restart camilladsp.service for stalls within this many seconds of it
+# becoming active — at boot the PW graph + capture wiring take longer than one
+# poll cycle to converge, and a premature restart wedges the graph.
+BOOT_GRACE_S="${BOOT_GRACE_S:-180}"
 
 stall_count=0
 
@@ -112,27 +116,55 @@ write_status() {
 EOF
 }
 
+# audio-mode state file. /var/lib survives reboots — the watchdog previously
+# read /run/audio-mode, which audio-mode stopped writing when its state moved
+# to /var/lib (the stale path silently disabled karaoke-awareness).
+AUDIO_MODE_FILE="${AUDIO_MODE_FILE:-/var/lib/audio-mode}"
+
+read_audio_mode() {
+    [ -r "$AUDIO_MODE_FILE" ] && cat "$AUDIO_MODE_FILE" 2>/dev/null || echo "unknown"
+}
+
 log "starting (poll=${POLL_INTERVAL_S}s, stall-restart=${STALL_RESTART_THRESHOLD})"
 
 while true; do
     # audio-mode awareness: during karaoke, CamillaDSP is intentionally stopped.
     # Skip the probe + self-heal path so the watchdog does not fight the mode switch.
-    if [ -r /run/audio-mode ] && [ "$(cat /run/audio-mode 2>/dev/null)" = "karaoke" ]; then
+    if [ "$(read_audio_mode)" = "karaoke" ]; then
         camilla="karaoke"
         stall_count=0
     elif probe_camilladsp; then
         camilla="running"
         stall_count=0
+        # PW-graph self-heal: camilladsp_capture links die whenever the capture
+        # node's ports are recreated (CamillaDSP or WirePlumber restart), and
+        # WirePlumber never relinks them (node.autoconnect=false by design).
+        # audio-mode wire is idempotent and fast when links already exist.
+        # WIRE_RETRIES=1: in this healthy path the ports must already exist.
+        WIRE_RETRIES=1 /usr/local/sbin/audio-mode wire >/dev/null 2>&1 \
+            || log "audio-mode wire failed (will retry next poll)"
     else
         camilla="stalled"
         stall_count=$((stall_count + 1))
         log "CamillaDSP not Running (consecutive: $stall_count)"
-        if [ "$stall_count" -ge "$STALL_RESTART_THRESHOLD" ]; then
-            log "restarting camilladsp.service after $stall_count consecutive stalls"
+        # A "not Running" daemon at boot is usually just UNWIRED: its capture
+        # (input_3 ← avr_cal_sweep:monitor) hasn't been linked yet, so it never
+        # leaves Starting. Restarting it here only wedges the graph (verified
+        # 2026-06-13: a mid-init restart left the null sink a detached driver and
+        # hung the daemon in 'deactivating'). So: try to WIRE it first — that is
+        # what actually lets it reach Running — and only restart as a last resort,
+        # and never during the boot grace window while it is still converging.
+        WIRE_RETRIES=2 /usr/local/sbin/audio-mode wire >/dev/null 2>&1 || true
+        svc_started=$(date -d "$(systemctl show camilladsp.service -p ActiveEnterTimestamp --value 2>/dev/null)" +%s 2>/dev/null || echo 0)
+        svc_uptime=$(( $(date +%s) - svc_started ))
+        if [ "$stall_count" -ge "$STALL_RESTART_THRESHOLD" ] && [ "$svc_started" -gt 0 ] && [ "$svc_uptime" -ge "$BOOT_GRACE_S" ]; then
+            log "restarting camilladsp.service after $stall_count consecutive stalls (uptime ${svc_uptime}s)"
             systemctl restart camilladsp || log "systemctl restart failed"
             # Give it a moment before next probe; don't reset stall_count here,
             # the next successful probe will. If restart didn't help, we stay red.
             sleep 5
+        elif [ "$stall_count" -ge "$STALL_RESTART_THRESHOLD" ]; then
+            log "stalled but within boot grace (uptime ${svc_uptime}s < ${BOOT_GRACE_S}s) — wiring, not restarting"
         fi
     fi
 
@@ -142,8 +174,7 @@ while true; do
         avr="down"
     fi
 
-    audio_mode="unknown"
-    [ -r /run/audio-mode ] && audio_mode="$(cat /run/audio-mode 2>/dev/null)"
+    audio_mode="$(read_audio_mode)"
 
     if [ "$camilla" = "stalled" ]; then
         led_state="camilla_stalled"
