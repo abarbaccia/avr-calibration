@@ -2250,8 +2250,15 @@ def test_camilladsp_default_devices_are_pipewire_shaped() -> None:
     assert pb["type"] == "PipeWire"
     assert "node_name" in cap and cap["node_name"]
     assert "node_name" in pb and pb["node_name"]
-    assert "autoconnect_to" in cap and "Scarlett" in cap["autoconnect_to"]
-    assert "autoconnect_to" in pb and "Scarlett" in pb["autoconnect_to"]
+    # autoconnect_to MUST be None for BOTH capture and playback: WirePlumber is a
+    # device-enumerator only on this rig and must never auto-link our nodes.
+    # `audio-mode wire` owns every link (capture:input_3 + 20 playback→Scarlett).
+    # A non-null autoconnect_to lets WP fall back to linking the node into any sink
+    # — the root cause of UMIK→capture (feedback loop) and
+    # camilladsp_playback→loopback_ref (deconvolution-reference contamination →
+    # "suspiciously flat FR" measurement failures). Regression guard.
+    assert cap["autoconnect_to"] is None
+    assert pb["autoconnect_to"] is None
     # PipeWire negotiates format; no explicit format key on the device dict.
     assert "format" not in cap
     assert "format" not in pb

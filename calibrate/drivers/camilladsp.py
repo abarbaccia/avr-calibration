@@ -72,17 +72,27 @@ _SCARLETT_PIPEWIRE_OUTPUT_NODE = (
     "alsa_output.usb-Focusrite_Scarlett_18i20_USB_P9W3FNX378D03D-00.multichannel-output"
 )
 
+# autoconnect_to is None for BOTH capture and playback by design: WirePlumber is a
+# device-enumerator only on this rig — it must NEVER auto-link our nodes. A non-null
+# autoconnect_to makes the node autoconnect=true, and when WP can't cleanly reach the
+# target it falls back to linking the node into ANY sink. That fallback is the single
+# root cause of the chronic failures: UMIK→camilladsp_capture (mic feedback loop) and
+# camilladsp_playback→loopback_ref (deconvolution-reference contamination → "flat FR"
+# measurement failures). With autoconnect=false on every node, `audio-mode wire` is the
+# sole, uncontested wiring owner (it creates capture:input_3 and all 20 playback→Scarlett
+# links explicitly, and re-converges from the watchdog). The _SCARLETT_*_NODE names are
+# kept for reference/documentation and for audio-mode, not for autoconnect.
 _DEFAULT_CAPTURE_DEVICE: dict[str, Any] = {
     "type": "PipeWire",
     "channels": 2,
     "node_name": "camilladsp_capture",
-    "autoconnect_to": _SCARLETT_PIPEWIRE_INPUT_NODE,
+    "autoconnect_to": None,
 }
 _DEFAULT_PLAYBACK_DEVICE: dict[str, Any] = {
     "type": "PipeWire",
     "channels": 10,
     "node_name": "camilladsp_playback",
-    "autoconnect_to": _SCARLETT_PIPEWIRE_OUTPUT_NODE,
+    "autoconnect_to": None,
 }
 
 

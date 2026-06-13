@@ -2165,6 +2165,45 @@ async def test_apply_fir_rejects_unbound_output_index(mock_dsp) -> None:
 
 
 @pytest.mark.asyncio
+async def test_reset_dsp_defaults_clears_mute(mock_dsp) -> None:
+    """reset_dsp_defaults MUST unmute every output.
+
+    `mute` is a SEPARATE flag from `gain_db`; a reset that only zeroes gain
+    leaves a stale mute that silently silences the output. This caused a
+    "sweep not detected" debugging session on 2026-06-13 — output 5 had
+    gain_reset=true but stayed mute=True from a prior run. Regression guard
+    for docs/pipewire-architecture.md R9.
+    """
+    from calibrate.graph import SignalGraph, Transducer
+    from calibrate import mcp_server as _mod
+    graph = SignalGraph(
+        sources=[], processors=[],
+        transducers=[
+            Transducer(name="sub5", role="sub", processor_ref="camilla", output_index=5,
+                       safety_profile_ref="svs_pb12_nsd", position=None),
+            Transducer(name="sub6", role="sub", processor_ref="camilla", output_index=6,
+                       safety_profile_ref="svs_pb12_nsd", position=None),
+        ],
+        groups=[], profiles=[],
+    )
+    cfg = MagicMock()
+    cfg.signal_graph = graph
+    with patch.object(_mod, "_config", return_value=cfg), \
+         patch.object(_mod, "_persist_dsp_state", lambda *a, **k: None):
+        await _tool_reset_dsp_defaults(dry_run=False)
+    # Every output must have been explicitly unmuted.
+    unmuted_indices = [
+        idx
+        for call in mock_dsp.unmute_outputs.await_args_list
+        for idx in call.args[0]
+    ]
+    assert 5 in unmuted_indices and 6 in unmuted_indices, (
+        f"reset must unmute every output; unmute_outputs calls="
+        f"{mock_dsp.unmute_outputs.await_args_list}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_clear_fir_rejects_unbound_output_index(mock_dsp) -> None:
     """clear_fir must reject indices not bound to a transducer when graph has any."""
     from calibrate.graph import SignalGraph, Transducer
@@ -6793,6 +6832,7 @@ async def test_reset_dsp_defaults_dry_run_does_not_touch_hardware(mock_dsp) -> N
     mock_dsp.set_output_gain.assert_not_awaited()
     mock_dsp.set_output_delay.assert_not_awaited()
     mock_dsp.clear_fir.assert_not_awaited()
+    mock_dsp.unmute_outputs.assert_not_awaited()  # R9: mute reset is also dry_run-gated
 
 
 @pytest.mark.asyncio

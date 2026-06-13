@@ -5537,13 +5537,22 @@ async def _tool_trigger_measurement(
         from .measurement_client import MeasurementServiceClient, MeasurementServiceError
         cfg = _config()
         mic_name = cfg.mic.get("name", "UMIK")
-        _meas_client = MeasurementServiceClient()
-        _idx, _dev = await _meas_client.find_umik_device(name_substring=mic_name)
-        if _idx is None:
-            return _err(
-                f"trigger_measurement requires {mic_name} microphone — none found on Pi host. "
-                "Check USB connection and that avr-measurement.service is running."
-            )
+        # R11 (docs/pipewire-architecture.md §6b): when the mic is captured via the
+        # 2-ch loopback_ref node, the UMIK is routed INTO loopback_ref and is no
+        # longer a standalone PortAudio capture device, so the legacy PortAudio
+        # find_umik_device probe spuriously reports "none found". In that mode the
+        # mic's presence is established by the loopback_ref:playback_FR link and
+        # the downstream flat-FR / ref-mic-identity guards, not by a PortAudio
+        # device enumeration. Only run the PortAudio probe on the legacy 1-ch path.
+        _loopback_2ch = int(cfg.measurement.get("loopback_ref_pw_channels", 1)) >= 2
+        if not _loopback_2ch:
+            _meas_client = MeasurementServiceClient()
+            _idx, _dev = await _meas_client.find_umik_device(name_substring=mic_name)
+            if _idx is None:
+                return _err(
+                    f"trigger_measurement requires {mic_name} microphone — none found on Pi host. "
+                    "Check USB connection and that avr-measurement.service is running."
+                )
     except MeasurementServiceError as exc:
         return _err(str(exc))
     except Exception as exc:
@@ -7503,6 +7512,22 @@ async def _tool_reset_dsp_defaults(
                 except Exception as exc:
                     log.warning("reset_dsp_defaults gain %s: %s", tname, exc)
             t_changes["gain_reset"] = True
+
+            # mute → False.  mute is a SEPARATE flag from gain_db: a reset that
+            # only zeroes gain leaves a stale mute that silently silences the
+            # output. Output 5 once survived a "reset" muted (gain_reset=true,
+            # mute=True) and produced "sweep not detected" for a full debugging
+            # session (2026-06-13). See docs/pipewire-architecture.md R9.
+            if not dry_run:
+                try:
+                    await _dsp.unmute_outputs([out_idx])  # type: ignore[union-attr]
+                    _persist_dsp_state(
+                        dsp_output_key(proc, out_idx, "mute"),
+                        {"muted": False},
+                    )
+                except Exception as exc:
+                    log.warning("reset_dsp_defaults mute %s: %s", tname, exc)
+            t_changes["mute_reset"] = True
 
             # delay → 0 ms
             if not dry_run:

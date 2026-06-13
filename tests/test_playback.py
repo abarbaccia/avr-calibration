@@ -426,6 +426,45 @@ class TestVerifyPwRecordBinding:
         assert reason == ""
 
 
+def test_start_pw_record_multi_source_links_each_source_in_order():
+    """_start_pw_record_multi_source starts pw-record with autoconnect OFF and
+    pw-links each source port to the recorder's input ports IN ORDER, so channel
+    k captures source_ports[k]. This is the R11 fix for `--target`'s
+    duplicate-one-channel behavior on a multi-ch sink monitor."""
+    import subprocess as _sp
+    from calibrate.drivers.playback import _start_pw_record_multi_source
+
+    fake_proc = MagicMock()
+    fake_proc.stdout.read.return_value = b""  # reader thread exits immediately
+    link_calls: list[list[str]] = []
+
+    def fake_run(cmd, *a, **k):
+        r = MagicMock()
+        if cmd[:2] == ["pw-link", "-i"]:
+            r.stdout = "cal_caprec_2ch:input_FL\ncal_caprec_2ch:input_FR\n"
+        else:
+            link_calls.append(cmd)
+            r.stdout = ""
+        return r
+
+    with (
+        patch.object(_sp, "Popen", return_value=fake_proc) as popen,
+        patch.object(_sp, "run", side_effect=fake_run),
+    ):
+        proc, chunks, t = _start_pw_record_multi_source(
+            ["loopback_ref:monitor_FL", "loopback_ref:monitor_FR"], 48000,
+        )
+        t.join(timeout=2.0)
+
+    popen_cmd = popen.call_args[0][0]
+    assert popen_cmd[0] == "pw-record"
+    assert "node.autoconnect=false" in popen_cmd
+    assert "2" in popen_cmd  # --channels 2
+    # Each source linked to the matching input port, in order.
+    assert ["pw-link", "loopback_ref:monitor_FL", "cal_caprec_2ch:input_FL"] in link_calls
+    assert ["pw-link", "loopback_ref:monitor_FR", "cal_caprec_2ch:input_FR"] in link_calls
+
+
 # ── LoopbackRefPlayback pw-record binding + identity checks ──────────────────
 
 class TestLoopbackRefPlaybackBinding:
@@ -472,6 +511,158 @@ class TestLoopbackRefPlaybackBinding:
 
         assert np.any(ref_out != 0), "ref_1d must be non-zero when binding is confirmed"
 
+    def test_mic_capture_starts_concurrently_with_binding_verify(self):
+        """R7: the base (mic) capture MUST start concurrently with ref binding
+        verification, not after it.
+
+        The old order was: start ref pw-record → block on
+        _verify_pw_record_binding (100s of ms, variable) → start mic capture.
+        That variable gap injected a large, run-to-run-variable ref/mic timebase
+        offset (observed avr_processing_ms 650–858 ms) that shoved the IR around
+        the analysis gate and collapsed the coherence proxy differently every
+        run. The base's PRE_DELAY gives the verify ample time to finish before the
+        sweep plays, so the verify must run *concurrently* with the base, not
+        gate it. Regression guard for docs/pipewire-architecture.md R7.
+        """
+        import time as _t
+        n = 4800
+        mic = np.sin(2 * np.pi * 50 * np.arange(n) / 48000) * 0.1
+        ref = np.sin(2 * np.pi * 50 * np.arange(n) / 48000) * 0.3
+        chunks: list[bytes] = [self._ref_raw_bytes(ref)]
+
+        verify_end: list[float] = []
+        base_started: list[float] = []
+
+        def _slow_verify(*a, **k):
+            _t.sleep(0.2)
+            verify_end.append(_t.monotonic())
+            return (True, "")
+
+        base = MagicMock()
+        sweep_1d = np.linspace(-0.5, 0.5, n)
+
+        def _base_play(*a, **k):
+            base_started.append(_t.monotonic())
+            return (sweep_1d, mic)
+
+        base.play_and_record = MagicMock(side_effect=_base_play)
+        base.skip_warmup = True
+
+        with (
+            patch(
+                "calibrate.drivers.playback._start_pw_record",
+                return_value=(MagicMock(), chunks, MagicMock()),
+            ),
+            patch("calibrate.drivers.playback._stop_pw_record"),
+            patch("calibrate.drivers.playback._verify_pw_record_binding", side_effect=_slow_verify),
+        ):
+            strategy = LoopbackRefPlayback(
+                base=base,
+                ref_pipewire_node="loopback_ref",
+                ref_pw_channels=1,
+            )
+            strategy.play_and_record(MagicMock(), 48000, 1, 1)
+
+        assert base_started and verify_end, "both base and verify must have run"
+        assert base_started[0] < verify_end[0], (
+            "mic capture (base) must start BEFORE binding verification completes; "
+            f"it started {base_started[0] - verify_end[0]:.3f}s relative to verify end "
+            "(positive = started after verify, the R7 bug)"
+        )
+
+    def test_r11_single_2ch_capture_splits_ref_and_mic(self):
+        """R11: with a 2-ch loopback capture, ref=ch0 and mic=ch1 come from ONE
+        sample-locked recording; the base strategy's separately-captured mic is
+        ignored. This is the structural fix for the inter-stream timebase offset
+        (docs/pipewire-architecture.md §6b)."""
+        n = 4800
+        ref_ch0 = np.sin(2 * np.pi * 50 * np.arange(n) / 48000) * 0.30   # stimulus ref
+        mic_ch1 = np.sin(2 * np.pi * 50 * np.arange(n) / 48000) * 0.07   # room mic (distinct level)
+        base_mic = np.full(n, 0.999, dtype=np.float64)                   # WRONG mic — must be ignored
+        interleaved = np.stack([ref_ch0, mic_ch1], axis=1).astype(np.float32).tobytes()
+        chunks: list[bytes] = [interleaved]
+
+        base = MagicMock()
+        sweep_1d = np.linspace(-0.5, 0.5, n)
+        base.play_and_record = MagicMock(return_value=(sweep_1d, base_mic))
+        base.skip_warmup = True
+
+        with (
+            patch(
+                "calibrate.drivers.playback._start_pw_record_multi_source",
+                return_value=(MagicMock(), chunks, MagicMock()),
+            ),
+            patch("calibrate.drivers.playback._stop_pw_record"),
+            patch("calibrate.drivers.playback._verify_pw_record_binding", return_value=(True, "")),
+        ):
+            strategy = LoopbackRefPlayback(
+                base=base,
+                ref_pipewire_node="loopback_ref",
+                ref_pw_channels=2,
+            )
+            sweep_out, mic_out, ref_out = strategy.play_and_record(MagicMock(), 48000, 1, 1)
+
+        assert np.allclose(ref_out[:200], ref_ch0[:200], atol=1e-4), "ref must be loopback ch0"
+        assert np.allclose(mic_out[:200], mic_ch1[:200], atol=1e-4), (
+            "mic must be loopback ch1 (sample-locked with ref), not the base strategy's mic"
+        )
+        assert not np.allclose(mic_out[:200], base_mic[:200]), (
+            "base strategy mic must be IGNORED in R11 2-ch mode"
+        )
+
+    def test_r11_2ch_raw_too_short_zeroes_ref(self):
+        """R11 error branch: if the 2-ch recording has too few bytes to decode,
+        the ref is zeroed (deconvolution falls back to the analytical template)."""
+        n = 4800
+        base_mic = np.sin(2 * np.pi * 50 * np.arange(n) / 48000) * 0.1
+        chunks: list[bytes] = [b"\x00\x00\x00\x00"]  # one float32 < 2ch*4 bytes
+
+        base = MagicMock()
+        base.play_and_record = MagicMock(return_value=(np.linspace(-0.5, 0.5, n), base_mic))
+        base.skip_warmup = True
+
+        with (
+            patch(
+                "calibrate.drivers.playback._start_pw_record_multi_source",
+                return_value=(MagicMock(), chunks, MagicMock()),
+            ),
+            patch("calibrate.drivers.playback._stop_pw_record"),
+            patch("calibrate.drivers.playback._verify_pw_record_binding", return_value=(True, "")),
+        ):
+            strategy = LoopbackRefPlayback(
+                base=base, ref_pipewire_node="loopback_ref", ref_pw_channels=2,
+            )
+            _sweep, _mic, ref_out = strategy.play_and_record(MagicMock(), 48000, 1, 1)
+
+        assert np.all(ref_out == 0), "ref must be zeroed when 2-ch raw is too short"
+
+    def test_r11_2ch_parse_exception_zeroes_ref(self):
+        """R11 error branch: a malformed 2-ch buffer (size not divisible by 2)
+        raises in reshape; it must be caught and the ref zeroed, not propagated."""
+        n = 4800
+        base_mic = np.sin(2 * np.pi * 50 * np.arange(n) / 48000) * 0.1
+        # 3 float32 samples → passes the >=2ch*4 byte guard but reshape(-1,2) fails.
+        chunks: list[bytes] = [np.zeros(3, dtype=np.float32).tobytes()]
+
+        base = MagicMock()
+        base.play_and_record = MagicMock(return_value=(np.linspace(-0.5, 0.5, n), base_mic))
+        base.skip_warmup = True
+
+        with (
+            patch(
+                "calibrate.drivers.playback._start_pw_record_multi_source",
+                return_value=(MagicMock(), chunks, MagicMock()),
+            ),
+            patch("calibrate.drivers.playback._stop_pw_record"),
+            patch("calibrate.drivers.playback._verify_pw_record_binding", return_value=(True, "")),
+        ):
+            strategy = LoopbackRefPlayback(
+                base=base, ref_pipewire_node="loopback_ref", ref_pw_channels=2,
+            )
+            _sweep, _mic, ref_out = strategy.play_and_record(MagicMock(), 48000, 1, 1)
+
+        assert np.all(ref_out == 0), "ref must be zeroed when 2-ch buffer is malformed"
+
     def test_wrong_binding_zeroes_ref(self):
         """When pw-link reports wrong binding, ref_1d is zeros."""
         n = 4800
@@ -504,6 +695,11 @@ class TestLoopbackRefPlaybackBinding:
             sweep_out, mic_out, ref_out = strategy.play_and_record(MagicMock(), 48000, 1, 1)
 
         assert np.all(ref_out == 0), "ref_1d must be all-zeros when binding check fails"
+        # R7: the base now runs CONCURRENTLY with a failing binding verify, so the
+        # sweep/mic result must still be valid (only the ref is sacrificed) —
+        # deconvolution falls back to the analytical sweep template.
+        assert sweep_out is not None and mic_out is not None
+        assert np.any(mic_out != 0), "mic recording must survive a binding-verify failure"
 
     def test_identity_check_zeroes_ref_when_ref_matches_mic(self):
         """When ref and mic peak+rms are within 0.5 dB, ref_1d is zeroed (same source)."""

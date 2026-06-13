@@ -67,6 +67,80 @@ def _start_pw_record(
     return proc, chunks, t
 
 
+def _start_pw_record_multi_source(
+    source_ports: list[str],
+    sample_rate: int,
+    node_name: str = "cal_caprec_2ch",
+) -> tuple:
+    """Capture N explicit source ports into ONE sample-locked pw-record stream.
+
+    `pw-record --target <sink>` on a multi-channel sink monitor collapses to a
+    single duplicated channel (verified: the two captured channels come back
+    bit-identical), so it cannot capture loopback_ref's distinct ref (FL) and
+    mic (FR) monitor ports. The fix (R11, docs/pipewire-architecture.md §6b) is
+    to start pw-record with autoconnect DISABLED and then explicitly `pw-link`
+    each source port to the recorder's input ports in order. Because it is one
+    stream, the channels share one clock and one start instant — there is no
+    inter-stream offset to corrupt the deconvolution.
+
+    `source_ports` order maps to channel order: source_ports[0] → channel 0, etc.
+    Returns (proc, chunks, reader_thread); caller uses `_stop_pw_record`.
+    """
+    import subprocess
+    import threading
+    import time as _t
+
+    n = len(source_ports)
+    cmd = [
+        "pw-record",
+        "--channels", str(n),
+        "--rate", str(sample_rate),
+        "--format", "f32",
+        "-P", "node.autoconnect=false",
+        "-P", f"node.name={node_name}",
+        "-",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    chunks: list[bytes] = []
+
+    def _read():
+        try:
+            while True:
+                data = proc.stdout.read(4096)
+                if not data:
+                    break
+                chunks.append(data)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_read, daemon=True)
+    t.start()
+
+    # Wait for the recorder's input ports to appear, then link each source
+    # explicitly (in order) so channel k captures source_ports[k].
+    in_ports: list[str] = []
+    for _ in range(30):  # up to ~3 s
+        try:
+            listing = subprocess.run(
+                ["pw-link", "-i"], capture_output=True, text=True, timeout=4
+            ).stdout
+        except Exception:
+            listing = ""
+        in_ports = [
+            ln.strip() for ln in listing.splitlines()
+            if ln.strip().startswith(f"{node_name}:")
+        ]
+        if len(in_ports) >= n:
+            break
+        _t.sleep(0.1)
+    for src, dst in zip(source_ports, in_ports[:n]):
+        try:
+            subprocess.run(["pw-link", src, dst], timeout=4, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    return proc, chunks, t
+
+
 def _stop_pw_record(proc, reader_thread) -> None:
     """Terminate pw-record and wait for the reader thread to drain."""
     try:
@@ -921,19 +995,42 @@ class LoopbackRefPlayback:
             ref_chunks: list[bytes] = []
             ref_reader = None
             try:
-                ref_proc, ref_chunks, ref_reader = _start_pw_record(
-                    self.ref_pipewire_node, sample_rate, channels=self.ref_pw_channels
-                )
+                if self.ref_pw_channels >= 2:
+                    # R11: capture the 2-ch loopback_ref monitor as ONE sample-locked
+                    # stream — ch0=ref (monitor_FL), ch1=mic (monitor_FR) — via
+                    # explicit per-port linking. `--target` would duplicate one
+                    # channel onto both (verified), so we link the two distinct
+                    # monitor ports ourselves. (docs/pipewire-architecture.md §6b)
+                    ref_proc, ref_chunks, ref_reader = _start_pw_record_multi_source(
+                        [f"{self.ref_pipewire_node}:monitor_FL",
+                         f"{self.ref_pipewire_node}:monitor_FR"],
+                        sample_rate,
+                    )
+                else:
+                    ref_proc, ref_chunks, ref_reader = _start_pw_record(
+                        self.ref_pipewire_node, sample_rate, channels=self.ref_pw_channels
+                    )
             except Exception as exc:
                 ref_failed[0] = True
                 ref_error[0] = f"pw-record start failed: {exc}"
 
-            # Verify that pw-record actually bound to the configured node.
-            # Without this check, PipeWire silently falls back to the default
-            # source (typically the UMIK mic) when the target node is absent.
-            # That produces a "loopback ref" that is statistically identical to
-            # the mic recording, making deconvolution timing completely degenerate
-            # (observed: avr_processing_ms bouncing 3–13 ms across sessions).
+            # R7 (docs/pipewire-architecture.md): start the mic/base capture
+            # IMMEDIATELY so the ref and mic pw-records share ~t0. The old order
+            # blocked on binding verification (100s of ms, variable) BETWEEN
+            # ref-start and mic-start, injecting a large, run-to-run-variable
+            # ref/mic timebase offset (observed avr_processing_ms 650–858 ms) that
+            # shoved the IR around the analysis gate and collapsed the coherence
+            # proxy differently every run. The base's PRE_DELAY gives binding
+            # verification ample time to finish before the sweep plays, so verify
+            # must run CONCURRENTLY with the base — not gate the mic start.
+            base_thread = threading.Thread(target=_base_runner, daemon=True)
+            base_thread.start()
+
+            # Verify that pw-record actually bound to the configured node,
+            # concurrently with the base PRE_DELAY window. Without this check,
+            # PipeWire silently falls back to the default source (typically the
+            # UMIK mic) when the target node is absent, producing a "loopback ref"
+            # statistically identical to the mic recording.
             if not ref_failed[0] and ref_proc is not None:
                 binding_ok, binding_reason = _verify_pw_record_binding(
                     self.ref_pipewire_node
@@ -945,8 +1042,6 @@ class LoopbackRefPlayback:
                     ref_failed[0] = True
                     ref_error[0] = binding_reason
 
-            base_thread = threading.Thread(target=_base_runner, daemon=True)
-            base_thread.start()
             base_thread.join(timeout=120.0)
             if base_thread.is_alive():
                 if ref_proc is not None:
@@ -977,10 +1072,26 @@ class LoopbackRefPlayback:
                         )
                         warmup_n = int(_actual_warmup_s * sample_rate)
                         ref_aligned = ref_full[warmup_n:]
-                        # Trim both to the same length.
-                        n = min(len(ref_aligned), len(mic_1d))
-                        ref_1d = ref_aligned[:n]
-                        mic_1d = mic_1d[:n]
+                        if self.ref_pw_channels >= 2:
+                            # R11 (docs/pipewire-architecture.md §6b): loopback_ref is
+                            # the 2-ch SAMPLE-LOCKED capture sink — ch0 = pre-DSP
+                            # stimulus reference, ch1 = UMIK mic. Take the mic from the
+                            # OTHER channel of THIS SAME recording so ref and mic share
+                            # one stream / one clock / one start: no inter-stream offset
+                            # can corrupt H = mic/ref. The base strategy still PLAYS the
+                            # sweep; its separately-captured mic is ignored in this mode.
+                            ref_col = self.ref_channel_index - 1
+                            mic_col = 1 if ref_col == 0 else 0
+                            mic_full = all_ch[:, mic_col].astype(np.float64)
+                            mic_aligned = mic_full[warmup_n:]
+                            n = min(len(ref_aligned), len(mic_aligned))
+                            ref_1d = ref_aligned[:n]
+                            mic_1d = mic_aligned[:n]
+                        else:
+                            # Legacy 1-ch loopback: ref only; mic from the base strategy.
+                            n = min(len(ref_aligned), len(mic_1d))
+                            ref_1d = ref_aligned[:n]
+                            mic_1d = mic_1d[:n]
                     else:
                         ref_failed[0] = True
                         ref_error[0] = "pw-record returned no data"
@@ -1093,7 +1204,15 @@ class LoopbackRefPlayback:
             # (typically the UMIK fell back as the default PipeWire source).
             # Treat the ref as invalid in that case so deconvolution falls back
             # to the analytical sweep template rather than dividing mic by itself.
-            if len(mic_1d) > 0 and np.any(mic_1d != 0):
+            #
+            # ONLY valid for the legacy 1-ch path (two separate pw-records that
+            # could both bind to the same wrong source). In R11 2-ch mode there is
+            # ONE recording (ch0=ref, ch1=mic) — no "two streams bound to the same
+            # source" failure exists, and the guard would FALSE-POSITIVE if the
+            # stimulus and the room response happen to sit within 0.5 dB (e.g. after
+            # large correction FIRs or a near-field mic), wrongly zeroing a perfectly
+            # valid sample-locked reference and defeating R11.
+            if self.ref_pw_channels < 2 and len(mic_1d) > 0 and np.any(mic_1d != 0):
                 mic_peak_db = 20 * np.log10(np.max(np.abs(mic_1d)) + 1e-12)
                 mic_rms_db = 20 * np.log10(np.sqrt(np.mean(mic_1d ** 2)) + 1e-12)
                 peak_match = abs(ref_peak_db - mic_peak_db) <= 0.5

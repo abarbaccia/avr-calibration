@@ -36,6 +36,52 @@ The MCP server runs in Docker sharing the host PipeWire socket via
   removing it silences the subs.
 - The miniDSP path (if ever touched) is CLI-only, never HTTP, never parallel.
 
+## PipeWire architecture — the ONE principle (memorize this)
+
+This rig is a **fixed appliance graph**, not a desktop. WirePlumber is a *dynamic
+policy engine* and every chronic PW failure here is WP making a dynamic decision
+that is wrong for a static graph. The whole architecture rests on one rule:
+
+> **WirePlumber is a device-enumerator ONLY. It must NEVER create a link.
+> `audio-mode wire` owns 100% of links. Therefore EVERY node is
+> `autoconnect=false`.**
+
+Corollaries — enforce these; do not add new band-aids that contradict them:
+
+- **`autoconnect=false` on every node**, no exceptions: `camilladsp_capture`,
+  `camilladsp_playback`, the UMIK, and both null sinks. In the CamillaDSP config
+  (`/home/pi/camilladsp/configs/scarlett.yml`) BOTH `capture.autoconnect_to` AND
+  `playback.autoconnect_to` must be `null`. If you ever see a node with
+  `autoconnect=true`, that is THE bug — fix the autoconnect, don't chase the link
+  it spawned.
+- **WP fallback is the enemy.** When an autoconnecting node can't reach its target,
+  WP links it to *any* available sink. That is the single root cause of:
+  (a) UMIK→`camilladsp_capture` = mic→subs→room→mic feedback loop;
+  (b) all 20 `camilladsp_playback:output_*` → `loopback_ref:playback_1` =
+  deconvolution-reference contamination → **"suspiciously flat FR (std<2 dB)"**
+  measurement failures. The fix for BOTH is `autoconnect=false`, never a one-off
+  `pw-link -d`.
+- **`diagnose_audio_stack` has a blind spot:** it does NOT detect
+  `camilladsp_playback`→`loopback_ref` contamination. Always also run
+  `pw-link -l` and confirm `loopback_ref:playback_1`'s ONLY input is
+  `avr_cal_sweep:monitor_FL`. More than one input = contamination = flat-FR.
+- **Keep the WP-policy-off guards:** `node.dont-reconnect=true` on `loopback_ref`
+  (`11-loopback-ref.conf`) and `restore-target=false`
+  (`41-no-restore-target.lua`). These exist because WP otherwise reconnects/
+  remembers targets. `restore-target=false` also stops every `pw-record`
+  (shared `application.name`) from inheriting a remembered target → identical
+  ref/mic capture.
+- **NEVER add `PIPEWIRE_LATENCY` (or `clock.force-quantum` on a running graph).**
+  Forcing a per-stream quantum renegotiates the graph mid-session → `pw-record`
+  rebinds off `loopback_ref` → flat-FR failures + ±15 dB magnitude swings.
+  Reverted for cause 2026-06-13. The clock is pinned globally (48000/256) in
+  `50-scarlett.lua`; that is the only place quantum is set.
+- **Scarlett stays on the ACP `multichannel` profile** (never `pro-audio` — it
+  renames the nodes to `pro-output-0`/`pro-input-0` and breaks every consumer).
+- **Prefer the structural fix over the band-aid.** Five different symptoms above
+  collapse to "a node autoconnected and WP linked it wrong." Reach for
+  `autoconnect=false` + `audio-mode wire`, not another targeted unlink or env var.
+
 ## What you operate (real files/units on the Pi)
 
 - **audio-mode** — `/usr/local/sbin/audio-mode {set cal|listening|karaoke}` and
@@ -70,8 +116,15 @@ The MCP server runs in Docker sharing the host PipeWire socket via
   `suspend-timeout=0` / `pause-on-idle=false` are pinned on the null sinks like
   the Scarlett.
 - **UMIK auto-linked into camilladsp_capture (feedback loop):** WirePlumber
-  fallback re-linked the mic; `pw-link -d` the offending link. (Capture
-  autoconnect should be null since the 2026-06-12 fix.)
+  fallback re-linked the mic. Root fix is `autoconnect=false` on the node (see
+  the ONE principle above), not just `pw-link -d`. Capture AND playback
+  `autoconnect_to` must be `null`.
+- **"Suspiciously flat FR (std<2 dB) / mic captured reference directly":** the
+  loopback reference is contaminated — `pw-link -l` and check
+  `loopback_ref:playback_1` has ONLY `avr_cal_sweep:monitor_FL` as input. If
+  `camilladsp_playback:output_*` links are present, that's WP fallback from
+  `playback.autoconnect_to` ≠ null. This is NOT a level problem; do not chase it
+  by raising gain.
 - **FIRs/PEQs appear inert:** Scarlett PCM routing reset — re-run
   `fix-scarlett-routing.sh`, confirm `amixer` shows PCM 0N → PCM N.
 

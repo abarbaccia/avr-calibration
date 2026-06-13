@@ -88,6 +88,32 @@ uv run python -m pytest tests/test_modal_fir.py -v
 uv run python -m pytest tests/ --cov --cov-report=term-missing
 ```
 
+## Test-Driven Development — HARD RULE
+
+**Write the test first. Always.** This codebase earned a long tail of
+production-only bugs (stale mute surviving a "reset", a mic resolving to the wrong
+device, a ref/mic timing race) because fixes were shipped and discovered broken on
+real hardware instead of caught by a test. The bare-metal/PipeWire layers are
+expensive to debug live — a reboot is minutes, a wrong measurement is hours. A
+unit test is seconds. Stop patching in prod; prove it in a test.
+
+The loop for ANY behavior change (bug fix or feature):
+
+1. **Write a failing test** that encodes the desired behavior / reproduces the bug.
+   Run it; watch it fail for the right reason.
+2. **Write the minimum code** to make it pass.
+3. **Run the full module test file**; keep it green.
+4. Only then deploy.
+
+- A bug fix without a regression test is incomplete — the test is what stops the
+  bug from coming back (e.g. the `autoconnect_to is None` guard in
+  `test_drivers.py`; the reset-clears-mute guard).
+- Hardware/PipeWire/PortAudio is mocked (`conftest.py` injects `sounddevice`/
+  `pytta`); there is no excuse for "can't test it without the rig." If a code path
+  truly can't be unit-tested, that's a design smell — refactor the pure logic out
+  so it can be.
+- "I verified it by running a sweep on the Pi" is NOT a substitute for a test.
+
 ## Testing conventions (from TESTING.md)
 
 - `tests/test_{module}.py` mirrors `calibrate/{module}.py`
