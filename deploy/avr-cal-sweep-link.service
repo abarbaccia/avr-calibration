@@ -4,8 +4,8 @@
 # The null sinks (avr_cal_sweep, loopback_ref) are created by the PipeWire
 # daemon itself (/etc/pipewire/pipewire.conf.d/10-avr-cal-sweep.conf,
 # 11-loopback-ref.conf). camilladsp_capture has node.autoconnect=false, so
-# WirePlumber never links it -- audio-mode wire is the single wiring owner
-# (mode-aware: cal -> avr_cal_sweep, listening -> Scarlett AUX2; plus the
+# WirePlumber never links it — `audio-mode wire` is the single wiring owner
+# (mode-aware: cal → avr_cal_sweep, listening → Scarlett AUX2; plus the
 # loopback_ref deconvolution tap and UMIK feedback-loop guard).
 #
 # This unit handles the session-start case. camilladsp.service ExecStartPost
@@ -14,10 +14,10 @@
 # Runs as the pi user via the user manager (XDG_RUNTIME_DIR=/run/user/1000)
 # so it joins the same PipeWire session WirePlumber owns.
 #
-# After=camilladsp.service: CamillaDSP takes ~30s at boot waiting for the
-# Scarlett; the prior 6s retry budget lost the race causing xrun storms on
-# loopback_ref and xcorr_peak_ms jitter (3.0 <-> 11-13 ms). Wants= (not
-# Requires=) so this unit still runs if camilladsp.service is absent.
+# After=camilladsp.service: CamillaDSP takes ~30 s at boot waiting for the
+# Scarlett; the prior 6 s retry budget lost the race, causing xrun storms on
+# loopback_ref and xcorr_peak_ms jitter (3.0 ↔ 11–13 ms). Wants= (not Requires=)
+# so this unit still runs if camilladsp.service is absent (e.g. a cal-off setup).
 Description=Wire camilladsp_capture PipeWire links for the current audio mode
 After=pipewire.service wireplumber.service camilladsp.service
 Wants=pipewire.service wireplumber.service camilladsp.service
