@@ -192,6 +192,53 @@ _ir_cache: _BoundedDict = _BoundedDict(8)
 _ir_cache_counter: list[int] = [0]
 
 
+def _ir_cache_dir() -> Path:
+    """Directory where impulse IRs are persisted across container restarts.
+
+    The in-memory ``_ir_cache`` is wiped on every container restart/deploy,
+    which made design_fir_trinnov fail with "ir_session_id not found" after
+    any hotfix. Persisting each IR to disk lets the read path recover it.
+    """
+    return Path(os.environ.get("AVR_IR_CACHE_DIR", "/tmp/avr-ir-cache"))
+
+
+def _persist_ir(ir_session_id: int, ir: list) -> None:
+    """Write an IR to disk as JSON. Best-effort: never raises."""
+    try:
+        cache_dir = _ir_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path = cache_dir / f"{int(ir_session_id)}.json"
+        path.write_text(json.dumps(list(ir)))
+    except Exception:
+        log.warning("Failed to persist IR %s to disk", ir_session_id, exc_info=True)
+
+
+def _load_ir_from_disk(ir_session_id: int) -> list | None:
+    """Load a persisted IR from disk, or None if absent/unreadable."""
+    try:
+        path = _ir_cache_dir() / f"{int(ir_session_id)}.json"
+        if not path.exists():
+            return None
+        return json.loads(path.read_text())
+    except Exception:
+        log.warning("Failed to load IR %s from disk", ir_session_id, exc_info=True)
+        return None
+
+
+def _get_cached_ir(ir_session_id: int) -> list | None:
+    """Return the cached IR for an id: in-memory fast path, then disk fallback.
+
+    On a disk hit, the in-memory cache is repopulated so subsequent reads are
+    fast. Returns None if the IR is in neither store.
+    """
+    if ir_session_id in _ir_cache:
+        return _ir_cache[ir_session_id]
+    ir = _load_ir_from_disk(ir_session_id)
+    if ir is not None:
+        _ir_cache[ir_session_id] = ir
+    return ir
+
+
 def _default_dsp_name() -> str | None:
     """Return the processor name of the active default DSP, or None.
 
@@ -4230,6 +4277,7 @@ async def _tool_design_fir_trinnov(
     phase_mode: str = "mixed",
     regularization_lambda: float = 0.01,
     freq_focus_hz: list[float] | None = None,
+    max_correction_db: float | None = None,
     preringing_ms: float = 20.0,
     freq_min: float = 20.0,
     freq_max: float = 120.0,
@@ -4275,13 +4323,14 @@ async def _tool_design_fir_trinnov(
     try:
         from .multi_fir import SubMeasurement, design_fir_trinnov
 
-        # Retrieve cached IR
-        if ir_session_id not in _ir_cache:
+        # Retrieve cached IR — in-memory fast path, disk fallback (survives
+        # container restart). See _get_cached_ir / _persist_ir.
+        room_ir = _get_cached_ir(ir_session_id)
+        if room_ir is None:
             return _err(
-                f"ir_session_id={ir_session_id} not found in cache. "
-                "Run measure_impulse_ir() first (cache is reset on container restart)."
+                f"ir_session_id={ir_session_id} not found in cache or on disk. "
+                "Run measure_impulse_ir() first."
             )
-        room_ir = _ir_cache[ir_session_id]
 
         # Load measurements from session store
         from .storage import SessionStore
@@ -4322,10 +4371,19 @@ async def _tool_design_fir_trinnov(
             if sess and sess.start_fr and sess.start_fr.loopback_xcorr_peak_ms is not None:
                 xcorr_peaks[sid] = sess.start_fr.loopback_xcorr_peak_ms
         xcorr_warnings: list[str] = []
+        # R11 (docs/pipewire-architecture.md §6b): with the 2-ch sample-locked
+        # loopback capture, each session's reference and mic come from ONE stream,
+        # so its H phase is correct regardless of the absolute loopback_xcorr_peak_ms
+        # — that value now only reflects onset detection (a sub with a deep MLP null
+        # has a later, noisier onset). The cross-session xcorr-consistency gate was
+        # built for the pre-R11 two-stream capture, where a varying offset DID
+        # corrupt phase; it is obsolete in R11 mode, so downgrade the >15 ms hard
+        # error to a warning there.
+        _loopback_2ch = int(_config().measurement.get("loopback_ref_pw_channels", 1)) >= 2
         if len(xcorr_peaks) >= 2:
             peaks_list = list(xcorr_peaks.values())
             xcorr_range = max(peaks_list) - min(peaks_list)
-            if xcorr_range > 15.0:
+            if xcorr_range > 15.0 and not _loopback_2ch:
                 ids_detail = ", ".join(
                     f"session {sid}: {ms:.2f} ms" for sid, ms in xcorr_peaks.items()
                 )
@@ -4334,6 +4392,15 @@ async def _tool_design_fir_trinnov(
                     f"{ids_detail}. This indicates a CamillaDSP pipeline restart or config push occurred "
                     "between measurements — phase comparison is invalid. Re-measure all subs with the same "
                     "pipeline topology (no config changes between solos; use Scarlett hardware mutes)."
+                )
+            elif xcorr_range > 15.0 and _loopback_2ch:
+                ids_detail = ", ".join(
+                    f"session {sid}: {ms:.2f} ms" for sid, ms in xcorr_peaks.items()
+                )
+                xcorr_warnings.append(
+                    f"xcorr range {xcorr_range:.2f} ms > 15 ms but loopback is the 2-ch sample-locked "
+                    f"capture (R11) — ref/mic share one stream so phase_rad is valid; the spread is "
+                    f"onset-detection variance (e.g. a deep MLP null), not pipeline drift. Per-session: {ids_detail}."
                 )
             elif xcorr_range > 0.5:
                 ids_detail = ", ".join(
@@ -4403,6 +4470,7 @@ async def _tool_design_fir_trinnov(
             phase_mode=phase_mode,
             regularization_lambda=regularization_lambda,
             freq_focus_hz=focus,
+            max_correction_db=max_correction_db,
             preringing_ms=preringing_ms,
             freq_min=freq_min,
             freq_max=freq_max,
@@ -5876,6 +5944,8 @@ async def _tool_measure_impulse_ir(
         _ir_cache_counter[0] += 1
         ir_session_id = _ir_cache_counter[0]
         _ir_cache[ir_session_id] = ir
+        # Persist to disk so design_fir_trinnov survives a container restart.
+        _persist_ir(ir_session_id, ir)
         return _ok(
             ir_session_id=ir_session_id,
             n_samples=len(ir),
@@ -11970,6 +12040,7 @@ _TOOLS: list[Tool] = [
                 "regularization_lambda": {"type": "number", "description": "Wiener regularization. Default 0.01 (tuned for this hardware's -28..-16 dBFS signal level).", "default": 0.01},
                 "preringing_ms": {"type": "number", "description": "Pre-ring budget for mixed phase (≈ latency, compensated via sub distance). Default 20.", "default": 20.0},
                 "freq_focus_hz": {"type": "array", "items": {"type": "number"}, "description": "[lo, hi] band to confine the correction to."},
+                "max_correction_db": {"type": "number", "description": "Clamp the per-band FIR gain to ±this many dB around its in-band median (phase preserved). Bounds Wiener over-correction when the baseline is near-converged but has tall GEOMETRY modes (a full inverse otherwise produces 20-37 dB cuts that gut the band). Omit = no clamp. Try 10-12 dB for a near-converged room."},
                 "freq_min": {"type": "number", "description": "Low edge of baseline ringing-mode report. Default 20 Hz.", "default": 20.0},
                 "freq_max": {"type": "number", "description": "High edge of baseline ringing-mode report. Default 120 Hz.", "default": 120.0},
                 "bands_per_octave": {"type": "integer", "description": "Filter-bank resolution for the report. Default 6 (1/6-octave).", "default": 6},

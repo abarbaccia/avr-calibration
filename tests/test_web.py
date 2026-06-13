@@ -575,6 +575,42 @@ class TestSystemStatus:
         assert len(umik_devices) == 1
         assert umik_devices[0]["connected"] is False
 
+    def test_status_r11_umik_via_loopback(self, db_store: SessionStore, client: TestClient) -> None:
+        """Under R11 (loopback_ref_pw_channels>=2) the UMIK is not a standalone
+        PortAudio device; status must report it connected via the loopback path
+        without calling find_umik_device (which would spuriously report None)."""
+        cfg = Config({
+            "denon": {"host": ""},  # skip Denon
+            "minidsp": {"host": "localhost", "port": 5380},
+            "mic": {"name": "UMIK"},
+            "measurement": {"loopback_ref_pw_channels": 2},
+        })
+
+        # If find_umik_device is called, it would (under R11) return None and
+        # mark the mic disconnected — so assert it is never called.
+        mock_meas_client = AsyncMock()
+        mock_meas_client.find_umik_device = AsyncMock(return_value=(None, None))
+
+        with (
+            patch("calibrate.web._load_config", return_value=cfg),
+            patch("calibrate.web.SessionStore", return_value=db_store),
+            patch("calibrate.web.httpx.AsyncClient") as httpx_cls,
+            patch("calibrate.measurement_client.MeasurementServiceClient", return_value=mock_meas_client),
+        ):
+            httpx_instance = AsyncMock()
+            httpx_instance.get.side_effect = Exception("offline")
+            httpx_cls.return_value.__aenter__ = AsyncMock(return_value=httpx_instance)
+            httpx_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            resp = client.get("/api/status")
+
+        data = resp.json()
+        umik_devices = [d for d in data["devices"] if "UMIK" in d["name"]]
+        assert len(umik_devices) == 1
+        assert umik_devices[0]["connected"] is True
+        assert "loopback" in umik_devices[0]["detail"].lower()
+        mock_meas_client.find_umik_device.assert_not_called()
+
     def test_status_with_last_run(self, db_store: SessionStore, client: TestClient) -> None:
         """When a run exists, last_run is populated."""
         with db_store._connect() as conn:

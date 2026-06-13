@@ -145,6 +145,7 @@ def design_multi_input_fir(
     preringing_ms: float = 20.0,
     regularization_lambda: float = 0.1,
     freq_focus_hz: tuple[float, float] | None = None,
+    max_correction_db: float | None = None,
     modal_intents: list[dict] | None = None,
     modal_taps: int | None = None,
     gabor_n_cycles: int = 1,
@@ -305,6 +306,24 @@ def design_multi_input_fir(
     for H_i in H_complex:
         H_mag_sq = np.abs(H_i) ** 2
         K_i = T_per_sub * np.conj(H_i) / (H_mag_sq + regularization_lambda ** 2)
+        # Optional correction clamp: bound the FIR's frequency-dependent gain to
+        # ±max_correction_db around its in-band median (the broadband level it
+        # applies), preserving the complex phase that delivers coherent summation.
+        # Without this, the Wiener inverse aimed at a near-converged baseline with
+        # +12–15 dB GEOMETRY modes (T60-dominated, not flat-magnitude excess)
+        # produced 20–37 dB cuts that gut the band (fir-design-reviewer, run 36).
+        # The clamp caps how hard the inverse drives without abandoning the
+        # coherent-sum design. None = no clamp (legacy behavior).
+        if max_correction_db is not None:
+            _mag = np.abs(K_i)
+            _band_mag = _mag[in_band]
+            _band_mag = _band_mag[_band_mag > 0]
+            if _band_mag.size:
+                _ref = float(np.median(_band_mag))
+                _lo = _ref * 10.0 ** (-abs(max_correction_db) / 20.0)
+                _hi = _ref * 10.0 ** (abs(max_correction_db) / 20.0)
+                _clamped = np.clip(_mag, _lo, _hi)
+                K_i = K_i / (_mag + 1e-20) * _clamped
         # Outside the focus band: use passthrough (identity per sub, K = 1/n_subs)
         # rather than zero. Setting K=0 outside the band gives the minimum-phase
         # reconstruction of a bandpass, which creates steep high-pass/low-pass
@@ -651,6 +670,7 @@ def design_fir_trinnov(
     phase_mode: str = "mixed",
     regularization_lambda: float = 0.01,
     freq_focus_hz: tuple[float, float] | None = None,
+    max_correction_db: float | None = None,
     preringing_ms: float = 20.0,
     freq_min: float = 20.0,
     freq_max: float = 120.0,
@@ -702,7 +722,8 @@ def design_fir_trinnov(
         measurements, target_points,
         sample_rate=sample_rate, num_taps=num_taps,
         phase_mode=phase_mode, regularization_lambda=regularization_lambda,
-        freq_focus_hz=freq_focus_hz, preringing_ms=preringing_ms,
+        freq_focus_hz=freq_focus_hz, max_correction_db=max_correction_db,
+        preringing_ms=preringing_ms,
     )
 
     # Informational baseline decay report from the measured room IR. This is a

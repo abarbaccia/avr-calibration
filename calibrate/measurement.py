@@ -1553,45 +1553,60 @@ class MeasurementEngine:
 
         async with _MEASURE_LOCK:
             for shot in range(n_averages):
-                # Start recorder
-                rec_proc = subprocess.Popen(
-                    pw_rec_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                )
-                await asyncio.sleep(0.05)  # brief settle before impulse
-
-                # Play impulse — run in executor so event loop stays live
-                play_proc = subprocess.Popen(
-                    pw_play_cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                rec_proc = None
+                play_proc = None
                 try:
-                    await loop.run_in_executor(
-                        None,
-                        lambda: play_proc.communicate(input=pcm_bytes, timeout=record_duration_s + 5),
+                    # Start recorder
+                    rec_proc = subprocess.Popen(
+                        pw_rec_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
                     )
-                except subprocess.TimeoutExpired:
-                    play_proc.kill()
-                    await loop.run_in_executor(None, play_proc.communicate)
+                    await asyncio.sleep(0.05)  # brief settle before impulse
 
-                # Wait for reverb tail without blocking event loop
-                await asyncio.sleep(record_duration_s)
-                rec_proc.kill()
-                raw = await loop.run_in_executor(
-                    None,
-                    lambda: rec_proc.stdout.read() if rec_proc.stdout else b"",
-                )
-                await loop.run_in_executor(None, rec_proc.communicate)
+                    # Play impulse — run in executor so event loop stays live
+                    play_proc = subprocess.Popen(
+                        pw_play_cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    try:
+                        await loop.run_in_executor(
+                            None,
+                            lambda: play_proc.communicate(input=pcm_bytes, timeout=record_duration_s + 5),
+                        )
+                    except subprocess.TimeoutExpired:
+                        play_proc.kill()
+                        await loop.run_in_executor(None, play_proc.communicate)
 
-                if raw:
-                    rec_f32 = np.frombuffer(raw, dtype=np.float32)
-                    n = min(len(rec_f32), rec_samples)
-                    accumulated[:n] += rec_f32[:n].astype(np.float64)
+                    # Wait for reverb tail without blocking event loop
+                    await asyncio.sleep(record_duration_s)
+                    rec_proc.kill()
+                    raw = await loop.run_in_executor(
+                        None,
+                        lambda: rec_proc.stdout.read() if rec_proc.stdout else b"",
+                    )
+                    await loop.run_in_executor(None, rec_proc.communicate)
 
-                await asyncio.sleep(0.1)  # brief gap between shots
+                    if raw:
+                        rec_f32 = np.frombuffer(raw, dtype=np.float32)
+                        n = min(len(rec_f32), rec_samples)
+                        accumulated[:n] += rec_f32[:n].astype(np.float64)
+
+                    await asyncio.sleep(0.1)  # brief gap between shots
+                finally:
+                    # Guarantee neither subprocess is left running if the client
+                    # disconnects or an exception is raised mid-shot. An orphaned
+                    # pw-record holds the mic node open and wedges the next
+                    # measurement until the service is restarted.
+                    for _proc in (play_proc, rec_proc):
+                        if _proc is not None and _proc.poll() is None:
+                            try:
+                                _proc.kill()
+                                _proc.communicate(timeout=2)
+                            except Exception:
+                                pass
 
         averaged = (accumulated / n_averages).tolist()
         return averaged

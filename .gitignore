@@ -31,3 +31,6 @@ build/
 *.sqlite3
 .claude/worktrees/
 .aider*
+
+# pytest-cov artifact
+.coverage

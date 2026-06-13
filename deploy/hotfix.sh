@@ -27,6 +27,24 @@ PKG_IN_CONTAINER="/opt/venv/lib/python3.11/site-packages/calibrate"
 SERVICE="avr-calibration"
 PI_HOTFIX_DIR="/tmp/avr-hotfix"
 
+# ── Bare-metal measurement service (a SEPARATE deploy target) ──────────────────
+# The avr-measurement.service runs on the Pi host (NOT in the container) and
+# executes the measurement-path modules below. It loads them from TWO locations:
+#   - the installed venv site-packages
+#   - the editable source checkout
+# Restarting the container alone does NOT update this service's code, so a
+# measurement-path hotfix must also be scp'd to both bare-metal paths.
+MEAS_SERVICE="avr-measurement.service"
+MEAS_VENV_PKG="/opt/avr-measurement/venv/lib/python3.11/site-packages/calibrate"
+MEAS_SRC_PKG="/opt/avr-measurement/src/calibrate"
+# calibrate/ files (relative to calibrate/) that the bare-metal service runs.
+MEAS_PATH_FILES=(
+    "measurement.py"
+    "measurement_service.py"
+    "measurement_client.py"
+    "drivers/playback.py"
+)
+
 SSH="ssh ${PI_USER}@${PI_HOST}"
 
 # ── --clean: wipe and restore ─────────────────────────────────────────────────
@@ -66,6 +84,18 @@ echo ""
 
 # ── Merge new files into stable accumulation dir ──────────────────────────────
 
+# Is `rel` (path relative to calibrate/) one the bare-metal service runs?
+is_measurement_path_file() {
+    local rel="$1"
+    local m
+    for m in "${MEAS_PATH_FILES[@]}"; do
+        [ "$rel" = "$m" ] && return 0
+    done
+    return 1
+}
+
+MEAS_DEPLOYED=0  # set to 1 if any measurement-path file was pushed to bare metal
+
 for f in "${FILES[@]}"; do
     if [ ! -f "$f" ]; then
         echo "ERROR: File not found: $f"
@@ -76,6 +106,31 @@ for f in "${FILES[@]}"; do
     $SSH "mkdir -p ${PI_HOTFIX_DIR}/${subdir}"
     echo "Copying $f → ${PI_USER}@${PI_HOST}:${PI_HOTFIX_DIR}/${rel}"
     scp "$f" "${PI_USER}@${PI_HOST}:${PI_HOTFIX_DIR}/${rel}"
+
+    # ── Bare-metal measurement service: also overlay measurement-path files ────
+    # into BOTH the venv site-packages and the editable source checkout so the
+    # host-side avr-measurement.service runs the hotfixed code, not stale code.
+    if is_measurement_path_file "$rel"; then
+        echo "  ↳ measurement-path file — also deploying to bare-metal ${MEAS_SERVICE}"
+        for dest_pkg in "${MEAS_VENV_PKG}" "${MEAS_SRC_PKG}"; do
+            # Only deploy to a location that actually exists on the Pi (the
+            # editable src checkout may be absent on some installs). Idempotent.
+            if $SSH "[ -d ${dest_pkg} ]"; then
+                echo "    → ${dest_pkg}/${rel}"
+                # scp into a user-writable temp path, then sudo-install it
+                # (the dest dirs are root-owned). Clean up the temp file after.
+                tmp="/tmp/avr-meas-hotfix-$$-$(echo "$rel" | tr '/' '_')"
+                scp "$f" "${PI_USER}@${PI_HOST}:${tmp}"
+                $SSH "sudo mkdir -p ${dest_pkg}/${subdir} \
+                      && sudo cp ${tmp} ${dest_pkg}/${rel} \
+                      && rm -f ${tmp} \
+                      && sudo find ${dest_pkg} -name __pycache__ -exec rm -rf {} + 2>/dev/null || true"
+            else
+                echo "    (skipped ${dest_pkg} — not present on Pi)"
+            fi
+        done
+        MEAS_DEPLOYED=1
+    fi
 done
 
 # ── Build bind-mount args from ALL accumulated files ──────────────────────────
@@ -121,8 +176,15 @@ $SSH "sudo docker run -d \
     -c 'find /opt/venv/lib/python3.11/site-packages/calibrate -name __pycache__ -exec rm -rf {} + 2>/dev/null; exec /entrypoint.sh' \
     && echo 'Container started.'"
 
-# Also restart measurement service to pick up any calibrate/ changes
-$SSH "sudo systemctl restart avr-measurement || true"
+# Restart the bare-metal measurement service so it picks up the freshly
+# deployed measurement-path code. Only when a measurement-path file was
+# actually deployed to bare metal — otherwise the restart is a no-op churn.
+if [ "${MEAS_DEPLOYED}" = "1" ]; then
+    echo "Restarting bare-metal ${MEAS_SERVICE} (measurement-path code changed)..."
+    $SSH "sudo systemctl restart ${MEAS_SERVICE} || true"
+else
+    echo "No measurement-path files changed — leaving ${MEAS_SERVICE} running."
+fi
 
 # ── Follow logs ───────────────────────────────────────────────────────────────
 

@@ -2006,12 +2006,25 @@ async def system_status() -> dict:
     # UMIK — query via bare-metal measurement service (Docker has no PipeWire access)
     try:
         mic_name = cfg.mic.get("name", "UMIK")
-        meas_client = MeasurementServiceClient()
-        _idx, _dev = await meas_client.find_umik_device(name_substring=mic_name)
-        if _idx is not None and _dev is not None:
-            devices.append({"name": f"UMIK ({mic_name})", "connected": True, "detail": str(_dev.get("name", ""))})
+        # R11: when the mic is captured via the 2-ch loopback_ref node, the UMIK
+        # is routed INTO loopback_ref and is no longer a standalone PortAudio
+        # capture device — find_umik_device spuriously reports "none found". In
+        # that mode the mic's presence is established by the loopback path, so
+        # skip the PortAudio probe and report it as routed-via-loopback.
+        _loopback_2ch = int(cfg.measurement.get("loopback_ref_pw_channels", 1)) >= 2
+        if _loopback_2ch:
+            devices.append({
+                "name": f"UMIK ({mic_name})",
+                "connected": True,
+                "detail": "via loopback_ref (R11)",
+            })
         else:
-            devices.append({"name": f"UMIK ({mic_name})", "connected": False, "detail": "Not found"})
+            meas_client = MeasurementServiceClient()
+            _idx, _dev = await meas_client.find_umik_device(name_substring=mic_name)
+            if _idx is not None and _dev is not None:
+                devices.append({"name": f"UMIK ({mic_name})", "connected": True, "detail": str(_dev.get("name", ""))})
+            else:
+                devices.append({"name": f"UMIK ({mic_name})", "connected": False, "detail": "Not found"})
     except Exception as e:
         devices.append({"name": "UMIK", "connected": False, "detail": str(e)})
 
