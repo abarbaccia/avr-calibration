@@ -11328,6 +11328,16 @@ _TOOLS: list[Tool] = [
                     "description": "Upper frequency bound in Hz (default: 200).",
                     "default": 200.0,
                 },
+                "bands_per_octave": {
+                    "type": "integer",
+                    "description": (
+                        "Filter-bank resolution. When set (e.g. 6 = 1/6-octave), uses the "
+                        "noise-robust bandpass + envelope-T20 Schroeder path instead of the "
+                        "default spectrogram path. REQUIRED for trustworthy sub-bass T60 "
+                        "below ~50 Hz, where the spectrogram's ~23 Hz bins alias modes. "
+                        "Omit for the spectrogram path (coarser below 50 Hz)."
+                    ),
+                },
             },
         },
     ),

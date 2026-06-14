@@ -8695,3 +8695,49 @@ async def test_design_fir_trinnov_no_self_cancellation_warning_for_minimum_phase
     assert result["ok"] is True
     assert result["self_cancellation_warning"] is None
     assert "⛔" not in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_decay_forwards_bands_per_octave():
+    """bands_per_octave must reach decay.analyze_decay (the noise-robust bandpass +
+    envelope-T20 Schroeder path) — required for trustworthy sub-bass T60 below 50 Hz,
+    where the default spectrogram path's ~23 Hz bins alias modes."""
+    fake_session = MagicMock()
+    fake_session.id = 7
+    fake_session.impulse_response = [1.0, 0.0, 0.0, 0.0]
+    fake_session.start_fr = MagicMock(sample_rate=48000)
+    fake_store = MagicMock()
+    fake_store.get_session.return_value = fake_session
+    captured: dict = {}
+
+    def fake_decay(*args, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    with patch("calibrate.storage.SessionStore", return_value=fake_store), \
+         patch("calibrate.decay.analyze_decay", side_effect=fake_decay):
+        result = await sut._tool_analyze_decay(session_id=7, bands_per_octave=6)
+    assert result["ok"] is True
+    assert captured.get("bands_per_octave") == 6
+
+
+@pytest.mark.asyncio
+async def test_analyze_decay_defaults_bands_per_octave_none():
+    """Omitting bands_per_octave keeps the legacy spectrogram path (None)."""
+    fake_session = MagicMock()
+    fake_session.id = 7
+    fake_session.impulse_response = [1.0, 0.0, 0.0, 0.0]
+    fake_session.start_fr = MagicMock(sample_rate=48000)
+    fake_store = MagicMock()
+    fake_store.get_session.return_value = fake_session
+    captured: dict = {}
+
+    def fake_decay(*args, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    with patch("calibrate.storage.SessionStore", return_value=fake_store), \
+         patch("calibrate.decay.analyze_decay", side_effect=fake_decay):
+        result = await sut._tool_analyze_decay(session_id=7)
+    assert result["ok"] is True
+    assert captured.get("bands_per_octave") is None
