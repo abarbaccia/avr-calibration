@@ -135,6 +135,30 @@ def _build_anti_pulse_fir(
     return fir
 
 
+def _self_cancellation_margin(h_combined, incoherent_mag, freqs_out, freq_focus_hz):
+    """Worst (most negative) coherent-vs-incoherent summation margin, in dB.
+
+    ``h_combined`` is the complex coherent acoustic sum Σ K_i·H_i at the mic;
+    ``incoherent_mag`` is Σ|K_i·H_i|. Their ratio in dB is ≤ 0: it is 0 dB when
+    every sub's realised contribution lands at the SAME phase (ideal coherent
+    summation) and goes deeply negative where the realised FIRs CANCEL at the
+    mic — the mixed-phase truncation notch (a non-causal Wiener inverse whose
+    anti-causal tail was truncated to the pre-ring window). Restricted to the
+    focus band. This is the metric that detects a self-cancelling design before
+    it ships; ~0 dB means the multi-sub FIR sums coherently as intended.
+    """
+    import numpy as np
+    margin = (20.0 * np.log10(np.abs(h_combined) + 1e-12)
+              - 20.0 * np.log10(incoherent_mag + 1e-12))
+    if freq_focus_hz:
+        mask = (freqs_out >= freq_focus_hz[0]) & (freqs_out <= freq_focus_hz[1])
+    else:
+        mask = np.ones_like(freqs_out, dtype=bool)
+    if not np.any(mask):
+        mask = np.ones_like(freqs_out, dtype=bool)
+    return round(float(np.min(margin[mask])), 2)
+
+
 def design_multi_input_fir(
     measurements: Sequence[SubMeasurement],
     target_points: Sequence[tuple[float, float]],
@@ -458,12 +482,29 @@ def design_multi_input_fir(
     # pred_n_fft would cause the irfft/rfft normalisations to differ, giving 30-50 dB
     # amplitude errors in fir_effect_bands (the "inverse gain" bug).
     H_combined = np.zeros_like(H_complex[0])
+    incoherent_mag = np.zeros_like(np.abs(H_complex[0]))
     for fir_td, H_i in zip(fir_list, H_complex):
         fir_full = np.zeros(n_fft)
         fir_full[:len(fir_td)] = fir_td
         K_actual = np.fft.rfft(fir_full)
-        H_combined += K_actual * H_i
+        contrib = K_actual * H_i
+        H_combined += contrib
+        incoherent_mag += np.abs(contrib)
     combined_db = 20 * np.log10(np.abs(H_combined) + 1e-12)
+
+    # ── Self-cancellation guard ──────────────────────────────────────────
+    # The coherent acoustic sum |Σ K_i·H_i| compared against the incoherent
+    # magnitude sum Σ|K_i·H_i|. The ratio (margin, in dB, ≤ 0) is 0 when every
+    # sub's realised contribution lands at the SAME phase at the mic (perfect
+    # coherent summation), and goes deeply negative where the realised FIRs
+    # CANCEL at the mic. That cancellation is the mixed-phase truncation notch:
+    # the complex Wiener inverse of an excess-phase response is non-causal, and
+    # truncating its anti-causal tail to the pre-ring window leaves each sub at
+    # a different residual phase. This metric DETECTS a self-cancelling design
+    # before it is applied to a sub (see design_fir_trinnov / fir-design-reviewer).
+    self_cancellation_margin_db = _self_cancellation_margin(
+        H_combined, incoherent_mag, freqs_out, freq_focus_hz
+    ) if n_subs >= 2 else 0.0
 
     # Downsample to 1/3-octave for compact response
     third_oct_centres = [
@@ -530,6 +571,7 @@ def design_multi_input_fir(
         "output_gain_db": output_gain_db,
         "latency_ms": latency_ms,
         "modal_pre_delay_ms": modal_pre_delay_ms,
+        "self_cancellation_margin_db": self_cancellation_margin_db,
     }
 
 
@@ -649,6 +691,7 @@ def design_fir_multi_modal(
         "output_gain_db": wiener.get("output_gain_db", 0.0),
         "latency_ms": round(pre_samples / sample_rate * 1000, 2),
         "modal_pre_delay_ms": round(min_needed_ms, 2),
+        "self_cancellation_margin_db": wiener.get("self_cancellation_margin_db", 0.0),
         "modal_notes": modal_notes,
         # FIRs contain Gabor anti-pulse pre-ring; apply_fir must use
         # intent="modal_cancel" so SafetyValidator uses the 60 dB cap.
@@ -764,6 +807,7 @@ def design_fir_trinnov(
         "per_sub_peak_boost_db": wiener["per_sub_peak_boost_db"],
         "output_gain_db": wiener.get("output_gain_db", 0.0),
         "latency_ms": wiener["latency_ms"],
+        "self_cancellation_margin_db": wiener.get("self_cancellation_margin_db", 0.0),
         "ringing_modes": ringing_modes,
         "n_ringing_modes": len(ringing_modes),
         # Pure magnitude/phase correction — strict thermal cap applies, and the

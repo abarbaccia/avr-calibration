@@ -8547,3 +8547,151 @@ def test_bounded_dict_update_moves_to_end_and_does_not_over_evict():
     assert 1 not in bd
     assert 0 in bd
     assert list(bd.keys()) == [2, 0, 3]
+
+
+# ---------------------------------------------------------------------------
+# design_fir_trinnov: max_correction_db reachable via target_curve (harness
+# fallback for clients with a stale tool schema that can't pass the top-level
+# arg). Top-level arg always wins.
+# ---------------------------------------------------------------------------
+
+
+def _trinnov_handler_mocks(design_capture: dict, self_cancellation_margin_db: float = 0.0):
+    """Build the patches needed to exercise _tool_design_fir_trinnov with a
+    single mocked sub measurement. design_capture receives the kwargs that
+    reach calibrate.multi_fir.design_fir_trinnov. self_cancellation_margin_db
+    seeds the design result so the handler's self-cancellation guard branch can
+    be exercised."""
+    fake_session = MagicMock()
+    fake_session.start_fr = MagicMock(
+        frequencies=[20.0, 40.0, 80.0],
+        spl=[-20.0, -18.0, -20.0],
+        phase=[0.0, 0.1, 0.2],
+        loopback_xcorr_peak_ms=70.0,
+    )
+    fake_store = MagicMock()
+    fake_store.get_session.return_value = fake_session
+
+    design_result = {
+        "firs": [[0.0, 1.0, 0.0]],
+        "num_subs": 1,
+        "latency_ms": 20.0,
+        "ringing_modes": [],
+        "n_ringing_modes": 0,
+        "predicted_combined": [],
+        "predicted_per_sub": [],
+        "per_sub_peak_boost_db": [0.0],
+        "output_gain_db": 0.0,
+        "self_cancellation_margin_db": self_cancellation_margin_db,
+    }
+
+    def fake_design(*args, **kwargs):
+        design_capture.update(kwargs)
+        return design_result
+
+    return [
+        patch("calibrate.storage.SessionStore", return_value=fake_store),
+        patch("calibrate.multi_fir.design_fir_trinnov", side_effect=fake_design),
+        patch.object(sut, "_get_cached_ir", return_value=[1.0, 0.0, 0.0]),
+        patch.object(sut, "_dsp", None),
+        patch.object(sut, "_config", return_value=MagicMock(
+            measurement={"loopback_ref_pw_channels": 2})),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_design_fir_trinnov_reads_max_correction_db_from_target_curve():
+    captured: dict = {}
+    import contextlib
+    with contextlib.ExitStack() as stack:
+        for p in _trinnov_handler_mocks(captured):
+            stack.enter_context(p)
+        result = await sut._tool_design_fir_trinnov(
+            ir_session_id=2,
+            measurements=[{"session_id": 810, "output_index": 5, "label": "sub5"}],
+            target_curve={
+                "points": [{"freq": 40, "spl": 1}, {"freq": 80, "spl": 0}],
+                "max_correction_db": 4.0,
+            },
+        )
+    assert result["ok"] is True
+    assert captured.get("max_correction_db") == 4.0
+
+
+@pytest.mark.asyncio
+async def test_design_fir_trinnov_toplevel_max_correction_db_wins_over_target_curve():
+    captured: dict = {}
+    import contextlib
+    with contextlib.ExitStack() as stack:
+        for p in _trinnov_handler_mocks(captured):
+            stack.enter_context(p)
+        result = await sut._tool_design_fir_trinnov(
+            ir_session_id=2,
+            measurements=[{"session_id": 810, "output_index": 5, "label": "sub5"}],
+            target_curve={
+                "points": [{"freq": 40, "spl": 1}, {"freq": 80, "spl": 0}],
+                "max_correction_db": 99.0,
+            },
+            max_correction_db=4.0,
+        )
+    assert result["ok"] is True
+    assert captured.get("max_correction_db") == 4.0
+
+
+@pytest.mark.asyncio
+async def test_design_fir_trinnov_no_clamp_when_absent_everywhere():
+    captured: dict = {}
+    import contextlib
+    with contextlib.ExitStack() as stack:
+        for p in _trinnov_handler_mocks(captured):
+            stack.enter_context(p)
+        result = await sut._tool_design_fir_trinnov(
+            ir_session_id=2,
+            measurements=[{"session_id": 810, "output_index": 5, "label": "sub5"}],
+            target_curve={"points": [{"freq": 40, "spl": 1}, {"freq": 80, "spl": 0}]},
+        )
+    assert result["ok"] is True
+    assert captured.get("max_correction_db") is None
+
+
+@pytest.mark.asyncio
+async def test_design_fir_trinnov_flags_self_cancellation_for_mixed_phase():
+    """When the realised mixed-phase FIRs cancel at the mic (margin <= -3 dB),
+    the handler must surface self_cancellation_warning + a ⛔ note steering to
+    phase_mode='minimum'. This guard must never be silently bypassed."""
+    captured: dict = {}
+    import contextlib
+    with contextlib.ExitStack() as stack:
+        for p in _trinnov_handler_mocks(captured, self_cancellation_margin_db=-6.0):
+            stack.enter_context(p)
+        result = await sut._tool_design_fir_trinnov(
+            ir_session_id=2,
+            measurements=[{"session_id": 810, "output_index": 5, "label": "sub5"}],
+            target_curve={"points": [{"freq": 40, "spl": 1}, {"freq": 80, "spl": 0}]},
+            phase_mode="mixed",
+        )
+    assert result["ok"] is True
+    assert result["self_cancellation_margin_db"] == -6.0
+    assert result["self_cancellation_warning"] is not None
+    assert "minimum" in result["self_cancellation_warning"]
+    assert "⛔" in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_design_fir_trinnov_no_self_cancellation_warning_for_minimum_phase():
+    """minimum phase is structurally immune to the truncation notch, so even with
+    a bad margin the handler must NOT emit the warning (no false steer)."""
+    captured: dict = {}
+    import contextlib
+    with contextlib.ExitStack() as stack:
+        for p in _trinnov_handler_mocks(captured, self_cancellation_margin_db=-6.0):
+            stack.enter_context(p)
+        result = await sut._tool_design_fir_trinnov(
+            ir_session_id=2,
+            measurements=[{"session_id": 810, "output_index": 5, "label": "sub5"}],
+            target_curve={"points": [{"freq": 40, "spl": 1}, {"freq": 80, "spl": 0}]},
+            phase_mode="minimum",
+        )
+    assert result["ok"] is True
+    assert result["self_cancellation_warning"] is None
+    assert "⛔" not in result["note"]
