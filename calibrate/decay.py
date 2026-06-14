@@ -158,14 +158,32 @@ def _analyze_decay_spectrogram(
 
     modes: list[DecayMode] = []
 
+    # Frame rate of the spectrogram energy-time curve: one column per hop.
+    if len(times) >= 2:
+        frame_rate = 1.0 / float(times[1] - times[0])
+    else:
+        frame_rate = float(sample_rate)
+
     for i, freq in enumerate(freqs_bass):
         energy = Sxx_bass[i, :]
         if np.max(energy) < 1e-20:
             continue
 
-        schroeder = np.cumsum(energy[::-1])[::-1]
-        schroeder_db = 10.0 * np.log10(schroeder / (schroeder[0] + 1e-30) + 1e-30)
-        t60_ms = _estimate_t60(schroeder_db, times)
+        # Lundeby noise-floor-aware T60: truncate Schroeder integration at the
+        # crosspoint where the decay meets the noise floor. The spectrogram
+        # energy IS already a (coarse) energy-time curve, so feed it directly
+        # with the frame rate and disable further block-averaging (block=1).
+        t60_ms = _lundeby_t60(
+            energy, sample_rate=int(round(frame_rate)),
+            block_ms=1000.0 / frame_rate,
+        )
+        if t60_ms is None:
+            # Fall back to the legacy noise-floor-gated Schroeder fit so we
+            # never silently lose a mode the Lundeby gate couldn't resolve on a
+            # very coarse spectrogram ETC.
+            schroeder = np.cumsum(energy[::-1])[::-1]
+            schroeder_db = 10.0 * np.log10(schroeder / (schroeder[0] + 1e-30) + 1e-30)
+            t60_ms = _estimate_t60(schroeder_db, times)
 
         if t60_ms is None or t60_ms < t60_threshold_ms:
             continue
@@ -285,12 +303,25 @@ def _analyze_decay_bandpass(
         if peak_db < min_peak_db:
             continue
 
-        # Direct envelope-based T20 estimation. Schroeder backward integration
-        # is contaminated by the noise floor in the IR tail — for a 500ms IR
-        # at -45 dB SNR it inflates T60 by 4-15× vs ground truth (validated
-        # against session 262, 2026-05-25). See _estimate_t60_envelope.
-        t60_ms = _estimate_t60_envelope(filtered, sample_rate)
-        if t60_ms is None or t60_ms < t60_threshold_ms:
+        # Lundeby noise-floor-aware T60 on the band energy (squared filtered
+        # signal). Truncates Schroeder integration at the crosspoint where the
+        # decay meets the noise floor — without this, full-window Schroeder
+        # integration over a long IR inflates T60 by 4-15× (session 262,
+        # 2026-05-25: 47 Hz read 1905 ms vs manual T20×3 of 117-308 ms).
+        #
+        # Cross-check against the Hilbert-envelope T20 estimator. For a clean
+        # centred mode the two agree. For a tone sitting BETWEEN band centres
+        # the bandpassed energy beats (non-exponential), and Lundeby's single
+        # slope over-estimates; the envelope's first-crossing time is robust to
+        # that distortion. Take the smaller (conservative) estimate so beating
+        # off-centre bands can't re-introduce inflation.
+        t60_lundeby = _lundeby_t60(filtered ** 2, sample_rate)
+        t60_env = _estimate_t60_envelope(filtered, sample_rate)
+        candidates = [c for c in (t60_lundeby, t60_env) if c is not None]
+        if not candidates:
+            continue
+        t60_ms = min(candidates)
+        if t60_ms < t60_threshold_ms:
             continue
 
         suggested_q = _t60_to_q(t60_ms)
@@ -307,6 +338,206 @@ def _analyze_decay_bandpass(
     for rank, mode in enumerate(modes, 1):
         mode.priority = rank
     return modes
+
+
+def _lundeby_t60(
+    energy: "np.ndarray",
+    sample_rate: int,
+    block_ms: float = 15.0,
+    min_usable_db: float = 15.0,
+    max_iter: int = 8,
+) -> float | None:
+    """Noise-floor-aware T60 via the Lundeby (1995) crosspoint method.
+
+    This is the shared fix for the T60 INFLATION bug. Schroeder backward
+    integration over the FULL IR window accumulates the noise tail as if it
+    were modal energy; for a 2.5 s IR whose mode decays in a few hundred ms the
+    integral picks up ~2 s of noise and inflates T60 by 4-15×. Lundeby finds the
+    *crosspoint* where the decay line meets the noise floor and truncates the
+    Schroeder integration there, so only the clean decay is integrated.
+
+    Args:
+        energy: energy decay curve — squared IR (broadband) or squared
+            band-filtered signal (bandpass path). One sample per IR sample.
+        sample_rate: sample rate in Hz.
+        block_ms: RMS-block size for the energy-time curve (Lundeby uses
+            ~10-20 ms blocks to smooth the squared signal).
+        min_usable_db: if the usable decay range above the noise floor is below
+            this, return None (can't estimate — better than inflating).
+        max_iter: maximum Lundeby crosspoint-refinement iterations.
+
+    Returns:
+        T60 in milliseconds, or None when the decay can't be reliably estimated.
+
+    Algorithm (Lundeby 1995):
+      1. Average the energy into ~10-20 ms blocks (energy-time curve, ETC).
+      2. Initial noise floor = mean energy of the last 10% of the IR.
+      3. Linear-fit the dB decay from peak down to ~noise_floor + 5-10 dB → slope.
+      4. Crosspoint = where the decay line meets the noise floor.
+      5. Iterate: recompute the noise floor from energy BEYOND the crosspoint
+         (+ a margin), recompute the local slope over a window ending near the
+         crosspoint, recompute the crosspoint, until it is stable within a few %.
+      6. Truncate Schroeder backward integration AT the crosspoint (integrate
+         only the clean decay, not the noise tail). Add Lundeby's noise
+         tail-correction term (compensation energy for the truncated tail).
+      7. Fit the decay slope over -5..-25 dB of the truncated Schroeder curve
+         (the T20 span) and extrapolate to 60 dB via -60/slope (== 3×T20); fall
+         back to the -5..-35 dB span (T30) when the -25 dB region is too short.
+         Require ≥ ``min_usable_db`` of clean decay above the noise floor, else
+         return None.
+    """
+    import numpy as np
+
+    energy = np.asarray(energy, dtype=np.float64)
+    n = len(energy)
+    if n < 64:
+        return None
+    if not np.any(energy > 0):
+        return None
+
+    # ── 1. Energy-time curve in ~block_ms blocks ────────────────────────────
+    block = max(1, int(round(sample_rate * block_ms / 1000.0)))
+    n_blocks = n // block
+    if n_blocks < 10:
+        # IR too short to block at this resolution; shrink the block so we
+        # still get a usable ETC (clamp to at least 10 blocks).
+        block = max(1, n // 10)
+        n_blocks = n // block
+    if n_blocks < 5:
+        return None
+
+    etc = energy[: n_blocks * block].reshape(n_blocks, block).mean(axis=1)
+
+    peak_val = float(np.max(etc))
+    if peak_val <= 0:
+        return None
+    etc_db = 10.0 * np.log10(etc / peak_val + 1e-30)
+    peak_idx = int(np.argmax(etc))
+
+    # ── 2. Initial noise floor: mean energy of last 10% of the ETC ──────────
+    tail_n = max(1, n_blocks // 10)
+    noise_energy = float(np.mean(etc[-tail_n:]))
+    noise_db = 10.0 * np.log10(noise_energy / peak_val + 1e-30)
+
+    # If the noise floor is already within min_usable_db of the peak there is
+    # no clean decay to fit — pure noise / dominated by noise.
+    if noise_db > -min_usable_db:
+        return None
+
+    # ── 3-5. Lundeby crosspoint iteration ───────────────────────────────────
+    # Initial fit: peak down to ~10 dB above the noise floor.
+    fit_top_db = -5.0
+    fit_floor_db = noise_db + 10.0
+    crosspoint_idx = None
+    slope = None
+
+    for _ in range(max_iter):
+        # Linear fit of the decay between fit_top_db and fit_floor_db, after
+        # the peak. (slope in dB / block-index.)
+        #
+        # CRITICAL: fit only the *contiguous* decay from the peak down to the
+        # FIRST crossing of fit_floor_db. A narrow 1/6-octave bandpass on a
+        # short IR rebounds (sidelobe / filter-ringing) above the floor after
+        # the real decay; selecting every block in the dB range would pull
+        # those rebound blocks into the fit and flatten the slope, re-inflating
+        # T60. Truncating at the first floor crossing keeps the fit on the
+        # clean decay only.
+        idx = np.arange(peak_idx, n_blocks)
+        seg_db = etc_db[peak_idx:]
+        below_floor = np.where(seg_db <= fit_floor_db)[0]
+        head_end = int(below_floor[0]) + 1 if len(below_floor) else len(seg_db)
+        head_idx = idx[:head_end]
+        head_db = seg_db[:head_end]
+        mask = (head_db <= fit_top_db) & (head_db >= fit_floor_db)
+        if np.sum(mask) < 3:
+            break
+        x = head_idx[mask].astype(np.float64)
+        y = head_db[mask]
+        try:
+            coeffs = np.polyfit(x, y, 1)
+        except (np.linalg.LinAlgError, ValueError):
+            break
+        slope = float(coeffs[0])           # dB per block
+        intercept = float(coeffs[1])
+        if slope >= 0:
+            return None                    # not decaying
+
+        # Crosspoint: decay line meets the (current) noise floor.
+        new_cross = (noise_db - intercept) / slope
+        new_cross_idx = int(round(new_cross))
+        new_cross_idx = max(peak_idx + 1, min(new_cross_idx, n_blocks - 1))
+
+        # Recompute noise floor from energy a margin BEYOND the crosspoint.
+        margin = max(1, int(0.05 * n_blocks))
+        noise_start = min(new_cross_idx + margin, n_blocks - 1)
+        if noise_start < n_blocks - 1:
+            noise_energy = float(np.mean(etc[noise_start:]))
+            noise_db = 10.0 * np.log10(noise_energy / peak_val + 1e-30)
+        fit_floor_db = noise_db + 10.0
+
+        # Converged if the crosspoint barely moved (< 2%).
+        if crosspoint_idx is not None and abs(new_cross_idx - crosspoint_idx) <= max(
+            1, int(0.02 * n_blocks)
+        ):
+            crosspoint_idx = new_cross_idx
+            break
+        crosspoint_idx = new_cross_idx
+
+    if crosspoint_idx is None or slope is None:
+        return None
+
+    # ── usable-range gate: need >= min_usable_db of clean decay ─────────────
+    usable_db = -noise_db        # peak is 0 dB; noise_db is negative
+    if usable_db < min_usable_db:
+        return None
+
+    # ── 6. Truncated Schroeder integration with Lundeby tail correction ─────
+    # Integrate the clean decay up to the crosspoint, then add the energy the
+    # truncated noise tail WOULD have contributed if the decay line continued
+    # (compensation term) so the Schroeder curve doesn't bend prematurely.
+    cross_sample = min(int((crosspoint_idx) * block), n)
+    cross_sample = max(cross_sample, peak_idx * block + block)
+    cross_sample = min(cross_sample, n)
+
+    clean = energy[:cross_sample]
+    if len(clean) < 8:
+        return None
+
+    # Lundeby compensation: energy of the extrapolated decay tail beyond the
+    # crosspoint. slope is dB/block → convert to dB/sample for the tail rate.
+    slope_per_sample = slope / block
+    decay_rate = -slope_per_sample / 10.0 * np.log(10.0)   # 1/sample, energy
+    if decay_rate > 0:
+        tail_energy_at_cross = float(clean[-1])
+        comp = tail_energy_at_cross / decay_rate           # ∫ e^{-k t} dt tail
+    else:
+        comp = 0.0
+
+    sch = np.cumsum(clean[::-1])[::-1] + comp
+    sch_db = 10.0 * np.log10(sch / (sch[0] + 1e-30) + 1e-30)
+    t = np.arange(len(sch)) / sample_rate
+
+    # ── 7. Fit the decay slope over -5..-25 dB (T20) and extrapolate to ─────
+    # 60 dB. ``-60/slope`` IS the T60 estimate regardless of the fit span, so
+    # no explicit ×3 / ×2 multiplier is needed. Prefer the -5..-25 dB span;
+    # fall back to -5..-35 dB (T30) when the -25 dB region is too short.
+    def _fit_t60(lo_db: float) -> float | None:
+        m = (sch_db <= -5.0) & (sch_db >= lo_db)
+        if np.sum(m) < 3:
+            return None
+        try:
+            c = np.polyfit(t[m], sch_db[m], 1)
+        except (np.linalg.LinAlgError, ValueError):
+            return None
+        s = c[0]
+        if s >= 0:
+            return None
+        return float((-60.0 / s) * 1000.0)
+
+    t60 = _fit_t60(-25.0)         # T20 span
+    if t60 is not None:
+        return t60
+    return _fit_t60(-35.0)        # T30 span fallback
 
 
 def _estimate_t60_envelope(

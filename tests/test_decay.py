@@ -12,6 +12,7 @@ from calibrate.decay import (
     DecayMode,
     _estimate_t60,
     _estimate_t60_envelope,
+    _lundeby_t60,
     _t60_to_q,
     analyze_decay,
     compare_decay,
@@ -436,6 +437,144 @@ class TestEstimateT60Spectrogram:
             f"Spectrogram path returned indeterminate T60 values > 750 ms: "
             f"{[(m.freq_hz, m.t60_ms) for m in long_modes]}. "
             "IR-window cap should have returned None for these."
+        )
+
+
+class TestLundebyT60:
+    """Tests for the Lundeby (1995) noise-floor-aware T60 estimator.
+
+    The core fix for the T60 INFLATION bug: Schroeder backward integration over
+    the FULL ~2.5 s IR window accumulates a noise tail that inflates T60 by
+    4-15×. Lundeby finds the crosspoint where the modal decay meets the noise
+    floor and truncates the Schroeder integration there, so only the clean decay
+    is integrated.
+
+    The shared helper ``_lundeby_t60(energy, sample_rate)`` takes an energy
+    decay curve (squared IR or squared band signal) and returns T60 in ms, or
+    None when the usable decay range above the noise floor is < ~15 dB.
+    """
+
+    @staticmethod
+    def _decaying_energy(
+        freq_hz: float,
+        t60_ms: float,
+        sample_rate: int = 48000,
+        duration_s: float = 2.5,
+        noise_db: float | None = -50.0,
+        seed: int = 7,
+    ) -> np.ndarray:
+        """Squared (energy) signal of a decaying sinusoid + white noise tail.
+
+        noise_db: additive white-noise level in dB relative to the peak
+        amplitude of the decaying sinusoid (None = no noise).
+        """
+        n = int(sample_rate * duration_s)
+        t = np.arange(n) / sample_rate
+        decay = np.exp(-6.9 / (t60_ms / 1000.0) * t)
+        sig = np.sin(2 * np.pi * freq_hz * t) * decay
+        if noise_db is not None:
+            rng = np.random.default_rng(seed)
+            noise_rms = 10.0 ** (noise_db / 20.0)
+            sig = sig + rng.normal(0, noise_rms, n)
+        return sig ** 2
+
+    def test_known_t60_not_inflated_by_noise_tail(self) -> None:
+        """A 400 ms T60 mode in a 2.5 s IR with a -50 dB noise tail must read
+        ~400 ms (±20%), NOT inflated to >1000 ms.
+
+        This is THE bug: full-window Schroeder integration over a 2.5 s IR would
+        accumulate ~2 s of noise and inflate T60 by 4-15×.
+        """
+        energy = self._decaying_energy(
+            freq_hz=50.0, t60_ms=400.0, duration_s=2.5, noise_db=-50.0,
+        )
+        est = _lundeby_t60(energy, sample_rate=48000)
+        assert est is not None, "Should estimate a clean 400 ms decay"
+        assert 320.0 <= est <= 480.0, (
+            f"Expected ~400 ms ±20%, got {est:.0f} ms "
+            "(inflation bug if >1000 ms)"
+        )
+
+    def test_pure_noise_returns_none(self) -> None:
+        """Pure white noise (no decaying mode) must return None — no spurious
+        huge T60."""
+        rng = np.random.default_rng(99)
+        n = int(48000 * 2.5)
+        energy = (rng.normal(0, 1.0, n)) ** 2
+        est = _lundeby_t60(energy, sample_rate=48000)
+        assert est is None, f"Pure noise must return None, got {est}"
+
+    def test_short_clean_decay_recovered(self) -> None:
+        """A short, clean decay with no noise tail must still estimate correctly
+        (truncation must not break the clean case)."""
+        energy = self._decaying_energy(
+            freq_hz=50.0, t60_ms=400.0, duration_s=0.8, noise_db=None,
+        )
+        est = _lundeby_t60(energy, sample_rate=48000)
+        assert est is not None, "Clean decay should estimate"
+        assert 320.0 <= est <= 480.0, f"Expected ~400 ms ±20%, got {est:.0f} ms"
+
+    def test_insufficient_range_returns_none(self) -> None:
+        """If usable decay above the noise floor is < ~15 dB, return None
+        (better than inflating)."""
+        # Noise floor at -10 dB: decay never gets >15 dB clear of noise.
+        energy = self._decaying_energy(
+            freq_hz=50.0, t60_ms=400.0, duration_s=2.5, noise_db=-10.0, seed=3,
+        )
+        est = _lundeby_t60(energy, sample_rate=48000)
+        assert est is None, (
+            f"Insufficient SNR (<15 dB usable) must return None, got {est}"
+        )
+
+
+class TestLundebyIntegratedPaths:
+    """End-to-end: both analyze_decay paths must report a real ~400 ms mode as
+    ~400 ms, NOT inflated to 3000+ ms, on a 2.5 s noisy IR."""
+
+    @staticmethod
+    def _noisy_ir(
+        freq_hz: float = 50.0,
+        t60_ms: float = 400.0,
+        sample_rate: int = 48000,
+        duration_s: float = 2.5,
+        noise_db: float = -50.0,
+        seed: int = 11,
+    ) -> list[float]:
+        n = int(sample_rate * duration_s)
+        t = np.arange(n) / sample_rate
+        decay = np.exp(-6.9 / (t60_ms / 1000.0) * t)
+        sig = np.sin(2 * np.pi * freq_hz * t) * decay
+        rng = np.random.default_rng(seed)
+        noise_rms = 10.0 ** (noise_db / 20.0)
+        sig = sig + rng.normal(0, noise_rms, n)
+        sig[0] = 1.0
+        return sig.tolist()
+
+    def test_spectrogram_path_not_inflated(self) -> None:
+        """Spectrogram path: 400 ms mode in a 2.5 s noisy IR reads ~400 ms,
+        never >1000 ms."""
+        ir = self._noisy_ir(freq_hz=50.0, t60_ms=400.0, duration_s=2.5)
+        modes = analyze_decay(ir, sample_rate=48000, t60_threshold_ms=100.0)
+        near_50 = [m for m in modes if abs(m.freq_hz - 50.0) < 12.0]
+        assert near_50, f"50 Hz mode should be detected, got {[m.freq_hz for m in modes]}"
+        best = min(m.t60_ms for m in near_50)
+        assert best < 1000.0, (
+            f"Spectrogram path inflated T60: best near-50Hz = {best:.0f} ms "
+            "(should be ~400, never >1000)"
+        )
+
+    def test_bandpass_path_not_inflated(self) -> None:
+        """Bandpass path: 400 ms mode in a 2.5 s noisy IR reads ~400 ms,
+        never >1000 ms."""
+        ir = self._noisy_ir(freq_hz=50.0, t60_ms=400.0, duration_s=2.5)
+        modes = analyze_decay(ir, sample_rate=48000, t60_threshold_ms=100.0,
+                              bands_per_octave=6)
+        near_50 = [m for m in modes if abs(m.freq_hz - 50.0) < 5.0]
+        assert near_50, f"50 Hz mode should be detected, got {[m.freq_hz for m in modes]}"
+        best = min(m.t60_ms for m in near_50)
+        assert best < 1000.0, (
+            f"Bandpass path inflated T60: best near-50Hz = {best:.0f} ms "
+            "(should be ~400, never >1000)"
         )
 
 
