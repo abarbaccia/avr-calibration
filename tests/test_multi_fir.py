@@ -419,3 +419,62 @@ def test_single_sub_trinnov():
     assert result["num_subs"] == 1
     assert len(result["firs"]) == 1
     assert len(result["firs"][0]) == 4096
+
+
+# ---------------------------------------------------------------------------
+# Self-cancellation guard: detect realised multi-sub FIRs that cancel at the
+# mic (the mixed-phase truncation notch) before they ship.
+# ---------------------------------------------------------------------------
+
+
+def test_self_cancellation_margin_helper_inphase_vs_opposing():
+    from calibrate.multi_fir import _self_cancellation_margin
+    freqs = np.linspace(20.0, 200.0, 100)
+    a = np.full(100, 0.5 + 0.0j)
+    # Two in-phase contributions: |a+a| == |a|+|a| → margin 0 dB (coherent).
+    margin_coherent = _self_cancellation_margin(a + a, np.abs(a) + np.abs(a), freqs, None)
+    assert abs(margin_coherent) < 0.1, margin_coherent
+    # Two opposing contributions: |a-a| == 0 → margin deeply negative (cancelling).
+    margin_cancel = _self_cancellation_margin(a - a, np.abs(a) + np.abs(a), freqs, None)
+    assert margin_cancel < -50.0, margin_cancel
+
+
+def test_self_cancellation_margin_focus_band_restriction():
+    from calibrate.multi_fir import _self_cancellation_margin
+    freqs = np.linspace(20.0, 200.0, 181)  # 1 Hz grid
+    a = np.full(len(freqs), 0.5 + 0.0j)
+    # Cancellation only OUTSIDE the focus band → in-band margin stays ~0.
+    coherent = a + a
+    incoh = np.abs(a) + np.abs(a)
+    out = freqs > 120.0
+    coherent[out] = 0.0  # force cancellation above 120 Hz
+    margin_inband = _self_cancellation_margin(coherent, incoh, freqs, (40.0, 100.0))
+    assert abs(margin_inband) < 0.1, margin_inband
+
+
+def test_design_reports_self_cancellation_margin_field():
+    """design_multi_input_fir always returns self_cancellation_margin_db; for two
+    well-behaved coherent subs it is ~0 dB (no cancellation)."""
+    freqs = np.linspace(20, 200, 200).tolist()
+    m1 = _synth_measurement(freqs, [0.0] * 200, label="sub1")
+    m2 = _synth_measurement(freqs, [0.0] * 200, label="sub2")
+    result = design_multi_input_fir(
+        [m1, m2], [(20, 0.0), (200, 0.0)],
+        num_taps=4096, sample_rate=48000, phase_mode="minimum",
+        freq_focus_hz=(40.0, 100.0), regularization_lambda=0.01)
+    assert "self_cancellation_margin_db" in result
+    assert result["self_cancellation_margin_db"] <= 0.01
+    assert result["self_cancellation_margin_db"] > -3.0  # coherent, no notch
+
+
+def test_self_cancellation_margin_focus_band_entirely_outside_grid():
+    """If freq_focus_hz falls entirely outside the FFT grid the in-band mask is
+    empty; the helper must fall back to the whole band (np.min on an empty slice
+    would otherwise crash). Returns the whole-band margin, no exception."""
+    from calibrate.multi_fir import _self_cancellation_margin
+    freqs = np.linspace(20.0, 200.0, 100)
+    a = np.full(100, 0.5 + 0.0j)
+    whole = _self_cancellation_margin(a + a, np.abs(a) + np.abs(a), freqs, None)
+    outside = _self_cancellation_margin(
+        a + a, np.abs(a) + np.abs(a), freqs, (500.0, 1000.0))
+    assert outside == whole  # fell back to whole-band, did not crash

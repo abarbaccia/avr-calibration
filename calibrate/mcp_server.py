@@ -4417,6 +4417,15 @@ async def _tool_design_fir_trinnov(
         points = target_curve.get("points", [])
         target_points = [(float(p["freq"]), float(p["spl"])) for p in points]
 
+        # Harness fallback: some MCP clients cache an older tool schema and
+        # cannot pass max_correction_db as a top-level arg. Honour it inside
+        # target_curve so the Wiener over-correction clamp stays reachable.
+        # The explicit top-level arg always wins.
+        if max_correction_db is None:
+            _tc_clamp = target_curve.get("max_correction_db")
+            if _tc_clamp is not None:
+                max_correction_db = float(_tc_clamp)
+
         focus = tuple(freq_focus_hz) if freq_focus_hz and len(freq_focus_hz) == 2 else None
 
         # Always design at the DSP's actual processing rate (caps.fir_sample_rate_hz).
@@ -4503,6 +4512,22 @@ async def _tool_design_fir_trinnov(
         if xcorr_warnings:
             note += " ⚠️ xcorr: " + "; ".join(xcorr_warnings)
 
+        # Self-cancellation guard: if the realised FIRs cancel at the mic (the
+        # mixed-phase truncation notch), the coherent sum sits well below the
+        # incoherent magnitude sum. Flag it and steer to phase_mode='minimum',
+        # which is causal/front-loaded and structurally immune to the notch.
+        self_cancel_db = result.get("self_cancellation_margin_db", 0.0)
+        self_cancellation_warning = None
+        if phase_mode != "minimum" and self_cancel_db <= -3.0:
+            self_cancellation_warning = (
+                f"SELF-CANCELLATION DETECTED: the realised {phase_mode}-phase FIRs sum "
+                f"{abs(self_cancel_db):.1f} dB BELOW their incoherent magnitude sum in the "
+                f"focus band — they cancel acoustically at the mic (the truncation notch). "
+                f"Do NOT apply. Re-run with phase_mode='minimum' (causal, immune to this) "
+                f"plus MSO delay/polarity alignment for inter-sub coherence."
+            )
+            note += " ⛔ " + self_cancellation_warning
+
         response = {
             "num_subs": result["num_subs"],
             "num_taps": num_taps,
@@ -4516,6 +4541,8 @@ async def _tool_design_fir_trinnov(
             "predicted_per_sub": result["predicted_per_sub"],
             "per_sub_peak_boost_db": result["per_sub_peak_boost_db"],
             "output_gain_db": result["output_gain_db"],
+            "self_cancellation_margin_db": self_cancel_db,
+            "self_cancellation_warning": self_cancellation_warning,
             "balance_warnings": balance_warnings,
             "xcorr_warnings": xcorr_warnings,
             "cache_ids": cache_ids,
