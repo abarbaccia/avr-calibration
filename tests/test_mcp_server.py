@@ -8556,12 +8556,18 @@ def test_bounded_dict_update_moves_to_end_and_does_not_over_evict():
 # ---------------------------------------------------------------------------
 
 
-def _trinnov_handler_mocks(design_capture: dict, self_cancellation_margin_db: float = 0.0):
+def _trinnov_handler_mocks(
+    design_capture: dict,
+    self_cancellation_margin_db: float = 0.0,
+    matched_filter_unsafe: bool = False,
+    pre_ring_energy_fraction: list | None = None,
+):
     """Build the patches needed to exercise _tool_design_fir_trinnov with a
     single mocked sub measurement. design_capture receives the kwargs that
     reach calibrate.multi_fir.design_fir_trinnov. self_cancellation_margin_db
     seeds the design result so the handler's self-cancellation guard branch can
-    be exercised."""
+    be exercised. matched_filter_unsafe / pre_ring_energy_fraction seed the
+    matched-filter (anti-causal-dominant) guard branch."""
     fake_session = MagicMock()
     fake_session.start_fr = MagicMock(
         frequencies=[20.0, 40.0, 80.0],
@@ -8583,6 +8589,12 @@ def _trinnov_handler_mocks(design_capture: dict, self_cancellation_margin_db: fl
         "per_sub_peak_boost_db": [0.0],
         "output_gain_db": 0.0,
         "self_cancellation_margin_db": self_cancellation_margin_db,
+        "matched_filter_unsafe": matched_filter_unsafe,
+        "pre_ring_energy_fraction": (
+            pre_ring_energy_fraction
+            if pre_ring_energy_fraction is not None
+            else [0.001]
+        ),
     }
 
     def fake_design(*args, **kwargs):
@@ -8695,6 +8707,62 @@ async def test_design_fir_trinnov_no_self_cancellation_warning_for_minimum_phase
     assert result["ok"] is True
     assert result["self_cancellation_warning"] is None
     assert "⛔" not in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_design_fir_trinnov_threads_decay_correction_ms():
+    """decay_correction_ms must reach calibrate.multi_fir.design_fir_trinnov so
+    the bounded-pre-ring windowed-target realization is actually invokable from
+    the MCP facade (without this it is dead code in production)."""
+    captured: dict = {}
+    import contextlib
+    with contextlib.ExitStack() as stack:
+        for p in _trinnov_handler_mocks(captured):
+            stack.enter_context(p)
+        result = await sut._tool_design_fir_trinnov(
+            ir_session_id=2,
+            measurements=[{"session_id": 810, "output_index": 5, "label": "sub5"}],
+            target_curve={"points": [{"freq": 40, "spl": 1}, {"freq": 80, "spl": 0}]},
+            phase_mode="mixed",
+            preringing_ms=20.0,
+            decay_correction_ms=80.0,
+        )
+    assert result["ok"] is True
+    assert captured.get("decay_correction_ms") == 80.0
+    # Safe design surfaces the telemetry and caches the FIRs.
+    assert result["matched_filter_unsafe"] is False
+    assert result["pre_ring_energy_fraction"] == [0.001]
+    assert len(result["cache_ids"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_design_fir_trinnov_blocks_matched_filter_unsafe_design():
+    """An anti-causal-dominant (matched-filter) design must NOT be cached and
+    must surface a ⛔ matched_filter_warning — this is the one guard the bounded
+    feature exists to provide; it must never be silently shippable."""
+    captured: dict = {}
+    import contextlib
+    with contextlib.ExitStack() as stack:
+        for p in _trinnov_handler_mocks(
+            captured, matched_filter_unsafe=True,
+            pre_ring_energy_fraction=[0.82],
+        ):
+            stack.enter_context(p)
+        result = await sut._tool_design_fir_trinnov(
+            ir_session_id=2,
+            measurements=[{"session_id": 810, "output_index": 5, "label": "sub5"}],
+            target_curve={"points": [{"freq": 40, "spl": 1}, {"freq": 80, "spl": 0}]},
+            phase_mode="mixed",
+            preringing_ms=20.0,
+            decay_correction_ms=80.0,
+        )
+    assert result["ok"] is True
+    assert result["matched_filter_unsafe"] is True
+    assert result["matched_filter_warning"] is not None
+    assert "MATCHED-FILTER UNSAFE" in result["matched_filter_warning"]
+    assert "⛔" in result["note"]
+    # Unsafe ⇒ no cached FIRs to apply.
+    assert result["cache_ids"] == []
 
 
 @pytest.mark.asyncio

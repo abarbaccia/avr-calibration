@@ -159,6 +159,37 @@ def _self_cancellation_margin(h_combined, incoherent_mag, freqs_out, freq_focus_
     return round(float(np.min(margin[mask])), 2)
 
 
+def _pre_ring_energy_fraction(fir) -> float:
+    """Fraction of FIR energy that lies BEFORE its peak (max-|tap|) sample.
+
+    A causal-dominant correction (zeros on the poles → energy decays FORWARD)
+    has most of its energy AFTER the peak, so this fraction is < 0.5. The
+    time-reversed *matched filter* of a decaying mode has its energy growing
+    toward the impulse (anti-causal), so the fraction is > 0.5. At exactly 0.5
+    the correction is time-symmetric (linear-phase-like). The peak sample
+    itself is excluded from both sides so a pure delta reads 0.0, not 0.5.
+    """
+    import numpy as np
+    f = np.asarray(fir, dtype=np.float64)
+    if f.size == 0:
+        return 0.0
+    energy = f * f
+    total = float(np.sum(energy))
+    if total <= 0.0:
+        return 0.0
+    peak = int(np.argmax(np.abs(f)))
+    e_before = float(np.sum(energy[:peak]))
+    return e_before / total
+
+
+def _matched_filter_unsafe(fir, threshold: float = 0.5) -> bool:
+    """True when the realised correction is anti-causal-dominant — the
+    time-reversed matched-filter signature that re-excites the mode (+40 dB,
+    T60 unchanged; see design_fir_trinnov docstring). The acoustician-anchored
+    line is f_pre = E(t<peak)/E_total > 0.5 (above 0.5 = time-reversed)."""
+    return _pre_ring_energy_fraction(fir) > threshold
+
+
 def design_multi_input_fir(
     measurements: Sequence[SubMeasurement],
     target_points: Sequence[tuple[float, float]],
@@ -170,6 +201,7 @@ def design_multi_input_fir(
     regularization_lambda: float = 0.1,
     freq_focus_hz: tuple[float, float] | None = None,
     max_correction_db: float | None = None,
+    decay_correction_ms: float | None = None,
     modal_intents: list[dict] | None = None,
     modal_taps: int | None = None,
     gabor_n_cycles: int = 1,
@@ -182,6 +214,26 @@ def design_multi_input_fir(
     total tap budget is split as: magnitude_taps = num_taps - modal_taps + 1,
     modal_taps = modal_taps (default auto-sized from mode frequencies).
 
+    BOUNDED-PRE-RING WINDOWED-TARGET mixed phase (``decay_correction_ms``):
+    The complex Wiener inverse of an excess-phase (modal) response is
+    NON-CAUSAL — its impulse has a long anti-causal pre-ring whose length
+    scales with the modal decay (room modes ring ~300-600 ms here). The plain
+    ``mixed`` realizer hard-truncates that tail to ``preringing_ms``, so each
+    sub lands at a different residual phase and they CANCEL at the mic
+    (``self_cancellation_margin_db`` goes deeply negative). Full inversion is
+    impossible with a short causal FIR. When ``decay_correction_ms`` is set
+    (e.g. 80 ms), instead of inverting the FULL decay the realizer inverts only
+    the FIRST ``decay_correction_ms`` of it, applying a time-domain window to
+    the realized k_i centered on the main peak: a Hann ramp-up bounding the
+    anti-causal pre-ring to ``preringing_ms``, a flat top protecting the peak,
+    and a Tukey taper over ``decay_correction_ms`` after the peak (75 % flat to
+    preserve the LF-carrying tail). The result is CAUSAL-dominant — its zeros
+    land on the poles (inside the unit circle → energy decays FORWARD), so it
+    shortens the early decay / corrects inter-sub phase WITHOUT becoming the
+    time-reversed matched filter that re-excites the mode (multi_fir.py:736).
+    A per-sub matched-filter check (pre-peak energy fraction > 0.5) flags any
+    design that is anti-causal-dominant. ``None`` = current behavior.
+
     Returns dict with:
         firs:                list[list[float]]  — one FIR per sub, peak-normalized
         predicted_per_sub:   list of 1/3-octave band SPL each sub contributes
@@ -189,6 +241,8 @@ def design_multi_input_fir(
         per_sub_peak_boost:  max dB boost per sub (for safety check by caller)
         latency_ms:          effective latency of the design
         modal_pre_delay_ms:  pre-ring from anti-pulses (0 if no modal_intents)
+        pre_ring_energy_fraction:  list[float] — per-sub E(t<peak)/E_total
+        matched_filter_unsafe:     bool — True if any sub is anti-causal-dominant
     """
     import numpy as np
 
@@ -197,6 +251,20 @@ def design_multi_input_fir(
         raise ValueError("multi-input FIR requires ≥ 1 measurement")
     if phase_mode not in ("minimum", "linear", "mixed"):
         raise ValueError(f"phase_mode must be minimum/linear/mixed, got {phase_mode!r}")
+    if decay_correction_ms is not None:
+        if decay_correction_ms <= 0:
+            raise ValueError(
+                f"decay_correction_ms must be > 0, got {decay_correction_ms!r}")
+        # Causal-dominant balance: the pre-ring budget must be at most half the
+        # decay window. A larger pre-ring inverts the causal/anti-causal balance
+        # and re-creates the matched filter — reject at the API boundary.
+        if not (0 < preringing_ms <= decay_correction_ms / 2.0):
+            raise ValueError(
+                f"preringing_ms ({preringing_ms}) must be in "
+                f"(0, decay_correction_ms/2={decay_correction_ms / 2.0}] for a "
+                f"causal-dominant bounded design; a larger pre-ring inverts the "
+                f"causal/anti-causal balance into a matched filter."
+            )
 
     # Modal anti-pulse + Wiener FIR combination — ARCHITECTURAL LIMITATION.
     #
@@ -415,27 +483,79 @@ def design_multi_input_fir(
             # K_i was designed to produce coherent summing at MLP.
             k_centered = np.roll(k_full, common_rotation)
 
-            if phase_mode == "linear":
-                half = mag_taps // 2
+            if phase_mode == "mixed" and decay_correction_ms is not None:
+                # ── BOUNDED-PRE-RING WINDOWED-TARGET realization ──
+                # Invert only the EARLY part of the decay. Window the realized
+                # k_centered (peak at target_center) with:
+                #   • a Hann ramp-up over `preringing_ms` before the peak
+                #     (bounds the anti-causal all-pass inverse pre-ring),
+                #   • a short flat top of a few samples around the peak
+                #     (protect the main impulse; avoid a C¹ kink that injects a
+                #     broadband spectral pedestal),
+                #   • a Tukey taper (α≈0.25, 75 % flat) over `decay_correction_ms`
+                #     after the peak (preserve the LF-carrying tail; a full
+                #     half-Hann ramp-down would over-attenuate the 25-40 Hz
+                #     correction the tail carries).
+                # Everything else is zero. The result is causal-dominant: its
+                # zeros land on the poles (energy decays FORWARD), so it shortens
+                # the early decay and corrects inter-sub phase WITHOUT becoming
+                # the matched filter (multi_fir.py:736).
+                pre_samples = int(round(preringing_ms / 1000 * sample_rate))
+                post_samples = int(round(decay_correction_ms / 1000 * sample_rate))
+                pre_samples = min(pre_samples, mag_taps // 2)
+                post_samples = min(post_samples, mag_taps - pre_samples - 1)
+
+                win_len = pre_samples + 1 + post_samples
+                w = np.zeros(win_len)
+                flat = max(2, min(pre_samples, post_samples) // 16)
+
+                # Pre-peak Hann ramp-up over the pre-ring (minus the flat top).
+                pre_taper = max(0, pre_samples - flat)
+                if pre_taper > 0:
+                    ramp = 0.5 * (1 - np.cos(np.pi * np.arange(pre_taper) / pre_taper))
+                    w[:pre_taper] = ramp
+                # Flat top straddling the peak (peak sits at index pre_samples).
+                w[pre_taper:pre_samples + 1 + flat] = 1.0
+                # Post-peak Tukey (α≈0.25): 75 % flat, short cosine skirt at end.
+                post_start = pre_samples + 1 + flat
+                post_n = win_len - post_start
+                if post_n > 0:
+                    post_taper = max(1, int(round(0.25 * post_n)))
+                    pw = np.ones(post_n)
+                    edge = 0.5 * (1 - np.cos(np.pi * np.arange(post_taper) / post_taper))
+                    pw[-post_taper:] = edge[::-1]
+                    w[post_start:] = pw
+
+                # Extract the same span from k_centered (peak at target_center).
+                seg_start = target_center - pre_samples
+                seg = k_centered[seg_start:seg_start + win_len].copy() * w
+
+                # Place into the mag_taps buffer with the peak at `pre_samples`
+                # (causal-dominant: the bulk of the FIR follows the impulse).
+                k_td = np.zeros(mag_taps)
+                k_td[:win_len] = seg
             else:
-                # mixed: keep only preringing_ms before the peak, rest after
-                pre_samples = int(preringing_ms / 1000 * sample_rate)
-                half = min(pre_samples, mag_taps // 2)
+                if phase_mode == "linear":
+                    half = mag_taps // 2
+                else:
+                    # mixed: keep only preringing_ms before the peak, rest after
+                    pre_samples = int(preringing_ms / 1000 * sample_rate)
+                    half = min(pre_samples, mag_taps // 2)
 
-            start = target_center - half
-            end = start + mag_taps
-            k_td = k_centered[start:end].copy()
+                start = target_center - half
+                end = start + mag_taps
+                k_td = k_centered[start:end].copy()
 
-            # Soft cosine taper at the edges only (preserve central impulse).
-            # Short taper (1/32 of FIR length) to avoid attenuating the
-            # impulse tails — those tails carry LOW-frequency response
-            # information, so an aggressive taper kills the bottom octave.
-            taper_len = max(1, mag_taps // 32)
-            window = np.ones(mag_taps)
-            edge = 0.5 * (1 - np.cos(np.pi * np.arange(taper_len) / taper_len))
-            window[:taper_len] = edge
-            window[-taper_len:] = edge[::-1]
-            k_td = k_td * window
+                # Soft cosine taper at the edges only (preserve central impulse).
+                # Short taper (1/32 of FIR length) to avoid attenuating the
+                # impulse tails — those tails carry LOW-frequency response
+                # information, so an aggressive taper kills the bottom octave.
+                taper_len = max(1, mag_taps // 32)
+                window = np.ones(mag_taps)
+                edge = 0.5 * (1 - np.cos(np.pi * np.arange(taper_len) / taper_len))
+                window[:taper_len] = edge
+                window[-taper_len:] = edge[::-1]
+                k_td = k_td * window
 
         fir_list.append(k_td)
 
@@ -506,6 +626,20 @@ def design_multi_input_fir(
         H_combined, incoherent_mag, freqs_out, freq_focus_hz
     ) if n_subs >= 2 else 0.0
 
+    # ── Matched-filter guard (per-sub causality) ──────────────────────────
+    # Compute the pre-peak energy fraction of every realised FIR. A causal-
+    # dominant correction (zeros on the poles, energy decays FORWARD) has
+    # f_pre < 0.5; an anti-causal-dominant one (f_pre > 0.5) IS the time-
+    # reversed matched filter that re-excites the mode (+40 dB, T60 unchanged;
+    # multi_fir.py:736). This is per-sub time-domain causality, independent of
+    # the cross-sub acoustic coherence the self-cancellation margin measures —
+    # a bounded design must satisfy BOTH. Surfaced as a field; never silently
+    # shipped.
+    pre_ring_energy_fraction = [
+        round(_pre_ring_energy_fraction(fir), 4) for fir in fir_list
+    ]
+    matched_filter_unsafe = any(f > 0.5 for f in pre_ring_energy_fraction)
+
     # Downsample to 1/3-octave for compact response
     third_oct_centres = [
         20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500,
@@ -572,6 +706,8 @@ def design_multi_input_fir(
         "latency_ms": latency_ms,
         "modal_pre_delay_ms": modal_pre_delay_ms,
         "self_cancellation_margin_db": self_cancellation_margin_db,
+        "pre_ring_energy_fraction": pre_ring_energy_fraction,
+        "matched_filter_unsafe": matched_filter_unsafe,
     }
 
 
@@ -715,6 +851,7 @@ def design_fir_trinnov(
     freq_focus_hz: tuple[float, float] | None = None,
     max_correction_db: float | None = None,
     preringing_ms: float = 20.0,
+    decay_correction_ms: float | None = None,
     freq_min: float = 20.0,
     freq_max: float = 120.0,
     bands_per_octave: int = 6,
@@ -755,6 +892,12 @@ def design_fir_trinnov(
                        (symmetric, highest latency), or 'minimum' (per-sub
                        magnitude only — no inter-sub coherence; single-sub use).
     preringing_ms    : pre-ring budget for mixed phase (≈ latency). Default 20.
+    decay_correction_ms : if set (e.g. 80), use the BOUNDED-PRE-RING WINDOWED-
+                       TARGET realization — invert only the first
+                       ``decay_correction_ms`` of the modal decay with a bounded
+                       pre-ring, keeping the correction causal-dominant so it
+                       shortens early decay / corrects inter-sub phase without
+                       becoming the matched filter. None = full-inversion mixed.
     freq_focus_hz    : optional (lo, hi) band to confine the correction to.
     freq_min/max     : frequency range for the baseline T60 report.
     bands_per_octave : filter-bank resolution for the baseline T60 report.
@@ -766,7 +909,7 @@ def design_fir_trinnov(
         sample_rate=sample_rate, num_taps=num_taps,
         phase_mode=phase_mode, regularization_lambda=regularization_lambda,
         freq_focus_hz=freq_focus_hz, max_correction_db=max_correction_db,
-        preringing_ms=preringing_ms,
+        preringing_ms=preringing_ms, decay_correction_ms=decay_correction_ms,
     )
 
     # Informational baseline decay report from the measured room IR. This is a
@@ -808,6 +951,8 @@ def design_fir_trinnov(
         "output_gain_db": wiener.get("output_gain_db", 0.0),
         "latency_ms": wiener["latency_ms"],
         "self_cancellation_margin_db": wiener.get("self_cancellation_margin_db", 0.0),
+        "pre_ring_energy_fraction": wiener.get("pre_ring_energy_fraction", []),
+        "matched_filter_unsafe": wiener.get("matched_filter_unsafe", False),
         "ringing_modes": ringing_modes,
         "n_ringing_modes": len(ringing_modes),
         # Pure magnitude/phase correction — strict thermal cap applies, and the

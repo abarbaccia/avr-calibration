@@ -4279,6 +4279,7 @@ async def _tool_design_fir_trinnov(
     freq_focus_hz: list[float] | None = None,
     max_correction_db: float | None = None,
     preringing_ms: float = 20.0,
+    decay_correction_ms: float | None = None,
     freq_min: float = 20.0,
     freq_max: float = 120.0,
     bands_per_octave: int = 6,
@@ -4315,6 +4316,16 @@ async def _tool_design_fir_trinnov(
     phase_mode       : 'mixed' (default, coherent multi-sub), 'linear', or
                        'minimum' (single-sub magnitude only — no coherence)
     preringing_ms    : pre-ring budget for mixed phase (≈ latency, default 20)
+    decay_correction_ms : if set (e.g. 80), use the BOUNDED-PRE-RING WINDOWED-
+                       TARGET realization — invert only the first
+                       decay_correction_ms of the modal decay with a bounded
+                       pre-ring, keeping the correction causal-dominant so it
+                       shortens early decay / corrects inter-sub phase WITHOUT
+                       becoming the matched filter (re-excites the mode +40 dB).
+                       Requires preringing_ms ≤ decay_correction_ms/2. The design
+                       returns matched_filter_unsafe / pre_ring_energy_fraction;
+                       an unsafe (anti-causal-dominant) design is blocked. None =
+                       full-inversion mixed (legacy).
     freq_focus_hz    : optional [lo, hi] band to confine the correction to
     freq_min/max     : frequency range for the baseline ringing-mode report
     bands_per_octave : filter-bank resolution for the report (default 6)
@@ -4481,24 +4492,45 @@ async def _tool_design_fir_trinnov(
             freq_focus_hz=focus,
             max_correction_db=max_correction_db,
             preringing_ms=preringing_ms,
+            decay_correction_ms=decay_correction_ms,
             freq_min=freq_min,
             freq_max=freq_max,
             bands_per_octave=bands_per_octave,
             t60_threshold_ms=t60_threshold_ms,
         )
 
+        # Matched-filter guard: a bounded-window design (decay_correction_ms)
+        # that came out anti-causal-dominant (pre-peak energy fraction > 0.5)
+        # IS the time-reversed matched filter — convolved back through the
+        # sub→mic path it re-excites the mode (+40 dB, T60 unchanged). NEVER
+        # cache/apply an unsafe design; surface it and force a redesign.
+        matched_filter_unsafe = bool(result.get("matched_filter_unsafe", False))
+        pre_ring_energy_fraction = result.get("pre_ring_energy_fraction", [])
+        matched_filter_warning = None
+        if matched_filter_unsafe:
+            worst = max(pre_ring_energy_fraction) if pre_ring_energy_fraction else 1.0
+            matched_filter_warning = (
+                f"MATCHED-FILTER UNSAFE: a realised FIR is anti-causal-dominant "
+                f"(pre-peak energy fraction {worst:.2f} > 0.50) — it is the "
+                f"time-reversed matched filter that re-excites the mode (+40 dB, "
+                f"T60 unchanged). FIRs NOT cached. Re-run with a larger "
+                f"decay_correction_ms and/or smaller preringing_ms "
+                f"(require preringing_ms ≤ decay_correction_ms/2)."
+            )
+
         # Cache FIRs — Trinnov is a pure magnitude/phase correction tagged
         # "correction", so apply_fir uses the strict thermal safety cap and
         # the FIR is safe to sweep through (no anti-pulse Gabor content).
         apply_intent = result.get("apply_intent", "correction")
         cache_ids = []
-        for fir_taps, m in zip(result["firs"], measurements):
-            output_index = int(m["output_index"])
-            session_id = int(m["session_id"])
-            cache_id = session_id * 1000 + output_index
-            _fir_design_cache[cache_id] = fir_taps
-            _fir_design_intent[cache_id] = apply_intent
-            cache_ids.append({"output_index": output_index, "design_session_id": cache_id})
+        if not matched_filter_unsafe:
+            for fir_taps, m in zip(result["firs"], measurements):
+                output_index = int(m["output_index"])
+                session_id = int(m["session_id"])
+                cache_id = session_id * 1000 + output_index
+                _fir_design_cache[cache_id] = fir_taps
+                _fir_design_intent[cache_id] = apply_intent
+                cache_ids.append({"output_index": output_index, "design_session_id": cache_id})
 
         note = (
             f"Trinnov coherent Wiener FIR: {result['num_subs']} subs, "
@@ -4527,6 +4559,8 @@ async def _tool_design_fir_trinnov(
                 f"plus MSO delay/polarity alignment for inter-sub coherence."
             )
             note += " ⛔ " + self_cancellation_warning
+        if matched_filter_warning:
+            note += " ⛔ " + matched_filter_warning
 
         response = {
             "num_subs": result["num_subs"],
@@ -4543,6 +4577,9 @@ async def _tool_design_fir_trinnov(
             "output_gain_db": result["output_gain_db"],
             "self_cancellation_margin_db": self_cancel_db,
             "self_cancellation_warning": self_cancellation_warning,
+            "pre_ring_energy_fraction": pre_ring_energy_fraction,
+            "matched_filter_unsafe": matched_filter_unsafe,
+            "matched_filter_warning": matched_filter_warning,
             "balance_warnings": balance_warnings,
             "xcorr_warnings": xcorr_warnings,
             "cache_ids": cache_ids,
@@ -12076,6 +12113,7 @@ _TOOLS: list[Tool] = [
                 "phase_mode": {"type": "string", "enum": ["minimum", "linear", "mixed"], "description": "Wiener phase mode. Default 'mixed' (coherent multi-sub). 'minimum' = single-sub magnitude only (no inter-sub coherence). 'linear' = symmetric, highest latency.", "default": "mixed"},
                 "regularization_lambda": {"type": "number", "description": "Wiener regularization. Default 0.01 (tuned for this hardware's -28..-16 dBFS signal level).", "default": 0.01},
                 "preringing_ms": {"type": "number", "description": "Pre-ring budget for mixed phase (≈ latency, compensated via sub distance). Default 20.", "default": 20.0},
+                "decay_correction_ms": {"type": "number", "description": "BOUNDED-PRE-RING WINDOWED-TARGET mixed phase: invert only the first N ms of the modal decay with a bounded pre-ring, keeping the correction causal-dominant so it shortens early decay / corrects inter-sub phase WITHOUT becoming the matched filter (re-excites the mode +40 dB). Requires preringing_ms ≤ decay_correction_ms/2. An anti-causal-dominant result is flagged matched_filter_unsafe and NOT cached. Omit = full-inversion mixed (legacy). Try 80-160 ms."},
                 "freq_focus_hz": {"type": "array", "items": {"type": "number"}, "description": "[lo, hi] band to confine the correction to."},
                 "max_correction_db": {"type": "number", "description": "Clamp the per-band FIR gain to ±this many dB around its in-band median (phase preserved). Bounds Wiener over-correction when the baseline is near-converged but has tall GEOMETRY modes (a full inverse otherwise produces 20-37 dB cuts that gut the band). Omit = no clamp. Try 10-12 dB for a near-converged room."},
                 "freq_min": {"type": "number", "description": "Low edge of baseline ringing-mode report. Default 20 Hz.", "default": 20.0},

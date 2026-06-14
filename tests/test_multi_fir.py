@@ -478,3 +478,242 @@ def test_self_cancellation_margin_focus_band_entirely_outside_grid():
     outside = _self_cancellation_margin(
         a + a, np.abs(a) + np.abs(a), freqs, (500.0, 1000.0))
     assert outside == whole  # fell back to whole-band, did not crash
+
+
+# ---------------------------------------------------------------------------
+# Bounded-pre-ring windowed-target mixed-phase (decay_correction_ms)
+#
+# Invert only the EARLY part of modal decay with a bounded pre-ring, so the
+# realised correction stays CAUSAL-dominant (zeros on the poles → energy
+# decays FORWARD) and does NOT become the time-reversed matched filter that
+# re-excites the mode (+40 dB, T60 unchanged). See multi_fir.py:736 and the
+# acoustician's spec: f_pre = E(t<peak)/E_total > 0.5 ⇒ anti-causal/matched.
+# ---------------------------------------------------------------------------
+
+
+def _second_order_allpass(f0_hz, r, sample_rate):
+    """2nd-order all-pass impulse response (pole r∠θ, zero at conj-reciprocal).
+
+    Localised excess phase around f0 — models a room cancellation, |A|=1 so
+    it preserves the cascaded mode's magnitude/T60 but makes H non-min-phase.
+    Returns (b, a) biquad coefficients.
+    """
+    theta = 2 * np.pi * f0_hz / sample_rate
+    a1 = -2 * r * np.cos(theta)
+    a2 = r * r
+    # All-pass: b = reverse(a)
+    b = np.array([a2, a1, 1.0])
+    a = np.array([1.0, a1, a2])
+    return b, a
+
+
+def _synth_excess_phase_mode(
+    mode_freq_hz=60.0, t60_ms=400.0, n_samples=48000, sample_rate=48000,
+    peak_at=100, allpass_r=0.988, noise_db=-60.0, seed=0,
+):
+    """Single-sub IR: decaying mode cascaded with a 2nd-order all-pass →
+    a NON-minimum-phase (excess-phase) response. Small noise floor added so
+    the decay estimators' noise gates are exercised like on real data."""
+    from scipy.signal import lfilter
+    ir = np.zeros(n_samples)
+    ir[peak_at] = 1.0
+    decay_rate = math.log(1000) / (t60_ms / 1000.0)
+    t = np.arange(n_samples - peak_at) / sample_rate
+    mode = np.exp(-decay_rate * t) * np.sin(2 * np.pi * mode_freq_hz * t)
+    ir[peak_at:] += mode * 0.5
+    # Cascade the all-pass to add excess phase (keeps |H| / T60 unchanged).
+    b, a = _second_order_allpass(mode_freq_hz, allpass_r, sample_rate)
+    ir = lfilter(b, a, ir)
+    # Small white noise floor, relative to peak.
+    rng = np.random.default_rng(seed)
+    peak = float(np.max(np.abs(ir))) + 1e-30
+    ir = ir + rng.standard_normal(n_samples) * peak * 10 ** (noise_db / 20.0)
+    return ir
+
+
+def _measurement_from_ir(ir, sample_rate, freqs, label=""):
+    """Derive a SubMeasurement (mag dB + phase) from a time-domain IR."""
+    ir = np.asarray(ir, dtype=float)
+    n_fft = 1
+    while n_fft < len(ir):
+        n_fft *= 2
+    H = np.fft.rfft(ir, n=n_fft)
+    fo = np.fft.rfftfreq(n_fft, d=1.0 / sample_rate)
+    freqs = np.asarray(freqs, dtype=float)
+    mag_db = np.interp(freqs, fo, 20 * np.log10(np.abs(H) + 1e-12))
+    phase = np.interp(freqs, fo, np.unwrap(np.angle(H)))
+    return SubMeasurement(freqs=list(freqs), spl_db=list(mag_db),
+                          phase_rad=list(phase), label=label)
+
+
+def _t20_at(ir, freq_hz, sample_rate=48000):
+    """T20 (≈ early-decay) of a single mode band, via the clean-decay estimator."""
+    from scipy.signal import butter, sosfiltfilt
+    from calibrate.decay import _estimate_t60_clean_decay, _lundeby_t60
+    ir = np.asarray(ir, dtype=float)
+    nyq = sample_rate / 2.0
+    lo = freq_hz * 2 ** (-1.0 / 6) / nyq
+    hi = freq_hz * 2 ** (1.0 / 6) / nyq
+    sos = butter(4, [lo, hi], btype="bandpass", output="sos")
+    band = sosfiltfilt(sos, ir)
+    t = _estimate_t60_clean_decay(band, sample_rate)
+    if t is None:
+        t = _lundeby_t60(band ** 2, sample_rate)
+    return t
+
+
+def test_decay_correction_ms_realizes_causal_dominant_correction():
+    """SYNTHETIC EXCESS-PHASE MODE: with decay_correction_ms set, the realised
+    correction must be CAUSAL-dominant (most energy AFTER the peak), shorten the
+    mode's early decay (T20 drops), and NOT amplify the steady-state mode (no
+    matched-filter +40 dB trap)."""
+    sr = 48000
+    ir = _synth_excess_phase_mode(mode_freq_hz=60.0, t60_ms=400.0,
+                                  n_samples=sr, sample_rate=sr, allpass_r=0.988)
+    freqs = np.linspace(20, 200, 400).tolist()
+    m = _measurement_from_ir(ir, sr, freqs, label="sub")
+    target = [(20, 0.0), (200, 0.0)]
+    res = design_multi_input_fir(
+        [m], target, num_taps=8192, sample_rate=sr, phase_mode="mixed",
+        preringing_ms=20.0, decay_correction_ms=80.0,
+        regularization_lambda=0.05, freq_focus_hz=(40.0, 120.0),
+    )
+
+    # (a) causal-dominant: the design must report the pre-peak energy fraction
+    # and it must be ≤ 0.5 (more than half pre-peak energy = matched filter).
+    assert "pre_ring_energy_fraction" in res
+    assert "matched_filter_unsafe" in res
+    f_pre = res["pre_ring_energy_fraction"][0]
+    assert f_pre <= 0.5, f"correction is anti-causal dominant (f_pre={f_pre:.3f})"
+    assert res["matched_filter_unsafe"] is False
+
+    # (b) shortens early decay: convolve correction with the mode IR; T20 drops.
+    corr = np.asarray(res["firs"][0])
+    corrected = np.convolve(ir, corr)[: len(ir)]
+    t20_before = _t20_at(ir, 60.0, sr)
+    t20_after = _t20_at(corrected, 60.0, sr)
+    assert t20_before is not None and t20_after is not None
+    assert t20_after < t20_before * 0.9, (
+        f"early decay must drop materially: before={t20_before:.0f}ms "
+        f"after={t20_after:.0f}ms"
+    )
+
+    # (c) steady-state mode magnitude NOT amplified > 3 dB (matched-filter guard).
+    n_fft = 65536
+    fo = np.fft.rfftfreq(n_fft, d=1.0 / sr)
+    bidx = int(np.argmin(np.abs(fo - 60.0)))
+    H_before = np.abs(np.fft.rfft(ir, n=n_fft))[bidx]
+    H_after = np.abs(np.fft.rfft(corrected, n=n_fft))[bidx]
+    gain_db = 20 * np.log10((H_after + 1e-12) / (H_before + 1e-12))
+    assert gain_db < 3.0, f"steady-state mode amplified {gain_db:.1f} dB (matched-filter trap)"
+
+
+def test_decay_correction_flags_matched_filter_as_unsafe():
+    """CONTROL — matched-filter rejection: a deliberately time-reversed-ringing
+    correction (anti-causal energy dominant) must be FLAGGED unsafe by the new
+    pre-ring-energy check."""
+    from calibrate.multi_fir import _matched_filter_unsafe, _pre_ring_energy_fraction
+    sr = 48000
+    n = 4096
+    # A causal decaying mode (energy after the peak) — SAFE.
+    causal = np.zeros(n)
+    peak = 200
+    causal[peak] = 1.0
+    t = np.arange(n - peak) / sr
+    causal[peak:] += 0.6 * np.exp(-t / 0.05) * np.sin(2 * np.pi * 60 * t)
+    f_causal = _pre_ring_energy_fraction(causal)
+    assert f_causal < 0.5
+    assert _matched_filter_unsafe(causal) is False
+
+    # Its time-reversal = the matched filter (energy GROWS toward the peak) — UNSAFE.
+    matched = causal[::-1].copy()
+    f_matched = _pre_ring_energy_fraction(matched)
+    assert f_matched > 0.5, f_matched
+    assert _matched_filter_unsafe(matched) is True
+
+
+def test_decay_correction_ms_improves_self_cancellation_two_sub():
+    """TWO-SUB: with decay_correction_ms set, the self-cancellation margin is
+    materially better (less negative) than the same design with
+    decay_correction_ms=None, because the bounded window reduces the truncation
+    cancellation that leaves each sub at a different residual phase."""
+    sr = 48000
+    # Two subs, same mode but DIFFERENT excess phase (different all-pass r) so
+    # the full-inversion truncation leaves different residual phases → they
+    # cancel; the bounded window keeps them causal-dominant and coherent.
+    ir5 = _synth_excess_phase_mode(mode_freq_hz=60.0, t60_ms=400.0, n_samples=sr,
+                                   sample_rate=sr, allpass_r=0.985, seed=1)
+    ir6 = _synth_excess_phase_mode(mode_freq_hz=60.0, t60_ms=400.0, n_samples=sr,
+                                   sample_rate=sr, allpass_r=0.992, seed=2)
+    freqs = np.linspace(20, 200, 400).tolist()
+    m5 = _measurement_from_ir(ir5, sr, freqs, label="sub5")
+    m6 = _measurement_from_ir(ir6, sr, freqs, label="sub6")
+    target = [(20, 0.0), (200, 0.0)]
+    common = dict(num_taps=8192, sample_rate=sr, phase_mode="mixed",
+                  preringing_ms=20.0, regularization_lambda=0.05,
+                  freq_focus_hz=(40.0, 120.0))
+
+    res_none = design_multi_input_fir([m5, m6], target, **common)
+    res_bounded = design_multi_input_fir([m5, m6], target,
+                                         decay_correction_ms=80.0, **common)
+
+    assert res_bounded["self_cancellation_margin_db"] > res_none["self_cancellation_margin_db"], (
+        f"bounded must improve margin: bounded="
+        f"{res_bounded['self_cancellation_margin_db']:.2f} "
+        f"none={res_none['self_cancellation_margin_db']:.2f}"
+    )
+
+
+def test_decay_correction_ms_none_is_backward_compatible():
+    """Backward-compat: decay_correction_ms=None reproduces existing mixed-phase
+    behavior EXACTLY (identical FIR taps)."""
+    freqs = np.linspace(20, 200, 120).tolist()
+    mag = [12.0 if 45 <= f <= 55 else 0.0 for f in freqs]
+    m1 = _synth_measurement(freqs, mag, label="sub1")
+    m2 = _synth_measurement(freqs, mag, label="sub2")
+    target = [(20, 0.0), (200, 0.0)]
+    common = dict(num_taps=4096, sample_rate=48000, phase_mode="mixed",
+                  preringing_ms=20.0, freq_focus_hz=(30.0, 120.0),
+                  regularization_lambda=0.01)
+    res_default = design_multi_input_fir([m1, m2], target, **common)
+    res_none = design_multi_input_fir([m1, m2], target,
+                                      decay_correction_ms=None, **common)
+    for a, b in zip(res_default["firs"], res_none["firs"]):
+        assert np.allclose(np.asarray(a), np.asarray(b), atol=0, rtol=0), (
+            "decay_correction_ms=None must reproduce existing taps exactly"
+        )
+
+
+def test_decay_correction_ms_rejects_bad_preringing_budget():
+    """preringing_ms must be ≤ decay_correction_ms / 2 (causal-dominant balance);
+    a larger pre-ring inverts the causal/anti-causal balance into a matched
+    filter and must be rejected at the API boundary."""
+    freqs = np.linspace(20, 200, 60).tolist()
+    m1 = _synth_measurement(freqs, [0.0] * 60, label="sub1")
+    m2 = _synth_measurement(freqs, [0.0] * 60, label="sub2")
+    target = [(20, 0.0), (200, 0.0)]
+    with pytest.raises(ValueError, match="preringing_ms"):
+        design_multi_input_fir(
+            [m1, m2], target, num_taps=2048, sample_rate=48000,
+            phase_mode="mixed", preringing_ms=60.0, decay_correction_ms=80.0,
+            freq_focus_hz=(40.0, 120.0),
+        )
+
+
+def test_trinnov_threads_decay_correction_ms():
+    """design_fir_trinnov must thread decay_correction_ms through to the Wiener
+    design and surface the matched-filter safety fields."""
+    sr = 48000
+    ir = _synth_excess_phase_mode(mode_freq_hz=60.0, t60_ms=400.0,
+                                  n_samples=sr, sample_rate=sr, allpass_r=0.988)
+    freqs = np.linspace(20, 120, 200).tolist()
+    m = _measurement_from_ir(ir, sr, freqs, label="sub")
+    result = design_fir_trinnov(
+        ir.tolist(), [m], [(20, 0.0), (120, 0.0)],
+        sample_rate=sr, num_taps=8192, phase_mode="mixed",
+        preringing_ms=20.0, decay_correction_ms=80.0,
+        regularization_lambda=0.05, freq_focus_hz=(40.0, 120.0),
+    )
+    assert "matched_filter_unsafe" in result
+    assert "pre_ring_energy_fraction" in result
+    assert result["matched_filter_unsafe"] is False
