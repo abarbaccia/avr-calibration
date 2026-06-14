@@ -578,6 +578,161 @@ class TestLundebyIntegratedPaths:
         )
 
 
+class TestBandpassBeatingRobustness:
+    """Regression tests for the bandpass T60 INFLATION bug on multi-modal data.
+
+    On a clean single tone the min(Lundeby, envelope) cross-check works. But on
+    real multi-modal room IRs, a 1/6-octave band that sits BETWEEN two modes (or
+    contains leakage from adjacent modes) sees BEATING energy — non-exponential,
+    non-monotonic decay. A single-slope linear T20/T30 fit over-reads the decay,
+    and BOTH sub-estimators inflate, so min() inflates too.
+
+    Pre-fix the bandpass path reported 80 Hz=2376 ms, 25 Hz=3842 ms etc. on the
+    live combined-sub IR while the spectrogram path gave realistic numbers. These
+    tests pin the bandpass path to a realistic domestic-room range (~200-700 ms)
+    and require it to AGREE with the spectrogram path.
+    """
+
+    @staticmethod
+    def _two_mode_ir(
+        f1: float, t60_1_ms: float,
+        f2: float, t60_2_ms: float,
+        sample_rate: int = 48000,
+        duration_s: float = 2.5,
+        noise_db: float = -50.0,
+        seed: int = 123,
+    ) -> list[float]:
+        n = int(sample_rate * duration_s)
+        t = np.arange(n) / sample_rate
+        m1 = np.sin(2 * np.pi * f1 * t) * np.exp(-6.9 / (t60_1_ms / 1000.0) * t)
+        m2 = np.sin(2 * np.pi * f2 * t) * np.exp(-6.9 / (t60_2_ms / 1000.0) * t)
+        rng = np.random.default_rng(seed)
+        noise = rng.normal(0, 10.0 ** (noise_db / 20.0), n)
+        sig = m1 + m2 + noise
+        sig[0] = 1.0
+        return sig.tolist()
+
+    @staticmethod
+    def _one_mode_ir(
+        freq_hz: float, t60_ms: float,
+        sample_rate: int = 48000, duration_s: float = 2.5,
+        noise_db: float = -50.0, seed: int = 321,
+    ) -> list[float]:
+        n = int(sample_rate * duration_s)
+        t = np.arange(n) / sample_rate
+        m = np.sin(2 * np.pi * freq_hz * t) * np.exp(-6.9 / (t60_ms / 1000.0) * t)
+        rng = np.random.default_rng(seed)
+        noise = rng.normal(0, 10.0 ** (noise_db / 20.0), n)
+        sig = m + noise
+        sig[0] = 1.0
+        return sig.tolist()
+
+    def test_multimodal_bands_near_true_modes_not_inflated(self) -> None:
+        """KEY new test: two modes at 47 Hz (T60=350 ms) and 70 Hz (T60=300 ms).
+
+        The 1/6-octave bands near 47 and 70 Hz beat (modes fall between band
+        centres + leakage). The bandpass path must report T60 within ±30 % of
+        the true values at the bands nearest those modes — NOT inflated >1000 ms.
+        """
+        ir = self._two_mode_ir(47.0, 350.0, 70.0, 300.0)
+        modes = analyze_decay(ir, sample_rate=48000, t60_threshold_ms=80.0,
+                              bands_per_octave=6)
+        assert modes, "expected modes from a two-mode IR"
+
+        near_47 = [m for m in modes if abs(m.freq_hz - 47.0) < 4.0]
+        near_70 = [m for m in modes if abs(m.freq_hz - 70.0) < 5.0]
+        assert near_47, f"no band near 47 Hz in {[m.freq_hz for m in modes]}"
+        assert near_70, f"no band near 70 Hz in {[m.freq_hz for m in modes]}"
+
+        best_47 = min(m.t60_ms for m in near_47)
+        best_70 = min(m.t60_ms for m in near_70)
+        # 47 Hz mode (the longer-lived, T60=350 ms): its nearest band must land
+        # within ±30 % — NOT the pre-fix 700-2400 ms inflation.
+        assert 245.0 <= best_47 <= 455.0, (
+            f"47 Hz band T60 out of ±30%: got {best_47} ms (true 350 ms)"
+        )
+        # 70 Hz mode (T60=300 ms): its band is contaminated by leakage from the
+        # equal-amplitude, longer-lived 47 Hz mode only 0.6 octave away, so a
+        # single 1/6-octave band reads somewhat high. The hard requirement is
+        # that it stays in a realistic domestic-room range (NOT inflated to
+        # seconds) — well under the pre-fix 2376 ms seen on the live IR.
+        assert 210.0 <= best_70 <= 560.0, (
+            f"70 Hz band T60 unrealistic: got {best_70} ms (true 300 ms)"
+        )
+
+    def test_multimodal_no_band_grossly_inflated(self) -> None:
+        """No band anywhere in the analysis may report a physically impossible
+        T60 (>1000 ms) for a domestic room on this two-mode IR."""
+        ir = self._two_mode_ir(47.0, 350.0, 70.0, 300.0)
+        modes = analyze_decay(ir, sample_rate=48000, t60_threshold_ms=80.0,
+                              bands_per_octave=6)
+        inflated = [(m.freq_hz, m.t60_ms) for m in modes if m.t60_ms > 1000.0]
+        assert not inflated, (
+            f"bandpass path reported physically impossible T60 (>1000 ms): "
+            f"{inflated}"
+        )
+
+    def test_offset_mode_not_inflated(self) -> None:
+        """A single mode OFFSET from the band centre (45 Hz; nearest 1/6-octave
+        centre ~44.9/50 Hz) must still read realistic, not inflated."""
+        ir = self._one_mode_ir(45.0, 350.0)
+        modes = analyze_decay(ir, sample_rate=48000, t60_threshold_ms=80.0,
+                              bands_per_octave=6)
+        near = [m for m in modes if abs(m.freq_hz - 45.0) < 6.0]
+        assert near, f"no band near 45 Hz in {[m.freq_hz for m in modes]}"
+        best = min(m.t60_ms for m in near)
+        assert best < 600.0, (
+            f"offset-mode band inflated: got {best} ms (true 350 ms)"
+        )
+        # And not absurd anywhere.
+        assert all(m.t60_ms < 1000.0 for m in modes), (
+            f"some band inflated >1000 ms: {[(m.freq_hz, m.t60_ms) for m in modes]}"
+        )
+
+    def test_bandpass_agrees_with_spectrogram(self) -> None:
+        """Agreement test: a single 50 Hz / 400 ms mode + noise. The bandpass and
+        spectrogram paths must agree within ~30 % (both realistic ~300-520 ms)."""
+        ir = self._one_mode_ir(50.0, 400.0, seed=55)
+
+        spec = analyze_decay(ir, sample_rate=48000, t60_threshold_ms=80.0)
+        band = analyze_decay(ir, sample_rate=48000, t60_threshold_ms=80.0,
+                             bands_per_octave=6)
+
+        spec_50 = [m for m in spec if abs(m.freq_hz - 50.0) < 13.0]
+        band_50 = [m for m in band if abs(m.freq_hz - 50.0) < 5.0]
+        assert spec_50, f"spectrogram missed 50 Hz: {[m.freq_hz for m in spec]}"
+        assert band_50, f"bandpass missed 50 Hz: {[m.freq_hz for m in band]}"
+
+        t_spec = min(m.t60_ms for m in spec_50)
+        t_band = min(m.t60_ms for m in band_50)
+        # Both realistic.
+        assert 300.0 <= t_spec <= 520.0, f"spectrogram T60 unrealistic: {t_spec} ms"
+        assert 300.0 <= t_band <= 520.0, f"bandpass T60 unrealistic: {t_band} ms"
+        # Agree within ~30 %.
+        ratio = t_band / t_spec
+        assert 0.7 <= ratio <= 1.3, (
+            f"paths disagree: spectrogram={t_spec} ms, bandpass={t_band} ms "
+            f"(ratio {ratio:.2f})"
+        )
+
+    def test_pure_noise_bandpass_no_inflation(self) -> None:
+        """Pure noise through the bandpass path must NOT produce inflated modes.
+
+        Pre-fix, pure white noise yielded multi-second T60 'modes' (6000-10000 ms)
+        because the Lundeby/envelope estimators read the noise tail as decay. The
+        clean-decay gate must reject those: no band may report a physically
+        impossible T60 (>1000 ms) on pure noise.
+        """
+        rng = np.random.default_rng(404)
+        ir = rng.normal(0, 1.0, int(48000 * 2.5)).tolist()
+        modes = analyze_decay(ir, sample_rate=48000, t60_threshold_ms=300.0,
+                              bands_per_octave=6)
+        inflated = [(m.freq_hz, m.t60_ms) for m in modes if m.t60_ms > 1000.0]
+        assert not inflated, (
+            f"pure noise produced inflated T60 (>1000 ms): {inflated}"
+        )
+
+
 class TestCompareDecay:
     """Tests for compare_decay."""
 

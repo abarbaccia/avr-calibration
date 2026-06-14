@@ -303,23 +303,40 @@ def _analyze_decay_bandpass(
         if peak_db < min_peak_db:
             continue
 
-        # Lundeby noise-floor-aware T60 on the band energy (squared filtered
-        # signal). Truncates Schroeder integration at the crosspoint where the
-        # decay meets the noise floor — without this, full-window Schroeder
-        # integration over a long IR inflates T60 by 4-15× (session 262,
-        # 2026-05-25: 47 Hz read 1905 ms vs manual T20×3 of 117-308 ms).
+        # Beating-robust per-band T60.
         #
-        # Cross-check against the Hilbert-envelope T20 estimator. For a clean
-        # centred mode the two agree. For a tone sitting BETWEEN band centres
-        # the bandpassed energy beats (non-exponential), and Lundeby's single
-        # slope over-estimates; the envelope's first-crossing time is robust to
-        # that distortion. Take the smaller (conservative) estimate so beating
-        # off-centre bands can't re-introduce inflation.
+        # In a 1/6-octave band a real mode often sits BETWEEN two band centres
+        # and/or shares the band with leakage from a neighbouring mode. The band
+        # energy then BEATS: the decay is non-exponential and non-monotonic
+        # (drops, plateaus while the two contributions interfere, then resumes).
+        # A single-slope linear T20/T30 fit over that plateau reads the decay
+        # far too slow — on the live combined-sub IR the old min(Lundeby,
+        # envelope) cross-check still reported 80 Hz=2376 ms, 25 Hz=3842 ms etc.
+        # because BOTH sub-estimators over-read on beating data.
+        #
+        # The fix: fit the slope only over the CLEAN, CONTIGUOUS, strictly-
+        # descending early decay (-5..-25 dB of the running-minimum envelope),
+        # stopping at the FIRST plateau/rebound — that initial run carries the
+        # dominant mode's true decay rate, before beating contaminates it. This
+        # estimator returns realistic values where Lundeby/envelope inflate, and
+        # returns None on noise rather than fabricating a huge T60.
+        #
+        # The clean-decay estimator is the REQUIRED gate: it returns a value
+        # ONLY when the band has a clean, contiguous descending decay. On a
+        # beating band whose decay never cleanly resolves (plateau dominates),
+        # or on a pure-noise band, it returns None — and we SKIP the band
+        # rather than fall back to the Lundeby/envelope estimators, which both
+        # over-read on exactly those bands (this is why the old min() of just
+        # those two still inflated: both inflate, so their min inflates too).
+        t60_clean = _estimate_t60_clean_decay(filtered, sample_rate)
+        if t60_clean is None:
+            continue
+        # Keep the conservative min() cross-check: a clean band's other two
+        # estimators agree, so min() can only tighten, never inflate.
         t60_lundeby = _lundeby_t60(filtered ** 2, sample_rate)
         t60_env = _estimate_t60_envelope(filtered, sample_rate)
-        candidates = [c for c in (t60_lundeby, t60_env) if c is not None]
-        if not candidates:
-            continue
+        candidates = [c for c in (t60_clean, t60_lundeby, t60_env)
+                      if c is not None]
         t60_ms = min(candidates)
         if t60_ms < t60_threshold_ms:
             continue
@@ -538,6 +555,124 @@ def _lundeby_t60(
     if t60 is not None:
         return t60
     return _fit_t60(-35.0)        # T30 span fallback
+
+
+def _estimate_t60_clean_decay(
+    filtered: "np.ndarray",
+    sample_rate: int,
+    block_ms: float = 15.0,
+    top_db: float = -5.0,
+    lo_db: float = -25.0,
+    min_usable_db: float = 25.0,
+    min_fit_db: float = 12.0,
+    stall_ms: float = 60.0,
+) -> float | None:
+    """Beating-robust per-band T60 from the clean early-decay slope.
+
+    This is the residual fix for the bandpass-path T60 INFLATION bug. The
+    Lundeby and Hilbert-envelope estimators both over-read on a BEATING band —
+    one where a mode sits between band centres, or two modes/leakage share the
+    band. Their energy decays, then PLATEAUS while the two contributions
+    interfere, then resumes; a single linear slope over -5..-25 dB is dragged
+    shallow by the plateau and reports a physically impossible T60 (seconds in a
+    domestic room). min(Lundeby, envelope) doesn't help because BOTH inflate.
+
+    Algorithm:
+      1. Hilbert envelope of the bandpassed signal, dB relative to its peak
+         (peak found in the first ~10 % of the IR).
+      2. Block-average into a ~``block_ms`` energy-time curve.
+      3. Noise-floor gate: median of the last 10 % must be > ``min_usable_db``
+         below the peak, else return None (not enough clean decay).
+      4. Running-minimum of the dB curve = the monotonic decay envelope.
+      5. Fit the slope over the CONTIGUOUS, STRICTLY-DESCENDING run of the
+         running-minimum from the -5 dB point, stopping at the FIRST stall
+         (running-min flat for ``stall_ms``) or at -25 dB — whichever comes
+         first. The plateau caused by beating is therefore EXCLUDED from the
+         fit; only the dominant mode's clean initial decay sets the slope.
+      6. Require at least ``min_fit_db`` of clean span; extrapolate -60/slope.
+
+    Returns T60 in ms, or None when the decay can't be cleanly fit (too short,
+    too noisy, or no descending run) — never extrapolates over a plateau.
+    """
+    import numpy as np
+    from scipy.signal import hilbert
+
+    if len(filtered) < 64:
+        return None
+
+    envelope = np.abs(hilbert(filtered))
+    if not np.any(envelope > 0):
+        return None
+
+    # Peak within the first ~10 % of the IR (modes ring out immediately).
+    search_end = max(int(len(envelope) * 0.10), 32)
+    peak_idx = int(np.argmax(envelope[:search_end]))
+    if float(envelope[peak_idx]) <= 0:
+        return None
+    envelope = envelope[peak_idx:]
+
+    block = max(1, int(round(sample_rate * block_ms / 1000.0)))
+    n_blocks = len(envelope) // block
+    if n_blocks < 10:
+        return None
+
+    etc = envelope[: n_blocks * block].reshape(n_blocks, block).mean(axis=1)
+    peak_val = float(np.max(etc))
+    if peak_val <= 0:
+        return None
+    etc_db = 20.0 * np.log10(etc / peak_val + 1e-30)
+
+    # Noise-floor gate.
+    tail_n = max(1, n_blocks // 10)
+    noise_db = float(np.median(etc_db[-tail_n:]))
+    if noise_db > -min_usable_db:
+        return None
+
+    # Running-minimum = monotonic decay envelope (beat ripple removed).
+    mono = np.minimum.accumulate(etc_db)
+
+    top_hits = np.where(mono <= top_db)[0]
+    if len(top_hits) == 0:
+        return None
+    i_top = int(top_hits[0])
+
+    # Walk the running-minimum from the -5 dB point, collecting the contiguous
+    # STRICTLY-DESCENDING blocks. Stop at the first stall (flat for stall_ms)
+    # or once we reach -25 dB. The plateau introduced by beating is a stall in
+    # the running-min, so it is excluded — only the clean initial slope is fit.
+    stall_blocks = max(1, int(round(stall_ms / block_ms)))
+    xs = [i_top]
+    ys = [float(mono[i_top])]
+    stall_run = 0
+    for i in range(i_top + 1, n_blocks):
+        if mono[i] <= lo_db:
+            xs.append(i)
+            ys.append(float(mono[i]))
+            break
+        if mono[i] >= mono[i - 1] - 0.05:   # essentially flat (a stall)
+            stall_run += 1
+            if stall_run >= stall_blocks:
+                break
+        else:
+            stall_run = 0
+            xs.append(i)
+            ys.append(float(mono[i]))
+
+    if len(xs) < 3:
+        return None
+    if ys[0] - ys[-1] < min_fit_db:
+        return None
+
+    x = np.asarray(xs, dtype=np.float64) * block / sample_rate
+    y = np.asarray(ys, dtype=np.float64)
+    try:
+        coeffs = np.polyfit(x, y, 1)
+    except (np.linalg.LinAlgError, ValueError):
+        return None
+    slope = float(coeffs[0])
+    if slope >= 0:
+        return None
+    return float((-60.0 / slope) * 1000.0)
 
 
 def _estimate_t60_envelope(
