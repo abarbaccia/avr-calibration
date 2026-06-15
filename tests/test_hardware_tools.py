@@ -459,6 +459,16 @@ avr_cal_sweep:monitor_FR
   |-> loopback_ref:playback_FR
 """
 
+    # R11 with the LOAD-BEARING mic feed present: UMIK → loopback_ref:playback_FR
+    # (the mic is loopback_ref:monitor_FR in the 2-ch sample-locked capture).
+    _R11_WITH_MIC = """\
+avr_cal_sweep:monitor_FL
+  |-> camilladsp_capture:input_3
+  |-> loopback_ref:playback_FL
+alsa_input.usb-miniDSP_Umik-1_Gain:capture_FL
+  |-> loopback_ref:playback_FR
+"""
+
     def _run(self, stdout: str, side_effect=None):
         from calibrate.measurement_service import _check_pw_link_l
         mock_result = MagicMock()
@@ -500,6 +510,23 @@ avr_cal_sweep:monitor_FR
         assert result["error"] is None
         assert result["input3_linked"] is True
         assert result["loopback_ref_linked"] is True
+
+    def test_loopback_ref_mic_feed_detected(self):
+        """UMIK→loopback_ref:playback_FR (the load-bearing 2-ch mic feed) is
+        detected as loopback_ref_mic_linked."""
+        result = self._run(self._R11_WITH_MIC)
+        assert result["error"] is None
+        assert result["loopback_ref_mic_linked"] is True
+
+    def test_loopback_ref_mic_feed_absent_is_false(self):
+        """Without the UMIK→loopback_ref:playback_FR link, loopback_ref_mic_linked
+        is False — this is the silent-mic failure mode (rec_1d=0)."""
+        result = self._run(self._GOOD_WIRING)
+        assert result["loopback_ref_mic_linked"] is False
+        # An avr_cal_sweep:monitor_FR→playback_FR link must NOT be mistaken for
+        # the UMIK mic feed (only a UMIK source counts).
+        result2 = self._run(self._R11_WIRING)
+        assert result2["loopback_ref_mic_linked"] is False
 
     def test_pw_link_not_found(self):
         result = self._run("", side_effect=FileNotFoundError("pw-link"))

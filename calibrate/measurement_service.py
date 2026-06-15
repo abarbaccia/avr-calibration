@@ -548,6 +548,7 @@ def _check_pw_link_l() -> dict:
     current_source_port: str | None = None
     input3_linked = False
     loopback_ref_linked = False
+    loopback_ref_mic_linked = False
     umik_sources: set[str] = set()
     playback_link_count = 0
 
@@ -582,6 +583,17 @@ def _check_pw_link_l() -> dict:
             ):
                 umik_sources.add(src_node)
 
+            # LOAD-BEARING mic feed for the 2-ch sample-locked capture:
+            # UMIK → loopback_ref:playback_FR. When loopback_ref_pw_channels>=2
+            # the mic IS loopback_ref:monitor_FR — without this link the mic
+            # channel is silent (rec_1d=0). Distinct from umik_into_dsp (the
+            # camilladsp_capture feedback hazard); this one is REQUIRED.
+            if (
+                ("umik" in src_node.lower() or "minidsp_umik" in src_node.lower())
+                and "loopback_ref:playback_FR" in dest
+            ):
+                loopback_ref_mic_linked = True
+
             # Count camilladsp_playback → Scarlett links (expect ~20)
             if "camilladsp_playback" in src_node and "scarlett" in dest.lower():
                 playback_link_count += 1
@@ -593,6 +605,7 @@ def _check_pw_link_l() -> dict:
         "error": None,
         "input3_linked": input3_linked,
         "loopback_ref_linked": loopback_ref_linked,
+        "loopback_ref_mic_linked": loopback_ref_mic_linked,
         "umik_into_dsp": len(umik_sources) > 0,
         "umik_sources": sorted(umik_sources),
         "playback_link_count": playback_link_count,
@@ -826,6 +839,21 @@ async def audio_stack_health():
                 "MISSING: avr_cal_sweep:monitor_FL → loopback_ref:playback_FL "
                 "(deconvolution reference tap) — coherence will collapse"
             )
+        # 2-ch sample-locked capture: the mic IS loopback_ref:monitor_FR, fed by
+        # UMIK→loopback_ref:playback_FR. Without it the mic channel is silent
+        # (rec_1d=0 → "Sweep not detected"). Only required when this capture mode
+        # is configured. (Root-caused 2026-06-15 after the link was wrongly torn
+        # down — see feedback_audio_mode_umik_loopback_link.)
+        try:
+            _lb_2ch = int(_cfg().measurement.get("loopback_ref_pw_channels", 1)) >= 2
+        except Exception:
+            _lb_2ch = False
+        if _lb_2ch and not wiring.get("loopback_ref_mic_linked"):
+            warnings.append(
+                "MISSING: UMIK→loopback_ref:playback_FR (LOAD-BEARING mic feed for "
+                "the 2-ch sample-locked capture) — the mic channel will be SILENT "
+                "(rec_1d=0 → 'Sweep not detected'). Run: audio-mode wire cal"
+            )
         if wiring.get("umik_into_dsp"):
             srcs = ", ".join(wiring.get("umik_sources", [])) or "unknown"
             warnings.append(
@@ -869,6 +897,7 @@ async def audio_stack_health():
         "wiring": {
             "input3_linked": wiring.get("input3_linked", False),
             "loopback_ref_linked": wiring.get("loopback_ref_linked", False),
+            "loopback_ref_mic_linked": wiring.get("loopback_ref_mic_linked", False),
             "umik_into_dsp": wiring.get("umik_into_dsp", False),
             "umik_sources": wiring.get("umik_sources", []),
             "playback_link_count": wiring.get("playback_link_count", 0),

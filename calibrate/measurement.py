@@ -35,6 +35,15 @@ _MEASUREMENT_TIMEOUT_S: float = 60.0
 """Timeout for a single play-and-record cycle. Prevents a hung audio device from
 blocking the calibration loop indefinitely."""
 
+_SILENT_RECORDING_RMS: float = 10 ** (-74.0 / 20.0)  # ≈ 2e-4, ~ -74 dBFS
+"""Below this RMS the recording is treated as SILENT (mic channel not captured),
+not as a low-correlation/aim problem. The quiet room floor (UMIK self-noise + hum)
+sits around -42 dBFS (~8e-3), so -74 dBFS only trips on a genuinely empty/zero
+recording. This distinction makes the failure self-diagnosing: a silent mic feed
+(e.g. the load-bearing UMIK→loopback_ref:playback_FR link missing in the 2-ch
+sample-locked capture) raises an actionable error instead of the generic
+"cross-correlation peak too low", which previously cost a multi-hour misdiagnosis."""
+
 _MEASURE_LOCK: asyncio.Lock = asyncio.Lock()
 """Module-level lock serializing all measure() calls across all MeasurementEngine instances.
 
@@ -623,6 +632,12 @@ class MeasurementEngine:
             Measure RMS of the first noise_floor_window_ms ms of the recording
             (before the sweep arrives). If above -40 dBFS → warn (don't raise).
 
+        Check 2a — Silent-recording gate (runs first):
+            If the recording RMS is below _SILENT_RECORDING_RMS the mic channel
+            captured nothing → raise check="silent_recording" naming the mic FEED
+            as the cause (not aim/level). Distinct from Check 2 so a missing mic
+            feed is self-diagnosing instead of looking like a low correlation.
+
         Check 2 — Sweep capture (FFT cross-correlation, O(N log N)):
             Compute normalized cross-correlation peak between sweep and recording.
             If peak < correlation_threshold → raise (sweep wasn't captured).
@@ -662,6 +677,36 @@ class MeasurementEngine:
         # bandpassed correlation so the start-of-sweep lag is repeatable.
         n = len(sweep_array)
         rec_t = rec_array[:n]
+
+        # ── Check 2a: Silent-recording gate (runs BEFORE correlation) ──────
+        # A zero / near-zero recording means the MIC CHANNEL CAPTURED NOTHING —
+        # a missing mic feed, not a low-correlation/aim/level problem. Catch it
+        # explicitly so the error names the cause instead of the generic
+        # "cross-correlation peak too low" (which sent a debugger hunting the
+        # sweep, the chain, and the math for hours when the real issue was a
+        # silent mic). The classic trigger: the 2-ch sample-locked capture
+        # (loopback_ref_pw_channels>=2) reads the mic from loopback_ref
+        # monitor_FR, fed by the UMIK→loopback_ref:playback_FR link — if that
+        # link is gone, monitor_FR is silent and rec is all zeros.
+        rec_t_rms = float(np.sqrt(np.mean(rec_t ** 2))) if len(rec_t) else 0.0
+        if rec_t_rms < _SILENT_RECORDING_RMS:
+            rms_db = 20.0 * np.log10(rec_t_rms + 1e-12)
+            raise MeasurementQualityError(
+                check="silent_recording",
+                detail=(
+                    f"Recording is silent (rms {rms_db:.0f} dBFS) — the mic "
+                    "channel captured no audio. This is a missing mic FEED, "
+                    "not an aim/level/correlation problem."
+                ),
+                suggestion=(
+                    "Check the mic capture, not the sweep. For the 2-ch "
+                    "sample-locked loopback capture (loopback_ref_pw_channels>=2) "
+                    "the mic is loopback_ref:monitor_FR — verify the load-bearing "
+                    "UMIK→loopback_ref:playback_FR link exists (`audio-mode wire`). "
+                    "Otherwise verify mic_pipewire_node / the UMIK is captured."
+                ),
+            )
+
         fft_len = n * 2  # zero-pad to avoid circular wrap
         S = np.fft.fft(sweep_array, fft_len)
         R = np.fft.fft(rec_t, fft_len)
