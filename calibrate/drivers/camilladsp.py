@@ -229,52 +229,10 @@ class _NoOpSweepContext:
         await self.exit()
 
 
-class _USBSweepContext:
-    """USB-route sweep context that applies a configured master gain for measurement.
-
-    CamillaDSP's operating volume (master_gain_db in config) is set before
-    each USB sweep and restored afterward.  Without this the sweep runs at
-    whatever volume was last set, which is typically the loud listening level.
-    """
-
-    def __init__(self, driver, config) -> None:
-        self._driver = driver
-        self._config = config
-        self._saved_gain: float | None = None
-        self.active = False
-
-    async def enter(self) -> "_USBSweepContext":
-        sweep_gain = self._config.measurement.get("master_gain_db")
-        if sweep_gain is not None:
-            try:
-                state = await self._driver.get_state()
-                self._saved_gain = float(state.get("volume", 0.0) or 0.0)
-                log.info(
-                    "USB sweep: master gain %.1f dB (was %.1f dB)",
-                    float(sweep_gain), self._saved_gain,
-                )
-                await self._driver.set_master_gain(float(sweep_gain))
-            except Exception as exc:
-                log.warning("USB sweep: failed to set master gain: %s", exc)
-                self._saved_gain = None
-        self.active = True
-        return self
-
-    async def exit(self) -> None:
-        self.active = False
-        if self._saved_gain is not None:
-            try:
-                await self._driver.set_master_gain(self._saved_gain)
-                log.info("USB sweep: restored master gain to %.1f dB", self._saved_gain)
-            except Exception as exc:
-                log.warning("USB sweep: failed to restore master gain: %s", exc)
-            self._saved_gain = None
-
-    async def __aenter__(self) -> "_USBSweepContext":
-        return await self.enter()
-
-    async def __aexit__(self, *_) -> None:
-        await self.exit()
+# NOTE: the former _USBSweepContext (which saved/forced/restored master gain per
+# USB sweep) was removed 2026-06-15. Master gain is now a single persistent value;
+# sweeps run at whatever it is. See sweep_context() and
+# docs/level-and-gain-architecture.md.
 
 
 class CamillaDSPDriver(DSPDriver):
@@ -516,6 +474,7 @@ class CamillaDSPDriver(DSPDriver):
             or self._output_gain or self._output_delay
             or self._output_polarity or self._output_muted
             or any(v for v in self._fir_state.values())
+            or self._master_gain_db != 0.0
         )
 
     async def rehydrate_from_active_state(
@@ -577,6 +536,11 @@ class CamillaDSPDriver(DSPDriver):
                     if inp is None:
                         continue
                     self._input_gain[int(inp)] = float(data["gain_db"])
+                elif parsed["kind"] == "master" and parsed["field"] == "gain":
+                    # Master gain (the sub level control) persists so the operating
+                    # level survives a reboot/MCP restart instead of falling back to
+                    # the 0 dB init default. See docs/level-and-gain-architecture.md.
+                    self._master_gain_db = float(data["gain_db"])
             except (KeyError, ValueError, TypeError) as exc:
                 log.warning("rehydrate_from_active_state: skipping key=%s: %s", key, exc)
 
@@ -1209,18 +1173,26 @@ class CamillaDSPDriver(DSPDriver):
     def sweep_context(self, config):
         """Return an async context manager that prepares CamillaDSP for a sweep.
 
-        USB route: applies ``master_gain_db`` from config for sweep duration,
-        then restores the previous volume.  Without this the sweep runs at
-        whatever listening volume was last set.
+        USB route: NO master-gain juggling — returns a no-op. The master gain is
+        the sub level control (scales the subs ~1:1) and is a single persistent
+        value set explicitly via ``set_master_gain`` / ``calibrate_level``; the
+        sweep runs at whatever it currently is. The old behaviour forced
+        ``config.measurement.master_gain_db`` for the sweep duration and restored
+        it after — a hidden override that silently defeated ``set_master_gain``
+        and ran sweeps at a stale (too-quiet, −50 dB) level, repeatedly
+        mis-diagnosed as a chain bug. See ``docs/level-and-gain-architecture.md``.
 
-        HDMI route: returns a ``DSPHDMISweepContext`` for source + gain management.
+        HDMI route: returns ``DSPHDMISweepContext`` for source + AVR-volume mgmt.
+
+        TODO(level-arch): the HDMI/Denon path still saves+restores the AVR volume
+        per sweep (DSPHDMISweepContext / DenonSweepContext). Evaluate folding that
+        into the audio-mode switch too, so NO per-sweep volume juggling remains
+        anywhere. Tracked in docs/level-and-gain-architecture.md.
         """
         from .dsp_driver import DSPHDMISweepContext
         route = config.measurement.get("playback_route", "usb")
         if route == "hdmi":
             return DSPHDMISweepContext(self, config)
-        if config.measurement.get("master_gain_db") is not None:
-            return _USBSweepContext(self, config)
         return _NoOpSweepContext()
 
     async def pipeline_state(self) -> str:
