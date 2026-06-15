@@ -6238,6 +6238,14 @@ async def _tool_calibrate_level(
                 verify_spl = round(verify_spl - overshoot, 1)
 
             update_config({"measurement": {"master_gain_db": final_gain}})
+            # Persist the chosen operating level so it survives a reboot/MCP
+            # restart (master gain is the sub level control). Sweeps run at this
+            # level directly — there is no per-sweep override any more.
+            from .storage import dsp_master_key
+            _persist_dsp_state(
+                dsp_master_key(_default_dsp_name() or "dsp"),
+                {"gain_db": float(final_gain)},
+            )
 
             _solo_offset = round(20.0 * _math.log10(_sub_count), 1) if _sub_count > 1 else 0.0
             _solo_gain = round(min(0.0, final_gain + _solo_offset), 1)
@@ -7801,14 +7809,22 @@ async def _tool_set_input_gain(input_index: int, gain_db: float) -> dict:
 
 
 async def _tool_set_master_gain(gain_db: float) -> dict:
-    """Set the miniDSP master output gain (-127 to 0 dB).
+    """Set the DSP master output gain (-127 to 0 dB).
 
-    Global attenuation applied before all outputs. Use to control sweep
-    playback volume without touching per-output alignment gains.
-    Always restore to 0.0 after sweeps are done.
+    On CamillaDSP this is the SUB level control (it scales the subs ~1:1, applied
+    on the LFE intermediate channel before the output router) — not a mains
+    control. It is a single PERSISTENT operating level: it is saved to
+    active_dsp_state and restored on restart/reboot, and sweeps run at whatever it
+    is (there is no per-sweep override). Do NOT "restore to 0 after sweeps" — that
+    was the old juggling model. See docs/level-and-gain-architecture.md.
     """
     try:
         await _dsp.set_master_gain(gain_db)  # type: ignore[union-attr]
+        from .storage import dsp_master_key
+        _persist_dsp_state(
+            dsp_master_key(_default_dsp_name() or "dsp"),
+            {"gain_db": float(gain_db)},
+        )
         return _ok(gain_db=max(-127.0, min(0.0, gain_db)))
     except DriverError as exc:
         return _err(str(exc))

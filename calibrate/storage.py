@@ -55,6 +55,16 @@ def dsp_input_channel_key(processor: str, input_index: int, field: str) -> str:
     return f"processor:{processor}:input:{input_index}:{field}"
 
 
+def dsp_master_key(processor: str, field: str = "gain") -> str:
+    """Canonical key for the global master-gain DSP state entry.
+
+    Master gain is a single global pipeline parameter (the sub level control on
+    CamillaDSP), not per-output. Persisting it lets the operating level survive a
+    reboot/MCP restart instead of falling back to the driver's init default.
+    """
+    return f"processor:{processor}:master:{field}"
+
+
 def parse_dsp_key(key: str) -> dict | None:
     """Parse a namespaced or legacy DSP key into components.
 
@@ -83,6 +93,12 @@ def parse_dsp_key(key: str) -> dict | None:
             return {
                 "processor": parts[1],
                 "kind": "input",
+                "field": parts[3],
+            }
+        if len(parts) == 4 and parts[2] == "master":
+            return {
+                "processor": parts[1],
+                "kind": "master",
                 "field": parts[3],
             }
         if len(parts) == 5 and parts[2] == "input":

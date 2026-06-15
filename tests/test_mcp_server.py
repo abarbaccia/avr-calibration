@@ -6493,6 +6493,11 @@ def test_parse_dsp_key_handles_both_shapes() -> None:
     assert parse_dsp_key("processor:camilla:input:eq") == {
         "processor": "camilla", "kind": "input", "field": "eq",
     }
+    # Master gain (global sub level) — round-trips via dsp_master_key
+    from calibrate.storage import dsp_master_key
+    assert parse_dsp_key(dsp_master_key("camilla")) == {
+        "processor": "camilla", "kind": "master", "field": "gain",
+    }
     # Legacy (processor=None)
     assert parse_dsp_key("output_eq_3") == {
         "processor": None, "kind": "output", "output_index": 3, "field": "eq",

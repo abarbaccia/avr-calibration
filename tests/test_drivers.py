@@ -1519,95 +1519,48 @@ async def test_camilladsp_set_master_gain_updates_shadow_and_pushes_config() -> 
     assert "SetVolume" not in cmds
 
 
-# ── _USBSweepContext ──────────────────────────────────────────────────────────
+# ── sweep_context: single persistent level, NO per-sweep master-gain juggling ──
 
-from calibrate.drivers.camilladsp import _USBSweepContext, _NoOpSweepContext
+from calibrate.drivers.camilladsp import _NoOpSweepContext
 
 
-def _make_config_with_gain(gain_db):
+def _make_config_with_gain(gain_db, route="usb"):
     from unittest.mock import MagicMock
     cfg = MagicMock()
     cfg.measurement.get.side_effect = lambda k, default=None: (
-        gain_db if k == "master_gain_db" else default
+        gain_db if k == "master_gain_db"
+        else route if k == "playback_route"
+        else default
     )
     return cfg
 
 
-def _make_camilla_stub(initial_volume=-20.0):
-    """Return a side_effect callable that stubs the CamillaDSP WS protocol."""
-    def _call(cmd, *args):
-        if cmd == "GetState":
-            return "Running"
-        if cmd == "GetMute":
-            return False
-        if cmd == "GetProcessingLoad":
-            return 0.0
-        # SetConfig is the real mechanism; just swallow it.
-        return None
-    return _call
+def test_camilladsp_usb_sweep_context_is_noop_even_when_gain_configured() -> None:
+    """USB sweep context no longer forces/restores master gain — it's a no-op.
 
-
-@pytest.mark.asyncio
-async def test_usb_sweep_context_sets_and_restores_master_gain() -> None:
+    The removed _USBSweepContext forced config.measurement.master_gain_db for the
+    sweep and restored it after, silently defeating set_master_gain and running
+    sweeps at a stale (too-quiet) level. Master gain is now a single persistent
+    operating level; sweeps run at whatever it is.
+    """
     driver = CamillaDSPDriver()
-    driver._master_gain_db = -20.0  # simulate the current operating gain
-
-    driver._client._ws = object()  # mark as connected
-    driver._client.call = AsyncMock(side_effect=_make_camilla_stub())
-    cfg = _make_config_with_gain(-50.0)
-
-    gains_set: list[float] = []
-    _real_set_gain = driver.set_master_gain
-
-    async def _spy(gain_db: float) -> None:
-        gains_set.append(float(gain_db))
-        await _real_set_gain(gain_db)
-
-    driver.set_master_gain = _spy  # type: ignore[method-assign]
-
-    ctx = _USBSweepContext(driver, cfg)
-    async with ctx:
-        assert ctx.active is True
-
-    # Should have set -50.0 on enter, then restored -20.0 on exit
-    assert gains_set == [-50.0, -20.0]
-    assert ctx.active is False
-
-
-@pytest.mark.asyncio
-async def test_usb_sweep_context_restores_on_exception() -> None:
-    driver = CamillaDSPDriver()
-    driver._master_gain_db = -20.0  # simulate the current operating gain
-
-    driver._client._ws = object()
-    driver._client.call = AsyncMock(side_effect=_make_camilla_stub())
-    cfg = _make_config_with_gain(-50.0)
-
-    gains_set: list[float] = []
-    _real_set_gain = driver.set_master_gain
-
-    async def _spy(gain_db: float) -> None:
-        gains_set.append(float(gain_db))
-        await _real_set_gain(gain_db)
-
-    driver.set_master_gain = _spy  # type: ignore[method-assign]
-
-    ctx = _USBSweepContext(driver, cfg)
-    try:
-        async with ctx:
-            raise RuntimeError("simulated sweep failure")
-    except RuntimeError:
-        pass
-
-    assert gains_set == [-50.0, -20.0]
-
-
-def test_camilladsp_sweep_context_returns_usb_context_when_gain_configured() -> None:
-    from calibrate.drivers.camilladsp import _USBSweepContext
-    driver = CamillaDSPDriver()
-    cfg = _make_config_with_gain(-50.0)
+    cfg = _make_config_with_gain(-50.0, route="usb")
     ctx = driver.sweep_context(cfg)
-    assert isinstance(ctx, _USBSweepContext)
+    assert isinstance(ctx, _NoOpSweepContext)
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_usb_sweep_does_not_change_master_gain() -> None:
+    """Entering/exiting the USB sweep context must NOT touch _master_gain_db."""
+    driver = CamillaDSPDriver()
+    driver._master_gain_db = -20.0
+    driver.set_master_gain = AsyncMock(
+        side_effect=AssertionError("sweep context must not set master gain")
+    )
+    cfg = _make_config_with_gain(-50.0, route="usb")
+    async with driver.sweep_context(cfg):
+        pass
+    assert driver._master_gain_db == -20.0
 
 
 def test_camilladsp_sweep_context_returns_noop_when_no_gain_configured() -> None:
@@ -1617,6 +1570,15 @@ def test_camilladsp_sweep_context_returns_noop_when_no_gain_configured() -> None
     cfg.measurement.get.side_effect = lambda k, default=None: default
     ctx = driver.sweep_context(cfg)
     assert isinstance(ctx, _NoOpSweepContext)
+
+
+def test_camilladsp_sweep_context_hdmi_still_returns_hdmi_context() -> None:
+    """HDMI route keeps its AVR-volume sweep context (TODO: evaluate later)."""
+    from calibrate.drivers.dsp_driver import DSPHDMISweepContext
+    driver = CamillaDSPDriver()
+    cfg = _make_config_with_gain(-20.0, route="hdmi")
+    ctx = driver.sweep_context(cfg)
+    assert isinstance(ctx, DSPHDMISweepContext)
 
 
 # ── _CamillaWSClient ──────────────────────────────────────────────────────────
@@ -2491,6 +2453,30 @@ async def test_camilladsp_rehydrate_restores_mute_state() -> None:
     mapping = driver._build_mixer()["output_router"]["mapping"]
     assert len(mapping[1]["sources"]) == 1
     assert mapping[1]["sources"][0]["mute"] is True
+
+
+@pytest.mark.asyncio
+async def test_camilladsp_rehydrate_restores_master_gain() -> None:
+    """Master gain (the sub level control) persists across restart/reboot.
+
+    Before this, master gain was not in active_dsp_state and came up at the
+    0 dB init default on every restart — the root cause of "subs too quiet"
+    after a reboot. The cal_master_gain Gain block must reflect the restored
+    value, and a master-only shadow must still push to the daemon.
+    """
+    driver = CamillaDSPDriver(output_channels=4)
+    _stub_client(driver)
+    assert driver._master_gain_db == 0.0  # init default
+    active_state = {
+        "processor:camilla:master:gain": {"gain_db": -22.5},
+    }
+    await driver.rehydrate_from_active_state(active_state)
+    assert driver._master_gain_db == -22.5
+    # The restored level must reach the pipeline's cal_master_gain Gain block.
+    filt = driver._build_filters()["cal_master_gain"]
+    assert filt["type"] == "Gain"
+    assert filt["parameters"]["gain"] == -22.5
+
 
 # ── Bug 4: pipeline_state — detect Inactive CamillaDSP pipeline ───────────────
 
