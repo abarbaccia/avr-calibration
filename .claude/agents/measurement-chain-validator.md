@@ -37,6 +37,17 @@ Run these and report each as ✅/❌ with the evidence:
    deficits and ±21 dB polarity-flip swings and sign flapping. Check `pw-link`
    for any UMIK output linked into `camilladsp_capture`. If present, that is the
    bug — stop here.
+   ⚠️ **Do NOT confuse this HAZARD link with the REQUIRED mic feed** (next item).
+2b. **Load-bearing mic feed present (2-ch sample-locked capture).** When
+   `loopback_ref_pw_channels ≥ 2` (the live config), the mic IS
+   `loopback_ref:monitor_FR`, fed by the LOAD-BEARING
+   `UMIK:capture_FL → loopback_ref:playback_FR` link. **This link MUST exist** —
+   if absent, the mic channel is silent and the recording is all zeros
+   (`rec_1d=0` → "Sweep not detected", `rec_t_rms≈0`). Check
+   `diagnose_audio_stack` → `wiring.loopback_ref_mic_linked` (or `pw-link -l` for
+   `→ loopback_ref:playback_FR`). It was wrongly torn down 2026-06-15 (cost a full
+   session). `UMIK→camilladsp_capture` = HAZARD (remove); `UMIK→loopback_ref:playback_FR`
+   = REQUIRED (keep). See `feedback_audio_mode_umik_loopback_link`.
 3. **Loopback ref alive, not idle-suspended.** `avr_cal_sweep` / `loopback_ref`
    null sinks suspend after ~5 s idle → monitor stops → loopback ref silent
    (~−83 dBFS). Confirm `suspend-timeout=0` / `pause-on-idle=false` are pinned.
@@ -44,8 +55,25 @@ Run these and report each as ✅/❌ with the evidence:
 4. **`resample.quality=14` on the UMIK node.** Without it, coherence ceilings at
    ~0.72 no matter what else is right.
 5. **Levels sane.** Per-band coherence ≥ ~0.9 and SNR ≥ ~20 dB; IR peak well
-   above −65 dBFS. ~−20 dBFS is healthy, −50 too quiet (raise master), −10
-   clips. A low band ⇒ raise master and re-measure, don't accept it.
+   above −65 dBFS. Master gain is the SUB level control (~1:1) and ~−35 dBFS is a
+   clean level here; −50 too quiet (raise master), −20 clips. A low band ⇒ raise
+   master and re-measure, don't accept it.
+   ⚠️ **A SILENT recording (rec_t_rms ≈ 0 / "silent_recording") is a missing mic
+   FEED, not aim/level** — go to check 2b, do not chase the sweep/level/correlation.
+
+## Two hard rules learned the expensive way (2026-06-15)
+
+- **`check_system` "No Umik found" (PortAudio) is an EXPECTED RED HERRING** with
+  the 2-ch capture: PipeWire holds the UMIK feeding `loopback_ref`, so PortAudio
+  can't open it — but `measure()` captures the mic via the loopback 2-ch
+  pw-record, NOT PortAudio. **Gate on an actual `measure()` + coherence, never on
+  the PortAudio mic check.**
+- **Measure-first / don't fix what measures fine.** Before recommending ANY
+  signal-path change (especially tearing down a PW link), confirm the chain is
+  actually broken with a baseline `measure()`. A chain that measures cleanly
+  (recent sessions worked) must not be "repaired" off a preflight proxy. Verify a
+  link's producers AND consumers against the live config + code before calling it
+  vestigial — memory/agent claims about load-bearing infra can be wrong.
 6. **Shaker (output 7) muted.** HARD RULE — muted for every `measure` call.
 7. **Master gain restored / known.** Stale per-output polarity/gain/delay from a
    prior run re-applies on every container restart; check for unexpected state.

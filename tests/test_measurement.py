@@ -589,8 +589,10 @@ class TestMeasurementQuality:
     def test_sweep_not_captured_raises_quality_error(self):
         engine = self._engine()
         sweep = self._make_sweep(9600)
-        # Recording is pure noise — no sweep correlation
-        rec = np.random.default_rng(7).standard_normal(9600) * 1e-6
+        # Recording is LOUD but uncorrelated with the sweep (DC offset — the
+        # zero-mean sweep correlates to ~0). Loud enough to pass the silent gate,
+        # so this exercises the correlation gate specifically.
+        rec = np.ones(9600) * 0.5
         with pytest.raises(MeasurementQualityError) as exc_info:
             engine.validate_recording(np, sweep, rec, 48000)
         assert exc_info.value.check == "sweep_capture"
@@ -598,10 +600,44 @@ class TestMeasurementQuality:
     def test_sweep_capture_error_has_suggestion(self):
         engine = self._engine()
         sweep = self._make_sweep(9600)
+        rec = np.ones(9600) * 0.5  # loud, uncorrelated → sweep_capture (not silent)
+        with pytest.raises(MeasurementQualityError) as exc_info:
+            engine.validate_recording(np, sweep, rec, 48000)
+        assert exc_info.value.check == "sweep_capture"
+        assert exc_info.value.suggestion  # non-empty
+
+    def test_silent_recording_raises_silent_recording_check(self):
+        """A zero/near-zero recording → check='silent_recording', NOT
+        'sweep_capture'. The mic feed is missing; this must not be misdiagnosed
+        as a low-correlation/aim problem (the 2026-06-15 multi-hour hunt)."""
+        engine = self._engine()
+        sweep = self._make_sweep(9600)
         rec = np.zeros(9600)
         with pytest.raises(MeasurementQualityError) as exc_info:
             engine.validate_recording(np, sweep, rec, 48000)
-        assert exc_info.value.suggestion  # non-empty
+        assert exc_info.value.check == "silent_recording"
+
+    def test_silent_recording_suggestion_names_mic_feed(self):
+        """The silent-recording error must point at the mic FEED (the
+        load-bearing UMIK→loopback_ref link), so it's self-diagnosing."""
+        engine = self._engine()
+        sweep = self._make_sweep(9600)
+        rec = np.zeros(9600)
+        with pytest.raises(MeasurementQualityError) as exc_info:
+            engine.validate_recording(np, sweep, rec, 48000)
+        sugg = exc_info.value.suggestion.lower()
+        assert "loopback_ref" in sugg and "umik" in sugg
+        assert "mic" in exc_info.value.detail.lower()
+
+    def test_near_silent_below_threshold_is_silent_not_sweep_capture(self):
+        """Recording just below the silent floor (e.g. residual dither) is
+        still 'silent_recording', not 'sweep_capture'."""
+        engine = self._engine()
+        sweep = self._make_sweep(9600)
+        rec = np.full(9600, 1e-5)  # ~-100 dBFS, below _SILENT_RECORDING_RMS
+        with pytest.raises(MeasurementQualityError) as exc_info:
+            engine.validate_recording(np, sweep, rec, 48000)
+        assert exc_info.value.check == "silent_recording"
 
     def test_low_snr_raises_quality_error(self):
         engine = self._engine()

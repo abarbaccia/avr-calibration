@@ -1080,6 +1080,14 @@ class LoopbackRefPlayback:
                             # one stream / one clock / one start: no inter-stream offset
                             # can corrupt H = mic/ref. The base strategy still PLAYS the
                             # sweep; its separately-captured mic is ignored in this mode.
+                            #
+                            # ⚠️ LOAD-BEARING DEPENDENCY: ch1 (monitor_FR) is fed by the
+                            # `UMIK:capture_FL → loopback_ref:playback_FR` PW link
+                            # (created by `audio-mode wire`). If that link is missing,
+                            # monitor_FR is silent → mic_1d = zeros → "Sweep not
+                            # detected" (validate_recording silent_recording gate). Do
+                            # NOT treat that link as vestigial. (Torn down 2026-06-15;
+                            # cost a full session. See feedback_audio_mode_umik_loopback_link.)
                             ref_col = self.ref_channel_index - 1
                             mic_col = 1 if ref_col == 0 else 0
                             mic_full = all_ch[:, mic_col].astype(np.float64)
