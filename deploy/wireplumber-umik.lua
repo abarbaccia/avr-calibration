@@ -22,17 +22,6 @@
 --   20-200 Hz (verified 2026-06-08). This property was lost when 51-umik.lua
 --   was rewritten for the feedback-loop fix (f8b8dc1, 2026-06-12) — re-added
 --   here so it survives deploys. It MUST coexist with node.autoconnect=false.
---
--- node.pause-on-idle / session.suspend-timeout-seconds (2026-06-14):
---   The system WirePlumber ALSA monitor (scripts/monitors/alsa.lua line 60) sets
---   node.pause-on-idle=false on ALL ALSA nodes by default. This keeps the UMIK in
---   state "running" with no consumers, holding /dev/snd/pcmC4D0c exclusively, so
---   PortAudio/sounddevice in avr-measurement.service cannot open it → "No Umik found".
---   Fix: override to node.pause-on-idle=true so PipeWire transitions the node to
---   "idle" when there are no consumers, then suspend-node.lua's 3-second timeout
---   fires → node enters "suspended" and releases the hw device.
---   session.suspend-timeout-seconds=3 is short enough to be responsive without
---   causing issues if a measurement client opens/closes quickly.
 
 table.insert(alsa_monitor.rules, {
   matches = {
@@ -43,7 +32,5 @@ table.insert(alsa_monitor.rules, {
   apply_properties = {
     ["node.autoconnect"] = false,
     ["resample.quality"] = 14,
-    ["node.pause-on-idle"] = true,
-    ["session.suspend-timeout-seconds"] = 3,
   },
 })

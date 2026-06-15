@@ -19,9 +19,9 @@
 #
 #   cal:       avr_cal_sweep:monitor_FL      → camilladsp_capture:input_3
 #   listening: Scarlett:capture_AUX2         → camilladsp_capture:input_3
-#   always:    avr_cal_sweep:monitor_FL      → loopback_ref:playback_FL  (ref X)
+#   always:    avr_cal_sweep:monitor_FL      → loopback_ref:playback_FL  (ref X, ch0)
+#   always:    UMIK:capture_FL               → loopback_ref:playback_FR  (mic Y, ch1)
 #   always:    remove any UMIK→camilladsp_capture links (feedback-loop guard)
-#   always:    remove any UMIK→loopback_ref links (UMIK captured directly by PortAudio)
 #
 # `audio-mode wire` is invoked from three places so the graph re-converges
 # after every disruption:
@@ -219,17 +219,6 @@ remove_umik_links() {
         unlink_one "${UMIK_NODE}:capture_FL" "${CAM_CAPTURE}:${port}"
         unlink_one "${UMIK_NODE}:capture_FR" "${CAM_CAPTURE}:${port}"
     done
-    # The UMIK is captured directly by PortAudio in the bare-metal measurement
-    # service. The old "sample-locked 2-ch loopback_ref" design (R11) linked
-    # UMIK:capture_FL → loopback_ref:playback_FR, but the current measurement
-    # config uses loopback_ref_channels=1 (FL only = reference) and captures
-    # the UMIK independently. Any UMIK→loopback_ref link keeps the node in
-    # state "running", holding /dev/snd/pcmCXD0c exclusively and preventing
-    # PortAudio from opening it → "No Umik found" in check_system. (2026-06-14)
-    unlink_one "${UMIK_NODE}:capture_FL" "${LOOPBACK_REF}:playback_FL"
-    unlink_one "${UMIK_NODE}:capture_FL" "${LOOPBACK_REF}:playback_FR"
-    unlink_one "${UMIK_NODE}:capture_FR" "${LOOPBACK_REF}:playback_FL"
-    unlink_one "${UMIK_NODE}:capture_FR" "${LOOPBACK_REF}:playback_FR"
 }
 
 cmd_wire() {
@@ -249,13 +238,17 @@ cmd_wire() {
 
     remove_umik_links
 
-    # loopback_ref deconvolution reference: avr_cal_sweep:monitor_FL → loopback_ref:playback_FL
-    # The UMIK is captured independently by PortAudio (mic_pipewire_node in config.yaml).
-    # loopback_ref_channels=1 so only FL (index 0) is used as the pre-DSP reference X.
-    # The old R11 "sample-locked 2-ch" design (UMIK→loopback_ref:playback_FR) is retired:
-    # the UMIK must be free (suspended) so PortAudio can open /dev/snd/pcmCXD0c. (2026-06-14)
+    # R11 single sample-locked capture (docs/pipewire-architecture.md §6b):
+    # loopback_ref is a 2-ch sink — ch0 (FL) = pre-DSP stimulus reference,
+    # ch1 (FR) = UMIK mic. Recording this ONE node gives ref+mic sample-locked
+    # (no inter-stream start offset to corrupt the deconvolution). The UMIK rides
+    # PW's resampler onto the graph clock into FR (R6 preserved). loopback_ref is a
+    # null sink whose monitor is only RECORDED (never routed to the subs), so the
+    # mic→sink link is not a feedback path.
     link_one "${SWEEP_SINK}:monitor_FL" "${LOOPBACK_REF}:playback_FL" \
         || log "WARNING: loopback_ref FL (ref) link failed (${SWEEP_SINK} or ${LOOPBACK_REF} missing?)"
+    link_one "${UMIK_NODE}:capture_FL" "${LOOPBACK_REF}:playback_FR" \
+        || log "WARNING: loopback_ref FR (mic) link failed (UMIK or ${LOOPBACK_REF} missing?)"
 
     # Playback: camilladsp_playback:output_N+1 → Scarlett playback_AUXN (20 ch).
     # WP 0.4.13's link policy wedges permanently when any client dies mid-
