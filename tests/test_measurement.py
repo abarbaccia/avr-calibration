@@ -1905,3 +1905,61 @@ class TestMeasureImpulseIr:
         # finally must reap both subprocesses (poll() is None → kill + communicate)
         rec_proc.kill.assert_called()
         play_proc.kill.assert_called()
+
+
+class TestNormalizeSweepPeak:
+    """normalize_sweep_peak: stimulus is scaled to a hot, safe peak.
+
+    PyTTa's native sweep peaks ~-37 dBFS, leaving the DAC ~36 dB below full scale
+    even at max master (the 'sub sweep too quiet' bug). Normalization is level-
+    invariant for the deconvolved FR — it only raises loudness/SNR.
+    """
+
+    def test_scales_quiet_sweep_up_to_target(self):
+        from calibrate.measurement import normalize_sweep_peak
+
+        arr = np.array([[0.01], [-0.005], [0.0]])  # peak 0.01 ≈ -40 dBFS
+        out = normalize_sweep_peak(arr, 0.5)
+        assert np.isclose(np.max(np.abs(out)), 0.5)
+
+    def test_scales_hot_sweep_down_to_target(self):
+        from calibrate.measurement import normalize_sweep_peak
+
+        arr = np.array([0.9, -0.8, 0.2])  # peak 0.9
+        out = normalize_sweep_peak(arr, 0.5)
+        assert np.isclose(np.max(np.abs(out)), 0.5)
+
+    def test_preserves_waveform_shape(self):
+        from calibrate.measurement import normalize_sweep_peak
+
+        arr = np.array([0.1, -0.05, 0.025])
+        out = normalize_sweep_peak(arr, 0.5)
+        assert np.allclose(out / np.max(np.abs(out)), arr / np.max(np.abs(arr)))
+
+    def test_silent_array_unchanged(self):
+        from calibrate.measurement import normalize_sweep_peak
+
+        arr = np.zeros((10, 1))
+        out = normalize_sweep_peak(arr, 0.5)
+        assert np.array_equal(out, arr)
+
+    def test_nonfinite_array_unchanged(self):
+        from calibrate.measurement import normalize_sweep_peak
+
+        arr = np.array([np.nan, 0.1, np.inf])
+        out = normalize_sweep_peak(arr, 0.5)
+        assert np.array_equal(out, arr, equal_nan=True)
+
+    def test_default_target_is_minus_6_dbfs(self):
+        from calibrate.measurement import DEFAULT_SWEEP_PEAK_AMPLITUDE
+
+        assert abs(20 * np.log10(DEFAULT_SWEEP_PEAK_AMPLITUDE) - (-6.02)) < 0.1
+
+    def test_default_target_safe_against_clipping_at_master_0(self):
+        # -6 dBFS stimulus + typical output/FIR makeup (~+4.5 dB) stays below 0 dBFS
+        # at master 0, so the DAC does not clip even at maximum master.
+        from calibrate.measurement import DEFAULT_SWEEP_PEAK_AMPLITUDE
+
+        worst_case_makeup_db = 4.5
+        stimulus_dbfs = 20 * np.log10(DEFAULT_SWEEP_PEAK_AMPLITUDE)
+        assert stimulus_dbfs + worst_case_makeup_db < 0.0

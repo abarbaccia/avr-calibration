@@ -44,6 +44,38 @@ recording. This distinction makes the failure self-diagnosing: a silent mic feed
 sample-locked capture) raises an actionable error instead of the generic
 "cross-correlation peak too low", which previously cost a multi-hour misdiagnosis."""
 
+
+DEFAULT_SWEEP_PEAK_AMPLITUDE: float = 0.5
+"""Target absolute peak (linear 0-1) for the played sweep stimulus ≈ -6 dBFS.
+
+PyTTa's native log sweep peaks ~-37 dBFS, which leaves the converter ~36 dB below
+full scale even at maximum master gain — far too quiet. The result: the subs are
+barely audible and acoustic SNR is poor (the "sub sweep is too quiet / coherence
+won't hold" symptom). The deconvolution measurement is LEVEL-INVARIANT
+(H = mic / loopback-ref, both scale together), so normalizing the stimulus changes
+loudness and SNR ONLY — never the measured frequency response. Master gain remains
+the operating level control on top of this hot-but-safe stimulus: -6 dBFS leaves
+headroom so the DAC does not clip even at master 0 dB (worst-case output/FIR makeup
+is a few dB). Override per-install via ``measurement.sweep_peak_amplitude``."""
+
+
+def normalize_sweep_peak(time_signal, target_peak: float = DEFAULT_SWEEP_PEAK_AMPLITUDE):
+    """Scale a sweep time-domain array so its absolute peak equals ``target_peak``.
+
+    Returns the input unchanged for a silent / non-finite array (zero & NaN guards),
+    and preserves the waveform shape otherwise. See ``DEFAULT_SWEEP_PEAK_AMPLITUDE``
+    for why the stimulus must be normalized up from PyTTa's native level.
+    """
+    import numpy as np
+
+    arr = np.asarray(time_signal, dtype=np.float64)
+    if arr.size == 0:
+        return time_signal
+    peak = float(np.max(np.abs(arr)))
+    if not np.isfinite(peak) or peak <= 0.0:
+        return time_signal
+    return arr * (target_peak / peak)
+
 _MEASURE_LOCK: asyncio.Lock = asyncio.Lock()
 """Module-level lock serializing all measure() calls across all MeasurementEngine instances.
 
@@ -848,6 +880,15 @@ class MeasurementEngine:
             )
         finally:
             _traceback.walk_stack = _orig_walk_stack
+
+        # Normalize the stimulus to a hot, safe peak. PyTTa's native sweep peaks
+        # ~-37 dBFS, leaving the DAC ~36 dB below full scale even at max master —
+        # far too quiet (subs barely audible, poor SNR). Level-invariant for the
+        # deconvolved FR; see normalize_sweep_peak / DEFAULT_SWEEP_PEAK_AMPLITUDE.
+        sweep.timeSignal = normalize_sweep_peak(
+            sweep.timeSignal,
+            float(cfg.get("sweep_peak_amplitude", DEFAULT_SWEEP_PEAK_AMPLITUDE)),
+        )
 
         # Strategy selection.
         #   - "hdmi" → direct-ALSA aplay subprocess (PortAudio inside the
