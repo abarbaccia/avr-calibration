@@ -289,7 +289,15 @@ class USBPlayback:
         import numpy as np
         import sounddevice as sd
 
-        sweep_array = sweep.timeSignal[:, 0].astype(np.float32)
+        # Normalize the stimulus to a hot, safe peak (PyTTa's native sweep is
+        # ~-38 dBFS, leaving the DAC ~36 dB below full scale — subs barely audible).
+        # Must be done on the EXTRACTED array: assigning sweep.timeSignal is dropped
+        # by PyTTa. Level-invariant for the deconvolved FR (H = mic / loopback-ref).
+        from ..measurement import normalize_sweep_peak, DEFAULT_SWEEP_PEAK_AMPLITUDE
+
+        sweep_array = normalize_sweep_peak(
+            sweep.timeSignal[:, 0].astype(np.float32), DEFAULT_SWEEP_PEAK_AMPLITUDE
+        ).astype(np.float32)
         n_samples = len(sweep_array)
 
         out_dev = int(sd.default.device[1])
@@ -424,7 +432,15 @@ class HDMIPlayback:
         import numpy as np
         import sounddevice as sd
 
-        sweep_array = sweep.timeSignal[:, 0].astype(np.float32)
+        # Normalize the stimulus to a hot, safe peak (PyTTa's native sweep is
+        # ~-38 dBFS, leaving the DAC ~36 dB below full scale — subs barely audible).
+        # Must be done on the EXTRACTED array: assigning sweep.timeSignal is dropped
+        # by PyTTa. Level-invariant for the deconvolved FR (H = mic / loopback-ref).
+        from ..measurement import normalize_sweep_peak, DEFAULT_SWEEP_PEAK_AMPLITUDE
+
+        sweep_array = normalize_sweep_peak(
+            sweep.timeSignal[:, 0].astype(np.float32), DEFAULT_SWEEP_PEAK_AMPLITUDE
+        ).astype(np.float32)
         n_samples = len(sweep_array)
 
         # Build multi-channel buffer with sweep on the target channel.
@@ -696,7 +712,15 @@ class HDMIPwCatPlayback:
         # Clean up any orphaned pw-cat stream nodes from previous crashed sweeps.
         self._kill_stale_pw_streams(self.pipewire_node)
 
-        sweep_array = sweep.timeSignal[:, 0].astype(np.float32)
+        # Normalize the stimulus to a hot, safe peak (PyTTa's native sweep is
+        # ~-38 dBFS, leaving the DAC ~36 dB below full scale — subs barely audible).
+        # Must be done on the EXTRACTED array: assigning sweep.timeSignal is dropped
+        # by PyTTa. Level-invariant for the deconvolved FR (H = mic / loopback-ref).
+        from ..measurement import normalize_sweep_peak, DEFAULT_SWEEP_PEAK_AMPLITUDE
+
+        sweep_array = normalize_sweep_peak(
+            sweep.timeSignal[:, 0].astype(np.float32), DEFAULT_SWEEP_PEAK_AMPLITUDE
+        ).astype(np.float32)
         n_samples = len(sweep_array)
         n_channels = max(self.channels, out_channel)
 

@@ -881,14 +881,11 @@ class MeasurementEngine:
         finally:
             _traceback.walk_stack = _orig_walk_stack
 
-        # Normalize the stimulus to a hot, safe peak. PyTTa's native sweep peaks
-        # ~-37 dBFS, leaving the DAC ~36 dB below full scale even at max master —
-        # far too quiet (subs barely audible, poor SNR). Level-invariant for the
-        # deconvolved FR; see normalize_sweep_peak / DEFAULT_SWEEP_PEAK_AMPLITUDE.
-        sweep.timeSignal = normalize_sweep_peak(
-            sweep.timeSignal,
-            float(cfg.get("sweep_peak_amplitude", DEFAULT_SWEEP_PEAK_AMPLITUDE)),
-        )
+        # NOTE: the stimulus is normalized to a hot, safe peak in the PLAYBACK
+        # strategy, on the extracted numpy array — NOT here. Assigning back to
+        # ``sweep.timeSignal`` is silently dropped by PyTTa's SignalObj (verified
+        # on the rig: DAC stayed at the native ~-38 dBFS). See
+        # ``normalize_sweep_peak`` applied in calibrate/drivers/playback.py.
 
         # Strategy selection.
         #   - "hdmi" → direct-ALSA aplay subprocess (PortAudio inside the
