@@ -1404,13 +1404,19 @@ def test_camilladsp_output_state_shape_matches_minidsp_contract() -> None:
 
 @pytest.mark.asyncio
 async def test_camilladsp_setup_opens_ws_probes_version_but_does_not_push() -> None:
-    """setup connects and probes version; it does NOT push a default pipeline.
+    """setup connects, probes version, and neutralizes the runtime volume fader;
+    it does NOT push a default pipeline.
 
     A fresh install keeps whatever config the daemon was started with (e.g.
     ``initial.yml``) until the first state mutation triggers a push. On
     restart, ``rehydrate_from_active_state`` reconciles the daemon with the
     persisted shadow — so a mid-session MCP restart doesn't wipe the running
     calibration by pushing an empty pipeline out from under it.
+
+    setup DOES force the runtime main volume to 0 dB and unmute: that fader is
+    separate from cal_master_gain, invisible to GetConfigJson, and persists in
+    CamillaDSP's statefile — a stale -35 dB value there silently attenuated all
+    outputs ~35 dB (the "subs too quiet" bug, 2026-06-18).
     """
     driver = CamillaDSPDriver()
     driver._client.connect = AsyncMock()
@@ -1420,9 +1426,13 @@ async def test_camilladsp_setup_opens_ws_probes_version_but_does_not_push() -> N
     await driver.setup()
 
     driver._client.connect.assert_awaited_once()
-    # Only GetVersion — no SetConfig, no push of any kind.
-    call_cmds = [c.args[0] for c in driver._client.call.await_args_list]
-    assert call_cmds == ["GetVersion"]
+    # GetVersion probe + runtime volume/mute neutralize — but NO SetConfig/push.
+    calls = [(c.args[0], (c.args[1] if len(c.args) > 1 else None))
+             for c in driver._client.call.await_args_list]
+    assert ("GetVersion", None) in calls
+    assert ("SetVolume", 0.0) in calls
+    assert ("SetMute", False) in calls
+    assert not any(cmd in {"SetConfig", "SetConfigJson"} for cmd, _ in calls)
 
 
 @pytest.mark.asyncio

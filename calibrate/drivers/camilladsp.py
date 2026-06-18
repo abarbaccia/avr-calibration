@@ -395,6 +395,23 @@ class CamillaDSPDriver(DSPDriver):
                 raise
             log.info("CamillaDSP %s at %s:%d", version, self._host, self._port)
 
+            # Neutralize CamillaDSP's runtime main volume fader on every connect.
+            # This is a SEPARATE control from the cal_master_gain Gain block (the
+            # architecture's level knob): it does NOT appear in GetConfigJson, it
+            # stacks on top of the entire pipeline, and CamillaDSP persists it in
+            # its statefile across restarts. A stale value here (found at -35 dB,
+            # 2026-06-18) silently attenuated every output ~35 dB — masquerading as
+            # "subs too quiet / poor coherence" through reboots and config rebuilds,
+            # invisible in every config dump. Forcing it to 0 + unmuting makes
+            # cal_master_gain the single source of level truth. NB: SetVolume DOES
+            # work on this build — the long-standing "no-op in v4" assumption (which
+            # is why this hid for so long) is wrong.
+            for _cmd, _arg in (("SetVolume", 0.0), ("SetMute", False)):
+                try:
+                    await self._client.call(_cmd, _arg)
+                except DriverError as exc:
+                    log.warning("CamillaDSP setup: %s reset failed: %s", _cmd, exc)
+
     async def close(self) -> None:
         async with self._lock:
             await self._client.close()
