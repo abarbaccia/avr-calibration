@@ -628,12 +628,15 @@ class HDMIPwCatPlayback:
     CHMAP_FOR_CHANNELS: dict[int, str] = {
         2: "FL,FR",
         4: "FL,FR,LFE,FC",
-        # ch 5/6 are SL,SR (SIDE surround) — NOT RL,RR (rear). This rig is a
-        # 5.1.4 with side surrounds and no rear-backs; labeling the 6-ch surround
-        # channels RL,RR routed them to nonexistent rear speakers → silent. Bench-
-        # verified 2026-06-22: sweep on ch4 with RL,RR → UMIK −45 dBFS (silent);
-        # with SL,SR → −3 dBFS (loud, = FL control). FL/FR/FC (ch 1/2/4) unchanged.
-        6: "FL,FR,LFE,FC,SL,SR",
+        # Surrounds are ASYMMETRIC on this rig: left = SL, right = RR. The
+        # hdmi-surround71 sink positions are FL,FR,RL,RR,FC,LFE,SL,SR and this AVR
+        # drives its left surround from the SL position but its right surround
+        # from the RR position. Bench-verified 2026-06-22 (UMIK peak: −3 dBFS =
+        # routes, −45 = silent): left surround routes only as SL (RL → silent);
+        # right surround routes only as RR (SR → silent). So 6-ch = SL,RR. Fronts
+        # (ch 1/2/4) unchanged. Do NOT "symmetrize" to SL,SR or RL,RR — either
+        # leaves one surround silent ("sweep not detected").
+        6: "FL,FR,LFE,FC,SL,RR",
     }
     """HDMI channel-map per channel count. Forces explicit speaker positions so
     FC is reachable and the surrounds route to the side-surround speakers."""

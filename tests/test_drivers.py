@@ -2788,11 +2788,12 @@ def test_playback_for_route_no_ref_returns_base() -> None:
 
 
 def test_hdmi_6ch_chmap_uses_side_surrounds() -> None:
-    """6-ch HDMI must label surrounds SL,SR (side) — not RL,RR (rear) — so they
-    reach the side-surround speakers on this 5.1.4 layout. Bench-verified
-    2026-06-22 (RL,RR → silent; SL,SR → loud). Fronts unchanged."""
+    """6-ch HDMI surrounds are ASYMMETRIC on this rig: left=SL, right=RR. The
+    sink is FL,FR,RL,RR,FC,LFE,SL,SR; the AVR drives its left surround from SL
+    and its right surround from RR. Bench-verified 2026-06-22 (SL routes / RL
+    silent; RR routes / SR silent). Fronts unchanged."""
     from calibrate.drivers.playback import HDMIPwCatPlayback
-    assert HDMIPwCatPlayback.CHMAP_FOR_CHANNELS[6] == "FL,FR,LFE,FC,SL,SR"
+    assert HDMIPwCatPlayback.CHMAP_FOR_CHANNELS[6] == "FL,FR,LFE,FC,SL,RR"
     assert HDMIPwCatPlayback.CHMAP_FOR_CHANNELS[4] == "FL,FR,LFE,FC"
     assert HDMIPwCatPlayback.CHMAP_FOR_CHANNELS[2] == "FL,FR"
 
