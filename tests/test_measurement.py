@@ -402,26 +402,52 @@ class TestMeasure:
         assert fr.loopback_xcorr_peak_ms is None
         assert fr.avr_processing_ms is None
 
+    @pytest.mark.asyncio
+    async def test_hdmi_route_uses_populated_tee_reference(self):
+        """When the HDMI ref-tee populates loopback_ref (hot stimulus on ch0),
+        the engine deconvolves mic/ref like the subs — proven by the loopback
+        xcorr fields being computed (NOT None). This is the fix that beats the
+        synchronous-deconv jitter wall (2026-06-22)."""
+        engine, _, mock_sweep, mock_recording = self._make_engine_with_mocks()
+        import numpy as _np
+        rng = _np.random.default_rng(13)
+        n = len(mock_sweep.timeSignal[:, 0])
+        sweep_1d = mock_sweep.timeSignal[:, 0]
+        # Tee'd reference = the played stimulus (hot); mic = a different acoustic
+        # signal so H=mic/ref is non-flat (no flat_response raise).
+        ref = sweep_1d.copy()
+        acoustic_mic = rng.standard_normal(n).astype(_np.float32)
+        mock_strategy = MagicMock()
+        mock_strategy.play_and_record.return_value = (sweep_1d, acoustic_mic, ref)
+        with patch("calibrate.drivers.playback.playback_for_route", return_value=mock_strategy):
+            fr = await engine.measure(route="hdmi")
+        assert isinstance(fr, FrequencyResponse)
+        assert fr.loopback_xcorr_peak_ms is not None
+        assert fr.avr_processing_ms is not None
+
 
 class TestUseSynchronousDeconv:
     """Unit tests for the deconvolution-reference decision helper."""
 
-    def test_hdmi_route_forces_synchronous_even_with_reference(self):
-        ref = np.ones(100, dtype=np.float32)  # a non-silent ref
-        assert _use_synchronous_deconv("hdmi", ref, np) is True
-
-    def test_usb_route_with_valid_reference_uses_loopback(self):
-        ref = np.ones(100, dtype=np.float32)
+    def test_populated_reference_uses_loopback(self):
+        # A real captured reference (incl. HDMI's tee'd stimulus) → use it.
+        ref = 0.3 * np.ones(100, dtype=np.float32)
+        assert _use_synchronous_deconv("hdmi", ref, np) is False
         assert _use_synchronous_deconv("usb", ref, np) is False
 
     def test_missing_reference_falls_back_to_synchronous(self):
         assert _use_synchronous_deconv("usb", None, np) is True
+        assert _use_synchronous_deconv("hdmi", None, np) is True
 
     def test_all_zero_reference_falls_back_to_synchronous(self):
         assert _use_synchronous_deconv("usb", np.zeros(100, dtype=np.float32), np) is True
 
-    def test_hdmi_route_with_no_reference_is_synchronous(self):
-        assert _use_synchronous_deconv("hdmi", None, np) is True
+    def test_effectively_silent_reference_falls_back_to_synchronous(self):
+        # Ref-tee didn't populate the tap → only the PW null-sink noise floor
+        # (not exactly zero). Must NOT divide the mic by noise.
+        rng = np.random.default_rng(3)
+        silent = (rng.standard_normal(4800).astype(np.float32) * 1e-6)
+        assert _use_synchronous_deconv("hdmi", silent, np) is True
 
 
 # ── MeasurementEngine._compute_fr() ──────────────────────────────────────────

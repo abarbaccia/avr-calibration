@@ -643,6 +643,7 @@ class HDMIPwCatPlayback:
         channels: int = 6,
         capture_pipewire_node: str | None = None,
         skip_warmup: bool = False,
+        ref_tee_node: str | None = None,
     ) -> None:
         if not pipewire_node:
             raise ValueError("HDMIPwCatPlayback requires a non-empty PipeWire node name")
@@ -652,6 +653,15 @@ class HDMIPwCatPlayback:
         self.channels = int(channels)
         self.capture_pipewire_node = capture_pipewire_node
         self.skip_warmup = skip_warmup
+        # Optional sample-locked reference tee. HDMI has no post-AVR electrical
+        # loopback, so synchronous (analytical-sweep) deconvolution is jitter-
+        # limited and smears the highs (measurement.py:~905). When set, we play
+        # the FL-channel sweep CONCURRENTLY into this PipeWire null sink (e.g.
+        # avr_cal_sweep), whose monitor_FL is wired to loopback_ref:playback_FL.
+        # The loopback then captures a populated reference SAMPLE-LOCKED with the
+        # mic (monitor_FR) — the same scheme the USB sub path uses — so H=mic/ref
+        # cancels common play/record jitter. (2026-06-22)
+        self.ref_tee_node = ref_tee_node
 
     @staticmethod
     def _kill_stale_pw_streams(sink_name: str) -> None:
@@ -701,6 +711,61 @@ class HDMIPwCatPlayback:
                 )
             except Exception:
                 pass
+
+    def _start_ref_tee(self, sweep_array, sample_rate):
+        """Concurrently play the FL-channel sweep into the reference null sink so
+        the loopback capture gets a populated, sample-locked reference. Returns
+        (proc, thread) or (None, None) when no tee node is configured. The feed
+        runs in a daemon thread so it overlaps the (blocking) HDMI playback."""
+        if not self.ref_tee_node:
+            return None, None
+        import subprocess, threading
+        import numpy as np
+        mono = (np.clip(sweep_array, -1.0, 1.0) * 32767).astype(np.int16)
+        stereo = np.zeros((len(mono), 2), dtype=np.int16)
+        stereo[:, 0] = mono  # FL = sweep, FR = silence
+        tee_bytes = stereo.tobytes()
+        cmd = [
+            "pw-cat", "--playback", "--target", self.ref_tee_node,
+            "--channels", "2", "--rate", str(sample_rate), "--format", "s16",
+            "--channel-map", "FL,FR", "-",
+        ]
+        try:
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        except Exception as exc:
+            log.warning("ref tee start failed (non-fatal, falls back to synchronous): %s", exc)
+            return None, None
+        timeout = max(30.0, len(mono) / sample_rate + 10.0)
+
+        def _feed():
+            try:
+                proc.communicate(input=tee_bytes, timeout=timeout)
+            except Exception:
+                try:
+                    proc.kill(); proc.communicate()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_feed, daemon=True)
+        t.start()
+        return proc, t
+
+    @staticmethod
+    def _stop_ref_tee(proc, thread) -> None:
+        if proc is None:
+            return
+        try:
+            if thread is not None:
+                thread.join(timeout=5.0)
+        except Exception:
+            pass
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
 
     def play_and_record(self, sweep, sample_rate, in_channel, out_channel):
         import subprocess
@@ -788,8 +853,12 @@ class HDMIPwCatPlayback:
                 self.capture_pipewire_node, sample_rate
             )
             proc = None
+            tee_proc, tee_t = None, None
             try:
                 _time.sleep(self.PRE_DELAY_S)
+                # Start the sample-locked reference tee just before the HDMI sweep
+                # so both play concurrently on the same PipeWire graph clock.
+                tee_proc, tee_t = self._start_ref_tee(sweep_array, sample_rate)
                 proc = subprocess.Popen(
                     pw_cmd,
                     stdin=subprocess.PIPE,
@@ -804,6 +873,7 @@ class HDMIPwCatPlayback:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.communicate()
+                    self._stop_ref_tee(tee_proc, tee_t)
                     _stop_pw_record(rec_proc, reader_t)
                     raise RuntimeError(
                         f"pw-cat --target {self.pipewire_node!r} timed out — HDMI sink may be unplugged"
@@ -816,6 +886,7 @@ class HDMIPwCatPlayback:
                     )
                 _time.sleep(self.POST_DELAY_S)
             finally:
+                self._stop_ref_tee(tee_proc, tee_t)
                 if proc is not None and proc.poll() is None:
                     try:
                         proc.kill()
@@ -846,9 +917,11 @@ class HDMIPwCatPlayback:
                 callback=_rec_callback,
             )
             proc = None
+            tee_proc, tee_t = None, None
             try:
                 in_stream.start()
                 _time.sleep(self.PRE_DELAY_S)
+                tee_proc, tee_t = self._start_ref_tee(sweep_array, sample_rate)
                 proc = subprocess.Popen(
                     pw_cmd,
                     stdin=subprocess.PIPE,
@@ -873,6 +946,7 @@ class HDMIPwCatPlayback:
                     )
                 _time.sleep(self.POST_DELAY_S)
             finally:
+                self._stop_ref_tee(tee_proc, tee_t)
                 try:
                     in_stream.stop()
                 except Exception:
@@ -1326,6 +1400,7 @@ def playback_for_route(
     loopback_ref_pipewire_node: str | None = None,
     loopback_ref_pw_channels: int = 1,
     hdmi_skip_warmup: bool = False,
+    hdmi_ref_tee_node: str | None = None,
 ) -> PlaybackStrategy:
     """Factory: return the right playback strategy for the configured route.
 
@@ -1350,6 +1425,7 @@ def playback_for_route(
                 channels=hdmi_channels,
                 capture_pipewire_node=capture_pipewire_node,
                 skip_warmup=hdmi_skip_warmup,
+                ref_tee_node=hdmi_ref_tee_node,
             )
         else:
             base = HDMIPlayback()

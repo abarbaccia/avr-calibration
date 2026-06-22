@@ -621,24 +621,29 @@ def _use_synchronous_deconv(route, ref_1d, np) -> bool:
     """Whether to deconvolve against the known sweep (synchronous) rather than the
     recorded loopback reference.
 
-    The HDMI/mains route has NO post-AVR electrical loopback: the reference tap
-    ``loopback_ref:monitor_FL`` is fed by ``avr_cal_sweep`` — the USB-sub null
-    sink — which an HDMI sweep bypasses entirely. So ``ref_1d`` is that tap's
-    near-silent noise floor (NOT exactly zero, so an all-zero guard misses it),
-    and deconvolving the mic against it produces a garbage ~1/f-slope FR with
-    ~0.5 coherence (observed 2026-06-22). Playback and capture share the 48 kHz
-    PipeWire clock, so synchronous deconvolution (mic vs the known digital sweep)
-    is the correct method for HDMI.
+    Prefer the recorded reference whenever one was actually captured — it is
+    sample-locked with the mic and cancels common play/record jitter (the USB sub
+    path relies on this; without it, analytical-sweep deconvolution smears the
+    highs and collapses coherence — see the loopback warning in measure()). HDMI
+    gets a populated reference via the FL-channel ref-tee into the loopback sink
+    (hdmi_ref_tee_node), so it uses the same recorded-ref path as the subs.
 
-    Also fall back to synchronous when no usable reference was captured at all
-    (``ref_1d`` absent or all-zero) — preserves the prior behaviour for the
-    no-loopback case.
+    Fall back to synchronous only when there is NO usable reference:
+      - ref_1d absent (2-tuple playback strategy), or
+      - ref_1d all-zero, or
+      - ref_1d effectively silent — RMS far below any real stimulus. This catches
+        the case where the ref-tee failed to populate the tap (its monitor sits
+        at the PW null-sink noise floor, ~-90 dBFS, NOT exactly zero). Dividing
+        the mic by that noise yields a garbage ~1/f-slope FR (observed
+        2026-06-22), so synchronous is strictly better there.
     """
-    if route == "hdmi":
-        return True
     if ref_1d is None:
         return True
     if np.all(ref_1d == 0):
+        return True
+    rms = float(np.sqrt(np.mean(np.square(np.asarray(ref_1d, dtype=np.float64)))))
+    # A real tee'd stimulus is ~-12 dBFS RMS; an unpopulated tap is <~-80 dBFS.
+    if rms < 1e-4:  # ≈ -80 dBFS
         return True
     return False
 
@@ -973,6 +978,13 @@ class MeasurementEngine:
                 loopback_ref_channel_index=loopback_ref_channel_index,
                 loopback_ref_pipewire_node=loopback_ref_pw_node,
                 loopback_ref_pw_channels=loopback_ref_pw_channels,
+                # HDMI has no post-AVR electrical loopback. Tee the FL-channel
+                # sweep into the usb null sink (avr_cal_sweep), whose monitor_FL
+                # feeds loopback_ref:playback_FL, so the loopback captures a
+                # populated reference SAMPLE-LOCKED with the mic — H=mic/ref then
+                # cancels the play/record jitter that wrecks synchronous HDMI
+                # deconvolution. Only meaningful when a PW loopback ref exists.
+                hdmi_ref_tee_node=usb_pipewire_node if loopback_ref_pw_node else None,
             )
         elif usb_pipewire_node:
             # USB route targeting a PipeWire node (e.g. avr_cal_sweep null sink).
