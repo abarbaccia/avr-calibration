@@ -625,6 +625,19 @@ class HDMIPwCatPlayback:
     POST_DELAY_S: float = 0.5
     """Seconds of trailing capture after pw-cat exits, to capture the room reverb tail."""
 
+    CHMAP_FOR_CHANNELS: dict[int, str] = {
+        2: "FL,FR",
+        4: "FL,FR,LFE,FC",
+        # ch 5/6 are SL,SR (SIDE surround) — NOT RL,RR (rear). This rig is a
+        # 5.1.4 with side surrounds and no rear-backs; labeling the 6-ch surround
+        # channels RL,RR routed them to nonexistent rear speakers → silent. Bench-
+        # verified 2026-06-22: sweep on ch4 with RL,RR → UMIK −45 dBFS (silent);
+        # with SL,SR → −3 dBFS (loud, = FL control). FL/FR/FC (ch 1/2/4) unchanged.
+        6: "FL,FR,LFE,FC,SL,SR",
+    }
+    """HDMI channel-map per channel count. Forces explicit speaker positions so
+    FC is reachable and the surrounds route to the side-surround speakers."""
+
     HDMI_WARMUP_S: float = 5.0
     """Seconds of silent PCM sent to the AVR *before* the recording starts.
     The AVR's PCM detection engine needs 3-5 s to lock onto the incoming HDMI
@@ -799,17 +812,11 @@ class HDMIPwCatPlayback:
         post_samples = int(self.POST_DELAY_S * sample_rate)
         rec_n = pre_samples + n_samples + post_samples
 
-        # Force the channel map so FC lands at the right PCM slot.
-        # Without this, the vc4-hdmi driver picks FL,FR,LFE,NA,RC,NA for
-        # AVRs whose EDID advertises back-center — FC is unreachable.
-        # With FL,FR,LFE,FC,RL,RR explicit, ch 4 = FC, ch 5/6 = RL/RR.
-        # Verified 2026-05-07 against amixer numid=2 values 3,4,8,7,5,6,0,0.
-        chmap_for_channels = {
-            2: "FL,FR",
-            4: "FL,FR,LFE,FC",
-            6: "FL,FR,LFE,FC,RL,RR",
-        }
-        chmap_arg = chmap_for_channels.get(n_channels)
+        # Force the channel map so FC lands at the right PCM slot and the
+        # surrounds reach the speakers. Without it the vc4-hdmi driver picks
+        # FL,FR,LFE,NA,RC,NA for AVRs whose EDID advertises back-center and FC
+        # is unreachable.
+        chmap_arg = self.CHMAP_FOR_CHANNELS.get(n_channels)
 
         pw_cmd = [
             "pw-cat",

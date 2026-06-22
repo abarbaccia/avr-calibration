@@ -2787,6 +2787,30 @@ def test_playback_for_route_no_ref_returns_base() -> None:
     assert not isinstance(p_hdmi, LoopbackRefPlayback)
 
 
+def test_hdmi_6ch_chmap_uses_side_surrounds() -> None:
+    """6-ch HDMI must label surrounds SL,SR (side) — not RL,RR (rear) — so they
+    reach the side-surround speakers on this 5.1.4 layout. Bench-verified
+    2026-06-22 (RL,RR → silent; SL,SR → loud). Fronts unchanged."""
+    from calibrate.drivers.playback import HDMIPwCatPlayback
+    assert HDMIPwCatPlayback.CHMAP_FOR_CHANNELS[6] == "FL,FR,LFE,FC,SL,SR"
+    assert HDMIPwCatPlayback.CHMAP_FOR_CHANNELS[4] == "FL,FR,LFE,FC"
+    assert HDMIPwCatPlayback.CHMAP_FOR_CHANNELS[2] == "FL,FR"
+
+
+def test_hdmi_factory_passes_ref_tee_node() -> None:
+    """playback_for_route threads hdmi_ref_tee_node to HDMIPwCatPlayback so the
+    HDMI sweep tees a sample-locked reference into the loopback sink."""
+    from calibrate.drivers.playback import HDMIPwCatPlayback, playback_for_route
+    p = playback_for_route(
+        "hdmi",
+        hdmi_pipewire_node="alsa_output.platform-107c701400.hdmi.hdmi-surround71",
+        hdmi_channels=6,
+        hdmi_ref_tee_node="avr_cal_sweep",
+    )
+    assert isinstance(p, HDMIPwCatPlayback)
+    assert p.ref_tee_node == "avr_cal_sweep"
+
+
 def test_playback_for_route_with_ref_wraps_in_loopback() -> None:
     """With loopback_ref_device set, factory wraps base in LoopbackRefPlayback."""
     from calibrate.drivers.playback import (
