@@ -1,4 +1,4 @@
--- WirePlumber rules for the Pi → Denon AVR HDMI output (vc4-hdmi, card0,
+-- WirePlumber rules for the Pi → Denon AVR HDMI output (vc4-hdmi, card1,
 -- platform-107c701400.hdmi). Installs to:
 --   /home/pi/.config/wireplumber/main.lua.d/53-hdmi-surround71.lua
 --

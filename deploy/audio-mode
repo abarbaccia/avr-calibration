@@ -64,7 +64,9 @@ LOOPBACK_REF="loopback_ref"
 # stereo sink exists and a 6-ch sweep is silently downmixed to stereo, so the
 # discrete channel never reaches its speaker ("sweep not detected"). cal mode pins
 # this profile explicitly instead of depending on enumeration timing luck.
-HDMI_CARD="${HDMI_CARD:-alsa_card.platform-107c701400.hdmi}"
+# HDMI_CARD_OVERRIDE: set this env var to pin a specific card (testing/emergency).
+# Normally empty; resolve_hdmi_card() detects the Denon at call time.
+HDMI_CARD_OVERRIDE="${HDMI_CARD:-}"
 HDMI_SURROUND_PROFILE="${HDMI_SURROUND_PROFILE:-output:hdmi-surround71}"
 
 # How long `wire` waits for camilladsp_capture ports to appear (seconds × 0.5).
@@ -240,18 +242,66 @@ restart_wireplumber() {
     as_pi systemctl --user restart wireplumber 2>/dev/null
 }
 
+# Resolve which pactl card is the connected Denon HDMI output at call time.
+# Returns the alsa_card.platform-*.hdmi name, or empty string on failure.
+# The Pi 5 has two vc4-hdmi controllers (107c701400, 107c706400). Which one
+# enumerates as card0/card1 can swap across reboots — NEVER hardcode a card index.
+# Resolution strategy (in order):
+#   1. Card whose pactl port reports device.product.name = "DENON-AVR" (EDID — definitive).
+#   2. First vc4-hdmi card with output:hdmi-surround71 available (requires AVR on+HDMI input).
+#   3. Empty string on failure.
+# Override: set HDMI_CARD env var to skip resolution (for testing / emergency).
+resolve_hdmi_card() {
+    if [ -n "${HDMI_CARD_OVERRIDE:-}" ]; then
+        echo "$HDMI_CARD_OVERRIDE"
+        return 0
+    fi
+    local cards
+    cards=$(as_pi timeout "$PW_LINK_TIMEOUT" pactl list cards 2>/dev/null)
+
+    # Strategy 1: card whose port advertises "DENON-AVR" (from AVR EDID).
+    local found
+    found=$(echo "$cards" | awk '
+        /^Card #/ { name="" }
+        /^\tName:/ { name=$2 }
+        /DENON-AVR/ && name ~ /platform-[0-9a-f]+\.hdmi/ { print name; exit }
+    ')
+    if [ -n "$found" ]; then
+        echo "$found"
+        return 0
+    fi
+
+    # Strategy 2: first vc4-hdmi card with output:hdmi-surround71 available.
+    found=$(echo "$cards" | awk '
+        /^Card #/ { name="" }
+        /^\tName:/ { name=$2 }
+        /output:hdmi-surround71.*available: yes/ && name ~ /platform-[0-9a-f]+\.hdmi/ { print name; exit }
+    ')
+    if [ -n "$found" ]; then
+        echo "$found"
+        return 0
+    fi
+
+    echo ""  # not found
+    return 1
+}
+
 hdmi_active_profile() {
+    # Accept optional card name argument; resolve if not supplied.
+    local card="${1:-$(resolve_hdmi_card)}"
+    [ -z "$card" ] && return 1
     as_pi timeout "$PW_LINK_TIMEOUT" pactl list cards 2>/dev/null \
-        | sed -n "/Name: ${HDMI_CARD}\$/,/^Card #/p" \
-        | awk '/Active Profile:/{print $3; exit}'
+        | awk -v card="$card" '
+            /^Card #/ { in_card=0 }
+            /^\tName:/ && $2==card { in_card=1 }
+            in_card && /Active Profile:/ { print $3; exit }
+        '
 }
 
 ensure_hdmi_surround() {
-    # Deterministically put the HDMI card on the surround71 profile so the 8-ch
-    # sink exists for cal-mode mains sweeps. Selecting an available profile creates
-    # its sink node, so this is the establish step (not just a preference hint like
-    # the WP apply-properties rule, which can only pick from already-enumerated
-    # profiles and cannot create one).
+    # Deterministically put the Denon HDMI card on the surround71 profile so the
+    # 8-ch sink exists for cal-mode mains sweeps. Resolves which card is the Denon
+    # at call time — never depends on a hardcoded card index (swaps across reboots).
     #   allow_restart=0 (wire / watchdog path): idempotent re-pin only, NEVER a WP
     #                   restart — frequent WP restarts flap every link (boot-wedge,
     #                   2026-06-13). Silent when already correct (no log spam).
@@ -260,10 +310,17 @@ ensure_hdmi_surround() {
     #                   EDID, then set it. Caller re-wires after (links drop on
     #                   restart). Requires the AVR powered on + on the HDMI input.
     local allow_restart="${1:-0}"
-    [ "$(hdmi_active_profile)" = "$HDMI_SURROUND_PROFILE" ] && return 0
+    local HDMI_CARD
+    HDMI_CARD=$(resolve_hdmi_card)
+    if [ -z "$HDMI_CARD" ]; then
+        log "WARNING: could not resolve Denon HDMI card — AVR off or not advertising EDID?"
+        return 1
+    fi
+    log "HDMI resolver selected: $HDMI_CARD"
+    [ "$(hdmi_active_profile "$HDMI_CARD")" = "$HDMI_SURROUND_PROFILE" ] && return 0
     if as_pi timeout "$PW_LINK_TIMEOUT" \
         pactl set-card-profile "$HDMI_CARD" "$HDMI_SURROUND_PROFILE" 2>/dev/null; then
-        log "HDMI card → $HDMI_SURROUND_PROFILE (8-ch sink for mains sweeps)"
+        log "HDMI card $HDMI_CARD → $HDMI_SURROUND_PROFILE (8-ch sink for mains sweeps)"
         return 0
     fi
     log "WARNING: $HDMI_SURROUND_PROFILE not available on $HDMI_CARD (AVR off / stereo-only at WP enum?)"
@@ -271,15 +328,17 @@ ensure_hdmi_surround() {
         log "restarting WirePlumber to re-enumerate HDMI profiles (AVR must be ON + on the Pi's HDMI input)"
         restart_wireplumber
         sleep 3
-        if as_pi timeout "$PW_LINK_TIMEOUT" \
+        HDMI_CARD=$(resolve_hdmi_card)
+        if [ -n "$HDMI_CARD" ] && as_pi timeout "$PW_LINK_TIMEOUT" \
             pactl set-card-profile "$HDMI_CARD" "$HDMI_SURROUND_PROFILE" 2>/dev/null; then
-            log "HDMI card → $HDMI_SURROUND_PROFILE (after WP re-enumerate)"
+            log "HDMI card $HDMI_CARD → $HDMI_SURROUND_PROFILE (after WP re-enumerate)"
             return 0
         fi
         log "ERROR: $HDMI_SURROUND_PROFILE still unavailable after WP restart — is the AVR powered on and on the Pi's HDMI input?"
     fi
     return 1
 }
+
 
 remove_umik_links() {
     # Feedback-loop guard: the UMIK is captured directly by the bare-metal
