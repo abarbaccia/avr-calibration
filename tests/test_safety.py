@@ -616,3 +616,110 @@ def test_general_intent_keeps_strict_thermal_cap() -> None:
     with pytest.raises(SafetyValidationError) as excinfo:
         SafetyValidator().validate_fir(taps, sample_rate=_FIR_RATE)
     assert "thermal" in str(excinfo.value).lower()
+
+
+# ── Effective-boost (excursion/port-compression) ceiling ─────────────────────
+# Distinct from the safety caps: predicts how much boost actually translates to
+# acoustic output vs is swallowed by driver excursion near the port tune.
+# See memory/feedback_cant_eq_boost_past_excursion.md.
+
+from calibrate.safety import (  # noqa: E402
+    interp_effective_boost_ceiling,
+    effective_boost_ceiling_db,
+    boost_translation_warnings,
+)
+from calibrate.graph import (  # noqa: E402
+    SVS_PB12_NSD_PROFILE,
+    TransducerProfile,
+    _parse_effective_boost_ceiling,
+)
+
+_PB12_CURVE = ((25.0, 1.0), (31.5, 1.5), (40.0, 3.0), (50.0, 6.0))
+
+
+def test_interp_ceiling_empty_curve_returns_none() -> None:
+    assert interp_effective_boost_ceiling((), 30.0) is None
+
+
+def test_interp_ceiling_holds_lowest_below_first_breakpoint() -> None:
+    assert interp_effective_boost_ceiling(_PB12_CURVE, 20.0) == 1.0
+
+
+def test_interp_ceiling_none_above_top_breakpoint() -> None:
+    # Above the curve the safety cap governs — no extra effective limit.
+    assert interp_effective_boost_ceiling(_PB12_CURVE, 80.0) is None
+
+
+def test_interp_ceiling_log_interpolates_between_breakpoints() -> None:
+    val = interp_effective_boost_ceiling(_PB12_CURVE, 40.0)
+    assert val == pytest.approx(3.0, abs=0.01)
+    mid = interp_effective_boost_ceiling(_PB12_CURVE, 35.0)
+    assert 1.5 < mid < 3.0  # between the 31.5 and 40 Hz breakpoints
+
+
+def test_pb12_profile_carries_effective_boost_ceiling() -> None:
+    assert SVS_PB12_NSD_PROFILE.effective_boost_ceiling == _PB12_CURVE
+    assert effective_boost_ceiling_db(SVS_PB12_NSD_PROFILE, 31.5) == pytest.approx(1.5)
+
+
+def test_boost_translation_warns_on_deep_bass_boost() -> None:
+    """A +5 dB boost at 31 Hz exceeds the ~1.5 dB effective ceiling → warned."""
+    filters = [{"type": "peaking", "freq": 31.5, "gain_db": 5.0, "q": 2.0}]
+    warns = boost_translation_warnings(SVS_PB12_NSD_PROFILE, filters)
+    assert len(warns) == 1
+    assert warns[0]["freq"] == 31.5
+    assert warns[0]["effective_ceiling_db"] == pytest.approx(1.5)
+    assert warns[0]["excess_db"] == pytest.approx(3.5, abs=0.01)
+
+
+def test_boost_translation_ignores_high_freq_and_cuts() -> None:
+    """A boost above the curve (80 Hz) and any cut never warn."""
+    filters = [
+        {"type": "peaking", "freq": 80.0, "gain_db": 5.0, "q": 2.0},   # above curve
+        {"type": "peaking", "freq": 31.5, "gain_db": -5.0, "q": 2.0},  # cut
+        {"type": "low_shelf", "freq": 50.0, "gain_db": 4.0, "q": 0.7},  # at top breakpoint → None (unconstrained)
+    ]
+    assert boost_translation_warnings(SVS_PB12_NSD_PROFILE, filters) == []
+
+
+def test_parse_effective_boost_ceiling_rejects_malformed_dict() -> None:
+    """A dict entry missing the db key raises a clear error (not a silent drop)."""
+    with pytest.raises(ValueError):
+        _parse_effective_boost_ceiling([{"freq": 40}])
+    with pytest.raises(ValueError):
+        _parse_effective_boost_ceiling([{"max_effective_boost_db": 3.0}])
+
+
+def test_parse_effective_boost_ceiling_sorts_and_accepts_dict_form() -> None:
+    parsed = _parse_effective_boost_ceiling(
+        [{"freq": 40, "max_effective_boost_db": 3}, [25, 1.0]]
+    )
+    assert parsed == ((25.0, 1.0), (40.0, 3.0))
+    assert _parse_effective_boost_ceiling(None) == ()
+
+
+def test_strictest_of_merges_effective_boost_ceiling() -> None:
+    """The strictest-of merge keeps the most restrictive ceiling across drivers."""
+    from calibrate.graph import SignalGraph, Transducer, Processor
+
+    weak = TransducerProfile(
+        name="weak", effective_boost_ceiling=((25.0, 0.5), (50.0, 4.0)),
+    )
+    strong = TransducerProfile(
+        name="strong", effective_boost_ceiling=((25.0, 2.0), (50.0, 8.0)),
+    )
+    graph = SignalGraph(
+        processors=(Processor(name="dsp", driver_ref="camilladsp", kind="dsp"),),
+        transducers=(
+            Transducer(name="a", role="sub", processor_ref="dsp",
+                       output_index=0, safety_profile_ref="weak"),
+            Transducer(name="b", role="sub", processor_ref="dsp",
+                       output_index=1, safety_profile_ref="strong"),
+        ),
+        profiles=(weak, strong),
+    )
+    merged = graph.strictest_profile(graph.transducers)
+    # Min at each breakpoint → the weak driver's ceiling.
+    assert effective_boost_ceiling_db(merged, 25.0) == pytest.approx(0.5)
+    assert effective_boost_ceiling_db(merged, 50.0) is None or \
+        interp_effective_boost_ceiling(merged.effective_boost_ceiling, 49.9) == pytest.approx(4.0, abs=0.2)

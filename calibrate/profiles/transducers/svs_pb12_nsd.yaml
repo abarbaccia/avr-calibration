@@ -10,6 +10,16 @@ max_change_simulated_db: 6
 hpf:
   freq: 18
   order: 4
+# Effective-boost ceiling (realizability, NOT safety): how much boost actually
+# reaches the listener vs is swallowed by excursion/port compression near the
+# ~22 Hz port tune. Measured run 40 (2026-06-19): +5 dB boost at 25-40 Hz
+# delivered ~+0.4 dB acoustically; 50-80 Hz translated fully. Ascending
+# (freq, max_effective_boost_db) breakpoints; above the top the safety cap governs.
+effective_boost_ceiling:
+  - [25, 1.0]
+  - [31.5, 1.5]
+  - [40, 3.0]
+  - [50, 6.0]
 notes: |
   SVS PB12-NSD, ported subwoofer with ~22 Hz port tune. Tight boost limits below
   30 Hz protect against port unloading; above the port tune the limit loosens

@@ -163,6 +163,53 @@ def valid_filters():
     ]
 
 
+@pytest.mark.asyncio
+async def test_unmute_output_accepts_singular_index(mock_dsp) -> None:
+    """unmute_output accepts output_index (singular) — alias for output_indices=[i].
+
+    Matches the singular convention of set_delay/set_output_gain/set_polarity;
+    passing output_index=7 previously errored ('target or output_indices required').
+    """
+    with patch("calibrate.mcp_server._persist_dsp_state"), \
+         patch("calibrate.mcp_server._default_dsp_name", return_value="camilla"):
+        result = await _tool_unmute_output(output_index=7)
+    assert result["ok"]
+    assert result["unmuted"] == [7]
+    mock_dsp.unmute_outputs.assert_awaited_once_with([7])
+
+
+@pytest.mark.asyncio
+async def test_mute_output_accepts_singular_index(mock_dsp) -> None:
+    with patch("calibrate.mcp_server._persist_dsp_state"), \
+         patch("calibrate.mcp_server._default_dsp_name", return_value="camilla"):
+        result = await _tool_mute_output(output_index=5)
+    assert result["ok"]
+    assert result["muted"] == [5]
+    mock_dsp.mute_outputs.assert_awaited_once_with([5])
+
+
+@pytest.mark.asyncio
+async def test_unmute_output_rejects_both_singular_and_plural(mock_dsp) -> None:
+    result = await _tool_unmute_output(output_index=7, output_indices=[7])
+    assert not result["ok"]
+    assert "not both" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_unmute_output_rejects_singular_index_with_target(mock_dsp) -> None:
+    """output_index expands to output_indices, so combining it with target conflicts."""
+    result = await _tool_unmute_output(output_index=5, target="subs")
+    assert not result["ok"]
+    assert "not both" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_mute_output_rejects_singular_index_with_target(mock_dsp) -> None:
+    result = await _tool_mute_output(output_index=5, target="subs")
+    assert not result["ok"]
+    assert "not both" in result["error"]
+
+
 @pytest.fixture
 def _empty_signal_graph():
     """Patch _config to a graph with no transducers — bypasses the apply_fir /
@@ -358,6 +405,53 @@ async def test_get_fr_summary_by_session_ids() -> None:
     assert result["count"] == 1
     assert result["sessions"][0]["id"] == 10
     assert "ir_summary" not in result["sessions"][0]  # no metadata
+
+
+@pytest.mark.asyncio
+async def test_get_fr_summary_resolution_finer_than_third() -> None:
+    """sixth_octave / twelfth_octave return more bands than the default third_octave.
+
+    The 1/3-octave default averages modal ripple away; callers judging flatness
+    need to be able to ask for finer resolution.
+    """
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(200), 800).tolist()
+    spl = [75.0] * len(freqs)
+    mock_fr = MagicMock()
+    mock_fr.frequencies = freqs
+    mock_fr.spl = spl
+    mock_fr.peak_spl = 75.0
+    mock_fr.freq_at_peak = 80.0
+    mock_fr.loopback_xcorr_peak_ms = None
+    mock_fr.avr_processing_ms = None
+    mock_session = MagicMock()
+    mock_session.id = 7
+    mock_session.timestamp = "2026-06-19T00:00:00Z"
+    mock_session.label = "res-test"
+    mock_session.start_fr = mock_fr
+    mock_session.metadata = None
+
+    with patch("calibrate.storage.SessionStore") as mock_store_cls:
+        mock_store = MagicMock()
+        mock_store.get_session.return_value = mock_session
+        mock_store_cls.return_value = mock_store
+        third = await _tool_get_fr_summary(session_ids=[7], resolution="third_octave")
+        sixth = await _tool_get_fr_summary(session_ids=[7], resolution="sixth_octave")
+        twelfth = await _tool_get_fr_summary(session_ids=[7], resolution="twelfth_octave")
+
+    n_third = len(third["sessions"][0]["bands"])
+    n_sixth = len(sixth["sessions"][0]["bands"])
+    n_twelfth = len(twelfth["sessions"][0]["bands"])
+    assert n_third < n_sixth < n_twelfth
+    assert third["sessions"][0]["resolution"] == "third_octave"
+    assert twelfth["sessions"][0]["resolution"] == "twelfth_octave"
+
+
+@pytest.mark.asyncio
+async def test_get_fr_summary_invalid_resolution() -> None:
+    result = await _tool_get_fr_summary(session_ids=[1], resolution="bogus")
+    assert not result["ok"]
+    assert "bogus" in result["error"]
 
 
 @pytest.mark.asyncio
@@ -3863,7 +3957,9 @@ async def test_simulate_eq_basic_prediction() -> None:
     ]
     with patch("calibrate.storage.SessionStore") as MockStore:
         _wire_mock_store(MockStore, [session])
-        result = await _tool_simulate_eq(session_id=1, filters=filters)
+        result = await _tool_simulate_eq(
+            session_id=1, filters=filters, full_resolution=True,
+        )
     assert result["ok"]
     assert result["num_filters"] == 1
     assert result["point_count"] > 0
@@ -3894,6 +3990,7 @@ async def test_simulate_eq_hpf_skipped() -> None:
         _wire_mock_store(MockStore, [session])
         result = await _tool_simulate_eq(
             session_id=1, filters=filters, min_hz=15.0, max_hz=100.0,
+            full_resolution=True,
         )
     assert result["ok"]
     pairs = result["predicted_fr"].split(",")
@@ -3916,6 +4013,7 @@ async def test_simulate_eq_low_shelf_response() -> None:
         _wire_mock_store(MockStore, [session])
         result = await _tool_simulate_eq(
             session_id=1, filters=filters, min_hz=20.0, max_hz=100.0,
+            full_resolution=True,
         )
     assert result["ok"]
     pairs = result["predicted_fr"].split(",")
@@ -3955,6 +4053,65 @@ async def test_call_tool_simulate_eq_dispatch() -> None:
     data = json.loads(texts[0].text)
     assert data["ok"]
     assert "predicted_fr" in data
+
+
+@pytest.mark.asyncio
+async def test_simulate_eq_downsampled_by_default() -> None:
+    """Default simulate_eq output is downsampled to band centres, not the raw grid.
+
+    A raw sweep is hundreds–thousands of points; dumping them all floods context.
+    The default must return a compact band set while reporting the raw count.
+    """
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 400).tolist()
+    spls = [75.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+
+    filters = [{"type": "peaking", "freq": 50.0, "gain_db": -3.0, "q": 2.0}]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        _wire_mock_store(MockStore, [session])
+        result = await _tool_simulate_eq(session_id=1, filters=filters)
+    assert result["ok"]
+    assert result["resolution"] == "sixth_octave"
+    # Raw grid was 400 points; downsampled output must be far smaller.
+    assert result["raw_point_count"] >= 300
+    assert result["point_count"] < 40
+    assert len(result["bands"]) == result["point_count"]
+    # Structured bands carry original/predicted/correction.
+    assert {"freq_hz", "original_db", "predicted_db", "correction_db"} <= set(
+        result["bands"][0]
+    )
+
+
+@pytest.mark.asyncio
+async def test_simulate_eq_twelfth_finer_than_sixth() -> None:
+    """twelfth_octave returns more bands than sixth_octave over the same range."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 400).tolist()
+    spls = [75.0] * len(freqs)
+    session = _make_fr_session(freqs, spls)
+    filters = [{"type": "peaking", "freq": 50.0, "gain_db": -3.0, "q": 2.0}]
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        _wire_mock_store(MockStore, [session])
+        sixth = await _tool_simulate_eq(
+            session_id=1, filters=filters, resolution="sixth_octave",
+        )
+        twelfth = await _tool_simulate_eq(
+            session_id=1, filters=filters, resolution="twelfth_octave",
+        )
+    assert twelfth["point_count"] > sixth["point_count"]
+
+
+@pytest.mark.asyncio
+async def test_simulate_eq_invalid_resolution() -> None:
+    session = _make_fr_session([20.0, 50.0, 120.0], [75.0, 75.0, 75.0])
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        _wire_mock_store(MockStore, [session])
+        result = await _tool_simulate_eq(
+            session_id=1, filters=[], resolution="bogus",
+        )
+    assert not result["ok"]
+    assert "bogus" in result["error"]
 
 
 # ── optimize_q ──────────────────────────────────────────────────────────────
@@ -5110,6 +5267,82 @@ async def test_fit_peq_for_target_finds_cut() -> None:
     # Filter should be near 60 Hz and a cut
     assert 50.0 < bf["freq"] < 75.0
     assert bf["gain_db"] < 0
+
+
+@pytest.mark.asyncio
+async def test_fit_peq_for_target_warns_on_unrealizable_deep_bass_boost() -> None:
+    """A designed deep-bass boost that exceeds the PB12 effective-boost ceiling is flagged.
+
+    The fix for the run-40 excursion wall: tooling should warn that a 25-40 Hz
+    boost won't translate acoustically (driver compresses it) before it's applied.
+    With no signal graph configured, _resolve_subs_profile falls back to the
+    built-in SVS PB12-NSD profile, which carries the ceiling curve.
+    """
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls = [75.0] * len(freqs)  # flat — target will demand a deep-bass boost
+    session = _make_fr_session(freqs, spls)
+    # Target sits +5 dB above measured around 31 Hz → fit designs a boost there.
+    target = {
+        "points": [{"freq": 28, "spl": 80.0}, {"freq": 36, "spl": 80.0}],
+        "band": [28, 36],
+    }
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        _wire_mock_store(MockStore, [session])
+        result = await _tool_fit_peq_for_target(
+            session_id=1, target_curve=target, freq_range=[28.0, 36.0],
+        )
+    assert result["ok"]
+    assert result["best_filter"]["gain_db"] > 1.5  # a real boost was designed
+    warns = result.get("boost_translation_warnings")
+    assert warns, "deep-bass boost above the PB12 ceiling must be flagged"
+    assert warns[0]["excess_db"] > 0
+
+
+def test_resolve_subs_profile_uses_signal_graph_when_available() -> None:
+    """_resolve_subs_profile resolves through the signal graph, not just the fallback.
+
+    Regression guard for the strictest_of/strictest_profile method-name bug: with
+    the wrong name the graph path raises, is swallowed, and silently falls back to
+    the PB12 constant — so this test patches a graph returning a DISTINCT profile
+    and asserts that profile (not the fallback) is returned.
+    """
+    from calibrate import mcp_server
+    from calibrate.graph import TransducerProfile
+
+    custom = TransducerProfile(
+        name="custom_subs", effective_boost_ceiling=((25.0, 0.2), (50.0, 2.0)),
+    )
+    graph = MagicMock()
+    graph.strictest_profile.return_value = custom
+    cfg = MagicMock()
+    cfg.signal_graph = graph
+
+    with patch.object(mcp_server, "_resolve_for_dispatch",
+                      return_value=[{"transducer": object()}]), \
+         patch.object(mcp_server, "_config", return_value=cfg):
+        prof = mcp_server._resolve_subs_profile()
+
+    assert prof is custom
+    graph.strictest_profile.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_fit_peq_for_target_no_boost_warning_for_cut() -> None:
+    """A cut design never triggers a boost-translation warning."""
+    import numpy as np
+    freqs = np.logspace(np.log10(20), np.log10(120), 200).tolist()
+    spls = [75.0 + 5.0 * np.exp(-((f - 31) ** 2) / 50) for f in freqs]  # peak at 31
+    session = _make_fr_session(freqs, spls)
+    target = {"points": [{"freq": 28, "spl": 75.0}, {"freq": 36, "spl": 75.0}], "band": [28, 36]}
+    with patch("calibrate.storage.SessionStore") as MockStore:
+        _wire_mock_store(MockStore, [session])
+        result = await _tool_fit_peq_for_target(
+            session_id=1, target_curve=target, freq_range=[28.0, 36.0],
+        )
+    assert result["ok"]
+    assert result["best_filter"]["gain_db"] < 0  # a cut
+    assert "boost_translation_warnings" not in result
 
 
 @pytest.mark.asyncio

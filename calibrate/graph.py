@@ -180,6 +180,17 @@ class TransducerProfile:
     # ``intent="modal_cancel"``; generic FIRs and PEQ writes still respect
     # the stricter ``max_boost_above_threshold_db`` cap.
     modal_cancel_max_boost_db: float = 20.0
+    # Effective-boost ceiling: how much PEQ/FIR boost actually TRANSLATES to
+    # acoustic output at the listener, vs being swallowed by driver excursion /
+    # port compression. This is DISTINCT from the safety caps above — those
+    # protect the driver; this predicts realizability. A ported sub near its
+    # port tune compresses boosts (measured on the PB12: a +5 dB boost at 25-40 Hz
+    # delivered ~+0.4 dB acoustically while 50-80 Hz translated fully). Encoded as
+    # ascending (freq_hz, max_effective_boost_db) breakpoints, log-freq interpolated.
+    # Empty = no known compression limit (assume boosts translate). Above the top
+    # breakpoint the safety cap governs (no extra limit). See
+    # memory/feedback_cant_eq_boost_past_excursion.md.
+    effective_boost_ceiling: tuple[tuple[float, float], ...] = ()
     notes: str = ""
 
 
@@ -227,6 +238,10 @@ SVS_PB12_NSD_PROFILE = TransducerProfile(
     hpf_freq_hz=18.0,
     hpf_order=4,
     modal_cancel_max_boost_db=60.0,
+    # Measured 2026-06-19 (run 40): a +5 dB input-PEQ boost delivered ~+0.4 dB
+    # acoustically at 25-40 Hz (excursion/port compression near the 22 Hz tune)
+    # while 50-80 Hz translated fully. Below ~50 Hz boosts barely realize.
+    effective_boost_ceiling=((25.0, 1.0), (31.5, 1.5), (40.0, 3.0), (50.0, 6.0)),
     notes="Default SVS PB12-NSD ported sub. Matches legacy safety.py constants.",
 )
 
@@ -269,8 +284,67 @@ def _profile_from_dict(data: dict) -> TransducerProfile:
         modal_cancel_max_boost_db=float(
             data.get("modal_cancel_max_boost_db", 14.0)
         ),
+        effective_boost_ceiling=_parse_effective_boost_ceiling(
+            data.get("effective_boost_ceiling")
+        ),
         notes=data.get("notes", ""),
     )
+
+
+def _merge_effective_boost_ceilings(
+    profiles: "list[TransducerProfile]",
+) -> tuple[tuple[float, float], ...]:
+    """Most-restrictive merge of several profiles' effective-boost ceilings.
+
+    Input EQ applies across every downstream driver, so a boost is only
+    realizable if the *weakest* driver can reproduce it. Builds a curve over the
+    union of all breakpoint frequencies, taking the minimum interpolated ceiling
+    at each. Profiles with no curve are treated as unconstrained (skipped).
+    """
+    from .safety import interp_effective_boost_ceiling
+    curves = [p.effective_boost_ceiling for p in profiles if p.effective_boost_ceiling]
+    if not curves:
+        return ()
+    if len(curves) == 1:
+        return curves[0]
+    freqs = sorted({f for curve in curves for f, _ in curve})
+    merged: list[tuple[float, float]] = []
+    for f in freqs:
+        vals = [
+            v for v in (interp_effective_boost_ceiling(c, f) for c in curves)
+            if v is not None
+        ]
+        if vals:
+            merged.append((f, min(vals)))
+    return tuple(merged)
+
+
+def _parse_effective_boost_ceiling(
+    raw: object,
+) -> tuple[tuple[float, float], ...]:
+    """Parse the effective_boost_ceiling config into ascending (freq, db) pairs.
+
+    Accepts a list of [freq, db] pairs or {freq, max_effective_boost_db} dicts.
+    Returns an empty tuple when unset. Pairs are sorted by frequency so the
+    interpolator sees monotonic input.
+    """
+    if not raw:
+        return ()
+    pairs: list[tuple[float, float]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            db_raw = item.get("max_effective_boost_db", item.get("db"))
+            if db_raw is None or "freq" not in item:
+                raise ValueError(
+                    "effective_boost_ceiling dict entries require 'freq' and "
+                    f"'max_effective_boost_db' (or 'db'); got {item!r}"
+                )
+            freq = float(item["freq"])
+            db = float(db_raw)
+        else:
+            freq, db = float(item[0]), float(item[1])
+        pairs.append((freq, db))
+    return tuple(sorted(pairs, key=lambda p: p[0]))
 
 
 def load_builtin_profiles() -> tuple[TransducerProfile, ...]:
@@ -422,6 +496,7 @@ class SignalGraph:
                 default=None,
             ),
             hpf_order=max(p.hpf_order for p in profiles),
+            effective_boost_ceiling=_merge_effective_boost_ceilings(profiles),
             notes="Synthetic strictest-of profile",
         )
 

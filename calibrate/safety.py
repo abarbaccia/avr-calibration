@@ -70,6 +70,79 @@ THIRD_OCTAVE_CENTRES_HZ: list[float] = [
 ]
 
 
+# ── Effective-boost (realizability) ceiling ──────────────────────────────────
+# DISTINCT from the safety caps above: the safety caps protect the driver; this
+# predicts how much boost will actually translate to acoustic output vs be
+# swallowed by excursion / port compression. See
+# memory/feedback_cant_eq_boost_past_excursion.md.
+
+def interp_effective_boost_ceiling(
+    curve: tuple[tuple[float, float], ...], freq_hz: float,
+) -> float | None:
+    """Log-frequency-interpolate an effective-boost ceiling curve.
+
+    *curve* is ascending (freq_hz, max_effective_boost_db) breakpoints. Returns
+    the ceiling in dB at *freq_hz*, or ``None`` when *freq_hz* is above the top
+    breakpoint (the safety cap governs there) or the curve is empty. Below the
+    lowest breakpoint the lowest value is held (boosts are even less realizable
+    there, but the min-boost-freq floor usually forbids them anyway).
+    """
+    if not curve:
+        return None
+    freqs = [f for f, _ in curve]
+    vals = [v for _, v in curve]
+    if freq_hz <= freqs[0]:
+        return vals[0]
+    if freq_hz >= freqs[-1]:
+        return None
+    for i in range(len(freqs) - 1):
+        f0, f1 = freqs[i], freqs[i + 1]
+        if f0 <= freq_hz <= f1:
+            t = math.log(freq_hz / f0) / math.log(f1 / f0)
+            return vals[i] + t * (vals[i + 1] - vals[i])
+    return None
+
+
+def effective_boost_ceiling_db(
+    profile: "TransducerProfile", freq_hz: float,
+) -> float | None:
+    """Effective-boost ceiling in dB for *profile* at *freq_hz* (None = no limit)."""
+    return interp_effective_boost_ceiling(profile.effective_boost_ceiling, freq_hz)
+
+
+def boost_translation_warnings(
+    profile: "TransducerProfile",
+    filters: list,
+    *,
+    tolerance_db: float = 1.0,
+) -> list[dict]:
+    """Flag boost filters that exceed the driver's effective-boost ceiling.
+
+    Returns one dict per offending positive-gain filter:
+    ``{freq, gain_db, effective_ceiling_db, excess_db}``. A boost above the
+    ceiling will not fully translate to acoustic output — the driver compresses
+    it. Pure prediction; never blocks (that's the safety validator's job). Cuts
+    and filters in unconstrained bands are ignored.
+    """
+    warnings: list[dict] = []
+    for f in filters:
+        gain = float(f.get("gain_db", 0.0) if isinstance(f, dict) else getattr(f, "gain_db", 0.0))
+        if gain <= 0:
+            continue
+        freq = float(f.get("freq", 0.0) if isinstance(f, dict) else getattr(f, "freq", 0.0))
+        ceiling = effective_boost_ceiling_db(profile, freq)
+        if ceiling is None:
+            continue
+        if gain > ceiling + tolerance_db:
+            warnings.append({
+                "freq": round(freq, 1),
+                "gain_db": round(gain, 2),
+                "effective_ceiling_db": round(ceiling, 2),
+                "excess_db": round(gain - ceiling, 2),
+            })
+    return warnings
+
+
 # ── Data types ─────────────────────────────────────────────────────────────────
 
 FilterType = Literal["peaking", "low_shelf", "high_shelf", "hpf", "lpf", "notch", "allpass"]

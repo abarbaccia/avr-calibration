@@ -555,6 +555,30 @@ def _downsample_to_third_octave(
     return bands
 
 
+_FR_RESOLUTION_BPO = {"third_octave": 3, "sixth_octave": 6, "twelfth_octave": 12}
+
+
+def _downsample_spl_resolution(
+    freqs: list[float], spl: list[float], resolution: str = "third_octave",
+) -> list[dict]:
+    """Downsample FR to {freq_hz, spl_db} dicts at the requested fractional-octave
+    resolution.
+
+    third_octave snaps to the ISO 266 centres (back-compat with the old default);
+    sixth_octave / twelfth_octave use the generic log-spaced binner so callers
+    that need to see modal ripple the 1/3-octave view averages away can ask for it.
+    """
+    if resolution == "third_octave":
+        return _downsample_to_third_octave(freqs, spl)
+    bpo = _FR_RESOLUTION_BPO.get(resolution)
+    if bpo is None:
+        raise ValueError(f"unknown resolution {resolution!r}")
+    return [
+        {"freq_hz": c, "spl_db": v}
+        for c, v in _downsample_fr_octave(freqs, spl, bpo)
+    ]
+
+
 def _downsample_group_delay(
     freqs: list[float], delay_ms: list[float],
 ) -> list[dict]:
@@ -585,12 +609,24 @@ def _downsample_coherence(
 
 async def _tool_get_fr_summary(
     session_ids: list[int] | None = None, limit: int = 5,
+    resolution: str = "third_octave",
 ) -> dict:
-    """Return 1/3-octave downsampled FR summaries — small enough for tool results.
+    """Return downsampled FR summaries — small enough for tool results.
 
     If *session_ids* is given, return those specific sessions.
     Otherwise return the last *limit* sessions.
+
+    ``resolution`` controls band density: "third_octave" (default, ~11 bands —
+    a quick status read), "sixth_octave" (~20), or "twelfth_octave" (~40 — fine
+    enough to see modal peaks/dips the 1/3-octave view averages away). Reach for
+    twelfth_octave before judging "how flat is it" — coarse bins flatter the
+    result. For RMS/max-deviation vs a target, use compute_deviation.
     """
+    if resolution not in _FR_RESOLUTION_BPO:
+        return _err(
+            f"unknown resolution {resolution!r}; "
+            f"choose from {sorted(_FR_RESOLUTION_BPO)}"
+        )
     if session_ids:
         session_ids = [int(x) for x in session_ids]
     from .storage import SessionStore
@@ -611,11 +647,12 @@ async def _tool_get_fr_summary(
                     "bands": [], "peak_spl": None, "freq_at_peak": None,
                 })
                 continue
-            bands = _downsample_to_third_octave(fr.frequencies, fr.spl)
+            bands = _downsample_spl_resolution(fr.frequencies, fr.spl, resolution)
             entry: dict = {
                 "id": s.id,
                 "label": s.label,
                 "timestamp": s.timestamp,
+                "resolution": resolution,
                 "bands": bands,
                 "peak_spl": round(fr.peak_spl, 1),
                 "freq_at_peak": round(fr.freq_at_peak, 1),
@@ -1551,7 +1588,12 @@ def _generate_band_centres(
         return [c for c in _THIRD_OCTAVE_CENTRES if lo_hz <= c <= hi_hz]
 
     # Generate from base frequency 1000 Hz using ISO formula: f = 1000 * 2^(k/N)
-    bpo = 6 if resolution == "sixth_octave" else 12
+    bpo = {"sixth_octave": 6, "twelfth_octave": 12}.get(resolution)
+    if bpo is None:
+        raise ValueError(
+            f"unknown resolution {resolution!r}; "
+            "expected third_octave, sixth_octave, or twelfth_octave"
+        )
     centres = []
     # k ranges to cover 20-200 Hz: 1000 * 2^(k/N) → k = N * log2(f/1000)
     k_min = int(math.floor(bpo * math.log2(lo_hz / 1000)))
@@ -1561,6 +1603,36 @@ def _generate_band_centres(
         if lo_hz <= c <= hi_hz:
             centres.append(round(c, 2))
     return centres
+
+
+def _bin_points_to_band_centres(
+    points: list[dict], resolution: str, lo_hz: float, hi_hz: float,
+) -> list[dict]:
+    """Average predicted-FR point dicts into fractional-octave bands.
+
+    *points* are {freq_hz, original_db, predicted_db, correction_db}. Returns the
+    same dict shape, one per band centre that has data, with each numeric field
+    averaged over the points falling in the band. Keeps simulate_eq output compact.
+    """
+    import math
+    if not points:
+        return []
+    bpo = _FR_RESOLUTION_BPO[resolution]
+    half_step = 2 ** (1 / (2 * bpo))
+    centres = _generate_band_centres(resolution, lo_hz, hi_hz)
+    out: list[dict] = []
+    for c in centres:
+        binned = [p for p in points if c / half_step <= p["freq_hz"] < c * half_step]
+        if not binned:
+            continue
+        n = len(binned)
+        out.append({
+            "freq_hz": round(c, 1),
+            "original_db": round(sum(p["original_db"] for p in binned) / n, 1),
+            "predicted_db": round(sum(p["predicted_db"] for p in binned) / n, 1),
+            "correction_db": round(sum(p["correction_db"] for p in binned) / n, 1),
+        })
+    return out
 
 
 async def _tool_compare_sessions(
@@ -1639,11 +1711,19 @@ async def _tool_simulate_eq(
     filters: list[dict],
     min_hz: float = 20.0,
     max_hz: float = 120.0,
+    resolution: str = "sixth_octave",
+    full_resolution: bool = False,
 ) -> dict:
     """Predict FR after applying proposed PEQ filters to a measurement.
 
     Pure simulation — no hardware writes. The LLM designs filters, this tool
     shows what the result would look like so the LLM can iterate before applying.
+
+    By default the predicted curve is downsampled to fractional-octave band
+    centres (``resolution``: sixth_octave ~20 pts, twelfth_octave ~40, third_octave
+    ~11) so the result stays compact — a raw sweep is ~2000+ points, which is
+    almost never what the caller needs and floods the context. Set
+    ``full_resolution=True`` only when you genuinely need every measured bin.
     """
     from .storage import SessionStore
     import math
@@ -1692,13 +1772,32 @@ async def _tool_simulate_eq(
                 "correction_db": round(total_correction, 1),
             })
 
-        # Compute compact FR string for the prediction
-        compact = ",".join(f"{p['freq_hz']}:{p['predicted_db']}" for p in predicted_fr)
+        # Downsample to band centres unless the caller wants the raw grid. A raw
+        # sweep is ~2000+ points; dumping that as a string floods the context for
+        # data the caller reads three landmarks from.
+        raw_point_count = len(predicted_fr)
+        if full_resolution:
+            out_points = predicted_fr
+        else:
+            if resolution not in _FR_RESOLUTION_BPO:
+                return _err(
+                    f"unknown resolution {resolution!r}; "
+                    f"choose from {sorted(_FR_RESOLUTION_BPO)}"
+                )
+            out_points = _bin_points_to_band_centres(
+                predicted_fr, resolution, min_hz, max_hz,
+            )
+
+        # Compact FR string (freq:predicted) + structured bands for the caller.
+        compact = ",".join(f"{p['freq_hz']}:{p['predicted_db']}" for p in out_points)
 
         return _ok(
             session_id=session_id,
             num_filters=len(filters),
-            point_count=len(predicted_fr),
+            resolution="raw" if full_resolution else resolution,
+            point_count=len(out_points),
+            raw_point_count=raw_point_count,
+            bands=out_points,
             predicted_fr=compact,
         )
     except Exception as exc:
@@ -2036,6 +2135,41 @@ async def _tool_sensitivity_analysis(
         )
     except Exception as exc:
         return _err(f"sensitivity_analysis failed: {exc}")
+
+
+def _resolve_subs_profile():
+    """Best-effort strictest safety profile for the sub group (for advisory checks).
+
+    Tries common sub group names through the signal graph; falls back to the
+    built-in SVS PB12-NSD profile. Never raises — advisory use only.
+    """
+    from .graph import SVS_PB12_NSD_PROFILE
+    try:
+        for group in ("subs", "sub", "bass"):
+            try:
+                records = _resolve_for_dispatch(group)
+            except Exception:
+                continue
+            transducers = [r["transducer"] for r in records if r.get("transducer")]
+            if transducers:
+                return _config().signal_graph.strictest_profile(transducers)
+    except Exception:
+        pass
+    return SVS_PB12_NSD_PROFILE
+
+
+def _boost_translation_warnings_for(filters: list[dict]) -> list[dict]:
+    """Effective-boost (excursion/port-compression) warnings for designed filters.
+
+    Advisory: flags boosts that won't fully translate to acoustic output on the
+    sub driver. Returns [] on any resolution failure — never blocks a design.
+    """
+    try:
+        from .safety import boost_translation_warnings
+        return boost_translation_warnings(_resolve_subs_profile(), filters)
+    except Exception as exc:
+        log.warning("boost-translation check failed: %s", exc)
+        return []
 
 
 async def _tool_fit_peq_for_target(
@@ -2441,6 +2575,9 @@ async def _tool_fit_peq_for_target(
                 result_payload["preserve_mean_suppressed"] = True
             if anchor_warning:
                 result_payload["anchor_warning"] = anchor_warning
+            _boost_warn = _boost_translation_warnings_for(fit_filters)
+            if _boost_warn:
+                result_payload["boost_translation_warnings"] = _boost_warn
             return _ok(**result_payload)
 
         # ── Single-filter grid search (N == 1) ──────────────────────────────
@@ -2524,6 +2661,9 @@ async def _tool_fit_peq_for_target(
             _single_payload["preserve_mean_suppressed"] = True
         if anchor_warning:
             _single_payload["anchor_warning"] = anchor_warning
+        _boost_warn = _boost_translation_warnings_for([{"type": ftype, **best_params}])
+        if _boost_warn:
+            _single_payload["boost_translation_warnings"] = _boost_warn
         return _ok(**_single_payload)
     except Exception as exc:
         return _err(f"fit_peq_for_target failed: {exc}")
@@ -7144,14 +7284,21 @@ async def _tool_set_avr_input(input_name: str) -> dict:
 
 async def _tool_mute_output(
     output_indices: list[int] | None = None,
+    output_index: int | None = None,
     target: str | None = None,
 ) -> dict:
     """Mute DSP outputs.
 
     Pass ``target`` (group/transducer/role) to dispatch by name through the
-    signal graph, or ``output_indices`` for raw legacy dispatch. Mutually
-    exclusive; at least one is required.
+    signal graph, or ``output_indices`` for raw legacy dispatch. ``output_index``
+    (singular) is an ergonomic alias for a one-element ``output_indices``, matching
+    the singular convention used by set_delay/set_output_gain/set_polarity.
+    Mutually exclusive; at least one is required.
     """
+    if output_index is not None:
+        if output_indices:
+            return _err("mute_output: pass output_index or output_indices, not both")
+        output_indices = [output_index]
     if target is not None and output_indices:
         return _err("mute_output: pass either target or output_indices, not both")
     from .storage import dsp_output_key
@@ -7191,9 +7338,19 @@ async def _tool_mute_output(
 
 async def _tool_unmute_output(
     output_indices: list[int] | None = None,
+    output_index: int | None = None,
     target: str | None = None,
 ) -> dict:
-    """Unmute DSP outputs. See ``mute_output`` for ``target`` semantics."""
+    """Unmute DSP outputs. See ``mute_output`` for ``target`` semantics.
+
+    Accepts ``output_index`` (singular) as an ergonomic alias for a one-element
+    ``output_indices`` — matches the singular convention used by set_delay,
+    set_output_gain, set_polarity, etc.
+    """
+    if output_index is not None:
+        if output_indices:
+            return _err("unmute_output: pass output_index or output_indices, not both")
+        output_indices = [output_index]
     if target is not None and output_indices:
         return _err("unmute_output: pass either target or output_indices, not both")
     from .storage import dsp_output_key
@@ -10943,6 +11100,10 @@ _TOOLS: list[Tool] = [
                     "items": {"type": "integer"},
                     "description": "Raw output indices on the default DSP (legacy).",
                 },
+                "output_index": {
+                    "type": "integer",
+                    "description": "Single raw output index — alias for a one-element output_indices.",
+                },
             },
         },
     ),
@@ -10950,7 +11111,7 @@ _TOOLS: list[Tool] = [
         name="unmute_output",
         description=(
             "Unmute DSP outputs by restoring gain to 0 dB. "
-            "Takes the same `target` / `output_indices` shape as mute_output."
+            "Takes the same `target` / `output_indices` / `output_index` shape as mute_output."
         ),
         inputSchema={
             "type": "object",
@@ -10963,6 +11124,10 @@ _TOOLS: list[Tool] = [
                     "type": "array",
                     "items": {"type": "integer"},
                     "description": "Raw output indices on the default DSP (legacy).",
+                },
+                "output_index": {
+                    "type": "integer",
+                    "description": "Single raw output index — alias for a one-element output_indices.",
                 },
             },
         },
@@ -11603,10 +11768,13 @@ _TOOLS: list[Tool] = [
     Tool(
         name="get_fr_summary",
         description=(
-            "Return frequency response data downsampled to 1/3-octave bands (11 points "
-            "from 20-200Hz). Much smaller than get_measurement_history — use this when you "
+            "Return frequency response data downsampled to fractional-octave bands. "
+            "Much smaller than get_measurement_history — use this when you "
             "need FR shape for analysis, convergence checks, or Harman target comparison. "
-            "Returns per-session: bands[{freq_hz, spl_db}], peak_spl, freq_at_peak, ir_summary."
+            "Returns per-session: resolution, bands[{freq_hz, spl_db}], peak_spl, freq_at_peak, ir_summary. "
+            "Default third_octave (~11 bands) is a quick status read; ask for twelfth_octave "
+            "(~40 bands) before judging flatness — coarse bins average modal peaks/dips away "
+            "and flatter the result. For RMS/max-deviation vs a target, use compute_deviation."
         ),
         inputSchema={
             "type": "object",
@@ -11620,6 +11788,13 @@ _TOOLS: list[Tool] = [
                     "type": "integer",
                     "description": "Number of recent sessions to return if session_ids not given (default: 5).",
                     "default": 5,
+                },
+                "resolution": {
+                    "type": "string",
+                    "enum": ["third_octave", "sixth_octave", "twelfth_octave"],
+                    "description": "Band density. third_octave (default, ~11 bands), "
+                    "sixth_octave (~20), twelfth_octave (~40, fine enough to see modal ripple).",
+                    "default": "third_octave",
                 },
             },
         },
@@ -11799,7 +11974,8 @@ _TOOLS: list[Tool] = [
             "Predict FR after applying proposed PEQ filters to a measurement. "
             "Pure simulation — no hardware writes. Design filters yourself, then call this "
             "to see the predicted result. Iterate in simulation before applying to hardware. "
-            "Returns compact predicted FR string and per-point original/predicted/correction values. "
+            "Returns a compact predicted FR string + structured `bands` (original/predicted/"
+            "correction per band), downsampled to band centres by default to stay compact. "
             "Allpass filters contribute 0 dB to predicted magnitude (phase-only)."
         ),
         inputSchema={
@@ -11825,6 +12001,18 @@ _TOOLS: list[Tool] = [
                 },
                 "min_hz": {"type": "number", "description": "Lower frequency bound (default: 20)"},
                 "max_hz": {"type": "number", "description": "Upper frequency bound (default: 120)"},
+                "resolution": {
+                    "type": "string",
+                    "enum": ["third_octave", "sixth_octave", "twelfth_octave"],
+                    "description": "Band density for the downsampled output (default sixth_octave).",
+                    "default": "sixth_octave",
+                },
+                "full_resolution": {
+                    "type": "boolean",
+                    "description": "Return every measured bin (~2000+ points) instead of band centres. "
+                    "Rarely needed — floods context. Default false.",
+                    "default": False,
+                },
             },
             "required": ["session_id", "filters"],
         },
@@ -12489,7 +12677,11 @@ _TOOLS: list[Tool] = [
             "set that would otherwise take N manual measure-and-tweak "
             "iterations. Up to 8 filters (SafetyValidator slot budget). "
             "Returns the filter list, RMS before/after, and optimizer status. "
-            "Peaking-only — pair with a mandatory HPF from apply_eq."
+            "Peaking-only — pair with a mandatory HPF from apply_eq. "
+            "If a designed boost exceeds the sub driver's effective-boost ceiling "
+            "(excursion/port compression near the port tune), the result includes "
+            "`boost_translation_warnings` — that boost won't fully translate to "
+            "acoustic output; no filter beats a mechanical excursion limit."
         ),
         inputSchema={
             "type": "object",
