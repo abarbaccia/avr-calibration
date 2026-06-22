@@ -8,6 +8,8 @@
 #               (port capture_AUX2) → camilladsp_capture:input_3 → subs.
 #   cal       : CamillaDSP runs, pikaraoke container stopped.
 #               Calibration routing: avr_cal_sweep null sink → camilladsp_capture:input_3.
+#               Also pins the Pi→AVR HDMI card to the 8-ch surround71 profile so
+#               discrete per-channel mains sweeps aren't downmixed to stereo.
 #   karaoke   : CamillaDSP stopped, pikaraoke container running. pikaraoke owns
 #               the Scarlett directly — no dmix, no buzz.
 #
@@ -53,6 +55,17 @@ UMIK_NODE="alsa_input.usb-miniDSP_Umik-1_Gain__18dB_00002-00.analog-stereo"
 CAM_CAPTURE="camilladsp_capture"
 SWEEP_SINK="avr_cal_sweep"
 LOOPBACK_REF="loopback_ref"
+
+# HDMI output card (Pi → AVR). Cal-mode mains sweeps inject discrete 6/8-ch
+# LPCM into the AVR over this card, so the 8-ch hdmi-surround71 sink MUST exist.
+# That sink is created only when the card's ACP is on the surround71 profile,
+# which WirePlumber enumerates from the AVR's EDID at card-creation time — if the
+# AVR was off / on another input / advertising stereo when WP enumerated, only the
+# stereo sink exists and a 6-ch sweep is silently downmixed to stereo, so the
+# discrete channel never reaches its speaker ("sweep not detected"). cal mode pins
+# this profile explicitly instead of depending on enumeration timing luck.
+HDMI_CARD="${HDMI_CARD:-alsa_card.platform-107c701400.hdmi}"
+HDMI_SURROUND_PROFILE="${HDMI_SURROUND_PROFILE:-output:hdmi-surround71}"
 
 # How long `wire` waits for camilladsp_capture ports to appear (seconds × 0.5).
 # The watchdog sets WIRE_RETRIES=1 — in its healthy path ports always exist.
@@ -210,6 +223,64 @@ port_exists() {
     timeout "$PW_LINK_TIMEOUT" env $PW_ENV pw-link -o -i 2>/dev/null | grep -qF "$1"
 }
 
+# Run a client in the pi user's PW/Pulse session regardless of our own uid.
+# pactl/wpctl/systemctl --user need the pi user's bus + pulse socket; unlike
+# pw-link (PipeWire-native, reachable by root via PIPEWIRE_RUNTIME_DIR), `env
+# XDG_RUNTIME_DIR=…` alone is NOT enough for pactl as root — it must drop to pi.
+as_pi() {
+    if [ "$(id -u)" = "0" ]; then
+        sudo -u pi env XDG_RUNTIME_DIR=/run/user/1000 "$@"
+    else
+        env XDG_RUNTIME_DIR=/run/user/1000 "$@"
+    fi
+}
+
+restart_wireplumber() {
+    # Force ACP to re-read the HDMI EDID and re-enumerate profiles.
+    as_pi systemctl --user restart wireplumber 2>/dev/null
+}
+
+hdmi_active_profile() {
+    as_pi timeout "$PW_LINK_TIMEOUT" pactl list cards 2>/dev/null \
+        | sed -n "/Name: ${HDMI_CARD}\$/,/^Card #/p" \
+        | awk '/Active Profile:/{print $3; exit}'
+}
+
+ensure_hdmi_surround() {
+    # Deterministically put the HDMI card on the surround71 profile so the 8-ch
+    # sink exists for cal-mode mains sweeps. Selecting an available profile creates
+    # its sink node, so this is the establish step (not just a preference hint like
+    # the WP apply-properties rule, which can only pick from already-enumerated
+    # profiles and cannot create one).
+    #   allow_restart=0 (wire / watchdog path): idempotent re-pin only, NEVER a WP
+    #                   restart — frequent WP restarts flap every link (boot-wedge,
+    #                   2026-06-13). Silent when already correct (no log spam).
+    #   allow_restart=1 (deliberate `set cal`): if the profile isn't available
+    #                   (AVR was off/stereo at WP enum), restart WP to re-read the
+    #                   EDID, then set it. Caller re-wires after (links drop on
+    #                   restart). Requires the AVR powered on + on the HDMI input.
+    local allow_restart="${1:-0}"
+    [ "$(hdmi_active_profile)" = "$HDMI_SURROUND_PROFILE" ] && return 0
+    if as_pi timeout "$PW_LINK_TIMEOUT" \
+        pactl set-card-profile "$HDMI_CARD" "$HDMI_SURROUND_PROFILE" 2>/dev/null; then
+        log "HDMI card → $HDMI_SURROUND_PROFILE (8-ch sink for mains sweeps)"
+        return 0
+    fi
+    log "WARNING: $HDMI_SURROUND_PROFILE not available on $HDMI_CARD (AVR off / stereo-only at WP enum?)"
+    if [ "$allow_restart" = "1" ]; then
+        log "restarting WirePlumber to re-enumerate HDMI profiles (AVR must be ON + on the Pi's HDMI input)"
+        restart_wireplumber
+        sleep 3
+        if as_pi timeout "$PW_LINK_TIMEOUT" \
+            pactl set-card-profile "$HDMI_CARD" "$HDMI_SURROUND_PROFILE" 2>/dev/null; then
+            log "HDMI card → $HDMI_SURROUND_PROFILE (after WP re-enumerate)"
+            return 0
+        fi
+        log "ERROR: $HDMI_SURROUND_PROFILE still unavailable after WP restart — is the AVR powered on and on the Pi's HDMI input?"
+    fi
+    return 1
+}
+
 remove_umik_links() {
     # Feedback-loop guard: the UMIK is captured directly by the bare-metal
     # measurement service (PortAudio). A UMIK→camilladsp_capture link creates
@@ -281,6 +352,10 @@ cmd_wire() {
                 log "ERROR: could not link ${SWEEP_SINK} → ${CAM_CAPTURE}:input_3"
                 return 1
             fi
+            # Keep the HDMI card on the 8-ch surround profile so mains sweeps
+            # aren't downmixed. Idempotent re-pin only — no WP restart on this
+            # frequently-called path (the watchdog runs `wire` every poll).
+            ensure_hdmi_surround 0 || true
             ;;
         listening)
             unlink_one "${SWEEP_SINK}:monitor_FL" "${CAM_CAPTURE}:input_3"
@@ -317,6 +392,11 @@ cmd_set() {
             ensure_pikaraoke_down
             ensure_camilladsp_up || true
             write_state cal
+            # Establish the 8-ch HDMI surround sink BEFORE wiring: if the profile
+            # isn't available (AVR was off at WP enum) this restarts WirePlumber to
+            # re-read the EDID, which drops all PW links — cmd_wire below then
+            # re-creates them. Needs the AVR powered on + on the Pi's HDMI input.
+            ensure_hdmi_surround 1 || true
             cmd_wire cal || true
             set_shaker_mute on                    # shaker muted during calibration
             relaunch_kiosk

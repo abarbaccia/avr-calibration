@@ -617,6 +617,32 @@ def _find_umik_device(devices, name_substring: str = "UMIK") -> int | None:
     return None
 
 
+def _use_synchronous_deconv(route, ref_1d, np) -> bool:
+    """Whether to deconvolve against the known sweep (synchronous) rather than the
+    recorded loopback reference.
+
+    The HDMI/mains route has NO post-AVR electrical loopback: the reference tap
+    ``loopback_ref:monitor_FL`` is fed by ``avr_cal_sweep`` — the USB-sub null
+    sink — which an HDMI sweep bypasses entirely. So ``ref_1d`` is that tap's
+    near-silent noise floor (NOT exactly zero, so an all-zero guard misses it),
+    and deconvolving the mic against it produces a garbage ~1/f-slope FR with
+    ~0.5 coherence (observed 2026-06-22). Playback and capture share the 48 kHz
+    PipeWire clock, so synchronous deconvolution (mic vs the known digital sweep)
+    is the correct method for HDMI.
+
+    Also fall back to synchronous when no usable reference was captured at all
+    (``ref_1d`` absent or all-zero) — preserves the prior behaviour for the
+    no-loopback case.
+    """
+    if route == "hdmi":
+        return True
+    if ref_1d is None:
+        return True
+    if np.all(ref_1d == 0):
+        return True
+    return False
+
+
 class MeasurementEngine:
     """Run a log-sweep measurement via PyTTa and return a FrequencyResponse.
 
@@ -1199,7 +1225,12 @@ class MeasurementEngine:
         _loopback_pre_camilla = bool(cfg.get("loopback_pre_camilla", False))
         _alsa_direct_ref = (bool(loopback_ref_device) and not loopback_ref_pw_node) or _loopback_pre_camilla
 
-        if ref_1d is not None and not np.all(ref_1d == 0):
+        # HDMI/mains has no post-AVR electrical loopback — the recorded reference
+        # tap carries no HDMI stimulus, so deconvolve synchronously against the
+        # known sweep instead of dividing the mic by the tap's noise floor.
+        _synchronous = _use_synchronous_deconv(route, ref_1d, np)
+
+        if not _synchronous:
             n_aligned = min(len(ref_1d), len(rec_1d))
             deconv_x = ref_1d[:n_aligned].astype(np.float64)
             deconv_y = rec_1d[:n_aligned].astype(np.float64)
@@ -1219,6 +1250,11 @@ class MeasurementEngine:
             deconv_x = sweep_for_deconv
             deconv_y = rec_for_deconv
             _alsa_direct_ref = False
+            if route == "hdmi" and ref_1d is not None:
+                log.info(
+                    "deconvolution: HDMI route — synchronous (mic vs known sweep); "
+                    "loopback ref tap carries no HDMI stimulus, ignored",
+                )
 
         # For ALSA direct reference: use the pre-padded sweep_for_deconv for xcorr
         # timing (consistent IR window placement independent of PW quantum).
@@ -1242,7 +1278,7 @@ class MeasurementEngine:
         # clock.force-quantum was set). Skip when ref_1d is absent: without a
         # loopback, deconvolution is against the analytical sweep, which is
         # intentionally flat.
-        _has_ref = ref_1d is not None and not np.all(ref_1d == 0)
+        _has_ref = (not _synchronous) and ref_1d is not None and not np.all(ref_1d == 0)
         if _has_ref and len(spl) >= 4:
             spl_std = float(np.std(spl))
             if spl_std < 2.0:
@@ -1250,21 +1286,25 @@ class MeasurementEngine:
                     check="flat_response",
                     detail=(
                         f"Deconvolved frequency response is suspiciously flat "
-                        f"(std={spl_std:.2f} dB across {len(spl)} bands). "
-                        "Mic likely captured the sweep reference directly rather "
-                        "than the acoustic output."
+                        f"(std={spl_std:.2f} dB across {len(spl)} bands). Either the "
+                        "mic captured the sweep reference directly (wrong PipeWire "
+                        "node), or the drive level is too high and the loopback/mic "
+                        "path is saturating (the deconvolution collapses to flat "
+                        "above a master ceiling — observed ~-30 dB on this rig)."
                     ),
                     suggestion=(
-                        "Retry the measurement. If it persists, check that "
-                        "loopback_ref_pipewire_node and mic_pipewire_node in "
-                        "config.yaml point to distinct PipeWire nodes, and that "
-                        "no pw-metadata force-quantum is active."
+                        "First, LOWER the master gain (e.g. to -33 dB) and retry — "
+                        "high master can saturate the measurement path even though "
+                        "deconvolution is otherwise level-invariant. If it persists "
+                        "at low master, check that loopback_ref_pipewire_node and "
+                        "mic_pipewire_node in config.yaml point to distinct PipeWire "
+                        "nodes, and that no pw-metadata force-quantum is active."
                     ),
                 )
 
         loopback_xcorr_peak_ms: Optional[float] = None
         avr_processing_ms: Optional[float] = None
-        if ref_1d is not None and not np.all(ref_1d == 0):
+        if not _synchronous:
             loopback_xcorr_peak_ms = _xcorr_delay_ms(np, ref_1d, rec_for_deconv, sample_rate)
             # Use unpadded sweep_1d: sweep_for_deconv includes pre_pad_samples offset
             # that would inflate avr_processing_ms by ~pre_delay_s seconds.

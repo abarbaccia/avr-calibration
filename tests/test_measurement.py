@@ -46,7 +46,7 @@ from click.testing import CliRunner
 
 from calibrate.cli import cli
 from calibrate.config import Config
-from calibrate.measurement import FrequencyResponse, MeasurementEngine, MeasurementQualityError, compute_session_metadata, detect_ir_onset, _xcorr_delay_ms
+from calibrate.measurement import FrequencyResponse, MeasurementEngine, MeasurementQualityError, compute_session_metadata, detect_ir_onset, _xcorr_delay_ms, _use_synchronous_deconv
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -374,6 +374,54 @@ class TestMeasure:
         with patch("calibrate.drivers.playback.playback_for_route", return_value=mock_strategy):
             fr = await engine.measure()
         assert isinstance(fr, FrequencyResponse)
+
+    @pytest.mark.asyncio
+    async def test_hdmi_route_ignores_silent_loopback_ref(self):
+        """HDMI/mains has no post-AVR loopback: the reference tap is fed by the
+        USB-sub null sink and is silent for HDMI sweeps. measure(route='hdmi')
+        must deconvolve synchronously (mic vs known sweep) and NOT divide the mic
+        by the near-silent reference. Observable: the ref-derived loopback xcorr
+        fields are None (the ref was bypassed), and no flat_response error fires.
+
+        Regression for the garbage 1/f-slope + ~0.5-coherence FR (2026-06-22)."""
+        engine, _, mock_sweep, mock_recording = self._make_engine_with_mocks()
+        import numpy as _np
+        rng = _np.random.default_rng(11)
+        n = len(mock_sweep.timeSignal[:, 0])
+        sweep_1d = mock_sweep.timeSignal[:, 0]
+        acoustic_mic = rng.standard_normal(n).astype(_np.float32)
+        # Reference tap carries only a tiny noise floor (NOT exactly zero) — the
+        # exact condition that defeats an all-zero guard.
+        silent_ref = (rng.standard_normal(n).astype(_np.float32) * 1e-6)
+        mock_strategy = MagicMock()
+        mock_strategy.play_and_record.return_value = (sweep_1d, acoustic_mic, silent_ref)
+        with patch("calibrate.drivers.playback.playback_for_route", return_value=mock_strategy):
+            fr = await engine.measure(route="hdmi")
+        assert isinstance(fr, FrequencyResponse)
+        # Synchronous path bypasses the loopback reference entirely.
+        assert fr.loopback_xcorr_peak_ms is None
+        assert fr.avr_processing_ms is None
+
+
+class TestUseSynchronousDeconv:
+    """Unit tests for the deconvolution-reference decision helper."""
+
+    def test_hdmi_route_forces_synchronous_even_with_reference(self):
+        ref = np.ones(100, dtype=np.float32)  # a non-silent ref
+        assert _use_synchronous_deconv("hdmi", ref, np) is True
+
+    def test_usb_route_with_valid_reference_uses_loopback(self):
+        ref = np.ones(100, dtype=np.float32)
+        assert _use_synchronous_deconv("usb", ref, np) is False
+
+    def test_missing_reference_falls_back_to_synchronous(self):
+        assert _use_synchronous_deconv("usb", None, np) is True
+
+    def test_all_zero_reference_falls_back_to_synchronous(self):
+        assert _use_synchronous_deconv("usb", np.zeros(100, dtype=np.float32), np) is True
+
+    def test_hdmi_route_with_no_reference_is_synchronous(self):
+        assert _use_synchronous_deconv("hdmi", None, np) is True
 
 
 # ── MeasurementEngine._compute_fr() ──────────────────────────────────────────
