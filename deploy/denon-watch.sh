@@ -21,7 +21,10 @@
 set -u
 
 CONFIG_FILE="${CONFIG_FILE:-/etc/audio-mode.conf}"
-STATE_FILE="${STATE_FILE:-/run/audio-mode}"
+# /var/lib (persists across reboots) is the single source of truth written by
+# audio-mode + read by camilladsp-watchdog. The old /run path was tmpfs and
+# audio-mode stopped writing it, so denon-watch saw "unknown" and fought the mode.
+STATE_FILE="${STATE_FILE:-/var/lib/audio-mode}"
 AUDIO_MODE_BIN="${AUDIO_MODE_BIN:-/usr/local/sbin/audio-mode}"
 
 # Defaults — overridden by /etc/audio-mode.conf if present.
@@ -99,8 +102,9 @@ while true; do
         want="karaoke"
     fi
 
-    # Don't touch cal — that's manual/recipe territory.
-    if [ "$cur" = "cal" ]; then
+    # Don't touch cal / cal-hdmi — those are manual/recipe territory and a flip
+    # mid-sweep would corrupt a calibration run.
+    if [ "$cur" = "cal" ] || [ "$cur" = "cal-hdmi" ]; then
         sleep "$POLL_INTERVAL_S"
         continue
     fi

@@ -3,15 +3,29 @@
 # and own ALL camilladsp_capture PipeWire wiring (`audio-mode wire`).
 #
 # Modes:
-#   listening : CamillaDSP runs, pikaraoke container stopped.
+#   listening : CamillaDSP runs.
 #               Normal home-theater operation. AVR sub pre-out → Scarlett input 3
 #               (port capture_AUX2) → camilladsp_capture:input_3 → subs.
-#   cal       : CamillaDSP runs, pikaraoke container stopped.
+#   cal       : CamillaDSP runs.
 #               Calibration routing: avr_cal_sweep null sink → camilladsp_capture:input_3.
 #               Also pins the Pi→AVR HDMI card to the 8-ch surround71 profile so
 #               discrete per-channel mains sweeps aren't downmixed to stereo.
-#   karaoke   : CamillaDSP stopped, pikaraoke container running. pikaraoke owns
-#               the Scarlett directly — no dmix, no buzz.
+#               Sub drive: pw-cat injection (bypasses Denon). Use for sub-only cal.
+#   cal-hdmi  : CamillaDSP runs.
+#               Integration routing: Scarlett:capture_AUX2 (Denon sub pre-out) →
+#               camilladsp_capture:input_3, so subs are driven by AVR bass management
+#               (the real LFE signal path). HDMI surround71 profile pinned.
+#               avr_cal_sweep → loopback_ref:playback_FL link kept so playback.py's
+#               ref-tee (HDMIPwCatPlayback.ref_tee_node=avr_cal_sweep) populates the
+#               deconvolution reference during HDMI sweeps.
+#               Use for: mains sweeps, sub↔mains integration, any measurement where
+#               the AVR's bass management must be in the signal path.
+#   karaoke   : CamillaDSP stopped so the Chromium kiosk can grab the Scarlett
+#               directly (hw:USB,0,0). PiKaraoke itself runs on a SEPARATE host
+#               (192.168.1.115:5555); the kiosk just renders its web UI and is the
+#               local audio-playback head (Chromium → ALSA default → karaoke_out →
+#               Scarlett PCM 1/2 → Line 1/2 → Denon). There is NO local pikaraoke
+#               container — never has been.
 #
 # ── Wiring ownership (single source of truth) ──────────────────────────────
 # CamillaDSP's capture node has node.autoconnect=false (autoconnect_to: null in
@@ -20,6 +34,7 @@
 # feedback loop, 2026-06-12). All capture links are created here, explicitly:
 #
 #   cal:       avr_cal_sweep:monitor_FL      → camilladsp_capture:input_3
+#   cal-hdmi:  Scarlett:capture_AUX2         → camilladsp_capture:input_3  (AVR bass-mgmt path)
 #   listening: Scarlett:capture_AUX2         → camilladsp_capture:input_3
 #   always:    avr_cal_sweep:monitor_FL      → loopback_ref:playback_FL  (ref X, ch0)
 #   always:    UMIK:capture_FL               → loopback_ref:playback_FR  (mic Y, ch1)
@@ -31,7 +46,7 @@
 #   2. camilladsp.service ExecStartPost   — after every CamillaDSP restart
 #   3. camilladsp-watchdog.sh             — every poll (idempotent self-heal)
 #
-# State file: /var/lib/audio-mode (single token: listening|cal|karaoke).
+# State file: /var/lib/audio-mode (single token: listening|cal|cal-hdmi|karaoke).
 # /var/lib survives reboots; /run (tmpfs) was wiped on every Pi restart, causing
 # audio-mode get to return "unknown" and requiring manual re-set after each reboot.
 # Read by camilladsp-watchdog.sh so it does NOT self-heal CamillaDSP during karaoke.
@@ -40,7 +55,8 @@ set -u
 
 STATE_FILE="${STATE_FILE:-/var/lib/audio-mode}"
 CAMILLA_SVC="${CAMILLA_SVC:-camilladsp.service}"
-PIKARAOKE_CONTAINER="${PIKARAOKE_CONTAINER:-pikaraoke}"
+# PiKaraoke runs on a SEPARATE host; the Pi only renders its web UI in the kiosk.
+PIKARAOKE_URL="${PIKARAOKE_URL:-http://192.168.1.115:5555/splash}"
 CAL_API_URL="${CAL_API_URL:-http://127.0.0.1:8000/api/cal-mode}"
 
 # PipeWire session env — works for both the pi user and root (watchdog).
@@ -55,6 +71,10 @@ UMIK_NODE="alsa_input.usb-miniDSP_Umik-1_Gain__18dB_00002-00.analog-stereo"
 CAM_CAPTURE="camilladsp_capture"
 SWEEP_SINK="avr_cal_sweep"
 LOOPBACK_REF="loopback_ref"
+# karaoke_sink — PW null sink the Chromium kiosk plays into (PULSE_SINK=karaoke_sink).
+# Its monitor is linked to Scarlett PCM 1/2 (playback_AUX0/AUX1) in karaoke mode so
+# the kiosk audio reaches the Denon via Line 1/2 — no raw-hw grab, CamillaDSP stays up.
+KARAOKE_SINK="karaoke_sink"
 
 # HDMI output card (Pi → AVR). Cal-mode mains sweeps inject discrete 6/8-ch
 # LPCM into the AVR over this card, so the 8-ch hdmi-surround71 sink MUST exist.
@@ -79,7 +99,7 @@ usage: audio-mode <command>
 
 commands:
   get                       Print current mode (listening|cal|karaoke|unknown).
-  set <listening|cal|karaoke>
+  set <listening|cal|cal-hdmi|karaoke>
                             Transition to the named mode.
   wire [mode]               (Re)create the camilladsp_capture PipeWire links for
                             the given mode (default: current mode). Idempotent.
@@ -169,17 +189,14 @@ ensure_camilladsp_down() {
     fi
 }
 
-ensure_pikaraoke_up() {
-    if ! docker ps --format '{{.Names}}' | grep -qx "$PIKARAOKE_CONTAINER"; then
-        log "starting $PIKARAOKE_CONTAINER container"
-        docker start "$PIKARAOKE_CONTAINER" >/dev/null
-    fi
-}
-
-ensure_pikaraoke_down() {
-    if docker ps --format '{{.Names}}' | grep -qx "$PIKARAOKE_CONTAINER"; then
-        log "stopping $PIKARAOKE_CONTAINER container"
-        docker stop "$PIKARAOKE_CONTAINER" >/dev/null
+# PiKaraoke is a remote service (192.168.1.115). Nothing to start/stop locally —
+# the kiosk just loads its web UI. Warn (non-fatal) if the server is unreachable
+# so a blank kiosk has an obvious explanation in the log.
+check_pikaraoke_server() {
+    if curl -s -o /dev/null --max-time 3 "$PIKARAOKE_URL"; then
+        log "PiKaraoke server reachable at $PIKARAOKE_URL"
+    else
+        log "WARNING: PiKaraoke server unreachable at $PIKARAOKE_URL — kiosk will show an error page"
     fi
 }
 
@@ -355,11 +372,7 @@ cmd_wire() {
     local mode="${1:-$(current_mode)}"
 
     case "$mode" in
-        karaoke)
-            log "wire: karaoke mode — CamillaDSP down, nothing to wire"
-            return 0
-            ;;
-        listening|cal) ;;
+        listening|cal|cal-hdmi|karaoke) ;;
         *)
             log "wire: unknown mode '$mode' — set a mode first (audio-mode set <mode>)"
             return 2
@@ -367,6 +380,14 @@ cmd_wire() {
     esac
 
     remove_umik_links
+
+    # Tear down the karaoke_sink → Scarlett PCM 1/2 links when NOT in karaoke, so
+    # the kiosk audio source is fully detached in listening/cal/cal-hdmi (the karaoke
+    # arm below re-creates them). Idempotent.
+    if [ "$mode" != "karaoke" ]; then
+        unlink_one "${KARAOKE_SINK}:monitor_FL" "${SCARLETT_PLAYBACK}:playback_AUX0"
+        unlink_one "${KARAOKE_SINK}:monitor_FR" "${SCARLETT_PLAYBACK}:playback_AUX1"
+    fi
 
     # R11 single sample-locked capture (docs/pipewire-architecture.md §6b):
     # loopback_ref is a 2-ch sink — ch0 (FL) = pre-DSP stimulus reference,
@@ -416,12 +437,50 @@ cmd_wire() {
             # frequently-called path (the watchdog runs `wire` every poll).
             ensure_hdmi_surround 0 || true
             ;;
+        cal-hdmi)
+            # Integration mode: subs driven by AVR bass management via physical
+            # Denon sub pre-out → Scarlett input 3 → CamillaDSP → subs.
+            # Do NOT inject avr_cal_sweep into input_3 — that would bypass the AVR
+            # and drive subs with the full-range pre-AVR stimulus, causing the ~23 dB
+            # sub/mains imbalance seen in session 893.
+            # avr_cal_sweep → loopback_ref:playback_FL is kept (wired unconditionally
+            # above) so playback.py's ref_tee (HDMIPwCatPlayback) can populate the
+            # deconvolution reference during HDMI sweeps.
+            unlink_one "${SWEEP_SINK}:monitor_FL" "${CAM_CAPTURE}:input_3"
+            if link_one "${SCARLETT_CAPTURE}:capture_AUX2" "${CAM_CAPTURE}:input_3"; then
+                log "wired (cal-hdmi): ${CAM_CAPTURE}:input_3 ← Scarlett:capture_AUX2 (Denon sub pre-out)"
+            else
+                log "ERROR: could not link Scarlett:capture_AUX2 → ${CAM_CAPTURE}:input_3"
+                return 1
+            fi
+            # Pin HDMI surround71 profile — required for discrete-channel mains sweeps.
+            ensure_hdmi_surround 0 || true
+            ;;
         listening)
             unlink_one "${SWEEP_SINK}:monitor_FL" "${CAM_CAPTURE}:input_3"
             if link_one "${SCARLETT_CAPTURE}:capture_AUX2" "${CAM_CAPTURE}:input_3"; then
                 log "wired (listening): ${CAM_CAPTURE}:input_3 ← Scarlett:capture_AUX2 (Denon LFE)"
             else
                 log "ERROR: could not link Scarlett:capture_AUX2 → ${CAM_CAPTURE}:input_3"
+                return 1
+            fi
+            ;;
+        karaoke)
+            # Karaoke = listening's sub path (Denon bass-manages the karaoke mix to
+            # its sub pre-out → Scarlett:capture_AUX2 → input_3 → CamillaDSP → subs)
+            # PLUS the kiosk audio source feeding the Denon's analog input: the
+            # Chromium kiosk plays into karaoke_sink, whose monitor we link to
+            # Scarlett PCM 1/2 (playback_AUX0/AUX1) → Mix A/B → Line 01/02 → Denon.
+            unlink_one "${SWEEP_SINK}:monitor_FL" "${CAM_CAPTURE}:input_3"
+            link_one "${SCARLETT_CAPTURE}:capture_AUX2" "${CAM_CAPTURE}:input_3" \
+                || log "WARNING: Scarlett:capture_AUX2 → ${CAM_CAPTURE}:input_3 failed (subs may be silent)"
+            local ks_ok=0
+            link_one "${KARAOKE_SINK}:monitor_FL" "${SCARLETT_PLAYBACK}:playback_AUX0" && ks_ok=$((ks_ok+1))
+            link_one "${KARAOKE_SINK}:monitor_FR" "${SCARLETT_PLAYBACK}:playback_AUX1" && ks_ok=$((ks_ok+1))
+            if [ "$ks_ok" -eq 2 ]; then
+                log "wired (karaoke): ${KARAOKE_SINK} → Scarlett PCM 1/2 (playback_AUX0/AUX1 → Line 01/02 → Denon)"
+            else
+                log "ERROR: only ${ks_ok}/2 ${KARAOKE_SINK}→Scarlett links up (${KARAOKE_SINK} sink missing? PW config not deployed?)"
                 return 1
             fi
             ;;
@@ -438,7 +497,6 @@ cmd_set() {
     case "$target" in
         listening)
             kill_kiosk                            # free Scarlett before camilladsp grabs it
-            ensure_pikaraoke_down
             ensure_camilladsp_up || true
             write_state listening
             cmd_wire listening || true
@@ -448,7 +506,6 @@ cmd_set() {
             ;;
         cal)
             kill_kiosk                            # free Scarlett before camilladsp grabs it
-            ensure_pikaraoke_down
             ensure_camilladsp_up || true
             write_state cal
             # Establish the 8-ch HDMI surround sink BEFORE wiring: if the profile
@@ -461,13 +518,32 @@ cmd_set() {
             relaunch_kiosk
             log "→ cal  (avr_cal_sweep → input_3; shaker muted)"
             ;;
+        cal-hdmi)
+            kill_kiosk                            # free Scarlett before camilladsp grabs it
+            ensure_camilladsp_up || true
+            write_state cal-hdmi
+            # Establish the 8-ch HDMI surround sink BEFORE wiring: if the profile
+            # isn't available (AVR was off at WP enum) this restarts WirePlumber to
+            # re-read the EDID, which drops all PW links — cmd_wire below then
+            # re-creates them. Needs the AVR powered on + on the Pi's HDMI input.
+            ensure_hdmi_surround 1 || true
+            cmd_wire cal-hdmi || true
+            set_shaker_mute on                    # shaker muted during calibration
+            relaunch_kiosk
+            log "→ cal-hdmi  (Scarlett:AUX2 → input_3 [Denon sub pre-out]; shaker muted; HDMI surround71)"
+            ;;
         karaoke)
-            ensure_camilladsp_down                # release Scarlett for Chromium
-            ensure_pikaraoke_up
-            set_shaker_mute on                    # shaker muted during karaoke
+            # CamillaDSP STAYS UP — PipeWire is the mixer/router, so Chromium and
+            # CamillaDSP coexist on the Scarlett with no exclusive-device fight.
+            # The kiosk plays into karaoke_sink (PULSE_SINK), whose monitor cmd_wire
+            # links to Scarlett PCM 1/2 → Line 1/2 → Denon.
+            ensure_camilladsp_up || true
             write_state karaoke
-            relaunch_kiosk                        # Chromium re-opens PCM 1/2 via karaoke_out
-            log "→ karaoke  (shaker muted; kiosk audio → Scarlett PCM 1/2 → Line 1/2)"
+            cmd_wire karaoke || true
+            check_pikaraoke_server                # remote server on .115 — warn if down
+            set_shaker_mute on                    # shaker muted during karaoke
+            relaunch_kiosk                        # Chromium opens karaoke_sink → PCM 1/2
+            log "→ karaoke  (CamillaDSP up; kiosk → karaoke_sink → Scarlett PCM 1/2 → Line 1/2; shaker muted)"
             ;;
         *)
             echo "unknown mode: $target" >&2

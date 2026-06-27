@@ -1,10 +1,14 @@
-# Pi-user ALSA default = karaoke_out (stereo → Scarlett PCM 1/2).
-# Chromium kiosk uses this for karaoke audio playback. In listening mode
-# CamillaDSP holds the hardware exclusively, so this open() fails — Chromium
-# stays silent until audio-mode set karaoke releases the device.
+# Pi-user ALSA default = PipeWire → karaoke_sink (stereo).
+# The Chromium kiosk plays karaoke audio to the ALSA "default" device; routing that
+# through PipeWire (instead of the old raw-hw "karaoke_out" plug onto hw:USB,0,0)
+# means Chromium and CamillaDSP coexist on the Scarlett with no exclusive-device
+# fight. `audio-mode wire` links karaoke_sink:monitor_FL/FR → Scarlett PCM 1/2
+# (playback_AUX0/AUX1) → Mix A/B → Line 01/02 → Denon. CamillaDSP stays running in
+# every mode now, so karaoke audio also gets the Denon's bass management to the subs.
 pcm.!default {
-    type plug
-    slave.pcm "karaoke_out"
+    type pipewire
+    playback_node "karaoke_sink"
+    hint.description "Default (PipeWire → karaoke_sink → Scarlett PCM 1/2)"
 }
 ctl.!default {
     type hw

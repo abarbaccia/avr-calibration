@@ -11,7 +11,8 @@
 #   listening : ACT solid green, PWR off
 #   cal       : ACT heartbeat green (slow blink) — calibration in progress
 #   karaoke   : ACT off, PWR solid red
-#   camilladsp stalled : ACT off, PWR fast-blink red  (overrides mode, except karaoke)
+#   camilladsp stalled : ACT off, PWR fast-blink red  (overrides mode; CamillaDSP
+#                        now runs in karaoke too, so a stall is healed there as well)
 #   avr-calibration container down : ACT heartbeat, PWR on (overlays listening only)
 #
 # Run as root via camilladsp-watchdog.service.
@@ -128,12 +129,12 @@ read_audio_mode() {
 log "starting (poll=${POLL_INTERVAL_S}s, stall-restart=${STALL_RESTART_THRESHOLD})"
 
 while true; do
-    # audio-mode awareness: during karaoke, CamillaDSP is intentionally stopped.
-    # Skip the probe + self-heal path so the watchdog does not fight the mode switch.
-    if [ "$(read_audio_mode)" = "karaoke" ]; then
-        camilla="karaoke"
-        stall_count=0
-    elif probe_camilladsp; then
+    # CamillaDSP runs in ALL modes now — karaoke included (PipeWire mixes the kiosk
+    # audio into the Scarlett alongside CamillaDSP, so the daemon no longer has to be
+    # stopped to free the device). So karaoke falls through the normal probe + wire
+    # self-heal path: `audio-mode wire` (no arg) re-derives the karaoke links from the
+    # state file. The karaoke LED state is still selected below by audio_mode.
+    if probe_camilladsp; then
         camilla="running"
         stall_count=0
         # PW-graph self-heal: camilladsp_capture links die whenever the capture
