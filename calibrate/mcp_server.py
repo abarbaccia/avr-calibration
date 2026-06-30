@@ -5177,6 +5177,20 @@ async def _tool_set_speaker_distances(
         return _err(f"{type(_avr).__name__} does not support direct distance writes")
     if not distances:
         return _err("distances is empty")
+    if commit:
+        # A Fin commit resets every channel NOT in the payload to firmware
+        # defaults, silently collapsing the layout to only the pushed
+        # channels (run-42 distance corruption: pushing SW1 alone zeroed
+        # every other channel's distance/level). Persisted distance changes
+        # must go through the full-envelope path which sends all channels
+        # atomically and aborts before Fin on any NACK. Volatile (commit=
+        # False) writes are still allowed for experimentation.
+        return _err(
+            "set_speaker_distances(commit=True) is blocked: a Fin commit "
+            "defaults every channel absent from the payload, collapsing the "
+            "layout. Use push_avr_speaker_layout (full-envelope, abort-on-"
+            "NACK) to persist distances. Pass commit=False for a volatile write."
+        )
     try:
         await _avr.set_speaker_distances(  # type: ignore[attr-defined]
             distances,
@@ -5341,7 +5355,48 @@ async def _tool_push_avr_speaker_layout(
 # Module-level cache of AVR-format polyphase-decimated coefficient vectors.
 # Keyed by (cache_key, channel_id) → list[float] of length 1024 (speaker)
 # or 704 (sub). Populated by ``design_avr_fir``; consumed by ``apply_avr_fir``.
+#
+# Write-through / read-through to disk: the in-memory dict alone is volatile —
+# a container restart wiped it, which made the run-41 corr1 mains calibration
+# unrecoverable (coefficients existed only here, never persisted). Designs now
+# also land under ``_AVR_FIR_CACHE_DIR`` so they survive a restart.
 _AVR_FIR_CACHE: dict[tuple[str, str], list[float]] = {}
+
+
+def _fir_store():
+    """SessionStore for FIR coefficient persistence. Indirection so tests can
+    patch it with a temp-DB store."""
+    from .storage import SessionStore
+    return SessionStore()
+
+
+def _avr_fir_cache_store(cache_key: str, channel_id: str, coefs: list[float]) -> None:
+    """Cache designed coefficients in memory AND in the SQLite DB (write-through).
+    The DB lives on the persistent bind mount, so designs survive a container
+    restart — closing the gap that made run-41 corr1 unrecoverable. DB
+    persistence is best-effort: a transient store error must not break design,
+    so it's swallowed (the in-memory cache still serves the same session)."""
+    _AVR_FIR_CACHE[(cache_key, channel_id)] = coefs
+    try:
+        _fir_store().save_avr_fir(cache_key, channel_id, coefs)
+    except Exception:  # noqa: BLE001 — persistence is best-effort
+        pass
+
+
+def _avr_fir_cache_load(cache_key: str, channel_id: str) -> list[float] | None:
+    """Read-through lookup: in-memory first, then the DB (survives a restart).
+    A DB hit repopulates the in-memory cache. Returns None on a genuine miss
+    or unreadable store."""
+    hit = _AVR_FIR_CACHE.get((cache_key, channel_id))
+    if hit is not None:
+        return hit
+    try:
+        coefs = _fir_store().get_avr_fir(cache_key, channel_id)
+    except Exception:  # noqa: BLE001 — persistence is best-effort
+        coefs = None
+    if coefs is not None:
+        _AVR_FIR_CACHE[(cache_key, channel_id)] = coefs
+    return coefs
 
 
 async def _tool_get_avr_audyssey_state() -> dict:
@@ -5427,7 +5482,7 @@ async def _tool_design_avr_fir(
     if not target_curve_db:
         ir = design_passthrough_ir(is_sub=is_sub)
         coefs = convert_xt32(ir)
-        _AVR_FIR_CACHE[(str(cache_key), channel_id)] = coefs
+        _avr_fir_cache_store(str(cache_key), channel_id, coefs)
         arr = np.asarray(coefs)
         return _ok(
             channel_id=channel_id,
@@ -5482,7 +5537,7 @@ async def _tool_design_avr_fir(
     except (ValueError, RuntimeError) as exc:
         return _err(f"FIR design failed: {exc}")
 
-    _AVR_FIR_CACHE[(str(cache_key), channel_id)] = coefs
+    _avr_fir_cache_store(str(cache_key), channel_id, coefs)
     arr = np.asarray(coefs)
 
     # Report what was smoothed so the caller can see how the request was
@@ -5609,7 +5664,7 @@ async def _tool_apply_avr_fir(
     for cid in selected:
         if cid not in available:
             return _err(f"channel {cid!r} not in .ady (available: {available})")
-        coefs = _AVR_FIR_CACHE.get((str(cache_key), cid))
+        coefs = _avr_fir_cache_load(str(cache_key), cid)
         if coefs is None:
             missing_in_cache.append(cid)
         else:
