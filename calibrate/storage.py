@@ -272,6 +272,19 @@ CREATE TABLE IF NOT EXISTS lesson_invalidators (
 CREATE INDEX IF NOT EXISTS idx_lessons_status ON lessons(status);
 CREATE INDEX IF NOT EXISTS idx_lessons_scope ON lessons(scope);
 CREATE INDEX IF NOT EXISTS idx_lesson_inv_lesson ON lesson_invalidators(lesson_id);
+
+-- Designed AVR-format FIR coefficient sets. Persists what was previously an
+-- in-memory-only cache (mcp_server._AVR_FIR_CACHE) — that volatility made the
+-- run-41 corr1 mains calibration unrecoverable after a container restart.
+-- Keyed by (cache_key, channel_id); coefficients stored as a JSON float array.
+CREATE TABLE IF NOT EXISTS avr_fir_coefficients (
+    cache_key     TEXT    NOT NULL,
+    channel_id    TEXT    NOT NULL,
+    coefficients  TEXT    NOT NULL,
+    num_taps      INTEGER NOT NULL,
+    updated_at    TEXT    NOT NULL,
+    PRIMARY KEY (cache_key, channel_id)
+);
 CREATE INDEX IF NOT EXISTS idx_lesson_inv_value ON lesson_invalidators(kind, value);
 """
 
@@ -670,6 +683,33 @@ class SessionStore:
                      json.dumps(target_curve_data) if target_curve_data else None,
                      json.dumps(sessions) if sessions else None, snapshot, run_id),
                 )
+
+    def save_avr_fir(self, cache_key: str, channel_id: str, coefficients: list[float]) -> None:
+        """Persist a designed AVR-format FIR coefficient set (upsert on
+        (cache_key, channel_id)). Survives container restarts so designs can be
+        re-pushed without re-deriving — the gap that lost run-41 corr1."""
+        ts = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO avr_fir_coefficients"
+                " (cache_key, channel_id, coefficients, num_taps, updated_at)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(cache_key, channel_id) DO UPDATE SET"
+                "  coefficients=excluded.coefficients,"
+                "  num_taps=excluded.num_taps,"
+                "  updated_at=excluded.updated_at",
+                (cache_key, channel_id, json.dumps(coefficients), len(coefficients), ts),
+            )
+
+    def get_avr_fir(self, cache_key: str, channel_id: str) -> list[float] | None:
+        """Return a persisted FIR coefficient set, or None if absent."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT coefficients FROM avr_fir_coefficients"
+                " WHERE cache_key=? AND channel_id=?",
+                (cache_key, channel_id),
+            ).fetchone()
+        return json.loads(row[0]) if row else None
 
     def save_iteration(
         self,

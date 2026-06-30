@@ -8075,16 +8075,31 @@ async def test_set_speaker_distances_dispatches_to_driver() -> None:
         result = await _tool_set_speaker_distances(
             distances={"FL": 4.05, "SW1": 30.72},
             n_positions=3,
-            commit=True,
+            commit=False,
         )
     assert result["ok"]
-    assert result["committed"] is True
+    assert result["committed"] is False
     assert result["distances_cm"] == {"FL": 405, "SW1": 3072}
     assert result["avr_max_delay_ms"] == 65.0
     assert result["audyssey"]["active"] is True
     avr.set_speaker_distances.assert_awaited_once_with(
-        {"FL": 4.05, "SW1": 30.72}, n_positions=3, commit=True, use_custom=False,
+        {"FL": 4.05, "SW1": 30.72}, n_positions=3, commit=False, use_custom=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_set_speaker_distances_commit_blocked() -> None:
+    """commit=True is blocked — a Fin commit defaults every channel NOT in the
+    payload, collapsing the layout (run-42 distance corruption). Callers must use
+    push_avr_speaker_layout (full-envelope, abort-on-NACK) to persist distances."""
+    avr = AsyncMock()
+    with patch("calibrate.mcp_server._avr", avr):
+        result = await _tool_set_speaker_distances(
+            distances={"SW1": 10.41}, commit=True,
+        )
+    assert not result["ok"]
+    assert "push_avr_speaker_layout" in result["error"]
+    avr.set_speaker_distances.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -8153,7 +8168,7 @@ async def test_set_speaker_distances_warns_when_audyssey_inactive_pure_direct() 
         "reason": "sound mode is Pure Direct — bypasses all DSP including Audyssey",
     }
     with patch("calibrate.mcp_server._avr", avr):
-        result = await _tool_set_speaker_distances(distances={"SW1": 30.72}, commit=True)
+        result = await _tool_set_speaker_distances(distances={"SW1": 30.72}, commit=False)
     assert result["ok"]
     assert result["audyssey"]["active"] is False
     assert "WARNING" in result["message"]
@@ -8173,7 +8188,7 @@ async def test_set_speaker_distances_warns_when_multi_eq_off() -> None:
         "reason": "MultEQ is Off — Audyssey distance/level/EQ disabled",
     }
     with patch("calibrate.mcp_server._avr", avr):
-        result = await _tool_set_speaker_distances(distances={"SW1": 30.72}, commit=True)
+        result = await _tool_set_speaker_distances(distances={"SW1": 30.72}, commit=False)
     assert result["ok"]
     assert result["audyssey"]["active"] is False
     assert "WARNING" in result["message"]
@@ -8192,7 +8207,7 @@ async def test_set_speaker_distances_unknown_audyssey_state_warns_softly() -> No
         "reason": None,
     }
     with patch("calibrate.mcp_server._avr", avr):
-        result = await _tool_set_speaker_distances(distances={"SW1": 30.72}, commit=True)
+        result = await _tool_set_speaker_distances(distances={"SW1": 30.72}, commit=False)
     assert result["ok"]
     assert result["audyssey"]["active"] is None
     assert "Could not confirm" in result["message"]
@@ -8205,7 +8220,7 @@ async def test_set_speaker_distances_audyssey_status_error_surfaced() -> None:
     avr.MAX_SPEAKER_DELAY_MS = 65.0
     avr.audyssey_status.side_effect = DriverError("avr unreachable for audyssey probe")
     with patch("calibrate.mcp_server._avr", avr):
-        result = await _tool_set_speaker_distances(distances={"SW1": 30.72}, commit=True)
+        result = await _tool_set_speaker_distances(distances={"SW1": 30.72}, commit=False)
     assert result["ok"]
     assert result["audyssey"]["active"] is None
     assert "Audyssey state probe failed" in result["message"]
@@ -8220,9 +8235,58 @@ async def test_set_speaker_distances_skips_audyssey_check_when_unsupported() -> 
             return None
         # no audyssey_status method
     with patch("calibrate.mcp_server._avr", _PlainAvr()):
-        result = await _tool_set_speaker_distances(distances={"SW1": 30.72}, commit=True)
+        result = await _tool_set_speaker_distances(distances={"SW1": 30.72}, commit=False)
     assert result["ok"]
     assert result["audyssey"] is None
+
+
+# ── AVR FIR cache persistence ──────────────────────────────────────────────────
+
+def test_avr_fir_cache_persists_across_restart(tmp_path) -> None:
+    """Designed AVR FIR coefficients must survive a container restart. The
+    in-memory _AVR_FIR_CACHE was volatile, which made run-41 corr1
+    unrecoverable. design_avr_fir write-through + apply_avr_fir read-through
+    against the SQLite DB (on the persistent bind mount) closes that gap."""
+    import calibrate.mcp_server as mcp
+    from calibrate.storage import SessionStore
+    store = SessionStore(db_path=tmp_path / "history.db")
+    coefs = [0.1, -0.2, 0.3, 0.0]
+    with patch.object(mcp, "_fir_store", lambda: store):
+        mcp._AVR_FIR_CACHE.clear()
+        mcp._avr_fir_cache_store("rebuild-2026-06-30", "FL", coefs)
+        # simulate a container restart: in-memory cache wiped, DB persists
+        mcp._AVR_FIR_CACHE.clear()
+        loaded = mcp._avr_fir_cache_load("rebuild-2026-06-30", "FL")
+        assert loaded == coefs
+        # read-through repopulates the in-memory cache
+        assert mcp._AVR_FIR_CACHE[("rebuild-2026-06-30", "FL")] == coefs
+        # a genuine miss returns None (not a stale/empty hit)
+        mcp._AVR_FIR_CACHE.clear()
+        assert mcp._avr_fir_cache_load("rebuild-2026-06-30", "MISSING") is None
+
+
+def test_avr_fir_cache_store_survives_db_error(tmp_path) -> None:
+    """DB persistence is best-effort — if the store raises, the in-memory
+    cache must still work (don't break design on a transient DB error)."""
+    import calibrate.mcp_server as mcp
+    def _boom():
+        raise RuntimeError("db unavailable")
+    with patch.object(mcp, "_fir_store", _boom):
+        mcp._AVR_FIR_CACHE.clear()
+        mcp._avr_fir_cache_store("ck", "FL", [1.0, 2.0])
+        assert mcp._AVR_FIR_CACHE[("ck", "FL")] == [1.0, 2.0]
+
+
+def test_session_store_avr_fir_roundtrip(tmp_path) -> None:
+    """SessionStore.save_avr_fir / get_avr_fir round-trip + upsert overwrite."""
+    from calibrate.storage import SessionStore
+    store = SessionStore(db_path=tmp_path / "history.db")
+    assert store.get_avr_fir("ck", "FL") is None
+    store.save_avr_fir("ck", "FL", [0.1, 0.2, 0.3])
+    assert store.get_avr_fir("ck", "FL") == [0.1, 0.2, 0.3]
+    # upsert: same key overwrites, no duplicate row
+    store.save_avr_fir("ck", "FL", [0.9])
+    assert store.get_avr_fir("ck", "FL") == [0.9]
 
 
 # ── restore_listening_mode ────────────────────────────────────────────────────
@@ -8752,7 +8816,7 @@ async def test_set_speaker_distances_use_custom_surfaces_deprecation_error() -> 
 
     with patch("calibrate.mcp_server._avr", _RealAvrLikeDriver()):
         result = await _tool_set_speaker_distances(
-            distances={"SW1": 17.91}, commit=True, use_custom=True,
+            distances={"SW1": 17.91}, commit=False, use_custom=True,
         )
     assert not result["ok"]
     assert "deprecated" in result["error"].lower()

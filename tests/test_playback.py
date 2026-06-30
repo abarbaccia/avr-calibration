@@ -181,7 +181,7 @@ class TestHDMIPlayback:
         assert write_args[0].dtype == np.int16
 
 
-_PW_NODE = "alsa_output.platform-107c701400.hdmi.hdmi-stereo"
+_PW_NODE = "alsa_output.platform-107c706400.hdmi.hdmi-stereo"
 
 
 class TestHDMIPwCatPlayback:

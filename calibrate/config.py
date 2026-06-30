@@ -188,7 +188,7 @@ measurement:
   denon_pure_direct: true      # true = force Pure Direct during sweep; false = keep current sound mode
   sweep_channel: "lfe"         # "lfe" = LFE/subwoofer channel, "left"/"right" = main
   playback_device: "miniDSP"   # substring matched against USB audio device names
-  hdmi_pipewire_node: null     # PipeWire node name for HDMI output (e.g. alsa_output.platform-107c701400.hdmi.hdmi-stereo)
+  hdmi_pipewire_node: null     # PipeWire node name for HDMI output (e.g. alsa_output.platform-107c706400.hdmi.hdmi-stereo)
   hdmi_playback_device: null   # deprecated; use hdmi_pipewire_node
   mic_device_index: null       # ALSA device index for UMIK mic; null = find by name
   hdmi_device_index: null      # ALSA device index for HDMI output; null = find by name

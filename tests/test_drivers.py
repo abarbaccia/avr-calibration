@@ -2781,7 +2781,7 @@ def test_playback_for_route_no_ref_returns_base() -> None:
     assert not isinstance(p_usb, LoopbackRefPlayback)
 
     p_hdmi = playback_for_route(
-        "hdmi", hdmi_pipewire_node="alsa_output.platform-107c701400.hdmi.hdmi-stereo", hdmi_channels=6,
+        "hdmi", hdmi_pipewire_node="alsa_output.platform-107c706400.hdmi.hdmi-stereo", hdmi_channels=6,
     )
     assert isinstance(p_hdmi, HDMIPwCatPlayback)
     assert not isinstance(p_hdmi, LoopbackRefPlayback)
@@ -2804,7 +2804,7 @@ def test_hdmi_factory_passes_ref_tee_node() -> None:
     from calibrate.drivers.playback import HDMIPwCatPlayback, playback_for_route
     p = playback_for_route(
         "hdmi",
-        hdmi_pipewire_node="alsa_output.platform-107c701400.hdmi.hdmi-surround71",
+        hdmi_pipewire_node="alsa_output.platform-107c706400.hdmi.hdmi-surround71",
         hdmi_channels=6,
         hdmi_ref_tee_node="avr_cal_sweep",
     )
